@@ -1,0 +1,5 @@
+services:
+  test:
+    build: .
+    cap_add:
+      - SYS_ADMIN

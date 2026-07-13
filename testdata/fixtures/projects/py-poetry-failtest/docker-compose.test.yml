@@ -1,0 +1,14 @@
+services:
+  test:
+    image: python:3.12.10-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "1"
+    mem_limit: 256m
+    pids_limit: 128
+    networks: [testnet]
+    command: ["python", "-c", "raise SystemExit(1)"]
+networks:
+  testnet:
+    internal: true

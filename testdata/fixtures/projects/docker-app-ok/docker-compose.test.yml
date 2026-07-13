@@ -1,0 +1,14 @@
+services:
+  test:
+    image: caddy:2.8.4-alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "1"
+    mem_limit: 256m
+    pids_limit: 128
+    networks: [testnet]
+    command: ["caddy", "version"]
+networks:
+  testnet:
+    internal: true

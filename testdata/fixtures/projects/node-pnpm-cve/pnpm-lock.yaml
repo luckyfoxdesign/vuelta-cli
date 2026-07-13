@@ -1,0 +1,10 @@
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      fixture-known-cve:
+        specifier: 1.0.0
+        version: 1.0.0
+packages:
+  fixture-known-cve@1.0.0:
+    resolution: {integrity: sha512-fixture}

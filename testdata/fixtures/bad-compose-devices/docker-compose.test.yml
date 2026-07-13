@@ -1,0 +1,5 @@
+services:
+  test:
+    build: .
+    devices:
+      - /dev/fuse:/dev/fuse

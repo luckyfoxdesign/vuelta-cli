@@ -1,0 +1,8 @@
+[tool.poetry]
+name = "fixture-py-poetry-ok"
+version = "0.1.0"
+description = "Deterministic Vuelta acceptance fixture"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+requests = "2.31.0"

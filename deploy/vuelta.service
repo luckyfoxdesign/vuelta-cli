@@ -1,0 +1,13 @@
+[Unit]
+Description=Vuelta dependency update run
+
+[Service]
+Type=oneshot
+User=vuelta
+Group=vuelta
+ExecStart=/usr/local/bin/vuelta run
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/vuelta %h/.local/state/vuelta

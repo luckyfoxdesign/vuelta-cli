@@ -1,0 +1,5 @@
+# This lock file is intentionally small and offline. Tests simulate the
+# package-manager update rather than contacting a package registry.
+[[package]]
+name = "requests"
+version = "2.31.0"

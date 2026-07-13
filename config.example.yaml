@@ -1,0 +1,114 @@
+# Copy to ~/.config/vuelta/config.yaml, fill in real values, and chmod 0600 it.
+notify:
+  webhook_url: "https://hooks.example.com/vuelta"   # optional
+  telegram:
+    bot_token: ""
+    chat_id: ""
+
+vuln_scan:
+  enabled: true
+  tool: trivy            # trivy | osv-scanner
+  fail_on_severity: HIGH  # CRITICAL | HIGH | MEDIUM
+  database_max_age_hours: 24  # stale/unreachable DB is a security-gate error, not a "clean" result
+  policy_file: ".vuelta-vulnerability-policy.yaml"  # optional, tracked, time-bounded exceptions only
+  image_scan:
+    enabled: true
+    tool: trivy          # trivy is the required portable scanner; docker_scout is optional enrichment
+    platforms: ["linux/amd64"]
+    vex: auto            # apply verified VEX attestations if the registry/DHI publishes them
+
+github_advisories:
+  enabled: true
+  api_url: "https://api.github.com"  # swap for a GitHub Enterprise URL if needed
+  token_env: "GITHUB_TOKEN"          # optional for public repos; read-only token, never passed into containers
+  required_for_github_remotes: false  # true: an API error/no access blocks the commit for GitHub remotes
+
+update:
+  min_release_age_days: 7  # reject versions younger than N days — protects against freshly-published malicious releases
+  egress:
+    network: "vuelta-update-egress"
+    proxy_container: "vuelta-egress-proxy"
+    proxy_url: "http://vuelta-egress-proxy:3128"
+    # Start it before every update run: docker compose up -d egress-proxy.
+    # Its checked-in allowlist is in egress/main.go; add a registry there and
+    # rebuild the proxy before adding a workspace that needs it.
+  images:                  # every image is an immutable digest from a trusted registry; no latest/lts tags
+    # arm64 digests resolved with `docker manifest inspect --verbose` on 2026-07-14.
+    # Re-resolve every digest deliberately before an image/toolchain upgrade.
+    python-poetry: "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153"
+    python-uv: "ghcr.io/astral-sh/uv:0.6.14@sha256:a06fb406bda92ac2c105cd45111a206b80294215d6480fa4ce4fd931ab66d7b2"
+    python-pip-tools: "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153"
+    node: "node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"
+    bun: "oven/bun:1.2@sha256:24b8162f18519860276bddcd5cf74045815be0bd1023b35061fb926f1b7989d2"
+  tools:                   # exact tool versions baked into the prepared images
+    npm_check_updates: "17.1.16"
+    poetry: "2.1.1"
+    pip_tools: "7.5.0"
+
+autofix:
+  enabled: false          # if true, `claude -p` is invoked when tests fail
+  container_image: "ghcr.io/example/vuelta-claude@sha256:<digest>" # immutable image with Claude CLI preinstalled
+  claude_bin: "claude"
+  max_turns: 10
+  allowed_tools: "Read,Edit,Grep"  # no Bash: test logs/diffs are untrusted input, see part C of the spec
+
+deploy_task:
+  mode: git_tag           # git_tag | queue_file
+  tag_prefix: "deploy-pending"   # for git_tag: deploy-pending/<project>
+  queue_file: "~/.config/vuelta/tasks.jsonl"  # for queue_file
+
+# Server-only worker configuration. Keep the two private signing keys outside
+# this file; these are base64-encoded Ed25519 *public* keys supplied by CI.
+# The configured Compose service must set image: "${VUELTA_IMAGE}".
+# production_worker:
+#   state_dir: "/var/lib/vuelta/deploy-state"
+#   source_mode: "signed_queue_file" # signed_queue_file | git_tag
+#   queue_file: "/var/lib/vuelta/delivery/candidates.jsonl"
+#   manifest_dir: "/var/lib/vuelta/delivery/manifests"
+#   candidate_public_key: "<base64-ed25519-public-key>"
+#   manifest_public_key: "<base64-ed25519-public-key>"
+#   # git_tag uses a pre-provisioned bare mirror instead of queue_file:
+#   # git_mirror: "/var/lib/vuelta/tag-mirror.git"
+#   # git_remote: "origin"
+#   # git_expected_origin: "ssh://git@example.invalid/project.git"
+#   # git_tag_prefix: "deploy-pending"
+#   # git_trusted_fingerprint: "<40-or-64-hex-fingerprint>"
+#   max_candidate_age_minutes: 60
+#   operation_timeout_seconds: 120
+#   projects:
+#     - name: api-service
+#       image_repository: "registry.example/vuelta/api-service"
+#       compose_file: "/etc/vuelta/api-service.compose.yml"
+#       service: api
+#       health_url: "https://api.example.com/healthz"
+#       smoke_url: "https://api.example.com/smoke"
+
+workspaces:
+  # This checked-in smoke configuration validates from the app/ directory.
+  # Replace it with explicit target repositories before a real update run.
+  - path: .
+    stack: docker
+    test:
+      compose_file: compose.yml
+      service: test
+      run_args: ["--rm"]
+    branch: main
+    remote: origin
+    docker_images:                 # only these project-relative files are analyzed/updated
+      files: ["Dockerfile"]
+      runtime_images: ["node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"]
+      platforms: ["linux/amd64"]
+
+git:
+  push_mode: review_branch         # review_branch (default) | direct_branch
+  allowed_changed_paths:           # required allowlist, otherwise every update is rolled back for manual review
+    - "poetry.lock"
+    - "pyproject.toml"
+    - "uv.lock"
+    - "requirements.in"
+    - "requirements.txt"
+    - "package.json"
+    - "package-lock.json"
+    - "pnpm-lock.yaml"
+    - "bun.lock"
+    - "Dockerfile*"

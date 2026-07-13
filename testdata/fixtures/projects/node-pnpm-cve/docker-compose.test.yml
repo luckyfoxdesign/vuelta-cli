@@ -1,0 +1,14 @@
+services:
+  test:
+    image: node:22.14.0-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "1"
+    mem_limit: 256m
+    pids_limit: 128
+    networks: [testnet]
+    command: ["node", "-e", "process.exit(0)"]
+networks:
+  testnet:
+    internal: true

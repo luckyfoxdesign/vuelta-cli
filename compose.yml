@@ -1,0 +1,65 @@
+services:
+  test:
+    build: .
+    working_dir: /src
+    volumes:
+      - .:/src
+      - go-mod-cache:/go/pkg/mod
+    command: ["go", "test", "./..."]
+
+  race:
+    build: .
+    working_dir: /src
+    environment:
+      CGO_ENABLED: "1"
+    volumes:
+      - .:/src
+      - go-mod-cache:/go/pkg/mod
+    command: ["go", "test", "-race", "./..."]
+
+  lint:
+    image: golangci/golangci-lint:v2.12.2-alpine
+    working_dir: /src
+    volumes:
+      - .:/src
+      - go-mod-cache:/go/pkg/mod
+    command: ["golangci-lint", "run", "./..."]
+
+  tidy:
+    build: .
+    working_dir: /src
+    volumes:
+      - .:/src
+      - go-mod-cache:/go/pkg/mod
+    command: ["go", "mod", "tidy"]
+
+  build:
+    build: .
+    working_dir: /src
+    volumes:
+      - .:/src
+      - go-mod-cache:/go/pkg/mod
+    command: ["go", "build", "-o", "/src/bin/vuelta", "./cmd/vuelta"]
+
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: egress/Dockerfile
+    container_name: vuelta-egress-proxy
+    environment:
+      VUELTA_EGRESS_ALLOW_HOSTS: >-
+        pypi.org,files.pythonhosted.org,registry.npmjs.org,registry.yarnpkg.com,
+        registry.bun.sh,github.com,objects.githubusercontent.com,ghcr.io,
+        registry-1.docker.io,auth.docker.io,production.cloudflare.docker.com
+    networks:
+      - default
+      - update-egress
+    restart: "no"
+
+volumes:
+  go-mod-cache:
+
+networks:
+  update-egress:
+    name: vuelta-update-egress
+    internal: true

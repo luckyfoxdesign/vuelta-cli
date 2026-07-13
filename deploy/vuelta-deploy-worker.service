@@ -1,0 +1,17 @@
+[Unit]
+Description=Vuelta verified production deploy worker
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=vuelta-deploy
+Group=vuelta-deploy
+SupplementaryGroups=docker
+ExecStart=/usr/local/bin/vuelta deploy worker /etc/vuelta/config.yaml
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/vuelta
+ReadWritePaths=/var/lib/vuelta

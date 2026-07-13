@@ -1,0 +1,182 @@
+# vuelta
+
+A one-shot CLI that scans a list of configured project workspaces, updates
+their dependency versions inside sandboxed containers, runs each project's
+tests, scans for CVEs, and — on success — queues a deploy task. It has no
+resident daemon; an external scheduler (launchd/systemd timer) runs
+`vuelta run` on a cadence.
+
+## Stack
+
+- Language: Go. A single static binary, no runtime install required on
+  target machines (laptop or server).
+- Runtime dependencies (not vendored, must exist in the environment): `git`,
+  `docker`/`docker compose`, and optionally `trivy`/`osv-scanner` for CVE
+  scanning.
+- Package managers (`poetry`/`uv`/`pip-tools`, `npm`/`pnpm`) run only inside
+  Docker containers, never on the host — their install scripts execute
+  arbitrary code and must stay isolated.
+
+## Layout
+
+```text
+cmd/vuelta/       # main.go, CLI entrypoint
+internal/
+  config/         # config.yaml parsing and validation
+  scanner/        # validates only explicitly configured project paths, detects stack
+  updater/        # per-stack dependency updates (python/js/docker)
+  vulnscan/       # trivy/osv-scanner integration
+  githubalerts/   # read-only GitHub Dependabot/Security Advisories client
+  sandbox/        # one-off sandboxed working copy for update/test
+  testrunner/     # runs docker compose test
+  autofix/        # optional claude -p invocation on test failure
+  gitops/         # commit, push, tags
+  tasks/          # deploy task creation/reading
+  notify/         # webhook/telegram notifications
+config.example.yaml
+```
+
+## Configuration
+
+Copy `config.example.yaml` to `~/.config/vuelta/config.yaml`, fill in real
+values, and set its permissions to `0600`. See the file for the full schema:
+notification targets, vulnerability scan settings, GitHub advisories,
+per-stack update pinning, autofix, deploy task mode, the list of
+`workspaces` to manage, and the git allowlist that gates which files an
+update run is allowed to touch.
+
+`vuelta` never scans parent directories or auto-discovers projects: only
+paths listed under `workspaces[]` are ever touched.
+
+## Runner isolation
+
+Each update starts from `git archive <base SHA>` in a fresh `0700` directory.
+Only tracked regular files are extracted; `.git`, ignored/untracked files,
+`.env*`, host credentials, sockets, and symlinks do not enter the runner. The
+original working tree is never mounted into an update or test container.
+
+Package-manager updates require the checked-in local egress proxy. Start it
+with `docker compose up -d egress-proxy`: update containers attach only to the
+internal `vuelta-update-egress` network and receive the proxy through explicit
+`HTTP(S)_PROXY` variables. The proxy allowlists only the registries in
+`egress/main.go`; Docker's default bridge is not an acceptable substitute.
+Vuelta inspects the network and proxy container before starting an updater and
+fails closed with an actionable diagnostic if either is unavailable. No host
+environment variable or GitHub token is passed to a runner.
+
+Every `docker-compose.test.yml` selected by a workspace must use immutable
+image digests and an explicit internal test network. Each service reachable by
+the test service must set a non-root numeric `user`, `cap_drop: [ALL]`,
+`security_opt: [no-new-privileges:true]`, and positive `cpus`, `mem_limit`,
+and `pids_limit` values. `privileged`, host namespaces, devices, Docker socket
+or absolute host mounts, `env_file`, inherited/interpolated environment values,
+external networks, mutable image tags, configs, and secrets are rejected.
+
+Fixtures and credentials for tests must be synthetic, concrete values declared
+in that compose file or generated inside the sandbox. Do not reference a host
+`.env`, developer credentials, or production secret store. To add a project,
+first provision its registry allowlist in the egress-policy layer, pin all
+runner/test images to digests, add the restricted compose profile, then add the
+workspace path and dependency-file allowlist to `config.yaml`.
+
+## Acceptance fixtures
+
+Deterministic, offline fixture projects and mock boundaries live in
+`testdata/fixtures/`. They never contain a nested Git repository: test setup
+copies one fixture into a temporary directory and initializes a fresh Git
+repository for each scenario.
+
+- `projects/py-poetry-ok`, `node-pnpm-ok`, and `docker-app-ok` cover the
+  accepted Python, Node, and digest-pinned Docker update paths.
+- `projects/py-poetry-failtest`, `node-pnpm-cve`, and `docker-app-cve` cover
+  a failing test, a package CVE, and a runtime/base-image CVE respectively.
+- `projects/malicious-postinstall` and `projects/escape-symlink` are hostile
+  inputs: they are only used to verify tracked-files-only sandboxing and path
+  rejection. They must never be run against a host checkout.
+- `bad-compose-*` files each isolate one prohibited Compose field and must be
+  rejected before Docker is invoked.
+- `mock-claude/claude` has explicit `fix` and `fail` modes; the former creates
+  an untracked file deliberately so rollback behavior remains observable.
+
+The Go test suite starts in-memory GitHub-alert and registry stand-ins; it
+does not contact GitHub, a package registry, or an OCI registry. The deploy
+target mock accepts only well-formed immutable candidate fields and can model
+either `healthy` or `rolled_back` results. Cryptographic tag verification and
+the real deployment adapter are owned by part G.
+
+## Development
+
+```bash
+docker compose run --rm test   # go test ./...
+docker compose run --rm lint   # golangci-lint run
+docker compose run --rm tidy   # go mod tidy
+docker compose run --rm build  # go build -o bin/vuelta ./cmd/vuelta
+make build-mac                 # darwin/arm64 binary via Docker
+make build-linux               # linux/amd64 binary via Docker
+make build                     # both targets
+```
+
+This command is also the repeatable local verification of the fixture suite.
+`docs/runbook-local.md` maps every acceptance criterion to its fixture and
+notes the remaining prerequisites for a full manual end-to-end run.
+
+## Operations
+
+`vuelta run`, `vuelta scan`, and `vuelta config validate` use
+`~/.config/vuelta/config.yaml` by default; a config path remains accepted for
+automation. `vuelta run --project NAME` selects one configured workspace and
+`--dry-run` never commits, pushes, or creates a deploy candidate.
+
+Deploy candidates are created explicitly after a protected merge:
+
+```bash
+vuelta deploy enqueue --project api-service --commit <full-sha> \
+  --image-digest sha256:<verified-image-digest> \
+  --manifest-digest sha256:<verified-manifest-digest>
+```
+
+The digests must come from the build and security-scan stage; mutable tags and
+branch names are refused. `queue_file` candidates can be inspected with
+`vuelta tasks list`. The local queue is only a handoff record, not proof that
+the production worker received it.
+
+Operational records are written to `~/.local/state/vuelta/vuelta.log` with a
+0700 state directory and 0600 files; use `--json-logs` with `run` when a
+machine-readable stdout/file stream is needed. Do not put test logs, diffs,
+webhook URLs, or Telegram tokens in notification text or audit fields.
+
+Scheduling is external. Templates live in `deploy/`: load
+`com.vuelta.run.plist` with `launchctl` on macOS after replacing `REPLACE_ME`,
+or install/enable `vuelta.service` and `vuelta.timer` on Linux. The systemd
+unit is an example and must be adjusted to the intended unprivileged user and
+binary path.
+
+### Verified production deploys
+
+`vuelta deploy worker /etc/vuelta/config.yaml` is a separate, one-shot
+server worker. Its `vuelta-deploy-worker.service`/timer template runs as a
+dedicated unprivileged account with a private state directory. It accepts only
+Ed25519-signed queue records or GPG-signed annotated tags from a configured
+bare mirror, plus a signed manifest, then pulls
+`<allowlisted-repository>@sha256:<digest>`, and never uses a mutable tag,
+`git pull`, source checkout, image build, SSH agent, or database migration.
+
+Configure `production_worker` with public keys/fingerprints only; signing keys
+stay in the CI/delivery system. The queue or bare mirror, manifest directory,
+and state directory must be private absolute paths. Each project has a fixed Compose file/service and
+health and smoke URLs; the Compose service must use `${VUELTA_IMAGE}` as its
+image. Before changing the service, the worker writes its currently running
+RepoDigest as the rollback target. A failed deploy, health check, smoke check,
+timeout, or restart from `running` rolls that digest back and verifies health
+again. Notifications contain only project, candidate ID, status, and digest.
+
+The worker schema intentionally has no migration command. Database migrations
+need a separately reviewed adapter, backup, reversibility proof, and rollback
+plan; they are never part of a dependency deploy.
+
+## Status
+
+Implemented: configuration, update pipeline, security gates, notifications,
+immutable candidate transport, and the signed-queue production worker with
+durable state and automatic rollback. The build pipeline remains responsible
+for producing and scanning the signed OCI artifact/manifest before delivery.

@@ -1,0 +1,6 @@
+{
+  "name": "fixture-node-pnpm-cve",
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.0",
+  "dependencies": { "fixture-known-cve": "1.0.0" }
+}
