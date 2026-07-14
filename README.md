@@ -160,6 +160,46 @@ tokens, or command logs. A missing, malformed, expired, reconfigured, dirty,
 rebased, or changed-input snapshot exits with code 3 before any package
 manager runs; create a fresh scan instead.
 
+### Direct local package mode
+
+`vuelta package local` is deliberately separate from both `vuelta run` and
+snapshot-based package commands. It accepts one explicitly supplied directory,
+does not inspect Git metadata, and never starts Docker. It is useful for a
+small local project, but it is less isolated: it never creates a commit, push,
+or deployment candidate and does not run the Docker-based CVE scan or
+container tests.
+
+Copy `local.example.yaml` to a private local policy file and restrict
+`allowed_packages` to direct dependencies. Find candidates without writing:
+
+```bash
+vuelta package local scan --policy ./vuelta-local.yaml /path/to/project
+```
+
+Apply only a scanned, allowlisted candidate with an explicit write
+confirmation:
+
+```bash
+vuelta package local update --policy ./vuelta-local.yaml \
+  --package example-package@2.3.4 --apply /path/to/project
+```
+
+`--dry-run` checks the requested candidate without writing. Manifests and
+locks must be regular root files and exactly one supported pair must exist:
+npm, pnpm, Bun, Poetry, uv, or pip-tools. Vuelta resolves the manager only
+from system `PATH`, rejects a manager inside the project, supplies a minimal
+environment without inherited credentials, and never runs a shell.
+
+Lifecycle/install scripts are disabled by default. `--allow-scripts` is an
+explicit warning-bearing opt-in to third-party code execution on the host.
+Project manager configuration is rejected by default; use
+`--allow-project-config` only after reviewing its registry, proxy,
+`script-shell`, and plugin settings. Vuelta backs up only the selected
+manifest/lock pair before an update and restores it if the manager fails or if
+the post-factum root allowlist check detects another change. That check is
+detection and recovery, not a sandbox: it cannot undo external side effects of
+a host process.
+
 Deploy candidates are created explicitly after a protected merge:
 
 ```bash

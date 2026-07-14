@@ -1,4 +1,6 @@
 # Copy to ~/.config/vuelta/config.yaml, fill in real values, and chmod 0600 it.
+# `vuelta package local` deliberately does not load this pipeline configuration:
+# copy local.example.yaml and pass it explicitly as `--policy` instead.
 notify:
   webhook_url: "https://hooks.example.com/vuelta"   # optional
   telegram:

@@ -53,3 +53,10 @@ func TestConfigInitNonInteractiveReportsMissingValue(t *testing.T) {
 		t.Fatalf("config init error = %v, want missing stack error", err)
 	}
 }
+
+func TestLocalPackageUpdateRejectsApplyAndDryRunTogether(t *testing.T) {
+	err := run([]string{"package", "local", "update", "--policy", "local.yaml", "--apply", "--dry-run"})
+	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("local update error = %v, want conflicting confirmation flags", err)
+	}
+}

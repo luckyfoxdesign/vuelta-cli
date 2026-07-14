@@ -17,7 +17,7 @@
 app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # main.go, CLI entrypoint
-├── internal/            # config, scanner, updater, updatesnapshot, vulnscan, githubalerts,
+├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
 │                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
@@ -48,6 +48,7 @@ make build                     # both cross-build targets
 
 - `go.mod` — Go module definition.
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
+- `local.example.yaml` — standalone allowlist policy for `vuelta package local`.
 - `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
@@ -65,6 +66,7 @@ make build                     # both cross-build targets
 - `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
+- `internal/localupdate/` — implements the explicitly less-isolated local package mode. It never calls Git or Docker, and is intentionally separate from the normal snapshot and pipeline packages.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
 - `internal/pipeline/` — orchestrates the main `vuelta run` sequence (part B §7): preflight, sandbox, security gate, update, diff/allowlist check, tests, optional autofix, commit, push, and notification — once per configured workspace, sequentially, under a process lock. The runner uses the hardened file/container isolation provided by sandbox, updater, and testrunner; CVE/GitHub-alerts/autofix remain stage seams.

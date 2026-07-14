@@ -174,6 +174,17 @@ type GitConfig struct {
 	AllowedChangedPaths []string `yaml:"allowed_changed_paths"`
 }
 
+// LocalPackagePolicy is the deliberately narrow configuration for
+// `vuelta package local`. It is loaded from its own file rather than the
+// sandboxed-pipeline configuration, so a local project need not have Git or
+// Docker available. It never accepts commands, registries, proxies, or
+// credentials.
+type LocalPackagePolicy struct {
+	AllowedPackages    []string `yaml:"allowed_packages"`
+	MinReleaseAgeDays  int      `yaml:"min_release_age_days"`
+	AllowProjectConfig bool     `yaml:"allow_project_config"`
+}
+
 const (
 	StackPython = "python"
 	StackNode   = "node"
@@ -186,6 +197,47 @@ var packageManagersByStack = map[string]map[string]bool{
 	StackPython: {"poetry": true, "uv": true, "pip-tools": true},
 	StackNode:   {"npm": true, "pnpm": true, "bun": true},
 	StackDocker: {},
+}
+
+var localPackageNamePattern = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// LoadLocalPackagePolicy reads a standalone local-mode policy. Keeping this
+// schema separate prevents local mode from accidentally inheriting a Git,
+// Docker, registry, proxy, or notification setting from the regular config.
+func LoadLocalPackagePolicy(path string) (LocalPackagePolicy, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return LocalPackagePolicy{}, fmt.Errorf("read local package policy %s: %w", path, err)
+	}
+	var policy LocalPackagePolicy
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&policy); err != nil {
+		return LocalPackagePolicy{}, fmt.Errorf("parse local package policy %s: %w", path, err)
+	}
+	if err := policy.Validate(); err != nil {
+		return LocalPackagePolicy{}, err
+	}
+	return policy, nil
+}
+
+// Validate rejects an empty allowlist and values which could be interpreted as
+// package-manager flags. Package names are exact allowlist entries.
+func (p LocalPackagePolicy) Validate() error {
+	if len(p.AllowedPackages) == 0 {
+		return errors.New("local package policy: allowed_packages is required")
+	}
+	if p.MinReleaseAgeDays < 0 {
+		return errors.New("local package policy: min_release_age_days must not be negative")
+	}
+	seen := make(map[string]bool, len(p.AllowedPackages))
+	for _, name := range p.AllowedPackages {
+		if !localPackageNamePattern.MatchString(name) || strings.HasPrefix(name, "-") || seen[name] {
+			return fmt.Errorf("local package policy: invalid or duplicate allowed package %q", name)
+		}
+		seen[name] = true
+	}
+	return nil
 }
 
 // Load reads and parses the config file at path. It does not validate.

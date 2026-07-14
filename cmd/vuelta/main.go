@@ -22,6 +22,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/deployworker"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
+	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
@@ -91,6 +92,8 @@ commands:
   scan [--project NAME] [config-path]
   package scan [--project NAME] [--json] [config-path]
   package update --snapshot ID [--dry-run] [config-path]
+  package local scan [--json] [--policy PATH] [--allow-project-config] <project-path>
+  package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>
   config validate [config-path]
   config init [options] <project-path> [config-path]
   tasks list [config-path]
@@ -107,16 +110,139 @@ func defaultConfigPath() (string, error) {
 
 func runPackage(args []string) error {
 	if len(args) < 1 {
-		return fail(exitConfig, "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path]")
+		return fail(exitConfig, packageUsage)
 	}
 	switch args[0] {
 	case "scan":
 		return runPackageScan(args[1:])
 	case "update":
 		return runPackageUpdate(args[1:])
+	case "local":
+		return runPackageLocal(args[1:])
 	default:
-		return fail(exitConfig, "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path]")
+		return fail(exitConfig, packageUsage)
 	}
+}
+
+const packageUsage = "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path] | vuelta package local scan [--json] [--policy PATH] [--allow-project-config] <project-path> | vuelta package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>"
+
+func runPackageLocal(args []string) error {
+	if len(args) < 1 {
+		return fail(exitConfig, packageUsage)
+	}
+	switch args[0] {
+	case "scan":
+		return runPackageLocalScan(args[1:])
+	case "update":
+		return runPackageLocalUpdate(args[1:])
+	default:
+		return fail(exitConfig, packageUsage)
+	}
+}
+
+func runPackageLocalScan(args []string) error {
+	fs := flag.NewFlagSet("package local scan", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	policyPath := fs.String("policy", "", "standalone local package policy")
+	jsonOutput := fs.Bool("json", false, "write machine-readable candidates")
+	allowProjectConfig := fs.Bool("allow-project-config", false, "allow reviewed project package-manager config")
+	if err := fs.Parse(args); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if len(fs.Args()) != 1 {
+		return fail(exitConfig, "usage: vuelta package local scan [--json] [--policy PATH] [--allow-project-config] <project-path>")
+	}
+	policy := config.LocalPackagePolicy{}
+	if *policyPath != "" {
+		var err error
+		policy, err = config.LoadLocalPackagePolicy(*policyPath)
+		if err != nil {
+			return fail(exitConfig, "%v", err)
+		}
+	}
+	if *allowProjectConfig || policy.AllowProjectConfig {
+		fmt.Fprintln(os.Stderr, "warning: local mode will honor reviewed project package-manager configuration; registry, proxy, plugins, or script-shell settings can affect host execution")
+	}
+	result, err := localupdate.NewService().Scan(context.Background(), fs.Args()[0], policy, *allowProjectConfig)
+	if err != nil {
+		return fail(exitFailure, "%v", err)
+	}
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Path           string                  `json:"path"`
+			Manager        string                  `json:"manager"`
+			Candidates     []localupdate.Candidate `json:"candidates"`
+			ReleaseAgeUsed bool                    `json:"release_age_used"`
+		}{result.Project.Root, result.Project.Manager, result.Candidates, result.ReleaseAgeUsed})
+	}
+	fmt.Printf("local %s: %d candidate(s)\n", result.Project.Manager, len(result.Candidates))
+	for _, candidate := range result.Candidates {
+		fmt.Printf("  %s: %s -> %s\n", candidate.Name, candidate.Current, candidate.Target)
+	}
+	if policy.MinReleaseAgeDays > 0 && !result.ReleaseAgeUsed {
+		fmt.Printf("note: %s cannot enforce min_release_age_days locally; no age restriction was claimed\n", result.Project.Manager)
+	}
+	fmt.Fprintln(os.Stderr, "local mode did not run Git operations, Docker isolation, CVE scanning, or container tests")
+	return nil
+}
+
+func runPackageLocalUpdate(args []string) error {
+	fs := flag.NewFlagSet("package local update", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	policyPath := fs.String("policy", "", "standalone local package policy (required)")
+	apply := fs.Bool("apply", false, "explicitly permit writes to the manifest and lock file")
+	dryRun := fs.Bool("dry-run", false, "scan and validate the selected update without writing")
+	allowProjectConfig := fs.Bool("allow-project-config", false, "allow reviewed project package-manager config")
+	allowScripts := fs.Bool("allow-scripts", false, "allow package lifecycle/install scripts on the host")
+	var packages repeatedFlag
+	fs.Var(&packages, "package", "selected package update NAME@VERSION (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if *policyPath == "" {
+		return fail(exitConfig, "--policy is required for local update")
+	}
+	if *apply && *dryRun {
+		return fail(exitConfig, "--apply and --dry-run cannot be used together")
+	}
+	if len(fs.Args()) != 1 {
+		return fail(exitConfig, "usage: vuelta package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>")
+	}
+	policy, err := config.LoadLocalPackagePolicy(*policyPath)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	selected := make([]localupdate.Candidate, 0, len(packages))
+	for _, value := range packages {
+		name, version, ok := strings.Cut(strings.TrimSpace(value), "@")
+		if strings.HasPrefix(value, "@") {
+			index := strings.LastIndex(value, "@")
+			if index > 0 {
+				name, version, ok = value[:index], value[index+1:], true
+			}
+		}
+		if !ok || name == "" || version == "" {
+			return fail(exitConfig, "--package must be NAME@VERSION")
+		}
+		selected = append(selected, localupdate.Candidate{Name: name, Target: version})
+	}
+	if *allowProjectConfig || policy.AllowProjectConfig {
+		fmt.Fprintln(os.Stderr, "warning: local mode will honor reviewed project package-manager configuration; registry, proxy, plugins, or script-shell settings can affect host execution")
+	}
+	if *allowScripts {
+		fmt.Fprintln(os.Stderr, "warning: --allow-scripts permits third-party package lifecycle/install code to execute on this host")
+	}
+	result, err := localupdate.NewService().Update(context.Background(), fs.Args()[0], policy, selected, localupdate.UpdateOptions{Apply: *apply, DryRun: *dryRun, AllowProjectConfig: *allowProjectConfig, AllowScripts: *allowScripts})
+	if err != nil {
+		return fail(exitFailure, "%v", err)
+	}
+	if *dryRun {
+		fmt.Printf("local %s update dry-run accepted for %d selected package(s); no files were written\n", result.Project.Manager, len(selected))
+	} else {
+		fmt.Printf("local %s update applied for %d selected package(s)\n", result.Project.Manager, len(selected))
+	}
+	fmt.Fprintln(os.Stderr, "local mode did not run Git operations, Docker isolation, CVE scanning, or container tests; its allowlist check is post-factum detection, not isolation")
+	return nil
 }
 
 func runPackageScan(args []string) error {

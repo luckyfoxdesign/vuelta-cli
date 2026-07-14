@@ -8,6 +8,27 @@ import (
 	"testing"
 )
 
+func TestLoadLocalPackagePolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "local.yaml")
+	if err := os.WriteFile(path, []byte("allowed_packages:\n  - '@scope/package'\nmin_release_age_days: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := LoadLocalPackagePolicy(path)
+	if err != nil {
+		t.Fatalf("LoadLocalPackagePolicy: %v", err)
+	}
+	if len(policy.AllowedPackages) != 1 || policy.AllowedPackages[0] != "@scope/package" {
+		t.Fatalf("policy = %#v", policy)
+	}
+}
+
+func TestLocalPackagePolicyRejectsFlagLikePackage(t *testing.T) {
+	err := (LocalPackagePolicy{AllowedPackages: []string{"--registry"}}).Validate()
+	if err == nil {
+		t.Fatal("expected flag-like package rejection")
+	}
+}
+
 func TestLoadDefaultsAutofixToNoShellTools(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("workspaces: []\n"), 0o600); err != nil {
