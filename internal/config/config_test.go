@@ -57,7 +57,7 @@ func TestValidateRejectsUnsafeTestRunArgument(t *testing.T) {
 func TestValidateSecurityConfigRequiresPinnedScannerImages(t *testing.T) {
 	validDigest := "scanner@sha256:" + strings.Repeat("a", 64)
 	cfg := Config{VulnScan: VulnScanConfig{
-		Enabled: true, Tool: "trivy", Image: validDigest,
+		DependencySource: "trivy", Image: validDigest,
 		FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
 		ImageScan: ImageScanConfig{Enabled: true, Tool: "trivy", Image: validDigest},
 	}}
@@ -67,5 +67,25 @@ func TestValidateSecurityConfigRequiresPinnedScannerImages(t *testing.T) {
 	cfg.VulnScan.ImageScan.Image = "aquasec/trivy:latest"
 	if errs := validateSecurityConfig(cfg); len(errs) == 0 || !strings.Contains(errs[0].Error(), "image") {
 		t.Fatalf("expected unpinned scanner image rejection, got %v", errs)
+	}
+}
+
+func TestValidateSecurityConfigRequiresOneCompatibleDependencySource(t *testing.T) {
+	validDigest := "scanner@sha256:" + strings.Repeat("a", 64)
+	cfg := Config{VulnScan: VulnScanConfig{
+		DependencySource: "github-dependabot", FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
+		ImageScan: ImageScanConfig{Enabled: true, Tool: "trivy", Image: validDigest},
+	}}
+	if errs := validateSecurityConfig(cfg); len(errs) != 0 {
+		t.Fatalf("valid Dependabot config errors = %v", errs)
+	}
+	cfg.VulnScan.Image = validDigest
+	if errs := validateSecurityConfig(cfg); len(errs) == 0 || !strings.Contains(errs[0].Error(), "must be empty") {
+		t.Fatalf("expected incompatible local scanner image rejection, got %v", errs)
+	}
+	cfg.VulnScan.DependencySource = ""
+	cfg.VulnScan.Image = ""
+	if errs := validateSecurityConfig(cfg); len(errs) == 0 || !strings.Contains(errs[0].Error(), "dependency_source") {
+		t.Fatalf("expected missing source rejection, got %v", errs)
 	}
 }

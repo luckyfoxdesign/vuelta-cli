@@ -11,10 +11,9 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
-// DefaultSecurityGate joins the required local scanner with the optional,
-// read-only GitHub alert source. Local scan failures always fail closed; GitHub
-// failures do the same only when the configuration requires alerts for a
-// GitHub remote.
+// DefaultSecurityGate runs exactly one configured dependency source. Trivy
+// image scans stay independent because Dependabot cannot inspect image OS
+// packages.
 type DefaultSecurityGate struct {
 	Scanner vulnscan.Scanner
 	GitHub  githubalerts.Client
@@ -44,15 +43,26 @@ func (g DefaultSecurityGate) PostCheck(ctx context.Context, workDir string, ws c
 }
 
 func (g DefaultSecurityGate) scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]vulnscan.Finding, error) {
-	local, err := g.Scanner.Scan(ctx, root, ws, cfg)
-	if err != nil {
-		return nil, err
+	switch cfg.VulnScan.DependencySource {
+	case "trivy", "osv-scanner":
+		local, err := g.Scanner.Scan(ctx, root, ws, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return local.Findings, nil
+	case "github-dependabot":
+		remote, err := g.GitHub.Scan(ctx, ws, cfg.GithubAdvisories)
+		if err != nil {
+			return nil, err
+		}
+		images, err := g.Scanner.ScanImages(ctx, root, ws, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return append(remote, images.Findings...), nil
+	default:
+		return nil, fmt.Errorf("unsupported dependency vulnerability source %q", cfg.VulnScan.DependencySource)
 	}
-	remote, err := g.GitHub.Scan(ctx, ws, cfg.GithubAdvisories)
-	if err != nil {
-		return nil, err
-	}
-	return append(local.Findings, remote...), nil
 }
 
 func reportFromFindings(findings []vulnscan.Finding) Report {

@@ -56,34 +56,31 @@ func (c Client) remoteURL(ctx context.Context, repoPath, remote string) (string,
 }
 
 // Scan returns open Dependabot alerts for a GitHub remote, enriched with
-// Global Security Advisory data where available. A non-GitHub remote is not
-// an error. For a required GitHub remote, every API/auth/rate-limit failure is
-// returned so the caller can fail closed.
+// Global Security Advisory data where available. It is called only when
+// GitHub Dependabot is the selected dependency source, so an unsupported
+// remote or any API/auth/rate-limit failure must fail closed.
 func (c Client) Scan(ctx context.Context, ws config.Workspace, cfg config.GithubAdvisoriesConfig) ([]vulnscan.Finding, error) {
-	if !cfg.Enabled {
-		return nil, nil
-	}
 	remote, err := c.remoteURL(ctx, ws.Path, ws.Remote)
 	if err != nil {
-		return nil, c.requiredError(cfg, false, err)
+		return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: %w", err)
 	}
 	owner, repo, githubRemote := githubRepository(remote)
 	if !githubRemote {
-		return nil, nil
+		return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: remote %q is not hosted by github.com", remote)
 	}
 	alerts, err := c.dependabotAlerts(ctx, cfg, owner, repo)
 	if err != nil {
-		return nil, c.requiredError(cfg, true, err)
+		return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: %w", err)
 	}
 	findings := make([]vulnscan.Finding, 0, len(alerts))
 	for _, alert := range alerts {
 		advisory, err := c.advisory(ctx, cfg, alert.Advisory.GHSAID)
 		if err != nil {
-			return nil, c.requiredError(cfg, true, err)
+			return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: %w", err)
 		}
 		id := firstNonEmpty(advisory.GHSAID, alert.Advisory.GHSAID, alert.Advisory.CVEID)
 		if id == "" || alert.Dependency.Package.Name == "" || alert.Dependency.ManifestPath == "" {
-			return nil, c.requiredError(cfg, true, fmt.Errorf("dependabot alert %d has incomplete advisory or dependency data", alert.Number))
+			return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: dependabot alert %d has incomplete advisory or dependency data", alert.Number)
 		}
 		findings = append(findings, vulnscan.Finding{
 			ID:               id,
@@ -96,13 +93,6 @@ func (c Client) Scan(ctx context.Context, ws config.Workspace, cfg config.Github
 		})
 	}
 	return findings, nil
-}
-
-func (c Client) requiredError(cfg config.GithubAdvisoriesConfig, githubRemote bool, err error) error {
-	if githubRemote && cfg.RequiredForGithubRemotes {
-		return fmt.Errorf("required GitHub Dependabot security source unavailable: %w", err)
-	}
-	return nil
 }
 
 type dependabotAlert struct {

@@ -50,8 +50,9 @@ type TelegramConfig struct {
 }
 
 type VulnScanConfig struct {
-	Enabled             bool   `yaml:"enabled"`
-	Tool                string `yaml:"tool"`
+	// DependencySource selects the only source used for dependency and lock-file
+	// findings. Image findings are configured independently below.
+	DependencySource    string `yaml:"dependency_source"`
 	Image               string `yaml:"image"`
 	FailOnSeverity      string `yaml:"fail_on_severity"`
 	DatabaseMaxAgeHours int    `yaml:"database_max_age_hours"`
@@ -71,10 +72,8 @@ type ImageScanConfig struct {
 }
 
 type GithubAdvisoriesConfig struct {
-	Enabled                  bool   `yaml:"enabled"`
-	APIURL                   string `yaml:"api_url"`
-	TokenEnv                 string `yaml:"token_env"`
-	RequiredForGithubRemotes bool   `yaml:"required_for_github_remotes"`
+	APIURL   string `yaml:"api_url"`
+	TokenEnv string `yaml:"token_env"`
 }
 
 type UpdateConfig struct {
@@ -368,14 +367,17 @@ func validateDeployTask(c DeployTaskConfig) []error {
 
 func validateSecurityConfig(c Config) []error {
 	var errs []error
-	if !c.VulnScan.Enabled {
-		errs = append(errs, errors.New("vuln_scan.enabled: must be true; disabling the local CVE gate is not supported"))
-	}
-	if c.VulnScan.Tool != "trivy" && c.VulnScan.Tool != "osv-scanner" {
-		errs = append(errs, fmt.Errorf("vuln_scan.tool: %q is not supported (trivy|osv-scanner)", c.VulnScan.Tool))
-	}
-	if !digestRefPattern.MatchString(c.VulnScan.Image) {
-		errs = append(errs, fmt.Errorf("vuln_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.Image))
+	switch c.VulnScan.DependencySource {
+	case "trivy", "osv-scanner":
+		if !digestRefPattern.MatchString(c.VulnScan.Image) {
+			errs = append(errs, fmt.Errorf("vuln_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.Image))
+		}
+	case "github-dependabot":
+		if c.VulnScan.Image != "" {
+			errs = append(errs, errors.New("vuln_scan.image: must be empty when dependency_source is github-dependabot; use vuln_scan.image_scan.image for image scanning"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("vuln_scan.dependency_source: %q is not supported (trivy|osv-scanner|github-dependabot)", c.VulnScan.DependencySource))
 	}
 	if severityRank(c.VulnScan.FailOnSeverity) < 1 {
 		errs = append(errs, fmt.Errorf("vuln_scan.fail_on_severity: %q is not supported (CRITICAL|HIGH|MEDIUM|LOW)", c.VulnScan.FailOnSeverity))
@@ -388,9 +390,6 @@ func validateSecurityConfig(c Config) []error {
 	}
 	if c.VulnScan.ImageScan.Enabled && !digestRefPattern.MatchString(c.VulnScan.ImageScan.Image) {
 		errs = append(errs, fmt.Errorf("vuln_scan.image_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.ImageScan.Image))
-	}
-	if c.GithubAdvisories.RequiredForGithubRemotes && !c.GithubAdvisories.Enabled {
-		errs = append(errs, errors.New("github_advisories.enabled: required when required_for_github_remotes is true"))
 	}
 	if c.Autofix.Enabled {
 		if !digestRefPattern.MatchString(c.Autofix.ContainerImage) {

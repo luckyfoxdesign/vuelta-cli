@@ -2,6 +2,8 @@ package vulnscan
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +26,7 @@ func TestScanParsesFreshStructuredTrivyResultWithoutIgnoreFlags(t *testing.T) {
 		},
 	}
 	root := t.TempDir()
-	report, err := scanner.Scan(context.Background(), root, config.Workspace{Path: root}, config.Config{VulnScan: config.VulnScanConfig{Enabled: true, Tool: "trivy", DatabaseMaxAgeHours: 24}})
+	report, err := scanner.Scan(context.Background(), root, config.Workspace{Path: root}, config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy", DatabaseMaxAgeHours: 24}})
 	if err != nil || len(report.Findings) != 1 {
 		t.Fatalf("Scan() = %+v, %v", report, err)
 	}
@@ -45,7 +47,7 @@ func TestScanRejectsStaleDatabase(t *testing.T) {
 		},
 	}
 	root := t.TempDir()
-	_, err := scanner.Scan(context.Background(), root, config.Workspace{Path: root}, config.Config{VulnScan: config.VulnScanConfig{Enabled: true, Tool: "trivy", DatabaseMaxAgeHours: 24}})
+	_, err := scanner.Scan(context.Background(), root, config.Workspace{Path: root}, config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy", DatabaseMaxAgeHours: 24}})
 	if err == nil || !strings.Contains(err.Error(), "older") {
 		t.Fatalf("expected stale database error, got %v", err)
 	}
@@ -59,9 +61,41 @@ func TestScanAcceptsTrivyResultWithoutDatabaseTimestampFromFreshTmpfs(t *testing
 			return []byte(`{"Results":[]}`), nil
 		},
 	}
-	report, err := scanner.Scan(context.Background(), t.TempDir(), config.Workspace{}, config.Config{VulnScan: config.VulnScanConfig{Enabled: true, Tool: "trivy", DatabaseMaxAgeHours: 24}})
+	report, err := scanner.Scan(context.Background(), t.TempDir(), config.Workspace{}, config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy", DatabaseMaxAgeHours: 24}})
 	if err != nil || len(report.Findings) != 0 {
 		t.Fatalf("Scan() = %+v, %v", report, err)
+	}
+}
+
+func TestScanImagesUsesOSPackagesOnlyWithoutDependencyScan(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	digest := "registry.example/service@sha256:" + strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM "+digest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var commands [][]string
+	scanner := Scanner{
+		Now: func() time.Time { return now },
+		Command: func(_ context.Context, _ string, _ string, args ...string) ([]byte, error) {
+			commands = append(commands, args)
+			return []byte(trivyJSON(now.Format(time.RFC3339))), nil
+		},
+	}
+	report, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "github-dependabot", DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("b", 64)},
+	}})
+	if err != nil || len(report.Findings) != 1 || len(commands) != 1 {
+		t.Fatalf("ScanImages() = %+v, %v; commands=%v", report, err, commands)
+	}
+	if !contains(commands[0], "--pkg-types") || !contains(commands[0], "os") {
+		t.Fatalf("image scan must restrict packages to OS packages: %v", commands[0])
+	}
+	if contains(commands[0], "fs") || contains(commands[0], "--include-dev-deps") {
+		t.Fatalf("image scan must not run a dependency filesystem scan: %v", commands[0])
 	}
 }
 

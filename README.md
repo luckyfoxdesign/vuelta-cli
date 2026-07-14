@@ -64,6 +64,12 @@ Vuelta inspects the network and proxy container before starting an updater and
 fails closed with an actionable diagnostic if either is unavailable. No host
 environment variable or GitHub token is passed to a runner.
 
+Dependency vulnerability findings come from exactly one configured source:
+Trivy, OSV-Scanner, or GitHub Dependabot. Selecting Dependabot does not scan
+lock files locally and makes its GitHub API access fail closed. Image scanning
+is independent: it remains Trivy-only and checks OS packages only, so language
+dependencies are not reported again from an immutable image.
+
 Vulnerability scanning uses the same fail-closed egress proxy. Its scanner
 containers have a read-only mount of the configured scan directory, run as a
 non-root UID with all capabilities dropped, and never receive a Docker socket.

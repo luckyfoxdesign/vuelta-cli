@@ -132,14 +132,11 @@ func (s Scanner) now() time.Time {
 	return time.Now()
 }
 
-// Scan checks dependency lock files and, for Docker workspaces, every exact
-// digest referenced by the explicitly configured docker_images.files. No
+// Scan checks dependency lock files with the selected local scanner and, for
+// Docker workspaces, every exact digest referenced by docker_images.files. No
 // scanner ignore flag is ever used: tracked policy is evaluated afterwards.
 func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
 	scanConfig := cfg.VulnScan
-	if !scanConfig.Enabled {
-		return Report{}, errors.New("local vulnerability scanner is disabled")
-	}
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
 	}
@@ -148,70 +145,104 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 		return Report{}, err
 	}
 
-	var findings []Finding
-	switch scanConfig.Tool {
+	findings, err := s.scanDependencies(ctx, root, cfg)
+	if err != nil {
+		return Report{}, err
+	}
+	imageFindings, err := s.scanImages(ctx, root, ws, cfg)
+	if err != nil {
+		return Report{}, err
+	}
+	return applyPolicy(append(findings, imageFindings...), policy), nil
+}
+
+// ScanImages checks configured immutable images without scanning repository
+// dependencies. It lets the security gate retain image coverage when
+// github-dependabot is selected as the dependency source.
+func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+	if root == "" {
+		return Report{}, errors.New("scan root is required")
+	}
+	policy, err := loadPolicy(ctx, ws.Path, cfg.VulnScan.PolicyFile, s.now())
+	if err != nil {
+		return Report{}, err
+	}
+	findings, err := s.scanImages(ctx, root, ws, cfg)
+	if err != nil {
+		return Report{}, err
+	}
+	return applyPolicy(findings, policy), nil
+}
+
+func (s Scanner) scanDependencies(ctx context.Context, root string, cfg config.Config) ([]Finding, error) {
+	scanConfig := cfg.VulnScan
+	switch scanConfig.DependencySource {
 	case "trivy":
 		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
 		if err != nil {
-			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
+			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
 		parsed, updated, err := parseTrivy(out)
 		if err != nil {
-			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
+			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
 		if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
-			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
+			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
-		findings = append(findings, parsed...)
+		return parsed, nil
 	case "osv-scanner":
 		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "osv-scanner", "--format", "json", "--lockfile", "/project")
 		if err != nil {
-			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
+			return nil, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
 		parsed, updated, err := parseOSV(out)
 		if err != nil {
-			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
+			return nil, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
 		if err := checkDatabaseAge(updated, scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
-			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
+			return nil, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
-		findings = append(findings, parsed...)
+		return parsed, nil
 	default:
-		return Report{}, fmt.Errorf("unsupported local scanner %q", scanConfig.Tool)
+		return nil, fmt.Errorf("unsupported local dependency scanner %q", scanConfig.DependencySource)
 	}
+}
 
-	if scanConfig.ImageScan.Enabled && ws.DockerImages != nil {
-		if scanConfig.ImageScan.Tool != "trivy" {
-			return Report{}, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
+func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]Finding, error) {
+	scanConfig := cfg.VulnScan
+	if !scanConfig.ImageScan.Enabled || ws.DockerImages == nil {
+		return nil, nil
+	}
+	if scanConfig.ImageScan.Tool != "trivy" {
+		return nil, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
+	}
+	images, err := imageDigests(root, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
+	if err != nil {
+		return nil, err
+	}
+	var findings []Finding
+	for _, image := range images {
+		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--format", "json"}
+		if scanConfig.ImageScan.VEX == "auto" {
+			args = append(args, "--vex", "repo")
 		}
-		images, err := imageDigests(root, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
-		if err != nil {
-			return Report{}, err
-		}
-		for _, image := range images {
-			args := []string{"image", "--scanners", "vuln", "--format", "json"}
-			if scanConfig.ImageScan.VEX == "auto" {
-				args = append(args, "--vex", "repo")
+		for _, platform := range imagePlatforms(ws, scanConfig) {
+			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, image)
+			out, err := s.command(ctx, root, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
+			if err != nil {
+				return nil, fmt.Errorf("trivy image scan %s (%s): %w", image, platform, err)
 			}
-			for _, platform := range imagePlatforms(ws, scanConfig) {
-				imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, image)
-				out, err := s.command(ctx, root, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
-				if err != nil {
-					return Report{}, fmt.Errorf("trivy image scan %s (%s): %w", image, platform, err)
-				}
-				parsed, updated, err := parseTrivy(out)
-				if err != nil {
-					return Report{}, fmt.Errorf("trivy image scan %s: %w", image, err)
-				}
-				if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
-					return Report{}, fmt.Errorf("trivy image scan %s: %w", image, err)
-				}
-				findings = append(findings, parsed...)
+			parsed, updated, err := parseTrivy(out)
+			if err != nil {
+				return nil, fmt.Errorf("trivy image scan %s: %w", image, err)
 			}
+			if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
+				return nil, fmt.Errorf("trivy image scan %s: %w", image, err)
+			}
+			findings = append(findings, parsed...)
 		}
 	}
-
-	return applyPolicy(findings, policy), nil
+	return findings, nil
 }
 
 func imagePlatforms(ws config.Workspace, cfg config.VulnScanConfig) []string {

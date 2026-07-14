@@ -28,7 +28,7 @@ func TestScanReadsDependabotAndGlobalAdvisory(t *testing.T) {
 	client := Client{HTTPClient: server.Client(), RemoteURL: func(context.Context, string, string) (string, error) {
 		return "git@github.com:acme/widget.git", nil
 	}}
-	findings, err := client.Scan(context.Background(), config.Workspace{Path: t.TempDir(), Remote: "origin"}, config.GithubAdvisoriesConfig{Enabled: true, APIURL: server.URL, RequiredForGithubRemotes: true})
+	findings, err := client.Scan(context.Background(), config.Workspace{Path: t.TempDir(), Remote: "origin"}, config.GithubAdvisoriesConfig{APIURL: server.URL})
 	if err != nil || len(findings) != 1 {
 		t.Fatalf("Scan() = %+v, %v", findings, err)
 	}

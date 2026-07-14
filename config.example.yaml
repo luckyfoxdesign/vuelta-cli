@@ -6,12 +6,15 @@ notify:
     chat_id: ""
 
 vuln_scan:
-  enabled: true
-  tool: trivy            # trivy | osv-scanner
+  # Exactly one dependency/lock-file source: trivy | osv-scanner | github-dependabot.
+  # This replaces vuln_scan.tool and github_advisories.enabled. Delete those
+  # legacy keys when migrating: source selection is fail-closed.
+  dependency_source: trivy
   # linux/arm64 digests resolved with `docker manifest inspect --verbose` on 2026-07-14.
-  # Re-resolve deliberately when upgrading either scanner.
+  # Required only for a trivy or osv-scanner dependency source; omit it for
+  # github-dependabot. Re-resolve deliberately when upgrading either scanner.
   image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
-  # For tool: osv-scanner use ghcr.io/google/osv-scanner@sha256:c41702c554122e8491c996b661d085919e42d54d49cfb9f2473beb5a3dfdf628.
+  # For dependency_source: osv-scanner use ghcr.io/google/osv-scanner@sha256:c41702c554122e8491c996b661d085919e42d54d49cfb9f2473beb5a3dfdf628.
   fail_on_severity: HIGH  # CRITICAL | HIGH | MEDIUM
   database_max_age_hours: 24  # stale/unreachable DB is a security-gate error, not a "clean" result
   policy_file: ".vuelta-vulnerability-policy.yaml"  # optional, tracked, time-bounded exceptions only
@@ -23,10 +26,10 @@ vuln_scan:
     vex: auto            # apply verified VEX attestations if the registry/DHI publishes them
 
 github_advisories:
-  enabled: true
   api_url: "https://api.github.com"  # swap for a GitHub Enterprise URL if needed
   token_env: "GITHUB_TOKEN"          # optional for public repos; read-only token, never passed into containers
-  required_for_github_remotes: false  # true: an API error/no access blocks the commit for GitHub remotes
+  # Used only when dependency_source is github-dependabot. That selected source
+  # is always fail-closed; private repositories need Dependabot alerts: read.
 
 update:
   min_release_age_days: 7  # reject versions younger than N days — protects against freshly-published malicious releases
