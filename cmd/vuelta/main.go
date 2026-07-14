@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/autofix"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/deployworker"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
@@ -81,6 +83,7 @@ commands:
   run [--project NAME] [--dry-run] [config-path]
   scan [--project NAME] [config-path]
   config validate [config-path]
+  config init [options] <project-path> [config-path]
   tasks list [config-path]
   deploy enqueue --project NAME --commit SHA --image-digest SHA256 --manifest-digest SHA256 [config-path]
   deploy worker [config-path]`
@@ -122,19 +125,130 @@ func loadConfig(path string) (*config.Config, error) {
 }
 
 func runConfig(args []string) error {
-	if len(args) < 1 || args[0] != "validate" {
-		return fail(exitConfig, "usage: vuelta config validate [config-path]")
+	if len(args) < 1 {
+		return fail(exitConfig, "usage: vuelta config validate [config-path] | vuelta config init [options] <project-path> [config-path]")
 	}
-	path, err := configPath(args[1:])
-	if err != nil {
-		return err
+	switch args[0] {
+	case "validate":
+		path, err := configPath(args[1:])
+		if err != nil {
+			return err
+		}
+		cfg, err := loadConfig(path)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("ok: %s is valid (%d workspace(s))\n", path, len(cfg.Workspaces))
+		return nil
+	case "init":
+		return runConfigInit(args[1:])
+	default:
+		return fail(exitConfig, "usage: vuelta config validate [config-path] | vuelta config init [options] <project-path> [config-path]")
 	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return err
+}
+
+type repeatedFlag []string
+
+func (f *repeatedFlag) String() string { return strings.Join(*f, ",") }
+func (f *repeatedFlag) Set(value string) error {
+	if value == "" {
+		return errors.New("value must not be empty")
 	}
-	fmt.Printf("ok: %s is valid (%d workspace(s))\n", path, len(cfg.Workspaces))
+	*f = append(*f, value)
 	return nil
+}
+
+func runConfigInit(args []string) error {
+	fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	stack := fs.String("stack", "", "selected stack: python, node, or docker")
+	manager := fs.String("package-manager", "", "selected package manager for python or node")
+	composeFile := fs.String("compose-file", "", "project-relative Compose file for the test profile")
+	service := fs.String("test-service", "", "Compose test service")
+	branch := fs.String("branch", "", "protected branch")
+	remote := fs.String("remote", "", "Git remote")
+	force := fs.Bool("force", false, "overwrite an existing config")
+	nonInteractive := fs.Bool("non-interactive", false, "fail instead of prompting for ambiguous values")
+	var allowPaths, dockerFiles, runtimeImages repeatedFlag
+	fs.Var(&allowPaths, "allow-path", "allowed changed path (repeatable)")
+	fs.Var(&dockerFiles, "docker-file", "project-relative Dockerfile for docker stack (repeatable)")
+	fs.Var(&runtimeImages, "runtime-image", "immutable runtime image digest for docker stack (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	positional := fs.Args()
+	if len(positional) < 1 || len(positional) > 2 {
+		return fail(exitConfig, "usage: vuelta config init [options] <project-path> [config-path]")
+	}
+	projectPath := positional[0]
+	path := ""
+	if len(positional) == 2 {
+		path = positional[1]
+	} else {
+		var err error
+		path, err = defaultConfigPath()
+		if err != nil {
+			return fail(exitConfig, "%v", err)
+		}
+	}
+	discovery, err := configinit.Detect(projectPath)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	input := configinit.Input{Stack: *stack, PackageManager: *manager, ComposeFile: *composeFile, TestService: *service, Branch: *branch, Remote: *remote, AllowedPaths: allowPaths, DockerFiles: dockerFiles, RuntimeImages: runtimeImages}
+	interactive := !*nonInteractive && configinit.IsTerminal(os.Stdin)
+	for {
+		cfg, buildErr := discovery.Build(input)
+		if buildErr == nil {
+			if err := configinit.Write(cfg, path, *force); err != nil {
+				return fail(exitConfig, "%v", err)
+			}
+			fmt.Printf("created validated config: %s\n", path)
+			return nil
+		}
+		var missing *configinit.MissingValueError
+		if !interactive || !errors.As(buildErr, &missing) {
+			return fail(exitConfig, "%v", buildErr)
+		}
+		value, err := promptChoice(missing.Flag, missing.Options)
+		if err != nil {
+			return fail(exitConfig, "%v", err)
+		}
+		switch missing.Flag {
+		case "--stack":
+			input.Stack = value
+		case "--package-manager":
+			input.PackageManager = value
+		case "--compose-file":
+			input.ComposeFile = value
+		case "--test-service":
+			input.TestService = value
+		case "--branch":
+			input.Branch = value
+		case "--remote":
+			input.Remote = value
+		case "--allow-path":
+			input.AllowedPaths = []string{value}
+		default:
+			return fail(exitConfig, "%s has no interactive prompt; use its flag", missing.Flag)
+		}
+	}
+}
+
+func promptChoice(flag string, options []string) (string, error) {
+	if len(options) > 0 {
+		fmt.Fprintf(os.Stderr, "%s is required; detected options: %s\n", flag, strings.Join(options, ", "))
+	}
+	fmt.Fprintf(os.Stderr, "%s: ", flag)
+	value, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(value) == 0 {
+		return "", fmt.Errorf("read %s: %w", flag, err)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", flag)
+	}
+	return value, nil
 }
 
 func runPipeline(args []string) error {
