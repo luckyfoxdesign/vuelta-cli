@@ -114,6 +114,39 @@ func TestMaliciousFixtureSandboxExcludesGitAndHostState(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsTrackedSymlinkArchiveMember(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixture requires a POSIX filesystem")
+	}
+	repoPath, _ := repo(t)
+	// A *tracked* symlink is the adversarial case the untracked-symlink test does
+	// not cover: git archive emits it as a symlink tar member, so extraction must
+	// refuse it rather than materialize a link that escapes the working copy.
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("host secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(repoPath, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repoPath, "add", "escape")
+	git(t, repoPath, "commit", "-q", "-m", "add tracked symlink")
+	sha := strings.TrimSpace(git(t, repoPath, "rev-parse", "HEAD"))
+
+	dir, cleanup, err := Prepare(context.Background(), repoPath, sha)
+	if err == nil {
+		_ = cleanup()
+		t.Fatalf("Prepare accepted a tracked symlink archive member; sandbox at %s", dir)
+	}
+	if !strings.Contains(err.Error(), "not a regular file or directory") {
+		t.Fatalf("Prepare error = %v, want tracked-symlink rejection", err)
+	}
+	if dir != "" {
+		t.Fatalf("Prepare returned a sandbox path %q on failure", dir)
+	}
+}
+
 func TestEscapeSymlinkFixtureDoesNotEnterSandbox(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink fixture requires a POSIX filesystem")
