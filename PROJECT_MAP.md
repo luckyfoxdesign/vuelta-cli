@@ -61,6 +61,7 @@ make build                     # both cross-build targets
 - `internal/autofix/` — optionally invokes `claude -p` when tests fail after an update. Test logs/diffs are untrusted input: the invocation never grants Bash tool access (see part C of the spec).
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
 - `internal/deployworker/` — applies authenticated, immutable deployment candidates and restores the previous digest when a rollout is unhealthy.
+- `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
@@ -72,7 +73,7 @@ make build                     # both cross-build targets
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
 - `internal/updater/` — bumps dependency versions per stack (python/node/docker) inside a sandboxed working copy. Each stack implements the Updater interface; see part B of the spec for pipeline wiring.
-- `internal/vulnscan/` — integrates trivy and/or osv-scanner for CVE scanning of dependencies and built images.
+- `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
 <!-- generated:end -->
 
 <!-- manual:start -->

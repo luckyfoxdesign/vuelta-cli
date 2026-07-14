@@ -44,7 +44,7 @@ func (g DefaultSecurityGate) PostCheck(ctx context.Context, workDir string, ws c
 }
 
 func (g DefaultSecurityGate) scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]vulnscan.Finding, error) {
-	local, err := g.Scanner.Scan(ctx, root, ws, cfg.VulnScan)
+	local, err := g.Scanner.Scan(ctx, root, ws, cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -53,3 +53,19 @@ func TestValidateRejectsUnsafeTestRunArgument(t *testing.T) {
 		t.Fatalf("expected run_args rejection, got %v", err)
 	}
 }
+
+func TestValidateSecurityConfigRequiresPinnedScannerImages(t *testing.T) {
+	validDigest := "scanner@sha256:" + strings.Repeat("a", 64)
+	cfg := Config{VulnScan: VulnScanConfig{
+		Enabled: true, Tool: "trivy", Image: validDigest,
+		FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
+		ImageScan: ImageScanConfig{Enabled: true, Tool: "trivy", Image: validDigest},
+	}}
+	if errs := validateSecurityConfig(cfg); len(errs) != 0 {
+		t.Fatalf("valid scanner config errors = %v", errs)
+	}
+	cfg.VulnScan.ImageScan.Image = "aquasec/trivy:latest"
+	if errs := validateSecurityConfig(cfg); len(errs) == 0 || !strings.Contains(errs[0].Error(), "image") {
+		t.Fatalf("expected unpinned scanner image rejection, got %v", errs)
+	}
+}

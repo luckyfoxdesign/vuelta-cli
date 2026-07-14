@@ -50,7 +50,8 @@ services:
       VUELTA_EGRESS_ALLOW_HOSTS: >-
         pypi.org,files.pythonhosted.org,registry.npmjs.org,registry.yarnpkg.com,
         registry.bun.sh,github.com,objects.githubusercontent.com,ghcr.io,
-        registry-1.docker.io,auth.docker.io,production.cloudflare.docker.com
+        pkg-containers.githubusercontent.com,api.osv.dev,registry-1.docker.io,
+        auth.docker.io,production.cloudflare.docker.com
     networks:
       - default
       - update-egress

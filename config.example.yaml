@@ -8,12 +8,17 @@ notify:
 vuln_scan:
   enabled: true
   tool: trivy            # trivy | osv-scanner
+  # linux/arm64 digests resolved with `docker manifest inspect --verbose` on 2026-07-14.
+  # Re-resolve deliberately when upgrading either scanner.
+  image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
+  # For tool: osv-scanner use ghcr.io/google/osv-scanner@sha256:c41702c554122e8491c996b661d085919e42d54d49cfb9f2473beb5a3dfdf628.
   fail_on_severity: HIGH  # CRITICAL | HIGH | MEDIUM
   database_max_age_hours: 24  # stale/unreachable DB is a security-gate error, not a "clean" result
   policy_file: ".vuelta-vulnerability-policy.yaml"  # optional, tracked, time-bounded exceptions only
   image_scan:
     enabled: true
     tool: trivy          # trivy is the required portable scanner; docker_scout is optional enrichment
+    image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
     platforms: ["linux/amd64"]
     vex: auto            # apply verified VEX attestations if the registry/DHI publishes them
 

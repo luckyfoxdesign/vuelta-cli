@@ -10,9 +10,9 @@ resident daemon; an external scheduler (launchd/systemd timer) runs
 
 - Language: Go. A single static binary, no runtime install required on
   target machines (laptop or server).
-- Runtime dependencies (not vendored, must exist in the environment): `git`,
-  `docker`/`docker compose`, and optionally `trivy`/`osv-scanner` for CVE
-  scanning.
+- Runtime dependencies (not vendored, must exist in the environment): `git`
+  and `docker`/`docker compose`. Trivy and OSV-Scanner always run from
+  configured digest-pinned containers, never from the host PATH.
 - Package managers (`poetry`/`uv`/`pip-tools`, `npm`/`pnpm`) run only inside
   Docker containers, never on the host — their install scripts execute
   arbitrary code and must stay isolated.
@@ -63,6 +63,18 @@ internal `vuelta-update-egress` network and receive the proxy through explicit
 Vuelta inspects the network and proxy container before starting an updater and
 fails closed with an actionable diagnostic if either is unavailable. No host
 environment variable or GitHub token is passed to a runner.
+
+Vulnerability scanning uses the same fail-closed egress proxy. Its scanner
+containers have a read-only mount of the configured scan directory, run as a
+non-root UID with all capabilities dropped, and never receive a Docker socket.
+Trivy receives `--image-src registry`, so an image scan pulls only through the
+allowlisted registry rather than inspecting the host Docker daemon. Each scan
+uses a new tmpfs cache and refreshes its vulnerability database through the
+proxy for every scan. If a scanner reports a database timestamp, it must also
+satisfy `vuln_scan.database_max_age_hours`. The checked-in allowlist includes
+Trivy's GHCR database endpoint and OSV's API. Add an image registry
+deliberately to the egress proxy before configuring a workspace that scans
+images from it.
 
 Every `docker-compose.test.yml` selected by a workspace must use immutable
 image digests and an explicit internal test network. Each service reachable by

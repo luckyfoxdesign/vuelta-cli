@@ -1,8 +1,9 @@
-// Package vulnscan integrates trivy and/or osv-scanner for CVE scanning of
-// dependencies and built images.
+// Package vulnscan runs pinned Trivy and/or OSV-Scanner containers for CVE
+// scanning of dependencies and built images.
 package vulnscan
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/egress"
 )
 
 // Finding is a normalized CVE/GHSA finding. It intentionally retains the
@@ -61,20 +63,66 @@ type Scanner struct {
 	Now     func() time.Time
 }
 
-func (s Scanner) command(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+func (s Scanner) command(ctx context.Context, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
 	if s.Command != nil {
 		return s.Command(ctx, dir, name, args...)
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	return dockerCommand(ctx, dir, image, egressConfig, name, args...)
+}
+
+// dockerCommand runs a scanner in its pinned image. The scanned directory is
+// the sole host mount and is read-only; vulnerability data lives in tmpfs and
+// is fetched only through the configured registry allowlist proxy.
+func dockerCommand(ctx context.Context, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+	if !exactDigest.MatchString(image) {
+		return nil, fmt.Errorf("scanner image %q is not pinned to an exact digest", image)
+	}
+	network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "docker", dockerRunArgs(image, dir, network, proxyURL, name, args)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("docker run %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return out, nil
+}
+
+func dockerRunArgs(image, dir, network, proxyURL, name string, args []string) []string {
+	dockerArgs := []string{
+		"run", "--rm",
+		"--user", "65532:65532",
+		"--read-only",
+		"--security-opt", "no-new-privileges",
+		"--cap-drop", "ALL",
+		"--cpus", "1",
+		"--memory", "2g",
+		"--pids-limit", "256",
+		"--network", network,
+		"--env", "HTTP_PROXY=" + proxyURL,
+		"--env", "HTTPS_PROXY=" + proxyURL,
+		"--env", "http_proxy=" + proxyURL,
+		"--env", "https_proxy=" + proxyURL,
+		"--env", "NO_PROXY=localhost,127.0.0.1",
+		"--env", "HOME=/tmp",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,size=2g",
+		"--mount", "type=bind,src=" + dir + ",dst=/project,readonly",
+		"--workdir", "/project",
+	}
+	if name == "trivy" {
+		dockerArgs = append(dockerArgs,
+			"--env", "TRIVY_CACHE_DIR=/tmp/trivy",
+			"--env", "TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
+		)
+	}
+	dockerArgs = append(dockerArgs, image)
+	return append(dockerArgs, args...)
 }
 
 func (s Scanner) now() time.Time {
@@ -87,22 +135,23 @@ func (s Scanner) now() time.Time {
 // Scan checks dependency lock files and, for Docker workspaces, every exact
 // digest referenced by the explicitly configured docker_images.files. No
 // scanner ignore flag is ever used: tracked policy is evaluated afterwards.
-func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.VulnScanConfig) (Report, error) {
-	if !cfg.Enabled {
+func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+	scanConfig := cfg.VulnScan
+	if !scanConfig.Enabled {
 		return Report{}, errors.New("local vulnerability scanner is disabled")
 	}
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
 	}
-	policy, err := loadPolicy(ctx, ws.Path, cfg.PolicyFile, s.now())
+	policy, err := loadPolicy(ctx, ws.Path, scanConfig.PolicyFile, s.now())
 	if err != nil {
 		return Report{}, err
 	}
 
 	var findings []Finding
-	switch cfg.Tool {
+	switch scanConfig.Tool {
 	case "trivy":
-		out, err := s.command(ctx, root, "trivy", "fs", "--scanners", "vuln", "--format", "json", root)
+		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
 		if err != nil {
 			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
@@ -110,12 +159,12 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 		if err != nil {
 			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
-		if err := checkDatabaseAge(updated, cfg.DatabaseMaxAgeHours, s.now()); err != nil {
+		if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
 			return Report{}, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
 		findings = append(findings, parsed...)
 	case "osv-scanner":
-		out, err := s.command(ctx, root, "osv-scanner", "--format", "json", "--lockfile", root)
+		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "osv-scanner", "--format", "json", "--lockfile", "/project")
 		if err != nil {
 			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
@@ -123,17 +172,17 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 		if err != nil {
 			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
-		if err := checkDatabaseAge(updated, cfg.DatabaseMaxAgeHours, s.now()); err != nil {
+		if err := checkDatabaseAge(updated, scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
 			return Report{}, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
 		findings = append(findings, parsed...)
 	default:
-		return Report{}, fmt.Errorf("unsupported local scanner %q", cfg.Tool)
+		return Report{}, fmt.Errorf("unsupported local scanner %q", scanConfig.Tool)
 	}
 
-	if cfg.ImageScan.Enabled && ws.DockerImages != nil {
-		if cfg.ImageScan.Tool != "trivy" {
-			return Report{}, fmt.Errorf("unsupported image scanner %q", cfg.ImageScan.Tool)
+	if scanConfig.ImageScan.Enabled && ws.DockerImages != nil {
+		if scanConfig.ImageScan.Tool != "trivy" {
+			return Report{}, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
 		}
 		images, err := imageDigests(root, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
 		if err != nil {
@@ -141,12 +190,12 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 		}
 		for _, image := range images {
 			args := []string{"image", "--scanners", "vuln", "--format", "json"}
-			if cfg.ImageScan.VEX == "auto" {
+			if scanConfig.ImageScan.VEX == "auto" {
 				args = append(args, "--vex", "repo")
 			}
-			for _, platform := range imagePlatforms(ws, cfg) {
-				imageArgs := append(append([]string{}, args...), "--platform", platform, image)
-				out, err := s.command(ctx, root, "trivy", imageArgs...)
+			for _, platform := range imagePlatforms(ws, scanConfig) {
+				imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, image)
+				out, err := s.command(ctx, root, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
 				if err != nil {
 					return Report{}, fmt.Errorf("trivy image scan %s (%s): %w", image, platform, err)
 				}
@@ -154,7 +203,7 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 				if err != nil {
 					return Report{}, fmt.Errorf("trivy image scan %s: %w", image, err)
 				}
-				if err := checkDatabaseAge(updated, cfg.DatabaseMaxAgeHours, s.now()); err != nil {
+				if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
 					return Report{}, fmt.Errorf("trivy image scan %s: %w", image, err)
 				}
 				findings = append(findings, parsed...)
@@ -250,9 +299,13 @@ func parseTrivy(data []byte) ([]Finding, time.Time, error) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, time.Time{}, fmt.Errorf("parse JSON: %w", err)
 	}
-	updated, err := parseTimestamp(firstNonEmpty(doc.Metadata.DBUpdatedAt, doc.Metadata.Database.UpdatedAt, doc.Metadata.UpdatedAt))
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("scanner database timestamp: %w", err)
+	var updated time.Time
+	if value := firstNonEmpty(doc.Metadata.DBUpdatedAt, doc.Metadata.Database.UpdatedAt, doc.Metadata.UpdatedAt); value != "" {
+		var err error
+		updated, err = parseTimestamp(value)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("scanner database timestamp: %w", err)
+		}
 	}
 	var findings []Finding
 	for _, result := range doc.Results {
@@ -264,6 +317,16 @@ func parseTrivy(data []byte) ([]Finding, time.Time, error) {
 		}
 	}
 	return normalize(findings), updated, nil
+}
+
+// freshDatabaseTimestamp accepts current Trivy reports that omit DB metadata.
+// dockerRunArgs always provides an empty tmpfs cache, so a successful scan has
+// necessarily fetched its database during this invocation.
+func freshDatabaseTimestamp(updated, now time.Time) time.Time {
+	if updated.IsZero() {
+		return now
+	}
+	return updated
 }
 
 // OSV's output schema deliberately carries no scanner-cache timestamp in

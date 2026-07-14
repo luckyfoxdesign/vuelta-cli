@@ -5,12 +5,12 @@ package updater
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/egress"
 )
 
 // Updater updates dependency versions for a single project.
@@ -26,72 +26,17 @@ type DockerRunner func(ctx context.Context, image string, args []string, workDir
 // ErrEgressPolicyUnavailable is returned when the registry allowlist policy
 // required for an update container has not been configured. The runner must
 // not substitute Docker's unrestricted default bridge network.
-var ErrEgressPolicyUnavailable = errors.New("updater egress policy unavailable")
-
-// egressPolicy supplies a Docker network whose egress is constrained by the
-// registry allowlist. It is deliberately private until part F wires the
-// policy implementation into the pipeline.
-type egressPolicy interface {
-	dockerNetwork(context.Context) (string, error)
-	proxyURL(context.Context) (string, error)
-}
-
-type denyEgressPolicy struct{}
-
-func (denyEgressPolicy) dockerNetwork(context.Context) (string, error) {
-	return "", ErrEgressPolicyUnavailable
-}
-
-func (denyEgressPolicy) proxyURL(context.Context) (string, error) {
-	return "", ErrEgressPolicyUnavailable
-}
-
-type localEgressPolicy struct {
-	config config.EgressConfig
-}
-
-func (p localEgressPolicy) dockerNetwork(ctx context.Context) (string, error) {
-	if err := dockerInspect(ctx, "network", p.config.Network); err != nil {
-		return "", fmt.Errorf("%w: network %q is unavailable; run `docker compose up -d egress-proxy`: %v", ErrEgressPolicyUnavailable, p.config.Network, err)
-	}
-	if err := dockerContainerRunning(ctx, p.config.ProxyContainer); err != nil {
-		return "", fmt.Errorf("%w: proxy container %q is unavailable; run `docker compose up -d egress-proxy`: %v", ErrEgressPolicyUnavailable, p.config.ProxyContainer, err)
-	}
-	return p.config.Network, nil
-}
-
-func (p localEgressPolicy) proxyURL(context.Context) (string, error) {
-	if p.config.ProxyURL == "" {
-		return "", ErrEgressPolicyUnavailable
-	}
-	return p.config.ProxyURL, nil
-}
-
-func dockerInspect(ctx context.Context, kind, name string) error {
-	cmd := exec.CommandContext(ctx, "docker", kind, "inspect", name)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("docker %s inspect: %w: %s", kind, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func dockerContainerRunning(ctx context.Context, name string) error {
-	cmd := exec.CommandContext(ctx, "docker", "container", "inspect", "--format", "{{.State.Running}}", name)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker container inspect: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	if strings.TrimSpace(string(out)) != "true" {
-		return errors.New("container is not running")
-	}
-	return nil
-}
+var ErrEgressPolicyUnavailable = egress.ErrPolicyUnavailable
 
 // NewDockerRunner returns a runner bound to the strict local egress policy.
 // It never falls back to Docker's default bridge network.
-func NewDockerRunner(egress config.EgressConfig) DockerRunner {
+func NewDockerRunner(egressConfig config.EgressConfig) DockerRunner {
 	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
-		return runDocker(ctx, image, args, workDir, localEgressPolicy{config: egress})
+		network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+		if err != nil {
+			return "", err
+		}
+		return runDocker(ctx, image, args, workDir, network, proxyURL)
 	}
 }
 
@@ -99,25 +44,17 @@ func NewDockerRunner(egress config.EgressConfig) DockerRunner {
 // policy is supplied by the sandbox layer, it fails closed before Docker is
 // started.
 func RunDocker(ctx context.Context, image string, args []string, workDir string) (string, error) {
-	return runDocker(ctx, image, args, workDir, denyEgressPolicy{})
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "", ErrEgressPolicyUnavailable
 }
 
 // runDocker starts a hardened update container using the network supplied by
 // policy. It is kept separate from the policy adapter so every updater shares
 // the same container baseline.
-func runDocker(ctx context.Context, image string, args []string, workDir string, policy egressPolicy) (string, error) {
+func runDocker(ctx context.Context, image string, args []string, workDir, network, proxyURL string) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	network, err := policy.dockerNetwork(ctx)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		return "", err
-	}
-	proxyURL, err := policy.proxyURL(ctx)
-	if err != nil {
 		return "", err
 	}
 

@@ -52,6 +52,7 @@ type TelegramConfig struct {
 type VulnScanConfig struct {
 	Enabled             bool   `yaml:"enabled"`
 	Tool                string `yaml:"tool"`
+	Image               string `yaml:"image"`
 	FailOnSeverity      string `yaml:"fail_on_severity"`
 	DatabaseMaxAgeHours int    `yaml:"database_max_age_hours"`
 	// PolicyFile is an optional project-relative, tracked YAML file containing
@@ -64,6 +65,7 @@ type VulnScanConfig struct {
 type ImageScanConfig struct {
 	Enabled   bool     `yaml:"enabled"`
 	Tool      string   `yaml:"tool"`
+	Image     string   `yaml:"image"`
 	Platforms []string `yaml:"platforms"`
 	VEX       string   `yaml:"vex"`
 }
@@ -372,6 +374,9 @@ func validateSecurityConfig(c Config) []error {
 	if c.VulnScan.Tool != "trivy" && c.VulnScan.Tool != "osv-scanner" {
 		errs = append(errs, fmt.Errorf("vuln_scan.tool: %q is not supported (trivy|osv-scanner)", c.VulnScan.Tool))
 	}
+	if !digestRefPattern.MatchString(c.VulnScan.Image) {
+		errs = append(errs, fmt.Errorf("vuln_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.Image))
+	}
 	if severityRank(c.VulnScan.FailOnSeverity) < 1 {
 		errs = append(errs, fmt.Errorf("vuln_scan.fail_on_severity: %q is not supported (CRITICAL|HIGH|MEDIUM|LOW)", c.VulnScan.FailOnSeverity))
 	}
@@ -380,6 +385,9 @@ func validateSecurityConfig(c Config) []error {
 	}
 	if c.VulnScan.ImageScan.Enabled && c.VulnScan.ImageScan.Tool != "trivy" {
 		errs = append(errs, errors.New("vuln_scan.image_scan.tool: must be trivy"))
+	}
+	if c.VulnScan.ImageScan.Enabled && !digestRefPattern.MatchString(c.VulnScan.ImageScan.Image) {
+		errs = append(errs, fmt.Errorf("vuln_scan.image_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.ImageScan.Image))
 	}
 	if c.GithubAdvisories.RequiredForGithubRemotes && !c.GithubAdvisories.Enabled {
 		errs = append(errs, errors.New("github_advisories.enabled: required when required_for_github_remotes is true"))
