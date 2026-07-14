@@ -6,6 +6,8 @@ package scanner
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,6 +38,15 @@ const (
 type PreflightResult struct {
 	CanonicalPath string
 	Skip          SkipReason
+}
+
+// SnapshotIdentity is the immutable workspace metadata used to bind a package
+// update plan to the exact project inputs that were scanned.
+type SnapshotIdentity struct {
+	CanonicalPath string
+	Remote        string
+	BaseRevision  string
+	InputHashes   map[string]string
 }
 
 // RequiredTools lists host binaries the pipeline needs before it can run
@@ -101,6 +112,35 @@ func Preflight(ctx context.Context, ws config.Workspace) (PreflightResult, error
 	return result, nil
 }
 
+// IdentityForSnapshot repeats the non-mutating preflight checks and returns
+// the Git revision, configured remote URL, and hashes of the only files that
+// package scanning is allowed to read. It never walks parent directories.
+func IdentityForSnapshot(ctx context.Context, ws config.Workspace) (SnapshotIdentity, error) {
+	pre, err := Preflight(ctx, ws)
+	if err != nil {
+		return SnapshotIdentity{}, err
+	}
+	if pre.Skip != SkipNone {
+		return SnapshotIdentity{}, fmt.Errorf("workspace cannot be snapshotted: %s", pre.Skip)
+	}
+	revision, err := runGit(ctx, pre.CanonicalPath, "rev-parse", "HEAD")
+	if err != nil {
+		return SnapshotIdentity{}, fmt.Errorf("resolve base revision: %w", err)
+	}
+	remoteURL := ""
+	if ws.Remote != "" {
+		remoteURL, err = runGit(ctx, pre.CanonicalPath, "remote", "get-url", ws.Remote)
+		if err != nil {
+			return SnapshotIdentity{}, fmt.Errorf("resolve remote URL: %w", err)
+		}
+	}
+	hashes, err := inputHashes(pre.CanonicalPath, ws)
+	if err != nil {
+		return SnapshotIdentity{}, err
+	}
+	return SnapshotIdentity{CanonicalPath: pre.CanonicalPath, Remote: strings.TrimSpace(remoteURL), BaseRevision: strings.TrimSpace(revision), InputHashes: hashes}, nil
+}
+
 func isClean(ctx context.Context, path string) (bool, error) {
 	out, err := runGit(ctx, path, "status", "--porcelain")
 	if err != nil {
@@ -145,6 +185,7 @@ var stackManifests = map[string][]string{
 	"python/pip-tools": {"requirements.in"},
 	"node/npm":         {"package.json", "package-lock.json"},
 	"node/pnpm":        {"package.json", "pnpm-lock.yaml"},
+	"node/bun":         {"package.json", "bun.lock"},
 }
 
 func stackFilesPresent(path string, ws config.Workspace) bool {
@@ -158,4 +199,34 @@ func stackFilesPresent(path string, ws config.Workspace) bool {
 		}
 	}
 	return true
+}
+
+func inputHashes(root string, ws config.Workspace) (map[string]string, error) {
+	files := append([]string(nil), stackManifests[ws.Stack+"/"+ws.PackageManager]...)
+	if ws.DockerImages != nil {
+		files = append(files, ws.DockerImages.Files...)
+	}
+	if len(files) == 0 {
+		return nil, errors.New("workspace has no configured update input files")
+	}
+	hashes := make(map[string]string, len(files))
+	for _, rel := range files {
+		if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(filepath.Clean(rel), ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("invalid update input path %q", rel)
+		}
+		info, err := os.Lstat(filepath.Join(root, rel))
+		if err != nil {
+			return nil, fmt.Errorf("stat update input %s: %w", rel, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("update input %s is not a regular file", rel)
+		}
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			return nil, fmt.Errorf("read update input %s: %w", rel, err)
+		}
+		sum := sha256.Sum256(data)
+		hashes[rel] = fmt.Sprintf("%x", sum)
+	}
+	return hashes, nil
 }

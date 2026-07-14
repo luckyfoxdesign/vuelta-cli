@@ -17,7 +17,7 @@
 app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # main.go, CLI entrypoint
-├── internal/            # config, scanner, updater, vulnscan, githubalerts,
+├── internal/            # config, scanner, updater, updatesnapshot, vulnscan, githubalerts,
 │                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
@@ -73,7 +73,8 @@ make build                     # both cross-build targets
 - `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
-- `internal/updater/` — bumps dependency versions per stack (python/node/docker) inside a sandboxed working copy. Each stack implements the Updater interface; see part B of the spec for pipeline wiring.
+- `internal/updater/` — discovers package candidates in read-only hardened containers and applies validated dependency and Docker image plans inside a sandboxed working copy.
+- `internal/updatesnapshot/` — stores short-lived, read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
 - `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
 <!-- generated:end -->
 

@@ -40,6 +40,30 @@ func NewDockerRunner(egressConfig config.EgressConfig) DockerRunner {
 	}
 }
 
+// NewReadOnlyDockerRunner executes package discovery in the same fail-closed
+// egress environment as updates, but makes both the container root filesystem
+// and project mount read-only. Tools can use /tmp only for ephemeral caches.
+func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) DockerRunner {
+	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
+		network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		cmd := exec.CommandContext(ctx, "docker", dockerReadOnlyArgs(image, args, workDir, network, proxyURL)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return string(out), ctxErr
+			}
+			return string(out), fmt.Errorf("docker read-only scan %s %s: %w: %s", image, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return string(out), nil
+	}
+}
+
 // RunDocker is the default update runner. Until a registry-scoped egress
 // policy is supplied by the sandbox layer, it fails closed before Docker is
 // started.
@@ -96,6 +120,17 @@ func dockerRunArgs(image string, args []string, workDir, network, proxyURL strin
 		image,
 	}, args...)
 	return dockerArgs
+}
+
+func dockerReadOnlyArgs(image string, args []string, workDir, network, proxyURL string) []string {
+	dockerArgs := dockerRunArgs(image, args, workDir, network, proxyURL)
+	for i, arg := range dockerArgs {
+		if arg == "-v" && i+1 < len(dockerArgs) {
+			dockerArgs[i+1] += ":ro"
+			break
+		}
+	}
+	return append(dockerArgs[:1], append([]string{"--read-only"}, dockerArgs[1:]...)...)
 }
 
 // NoopUpdater reports no change; used for workspaces with nothing to update

@@ -41,7 +41,7 @@ trap 'rm -f "$tmp"' EXIT
   printf 'app/\n'
   printf '├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md\n'
   printf '├── cmd/vuelta/          # main.go, CLI entrypoint\n'
-	printf '├── internal/            # config, scanner, updater, vulnscan, githubalerts,\n'
+	printf '├── internal/            # config, scanner, updater, updatesnapshot, vulnscan, githubalerts,\n'
 	printf '│                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging\n'
 	printf '├── egress/              # local registry-allowlisting forward proxy\n'
 	printf '├── deploy/              # launchd and systemd scheduler examples\n'

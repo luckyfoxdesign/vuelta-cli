@@ -5,7 +5,9 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,6 +81,8 @@ type GithubAdvisoriesConfig struct {
 
 type UpdateConfig struct {
 	MinReleaseAgeDays int               `yaml:"min_release_age_days"`
+	SnapshotTTLHours  int               `yaml:"snapshot_ttl_hours"`
+	SnapshotStateDir  string            `yaml:"snapshot_state_dir"`
 	Egress            EgressConfig      `yaml:"egress"`
 	Images            map[string]string `yaml:"images"`
 	Tools             map[string]string `yaml:"tools"`
@@ -206,7 +211,7 @@ func Load(path string) (*Config, error) {
 		ClaudeBin:    "claude",
 		MaxTurns:     10,
 		AllowedTools: "Read,Edit,Grep",
-	}}
+	}, Update: UpdateConfig{SnapshotTTLHours: 24}}
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -248,6 +253,15 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, validateEgress(c.Update.Egress)...)
+	if c.Update.MinReleaseAgeDays < 0 {
+		errs = append(errs, errors.New("update.min_release_age_days: must not be negative"))
+	}
+	if c.Update.SnapshotTTLHours != 0 && (c.Update.SnapshotTTLHours < 1 || c.Update.SnapshotTTLHours > 168) {
+		errs = append(errs, errors.New("update.snapshot_ttl_hours: must be between 1 and 168"))
+	}
+	if c.Update.SnapshotStateDir != "" && !filepath.IsAbs(c.Update.SnapshotStateDir) {
+		errs = append(errs, errors.New("update.snapshot_state_dir: must be absolute when set"))
+	}
 
 	if len(c.Git.AllowedChangedPaths) == 0 {
 		errs = append(errs, errors.New("git.allowed_changed_paths: allowlist is required, otherwise every update is rolled back for manual review"))
@@ -261,6 +275,48 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// SnapshotTTL returns the validated lifetime of a package update plan.
+func (c Config) SnapshotTTL() time.Duration {
+	if c.Update.SnapshotTTLHours == 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(c.Update.SnapshotTTLHours) * time.Hour
+}
+
+// SnapshotStateDir returns the private local state directory used for package
+// update plans. An explicit config value is preferred; the default is scoped
+// to the user's OS configuration directory.
+func (c Config) SnapshotStateDir() (string, error) {
+	if c.Update.SnapshotStateDir != "" {
+		return c.Update.SnapshotStateDir, nil
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config directory: %w", err)
+	}
+	return filepath.Join(dir, "vuelta", "update-snapshots"), nil
+}
+
+// SnapshotPolicyHash fingerprints only update-relevant, non-secret policy.
+// Notification credentials and GitHub token configuration are deliberately
+// excluded so snapshots never become a side channel for those values.
+func (c Config) SnapshotPolicyHash(ws Workspace) (string, error) {
+	policy := struct {
+		Workspace           Workspace
+		MinReleaseAgeDays   int
+		Egress              EgressConfig
+		Images              map[string]string
+		Tools               map[string]string
+		AllowedChangedPaths []string
+	}{ws, c.Update.MinReleaseAgeDays, c.Update.Egress, c.Update.Images, c.Update.Tools, c.Git.AllowedChangedPaths}
+	data, err := json.Marshal(policy)
+	if err != nil {
+		return "", fmt.Errorf("encode snapshot policy: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum), nil
 }
 
 func validateEgress(c EgressConfig) []error {

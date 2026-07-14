@@ -24,7 +24,8 @@ cmd/vuelta/       # main.go, CLI entrypoint
 internal/
   config/         # config.yaml parsing and validation
   scanner/        # validates only explicitly configured project paths, detects stack
-  updater/        # per-stack dependency updates (python/js/docker)
+  updater/        # read-only candidate scan and per-stack updates (python/js/docker)
+  updatesnapshot/ # atomic, short-lived package-update plans
   vulnscan/       # trivy/osv-scanner integration
   githubalerts/   # read-only GitHub Dependabot/Security Advisories client
   sandbox/        # one-off sandboxed working copy for update/test
@@ -144,6 +145,20 @@ notes the remaining prerequisites for a full manual end-to-end run.
 `~/.config/vuelta/config.yaml` by default; a config path remains accepted for
 automation. `vuelta run --project NAME` selects one configured workspace and
 `--dry-run` never commits, pushes, or creates a deploy candidate.
+
+`vuelta scan` remains the CVE/security scan. Package updates use a separate
+two-step interface: `vuelta package scan` performs a read-only package and
+digest check, stores an opaque local snapshot ID, and prints its candidates.
+Use `vuelta package update --snapshot <id>` before the configured TTL expires
+to apply exactly that plan through the normal sandbox, security checks, tests,
+and Git policy. Add `--json` to the scan command for scheduling/automation or
+`--dry-run` to the update command to stop before commit/push. Snapshots are
+stored in `~/.config/vuelta/update-snapshots` by default (or the absolute
+`update.snapshot_state_dir`); they contain only identity metadata, hashes of
+allowed manifests/locks, and candidate versions—never file contents, `.env`,
+tokens, or command logs. A missing, malformed, expired, reconfigured, dirty,
+rebased, or changed-input snapshot exits with code 3 before any package
+manager runs; create a fresh scan instead.
 
 Deploy candidates are created explicitly after a protected merge:
 

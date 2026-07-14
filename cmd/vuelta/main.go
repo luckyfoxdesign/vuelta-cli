@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,14 +25,18 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
+	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/tasks"
+	"github.com/luckyfoxdesign/vuelta/internal/updater"
+	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
 const (
-	exitOK      = 0
-	exitFailure = 1
-	exitConfig  = 2
+	exitOK       = 0
+	exitFailure  = 1
+	exitConfig   = 2
+	exitSnapshot = 3
 )
 
 type commandError struct {
@@ -68,6 +73,8 @@ func run(args []string) error {
 		return runPipeline(args[1:])
 	case "scan":
 		return runScan(args[1:])
+	case "package":
+		return runPackage(args[1:])
 	case "tasks":
 		return runTasks(args[1:])
 	case "deploy":
@@ -82,6 +89,8 @@ const usage = `usage: vuelta <command> [options] [config-path]
 commands:
   run [--project NAME] [--dry-run] [config-path]
   scan [--project NAME] [config-path]
+  package scan [--project NAME] [--json] [config-path]
+  package update --snapshot ID [--dry-run] [config-path]
   config validate [config-path]
   config init [options] <project-path> [config-path]
   tasks list [config-path]
@@ -94,6 +103,168 @@ func defaultConfigPath() (string, error) {
 		return "", fmt.Errorf("resolve config directory: %w", err)
 	}
 	return filepath.Join(dir, "vuelta", "config.yaml"), nil
+}
+
+func runPackage(args []string) error {
+	if len(args) < 1 {
+		return fail(exitConfig, "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path]")
+	}
+	switch args[0] {
+	case "scan":
+		return runPackageScan(args[1:])
+	case "update":
+		return runPackageUpdate(args[1:])
+	default:
+		return fail(exitConfig, "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path]")
+	}
+}
+
+func runPackageScan(args []string) error {
+	fs := flag.NewFlagSet("package scan", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	project := fs.String("project", "", "scan only one configured project")
+	jsonOutput := fs.Bool("json", false, "write machine-readable snapshots")
+	if err := fs.Parse(args); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	path, err := configPath(fs.Args())
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	if err := filterProject(cfg, *project); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if err := scanner.CheckTools(); err != nil {
+		return fail(exitFailure, "%v", err)
+	}
+	stateDir, err := cfg.SnapshotStateDir()
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	store := updatesnapshot.Store{Dir: stateDir}
+	type result struct {
+		Project    string                     `json:"project"`
+		ID         string                     `json:"id"`
+		ExpiresAt  time.Time                  `json:"expires_at"`
+		Candidates []updatesnapshot.Candidate `json:"candidates"`
+	}
+	results := make([]result, 0, len(cfg.Workspaces))
+	for _, ws := range cfg.Workspaces {
+		identity, err := scanner.IdentityForSnapshot(context.Background(), ws)
+		if err != nil {
+			return fail(exitFailure, "%s: %v", filepath.Base(ws.Path), err)
+		}
+		candidateScanner, err := updater.ResolveCandidateScanner(ws, *cfg)
+		if err != nil {
+			return fail(exitConfig, "%s: %v", filepath.Base(ws.Path), err)
+		}
+		candidates, err := candidateScanner.Scan(context.Background(), identity.CanonicalPath)
+		if err != nil {
+			return fail(exitFailure, "%s: package scan: %v", filepath.Base(ws.Path), err)
+		}
+		policyHash, err := cfg.SnapshotPolicyHash(ws)
+		if err != nil {
+			return fail(exitConfig, "%s: %v", filepath.Base(ws.Path), err)
+		}
+		snapshot, err := updatesnapshot.New(time.Now(), cfg.SnapshotTTL(), updatesnapshot.WorkspaceIdentity{CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes}, policyHash, candidates)
+		if err != nil {
+			return fail(exitFailure, "%s: create snapshot: %v", filepath.Base(ws.Path), err)
+		}
+		if err := store.Save(snapshot); err != nil {
+			return fail(exitFailure, "%s: save snapshot: %v", filepath.Base(ws.Path), err)
+		}
+		results = append(results, result{Project: filepath.Base(ws.Path), ID: snapshot.ID, ExpiresAt: snapshot.ExpiresAt, Candidates: snapshot.Candidates})
+	}
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(results)
+	}
+	for _, result := range results {
+		fmt.Printf("%s: snapshot %s (%d candidate(s), expires %s)\n", result.Project, result.ID, len(result.Candidates), result.ExpiresAt.Format(time.RFC3339))
+		for _, candidate := range result.Candidates {
+			fmt.Printf("  %s %s: %s -> %s\n", candidate.Kind, candidate.Name, candidate.Current, candidate.Target)
+		}
+	}
+	return nil
+}
+
+func runPackageUpdate(args []string) error {
+	fs := flag.NewFlagSet("package update", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.String("snapshot", "", "snapshot ID returned by package scan")
+	dryRun := fs.Bool("dry-run", false, "run security checks and tests without commit or push")
+	if err := fs.Parse(args); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if *id == "" {
+		return fail(exitConfig, "--snapshot is required")
+	}
+	path, err := configPath(fs.Args())
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	stateDir, err := cfg.SnapshotStateDir()
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	snapshot, err := (updatesnapshot.Store{Dir: stateDir}).Load(*id)
+	if err != nil {
+		return fail(exitSnapshot, "%v", err)
+	}
+	ws, err := workspaceForSnapshot(*cfg, snapshot)
+	if err != nil {
+		return fail(exitSnapshot, "%v", err)
+	}
+	if err := updatesnapshot.ValidateForWorkspace(context.Background(), snapshot, *cfg, ws, time.Now()); err != nil {
+		return fail(exitSnapshot, "%v", err)
+	}
+	recheck, err := updater.ResolveCandidateScanner(ws, *cfg)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	logger, err := logging.New(false)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	deps := pipeline.Deps{Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}}, Autofix: autofix.Runner{}, Notifier: notify.New(cfg.Notify), Logger: logger}
+	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
+		return updater.PlannedUpdater{Candidates: snapshot.Candidates, Workspace: ws, Config: *cfg, Recheck: recheck, Validate: func(ctx context.Context) error {
+			return updatesnapshot.ValidateForWorkspace(ctx, snapshot, *cfg, ws, time.Now())
+		}}, nil
+	}
+	filtered := *cfg
+	filtered.Workspaces = []config.Workspace{ws}
+	lock, err := pipeline.DefaultLockPath()
+	if err != nil {
+		return fail(exitConfig, "resolve default lock path: %v", err)
+	}
+	summary, err := pipeline.Run(context.Background(), deps, filtered, lock, *dryRun)
+	if err != nil {
+		return fail(exitFailure, "%v", err)
+	}
+	updated, skipped, failed := summary.Counts()
+	fmt.Printf("vuelta package update finished: %d updated, %d skipped, %d failed\n", updated, skipped, failed)
+	if failed > 0 {
+		return fail(exitFailure, "%d workspace(s) failed", failed)
+	}
+	return nil
+}
+
+func workspaceForSnapshot(cfg config.Config, snapshot updatesnapshot.Snapshot) (config.Workspace, error) {
+	for _, ws := range cfg.Workspaces {
+		canonical, err := filepath.EvalSymlinks(ws.Path)
+		if err == nil && canonical == snapshot.Workspace.CanonicalPath {
+			return ws, nil
+		}
+	}
+	return config.Workspace{}, fmt.Errorf("snapshot workspace is not configured")
 }
 
 func configPath(args []string) (string, error) {

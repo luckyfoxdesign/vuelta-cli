@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -211,6 +212,54 @@ func TestDockerRunArgsIncludeSecurityBaseline(t *testing.T) {
 	if slicesContain(got, "/var/run/docker.sock") || slicesContain(got, "host") {
 		t.Fatalf("docker args must not expose a Docker socket or host namespace: %q", got)
 	}
+}
+
+func TestDockerReadOnlyArgsProtectProject(t *testing.T) {
+	got := dockerReadOnlyArgs("node@sha256:x", []string{"npx", "ncu"}, "/sandbox/project", "egress", "http://proxy:3128")
+	if !slicesContain(got, "--read-only") || !slicesContain(got, "/sandbox/project:/project:ro") {
+		t.Fatalf("read-only scan args missing protections: %q", got)
+	}
+}
+
+func TestParsePackageCandidates(t *testing.T) {
+	candidates, err := parsePackageCandidates("npm", []byte(`{"left-pad":"1.3.0","@scope/pkg":"2.0.0"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || candidates[0].Target == "" || candidates[1].Name == "" {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+}
+
+func TestPlannedUpdaterDoesNotWriteWhenSnapshotValidationFails(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "package-lock.json", "unchanged\n")
+	called := false
+	u := PlannedUpdater{
+		Candidates: []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "1.2.3"}},
+		Validate:   func(context.Context) error { return errors.New("stale snapshot") },
+		Recheck:    fakeCandidateScanner{called: &called},
+	}
+	if _, err := u.Update(context.Background(), dir); err == nil {
+		t.Fatal("expected validation error")
+	}
+	if called {
+		t.Fatal("candidate recheck must not run after failed validation")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "unchanged\n" {
+		t.Fatalf("project changed after failed validation: %q", data)
+	}
+}
+
+type fakeCandidateScanner struct{ called *bool }
+
+func (f fakeCandidateScanner) Scan(context.Context, string) ([]updatesnapshot.Candidate, error) {
+	*f.called = true
+	return nil, nil
 }
 
 func slicesContain(values []string, want string) bool {
