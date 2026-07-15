@@ -1,0 +1,30 @@
+vuelta — checks and safely updates dependencies
+
+Examples:
+  vuelta scan
+  vuelta package scan --project api
+  vuelta run --dry-run
+
+Everyday commands:
+  run          run the configured update pipeline
+  scan         scan configured projects for security findings
+  package      inspect or apply dependency updates
+
+Configuration:
+  config       create or validate configuration
+
+Operations:
+  tasks        inspect deployment tasks
+
+Help:
+  help         show top-level or command-specific help
+
+Global options:
+  -c, --config PATH          use an alternate config.yaml
+  --no-input                 disable prompts; does not confirm changes
+  --no-color                 disable color and terminal formatting
+  -h, --help                 show help and exit
+  --version                  show version and exit
+
+Run 'vuelta help <command>' for command details.
+Run 'vuelta help --all' to include CI and server commands.

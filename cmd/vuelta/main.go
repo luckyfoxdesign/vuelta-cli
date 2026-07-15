@@ -40,6 +40,9 @@ const (
 	exitSnapshot = 3
 )
 
+// version is set at build time with -ldflags when a release is produced.
+var version = "dev"
+
 type commandError struct {
 	code int
 	err  error
@@ -64,41 +67,8 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) < 1 {
-		return fail(exitConfig, usage)
-	}
-	switch args[0] {
-	case "config":
-		return runConfig(args[1:])
-	case "run":
-		return runPipeline(args[1:])
-	case "scan":
-		return runScan(args[1:])
-	case "package":
-		return runPackage(args[1:])
-	case "tasks":
-		return runTasks(args[1:])
-	case "deploy":
-		return runDeploy(args[1:])
-	default:
-		return fail(exitConfig, "unknown command %q\n\n%s", args[0], usage)
-	}
+	return newCLI(cliIO{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, lookup: os.LookupEnv}).run(args)
 }
-
-const usage = `usage: vuelta <command> [options] [config-path]
-
-commands:
-  run [--project NAME] [--dry-run] [config-path]
-  scan [--project NAME] [config-path]
-  package scan [--project NAME] [--json] [config-path]
-  package update --snapshot ID [--dry-run] [config-path]
-  package local scan [--json] [--policy PATH] [--allow-project-config] <project-path>
-  package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>
-  config validate [config-path]
-  config init [options] <project-path> [config-path]
-  tasks list [config-path]
-  deploy enqueue --project NAME --commit SHA --image-digest SHA256 --manifest-digest SHA256 [config-path]
-  deploy worker [config-path]`
 
 func defaultConfigPath() (string, error) {
 	dir, err := os.UserConfigDir()

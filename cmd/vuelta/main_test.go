@@ -24,7 +24,7 @@ func TestConfigInitNonInteractive(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	err := run([]string{"config", "init", "--non-interactive", "--branch", "main", "--remote", "origin", project, path})
+	err := run([]string{"config", "init", project, "--no-input", "--branch", "main", "--remote", "origin", "--config", path})
 	if err != nil {
 		t.Fatalf("config init: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestConfigInitNonInteractive(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("generated config validation: %v", err)
 	}
-	if err := run([]string{"config", "init", "--non-interactive", "--branch", "main", "--remote", "origin", project, path}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if err := run([]string{"--config", path, "config", "init", "--no-input", "--branch", "main", "--remote", "origin", project}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second config init error = %v, want no-overwrite error", err)
 	}
 }
