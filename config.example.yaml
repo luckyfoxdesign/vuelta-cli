@@ -101,7 +101,8 @@ deploy_task:
 workspaces:
   # This checked-in smoke configuration validates from the app/ directory.
   # Replace it with explicit target repositories before a real update run.
-  - path: .
+  - name: vuelta-app             # stable project name used by CLI selectors and output
+    path: .                      # canonicalized when added with `vuelta project add`
     stack: docker
     test:
       compose_file: compose.yml
@@ -109,6 +110,8 @@ workspaces:
       run_args: ["--rm"]
     branch: main
     remote: origin
+    allowed_changed_paths:       # project-scoped allowlist used for update diff checks
+      - "Dockerfile*"
     docker_images:                 # only these project-relative files are analyzed/updated
       files: ["Dockerfile"]
       runtime_images: ["node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"]
@@ -116,14 +119,5 @@ workspaces:
 
 git:
   push_mode: review_branch         # review_branch (default) | direct_branch
-  allowed_changed_paths:           # required allowlist, otherwise every update is rolled back for manual review
-    - "poetry.lock"
-    - "pyproject.toml"
-    - "uv.lock"
-    - "requirements.in"
-    - "requirements.txt"
-    - "package.json"
-    - "package-lock.json"
-    - "pnpm-lock.yaml"
-    - "bun.lock"
-    - "Dockerfile*"
+  # Legacy configs may keep one config-wide allowed_changed_paths list here.
+  # New projects persist a scoped allowlist in each workspaces[] entry.

@@ -52,10 +52,10 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 		t.Fatalf("permissions = %04o, want 0600", got)
 	}
 	if err := Write(cfg, path, false); err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("Write without force error = %v, want no-overwrite error", err)
+		t.Fatalf("Write without replace error = %v, want no-overwrite error", err)
 	}
 	if err := Write(cfg, path, true); err != nil {
-		t.Fatalf("Write with force: %v", err)
+		t.Fatalf("Write with replace: %v", err)
 	}
 }
 

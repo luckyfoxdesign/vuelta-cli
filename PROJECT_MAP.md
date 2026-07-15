@@ -61,7 +61,7 @@ make build                     # both cross-build targets
 
 - `internal/autofix/` — optionally invokes `claude -p` when tests fail after an update. Test logs/diffs are untrusted input: the invocation never grants Bash tool access (see part C of the spec).
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
-- `internal/configinit/` — deterministically detects a selected project's supported files and generates a validated Vuelta configuration. It never walks parent directories or reads unallowlisted files.
+- `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
 - `internal/deployworker/` — applies authenticated, immutable deployment candidates and restores the previous digest when a rollout is unhealthy.
 - `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.
@@ -91,6 +91,7 @@ make build                     # both cross-build targets
 ## Conventions
 
 - `internal/config` never auto-discovers projects: only `workspaces[].path` from the config is ever touched.
+- New workspaces persist stable names and project-scoped changed-path allowlists; unnamed legacy workspaces use a warning-only basename fallback without automatic rewrites.
 - Go module dependencies are managed only via `docker compose run --rm tidy`, never a host-installed `go`.
 
 ## Known Sharp Edges

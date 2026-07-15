@@ -1,10 +1,6 @@
-// Package configinit deterministically detects a selected project's supported
-// files and generates a validated Vuelta configuration. It never walks parent
-// directories or reads unallowlisted files.
 package configinit
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,8 +13,6 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"gopkg.in/yaml.v3"
 )
-
-const trivyImage = "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
 
 var (
 	composeNames = []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
@@ -43,8 +37,8 @@ type Discovery struct {
 // Input supplies choices that could not be made deterministically. Repeated
 // fields correspond to repeatable CLI flags.
 type Input struct {
-	Stack, PackageManager, ComposeFile, TestService, Branch, Remote string
-	AllowedPaths, DockerFiles, RuntimeImages                        []string
+	Name, Stack, PackageManager, ComposeFile, TestService, Branch, Remote string
+	AllowedPaths, DockerFiles, RuntimeImages                              []string
 }
 
 // MissingValueError identifies a required flag when detection is ambiguous or
@@ -191,47 +185,90 @@ func gitValues(root string, args ...string) []string {
 	return uniqueSorted(strings.Fields(string(out)))
 }
 
-// Build returns a config only when every required selection is explicit or
-// uniquely detected. It validates the generated config before it is written.
+// NewConfig returns the empty, validated container created by config init.
+// It deliberately contains no workspace and no credentials.
+func NewConfig() *config.Config {
+	return &config.Config{
+		VulnScan: config.VulnScanConfig{
+			DependencySource: "trivy", Image: trivyImage,
+			FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
+		},
+		Update: config.UpdateConfig{
+			MinReleaseAgeDays: 7,
+			SnapshotTTLHours:  24,
+			Egress: config.EgressConfig{
+				Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy",
+				ProxyURL: "http://vuelta-egress-proxy:3128",
+			},
+			Images: defaultImages(),
+			Tools:  map[string]string{"npm_check_updates": "17.1.16", "poetry": "2.1.1", "pip_tools": "7.5.0"},
+		},
+		Autofix: config.AutofixConfig{
+			Enabled: false, ClaudeBin: "claude", MaxTurns: 10, AllowedTools: "Read,Edit,Grep",
+		},
+		DeployTask: config.DeployTaskConfig{Mode: "git_tag", TagPrefix: "deploy-pending"},
+		Workspaces: []config.Workspace{},
+		Git:        config.GitConfig{PushMode: "review_branch"},
+	}
+}
+
+// Build preserves the original wizard API for callers that need a complete
+// one-workspace config. New onboarding uses NewConfig followed by
+// BuildWorkspace and a yaml.Node edit.
 func (d Discovery) Build(input Input) (*config.Config, error) {
-	stack, err := choose("--stack", input.Stack, d.Stacks)
+	ws, err := d.BuildWorkspace(input)
 	if err != nil {
 		return nil, err
 	}
+	cfg := NewConfig()
+	cfg.Workspaces = []config.Workspace{ws}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("generated configuration is invalid: %w", err)
+	}
+	return cfg, nil
+}
+
+// BuildWorkspace returns a workspace only when every required selection is
+// explicit or uniquely detected.
+func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
+	stack, err := choose("--stack", input.Stack, d.Stacks)
+	if err != nil {
+		return config.Workspace{}, err
+	}
 	if !contains(d.Stacks, stack) {
-		return nil, fmt.Errorf("--stack %q was not detected in the selected project", stack)
+		return config.Workspace{}, fmt.Errorf("--stack %q was not detected in the selected project", stack)
 	}
 	manager := ""
 	if stack != config.StackDocker {
 		manager, err = choose("--package-manager", input.PackageManager, d.PackageManagers[stack])
 		if err != nil {
-			return nil, err
+			return config.Workspace{}, err
 		}
 		if !contains(d.PackageManagers[stack], manager) {
-			return nil, fmt.Errorf("--package-manager %q was not detected for stack %q", manager, stack)
+			return config.Workspace{}, fmt.Errorf("--package-manager %q was not detected for stack %q", manager, stack)
 		}
 	}
 	composeFile, err := choose("--compose-file", input.ComposeFile, d.ComposeFiles)
 	if err != nil {
-		return nil, err
+		return config.Workspace{}, err
 	}
 	if !contains(d.ComposeFiles, composeFile) {
-		return nil, fmt.Errorf("--compose-file %q is not a detected project-root Compose file", composeFile)
+		return config.Workspace{}, fmt.Errorf("--compose-file %q is not a detected project-root Compose file", composeFile)
 	}
 	service, err := choose("--test-service", input.TestService, d.Services[composeFile])
 	if err != nil {
-		return nil, err
+		return config.Workspace{}, err
 	}
 	if !contains(d.Services[composeFile], service) {
-		return nil, fmt.Errorf("--test-service %q is not a service in %s", service, composeFile)
+		return config.Workspace{}, fmt.Errorf("--test-service %q is not a service in %s", service, composeFile)
 	}
 	branch, err := choose("--branch", input.Branch, d.Branches)
 	if err != nil {
-		return nil, err
+		return config.Workspace{}, err
 	}
 	remote, err := choose("--remote", input.Remote, d.Remotes)
 	if err != nil {
-		return nil, err
+		return config.Workspace{}, err
 	}
 
 	allowed := input.AllowedPaths
@@ -239,15 +276,20 @@ func (d Discovery) Build(input Input) (*config.Config, error) {
 		allowed = defaultAllowedPaths(stack, manager, d.DockerFiles)
 	}
 	if len(allowed) == 0 {
-		return nil, &MissingValueError{Flag: "--allow-path"}
+		return config.Workspace{}, &MissingValueError{Flag: "--allow-path"}
 	}
 	for _, path := range allowed {
 		if !safeProjectPath(path) {
-			return nil, fmt.Errorf("--allow-path %q escapes the selected project", path)
+			return config.Workspace{}, fmt.Errorf("--allow-path %q escapes the selected project", path)
 		}
 	}
-	ws := config.Workspace{Path: d.Root, Stack: stack, PackageManager: manager, Branch: branch, Remote: remote,
-		Test: config.TestProfile{ComposeFile: composeFile, Service: service, RunArgs: []string{"--rm"}}}
+	name := input.Name
+	if name == "" {
+		name = filepath.Base(d.Root)
+	}
+	ws := config.Workspace{Name: name, Path: d.Root, Stack: stack, PackageManager: manager, Branch: branch, Remote: remote,
+		AllowedChangedPaths: uniqueSorted(allowed),
+		Test:                config.TestProfile{ComposeFile: composeFile, Service: service, RunArgs: []string{"--rm"}}}
 	if stack == config.StackDocker {
 		files := input.DockerFiles
 		if len(files) == 0 {
@@ -255,7 +297,7 @@ func (d Discovery) Build(input Input) (*config.Config, error) {
 		}
 		for _, file := range files {
 			if !contains(d.DockerFiles, file) {
-				return nil, fmt.Errorf("--docker-file %q is not a detected project-root Dockerfile", file)
+				return config.Workspace{}, fmt.Errorf("--docker-file %q is not a detected project-root Dockerfile", file)
 			}
 		}
 		images := input.RuntimeImages
@@ -264,17 +306,12 @@ func (d Discovery) Build(input Input) (*config.Config, error) {
 		}
 		ws.DockerImages = &config.DockerImagesSpec{Files: uniqueSorted(files), RuntimeImages: uniqueSorted(images), Platforms: []string{"linux/amd64"}}
 	}
-	cfg := &config.Config{
-		VulnScan:   config.VulnScanConfig{DependencySource: "trivy", Image: trivyImage, FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24},
-		Update:     config.UpdateConfig{MinReleaseAgeDays: 7, Egress: config.EgressConfig{Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy", ProxyURL: "http://vuelta-egress-proxy:3128"}, Images: defaultImages(), Tools: map[string]string{"npm_check_updates": "17.1.16", "poetry": "2.1.1", "pip_tools": "7.5.0"}},
-		Autofix:    config.AutofixConfig{Enabled: false, ClaudeBin: "claude", MaxTurns: 10, AllowedTools: "Read,Edit,Grep"},
-		DeployTask: config.DeployTaskConfig{Mode: "git_tag", TagPrefix: "deploy-pending"}, Workspaces: []config.Workspace{ws},
-		Git: config.GitConfig{PushMode: "review_branch", AllowedChangedPaths: uniqueSorted(allowed)},
-	}
+	cfg := NewConfig()
+	cfg.Workspaces = []config.Workspace{ws}
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("generated configuration is invalid: %w", err)
+		return config.Workspace{}, fmt.Errorf("generated workspace is invalid: %w", err)
 	}
-	return cfg, nil
+	return ws, nil
 }
 
 func choose(flag, supplied string, options []string) (string, error) {
@@ -304,16 +341,6 @@ func defaultAllowedPaths(stack, manager string, dockerFiles []string) []string {
 		return dockerFiles
 	}
 	return nil
-}
-
-func defaultImages() map[string]string {
-	return map[string]string{
-		"python-poetry":    "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153",
-		"python-uv":        "ghcr.io/astral-sh/uv:0.6.14@sha256:a06fb406bda92ac2c105cd45111a206b80294215d6480fa4ce4fd931ab66d7b2",
-		"python-pip-tools": "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153",
-		"node":             "node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3",
-		"bun":              "oven/bun:1.2@sha256:24b8162f18519860276bddcd5cf74045815be0bd1023b35061fb926f1b7989d2",
-	}
 }
 
 func uniqueSorted(values []string) []string {
@@ -346,51 +373,13 @@ func safeProjectPath(path string) bool {
 	return cleaned != ".." && !strings.HasPrefix(cleaned, ".."+string(filepath.Separator))
 }
 
-// Write serializes an already-validated config. It never overwrites an
-// existing config unless force is true and refuses symlink destinations.
-func Write(cfg *config.Config, path string, force bool) error {
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("validate generated config: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("refusing to write config through a symlink")
-		}
-		if !force {
-			return fmt.Errorf("config %s already exists (use --force to overwrite)", path)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect config path: %w", err)
-	}
-	data, err := yaml.Marshal(cfg)
+// Write plans and atomically applies creation or replacement of a config.
+func Write(cfg *config.Config, path string, replace bool) error {
+	plan, err := PlanConfigWrite(cfg, path, replace)
 	if err != nil {
-		return fmt.Errorf("serialize config: %w", err)
+		return err
 	}
-	flags := os.O_WRONLY | os.O_CREATE
-	if force {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	f, err := os.OpenFile(path, flags, 0o600)
-	if err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	_, writeErr := f.Write(data)
-	closeErr := f.Close()
-	if writeErr != nil {
-		return fmt.Errorf("write config: %w", writeErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close config: %w", closeErr)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("restrict config permissions: %w", err)
-	}
-	return nil
+	return plan.Apply(path)
 }
 
 // IsTerminal reports whether r is an interactive terminal without reading it.

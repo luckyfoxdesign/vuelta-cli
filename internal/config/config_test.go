@@ -110,3 +110,35 @@ func TestValidateSecurityConfigRequiresOneCompatibleDependencySource(t *testing.
 		t.Fatalf("expected missing source rejection, got %v", errs)
 	}
 }
+
+func TestValidateRejectsDuplicateWorkspaceNamesAndCanonicalPaths(t *testing.T) {
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workspace := Workspace{
+		Name: "api", Path: project, Stack: StackNode, PackageManager: "npm",
+		Test:                TestProfile{ComposeFile: "compose.yml", Service: "test", RunArgs: []string{"--rm"}},
+		AllowedChangedPaths: []string{"package.json"},
+	}
+	cfg := Config{Workspaces: []Workspace{workspace, workspace}}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "duplicates workspaces[0]") || !strings.Contains(err.Error(), "canonical path") {
+		t.Fatalf("duplicate identity error = %v", err)
+	}
+}
+
+func TestUnnamedWorkspaceUsesFallbackWithoutMutation(t *testing.T) {
+	workspace := Workspace{Path: "/tmp/example-api"}
+	cfg := Config{Workspaces: []Workspace{workspace}}
+	warnings := cfg.WorkspaceWarnings()
+	if got := WorkspaceName(cfg.Workspaces[0]); got != "example-api" {
+		t.Fatalf("fallback name = %q", got)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "without rewriting") {
+		t.Fatalf("warnings = %v", warnings)
+	}
+	if cfg.Workspaces[0].Name != "" {
+		t.Fatal("fallback mutated the loaded workspace")
+	}
+}

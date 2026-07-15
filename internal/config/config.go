@@ -24,7 +24,7 @@ import (
 // e.g. "python:3.12-slim@sha256:<64 hex chars>". It rejects unfilled
 // placeholders like "@sha256:<digest>".
 var digestRefPattern = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
-var productionNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var projectNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // Config mirrors the config.yaml schema.
 type Config struct {
@@ -160,13 +160,17 @@ type DockerImagesSpec struct {
 }
 
 type Workspace struct {
-	Path           string            `yaml:"path"`
-	Stack          string            `yaml:"stack"`
-	PackageManager string            `yaml:"package_manager"`
-	Test           TestProfile       `yaml:"test"`
-	Branch         string            `yaml:"branch"`
-	Remote         string            `yaml:"remote"`
-	DockerImages   *DockerImagesSpec `yaml:"docker_images,omitempty"`
+	Name           string      `yaml:"name,omitempty"`
+	Path           string      `yaml:"path"`
+	Stack          string      `yaml:"stack"`
+	PackageManager string      `yaml:"package_manager"`
+	Test           TestProfile `yaml:"test"`
+	Branch         string      `yaml:"branch"`
+	Remote         string      `yaml:"remote"`
+	// AllowedChangedPaths overrides the legacy config-wide Git allowlist for
+	// this workspace. Older configs continue to use git.allowed_changed_paths.
+	AllowedChangedPaths []string          `yaml:"allowed_changed_paths,omitempty"`
+	DockerImages        *DockerImagesSpec `yaml:"docker_images,omitempty"`
 }
 
 type GitConfig struct {
@@ -252,6 +256,19 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+
+	cfg.sourcePath = path
+	cfg.sourceMode = info.Mode()
+	return cfg, nil
+}
+
+// Parse decodes config bytes with the same safe defaults and strict field
+// checking as Load, without reading from the filesystem.
+func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a test profile
 
@@ -265,11 +282,8 @@ func Load(path string) (*Config, error) {
 		AllowedTools: "Read,Edit,Grep",
 	}, Update: UpdateConfig{SnapshotTTLHours: 24}}
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, err
 	}
-
-	cfg.sourcePath = path
-	cfg.sourceMode = info.Mode()
 	return &cfg, nil
 }
 
@@ -282,20 +296,62 @@ func (c *Config) PermissionWarning() (string, bool) {
 	return "", false
 }
 
+// WorkspaceName returns the persistent name when present and the legacy
+// basename fallback otherwise. Loading an old config never writes this value
+// back to disk.
+func WorkspaceName(ws Workspace) string {
+	if ws.Name != "" {
+		return ws.Name
+	}
+	return filepath.Base(filepath.Clean(ws.Path))
+}
+
+// WorkspaceWarnings reports lazy-migration warnings for unnamed workspaces.
+func (c *Config) WorkspaceWarnings() []string {
+	warnings := make([]string, 0)
+	for i, ws := range c.Workspaces {
+		if ws.Name == "" {
+			warnings = append(warnings, fmt.Sprintf("workspaces[%d] has no name; using %q from the path without rewriting the config", i, WorkspaceName(ws)))
+		}
+	}
+	return warnings
+}
+
+// AllowedChangedPaths returns the workspace-scoped allowlist when present,
+// falling back to the config-wide field used by older configurations.
+func (c Config) AllowedChangedPaths(ws Workspace) []string {
+	if len(ws.AllowedChangedPaths) > 0 {
+		return ws.AllowedChangedPaths
+	}
+	return c.Git.AllowedChangedPaths
+}
+
 // Validate checks the loaded config against the invariants in the spec:
 // every workspace path must exist and be a git repository, stack/package_manager
 // pairs must be valid, image references must be pinned by digest, the git
-// allowlist must be non-empty, and docker_images.files must stay inside the
-// project directory as plain files.
+// allowlist must be present for every configured workspace, and
+// docker_images.files must stay inside the project directory as plain files.
 func (c *Config) Validate() error {
 	var errs []error
 
-	if len(c.Workspaces) == 0 {
-		errs = append(errs, errors.New("workspaces: at least one entry is required"))
-	}
-
+	seenNames := make(map[string]int, len(c.Workspaces))
+	seenPaths := make(map[string]int, len(c.Workspaces))
 	for i, ws := range c.Workspaces {
 		errs = append(errs, validateWorkspace(i, ws)...)
+		name := WorkspaceName(ws)
+		if previous, ok := seenNames[name]; ok {
+			errs = append(errs, fmt.Errorf("workspaces[%d].name: %q duplicates workspaces[%d]", i, name, previous))
+		} else {
+			seenNames[name] = i
+		}
+		canonical, err := canonicalWorkspacePath(ws.Path)
+		if err == nil {
+			if previous, ok := seenPaths[canonical]; ok {
+				errs = append(errs, fmt.Errorf("workspaces[%d].path: canonical path %q duplicates workspaces[%d]", i, canonical, previous))
+			} else {
+				seenPaths[canonical] = i
+			}
+		}
 	}
 
 	for name, ref := range c.Update.Images {
@@ -315,8 +371,17 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("update.snapshot_state_dir: must be absolute when set"))
 	}
 
-	if len(c.Git.AllowedChangedPaths) == 0 {
-		errs = append(errs, errors.New("git.allowed_changed_paths: allowlist is required, otherwise every update is rolled back for manual review"))
+	if len(c.Workspaces) > 0 && len(c.Git.AllowedChangedPaths) == 0 {
+		missingAllowlist := false
+		for _, ws := range c.Workspaces {
+			if len(ws.AllowedChangedPaths) == 0 {
+				missingAllowlist = true
+				break
+			}
+		}
+		if missingAllowlist {
+			errs = append(errs, errors.New("git.allowed_changed_paths: allowlist is required, otherwise every update is rolled back for manual review"))
+		}
 	}
 
 	errs = append(errs, validateSecurityConfig(*c)...)
@@ -362,7 +427,7 @@ func (c Config) SnapshotPolicyHash(ws Workspace) (string, error) {
 		Images              map[string]string
 		Tools               map[string]string
 		AllowedChangedPaths []string
-	}{ws, c.Update.MinReleaseAgeDays, c.Update.Egress, c.Update.Images, c.Update.Tools, c.Git.AllowedChangedPaths}
+	}{ws, c.Update.MinReleaseAgeDays, c.Update.Egress, c.Update.Images, c.Update.Tools, c.AllowedChangedPaths(ws)}
 	data, err := json.Marshal(policy)
 	if err != nil {
 		return "", fmt.Errorf("encode snapshot policy: %w", err)
@@ -426,14 +491,14 @@ func validateProductionWorker(c *ProductionWorkerConfig) []error {
 	seen := make(map[string]bool)
 	for i, project := range c.Projects {
 		label := fmt.Sprintf("production_worker.projects[%d]", i)
-		if !productionNamePattern.MatchString(project.Name) || seen[project.Name] {
+		if !projectNamePattern.MatchString(project.Name) || seen[project.Name] {
 			errs = append(errs, fmt.Errorf("%s.name must be a unique project name", label))
 		}
 		seen[project.Name] = true
 		if !validImageRepository(project.ImageRepository) {
 			errs = append(errs, fmt.Errorf("%s.image_repository must be an allowlisted repository without a tag or digest", label))
 		}
-		if !filepath.IsAbs(project.ComposeFile) || !productionNamePattern.MatchString(project.Service) {
+		if !filepath.IsAbs(project.ComposeFile) || !projectNamePattern.MatchString(project.Service) {
 			errs = append(errs, fmt.Errorf("%s.compose_file must be absolute and service must be a compose service name", label))
 		}
 		for name, rawURL := range map[string]string{"health_url": project.HealthURL, "smoke_url": project.SmokeURL} {
@@ -544,6 +609,9 @@ func allowedAutofixTools(value string) bool {
 func validateWorkspace(i int, ws Workspace) []error {
 	var errs []error
 	label := fmt.Sprintf("workspaces[%d]", i)
+	if ws.Name != "" && !projectNamePattern.MatchString(ws.Name) {
+		errs = append(errs, fmt.Errorf("%s.name: must start with an alphanumeric character and contain only letters, digits, dot, underscore, or hyphen", label))
+	}
 
 	if ws.Path == "" {
 		errs = append(errs, fmt.Errorf("%s.path: required", label))
@@ -610,6 +678,14 @@ func validateWorkspace(i int, ws Workspace) []error {
 	}
 
 	return errs
+}
+
+func canonicalWorkspacePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 // validateDockerImageFile ensures f stays inside root as a project-relative

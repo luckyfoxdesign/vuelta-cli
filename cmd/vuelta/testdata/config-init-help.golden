@@ -1,23 +1,15 @@
-vuelta config init — detect a project and create validated configuration
+vuelta config init — create an empty validated configuration
 
 Examples:
-  vuelta config init .
-  vuelta config init . --no-input --stack node --package-manager npm --branch main --remote origin
+  vuelta config init
+  vuelta config init --replace --yes
 
 Usage:
-  vuelta config init [options] <project-path> [config-path]
+  vuelta config init [options] [config-path]
 
 Options:
-  --stack STACK              select python, node, or docker
-  --package-manager NAME     select the Python or Node package manager
-  --compose-file PATH        set the project-relative Compose file
-  --test-service NAME        set the Compose test service
-  --branch NAME              set the protected branch
-  --remote NAME              set the Git remote
-  --allow-path PATH          allow a changed path (repeatable)
-  --docker-file PATH         select a Dockerfile (repeatable)
-  --runtime-image DIGEST     set an immutable runtime image (repeatable)
-  --force                    overwrite an existing config
+  --replace                  replace an existing config after review
+  --yes                      confirm the displayed replacement diff
   --non-interactive          legacy alias for --no-input
 
 Defaults:
@@ -32,4 +24,4 @@ Global options:
   --version                  show version and exit
 
 Security:
-  --force replaces an existing configuration; review the destination path first.
+  Replacement requires --replace and confirmation; --yes confirms only the displayed diff.

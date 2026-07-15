@@ -93,7 +93,7 @@ func (d Deps) resolveUpdater(ws config.Workspace, cfg config.Config) (updater.Up
 // next workspace (part B §7 closing note: summary counts updated/skipped/failed).
 func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.Workspace, dryRun bool) (output notify.ProjectResult) {
 	now := deps.now()
-	label := filepath.Base(ws.Path)
+	label := config.WorkspaceName(ws)
 
 	// Step 1: preflight.
 	if err := scanner.CheckTools(); err != nil {
@@ -103,7 +103,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	if err != nil {
 		return failResult(label, "preflight", err)
 	}
-	project := filepath.Base(pre.CanonicalPath)
+	project := label
 	audit := logging.AuditRecord{Project: project}
 	defer func() {
 		if deps.Logger == nil {
@@ -159,7 +159,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	if err := gitops.SyncTree(sandboxDir, landingDir); err != nil {
 		return failResult(project, "sync sandbox to landing copy", err)
 	}
-	if err := gitops.DiffCheck(ctx, landingDir, cfg.Git.AllowedChangedPaths); err != nil {
+	if err := gitops.DiffCheck(ctx, landingDir, cfg.AllowedChangedPaths(ws)); err != nil {
 		return failResult(project, "diff policy", err)
 	}
 	if changedPaths, err := gitops.ChangedPaths(ctx, landingDir); err != nil {
@@ -182,7 +182,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	}
 	autofixApplied := false
 	if !result.Passed && cfg.Autofix.Enabled {
-		allowedDiff, diffErr := gitops.AllowlistedDiff(ctx, landingDir, cfg.Git.AllowedChangedPaths)
+		allowedDiff, diffErr := gitops.AllowlistedDiff(ctx, landingDir, cfg.AllowedChangedPaths(ws))
 		if diffErr != nil {
 			return failResult(project, "autofix diff policy", diffErr)
 		}
@@ -241,7 +241,7 @@ func finishAfterAutofix(ctx context.Context, project string, ws config.Workspace
 	if err := gitops.SyncTree(sandboxDir, landingDir); err != nil {
 		return failResult(project, "sync sandbox to landing copy after autofix", err)
 	}
-	if err := gitops.DiffCheck(ctx, landingDir, cfg.Git.AllowedChangedPaths); err != nil {
+	if err := gitops.DiffCheck(ctx, landingDir, cfg.AllowedChangedPaths(ws)); err != nil {
 		return failResult(project, "diff policy after autofix", err)
 	}
 	if changedPaths, err := gitops.ChangedPaths(ctx, landingDir); err != nil {

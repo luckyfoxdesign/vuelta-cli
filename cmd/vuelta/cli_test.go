@@ -16,8 +16,8 @@ func TestTopLevelHelpGolden(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	assertGolden(t, "top-level-help.golden", stdout.String())
-	if strings.Contains(stdout.String(), "\n  project ") || strings.Contains(stdout.String(), "\n  update ") {
-		t.Fatal("top-level help advertises a command that is not executable yet")
+	if !strings.Contains(stdout.String(), "\n  project ") || strings.Contains(stdout.String(), "\n  update ") {
+		t.Fatal("top-level help does not match the executable command surface")
 	}
 }
 

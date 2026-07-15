@@ -111,19 +111,21 @@ var commandDefinitions = []commandDefinition{
 		security: []string{"--apply permits writes; --allow-scripts permits third-party code to run on the host."}, handler: "package local update",
 	},
 	{
-		path: []string{"config"}, usage: "vuelta config <command>",
-		description: "create or validate configuration", group: "Configuration",
-		examples: []string{"vuelta config validate", "vuelta config init --no-input --branch main --remote origin ."},
+		path: []string{"project"}, usage: "vuelta project <command>",
+		description: "list or add configured projects", group: "Configuration",
+		examples: []string{"vuelta project list", "vuelta project add . --name api"},
 	},
 	{
-		path: []string{"config", "validate"}, usage: "vuelta config validate [config-path]",
-		description: "validate the selected configuration", examples: []string{"vuelta config validate", "vuelta --config ./vuelta.yaml config validate"},
-		takesConfig: true, handler: "config validate",
+		path: []string{"project", "list"}, usage: "vuelta project list [--json] [config-path]",
+		description: "list stable project names and canonical paths", examples: []string{"vuelta project list", "vuelta project list --json"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "project list",
 	},
 	{
-		path: []string{"config", "init"}, usage: "vuelta config init [options] <project-path> [config-path]",
-		description: "detect a project and create validated configuration", examples: []string{"vuelta config init .", "vuelta config init . --no-input --stack node --package-manager npm --branch main --remote origin"},
+		path: []string{"project", "add"}, usage: "vuelta project add [options] <path> [config-path]",
+		description: "detect and add one project", examples: []string{"vuelta project add . --name api", "vuelta project add . --name api --no-input --branch main --remote origin --yes"},
 		options: []optionDefinition{
+			{names: []string{"--name"}, valueName: "NAME", description: "set the persistent project name (defaults to path basename)"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select python, node, or docker"},
 			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the Python or Node package manager"},
 			{names: []string{"--compose-file"}, valueName: "PATH", description: "set the project-relative Compose file"},
@@ -133,10 +135,31 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--allow-path"}, valueName: "PATH", description: "allow a changed path (repeatable)"},
 			{names: []string{"--docker-file"}, valueName: "PATH", description: "select a Dockerfile (repeatable)"},
 			{names: []string{"--runtime-image"}, valueName: "DIGEST", description: "set an immutable runtime image (repeatable)"},
-			{names: []string{"--force"}, description: "overwrite an existing config"},
+			{names: []string{"--yes"}, description: "confirm the displayed config diff"},
 			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
 		},
-		security: []string{"--force replaces an existing configuration; review the destination path first."}, takesConfig: true, handler: "config init",
+		security: []string{"The selected path is detected without inspecting parent directories; writes require a reviewed diff."}, takesConfig: true, handler: "project add",
+	},
+	{
+		path: []string{"config"}, usage: "vuelta config <command>",
+		description: "create or validate configuration", group: "Configuration",
+		examples: []string{"vuelta config init", "vuelta config validate"},
+	},
+	{
+		path: []string{"config", "validate"}, usage: "vuelta config validate [--json] [config-path]",
+		description: "validate the selected configuration", examples: []string{"vuelta config validate", "vuelta --config ./vuelta.yaml config validate --json"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "config validate",
+	},
+	{
+		path: []string{"config", "init"}, usage: "vuelta config init [options] [config-path]",
+		description: "create an empty validated configuration", examples: []string{"vuelta config init", "vuelta config init --replace --yes"},
+		options: []optionDefinition{
+			{names: []string{"--replace"}, description: "replace an existing config after review"},
+			{names: []string{"--yes"}, description: "confirm the displayed replacement diff"},
+			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
+		},
+		security: []string{"Replacement requires --replace and confirmation; --yes confirms only the displayed diff."}, takesConfig: true, handler: "config init",
 	},
 	{
 		path: []string{"tasks"}, usage: "vuelta tasks <command>",
@@ -240,7 +263,7 @@ func (c *cli) run(args []string) error {
 	if definition.handler == "" {
 		return c.writeCommandHelp(definition)
 	}
-	if globals.noInput && definition.handler == "config init" {
+	if globals.noInput && (definition.handler == "config init" || definition.handler == "project add") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
 	if globals.config != "" && definition.takesConfig {
@@ -491,6 +514,10 @@ func dispatchCommand(handler string, args []string) error {
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":
 		return runConfigInit(args)
+	case "project list":
+		return runProjectList(args)
+	case "project add":
+		return runProjectAdd(args)
 	case "tasks list":
 		return runTasks(append([]string{"list"}, args...))
 	case "deploy enqueue":
