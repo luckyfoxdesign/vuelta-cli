@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/tasks"
 )
 
@@ -27,9 +27,7 @@ func (s GitTagSource) git(ctx context.Context, args ...string) (string, error) {
 	if s.Run != nil {
 		return s.Run(ctx, s.Repository, args...)
 	}
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = s.Repository
-	out, err := cmd.Output()
+	out, err := gitexec.Output(ctx, s.Repository, args...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -44,6 +42,12 @@ func (s GitTagSource) git(ctx context.Context, args ...string) (string, error) {
 func (s GitTagSource) Pending(ctx context.Context) ([]Delivery, error) {
 	if s.Repository == "" || s.Remote == "" || s.ExpectedOrigin == "" || s.TagPrefix == "" || s.TrustedFingerprint == "" {
 		return nil, errors.New("git tag source is incomplete")
+	}
+	if err := gitexec.ValidateRemoteName(s.Remote); err != nil {
+		return nil, err
+	}
+	if err := gitexec.ValidateTag(strings.TrimSuffix(s.TagPrefix, "/")); err != nil {
+		return nil, err
 	}
 	origin, err := s.git(ctx, "remote", "get-url", s.Remote)
 	if err != nil {
@@ -68,6 +72,9 @@ func (s GitTagSource) Pending(ctx context.Context) ([]Delivery, error) {
 }
 
 func (s GitTagSource) delivery(ctx context.Context, tag string) (Delivery, error) {
+	if err := gitexec.ValidateTag(tag); err != nil {
+		return Delivery{}, err
+	}
 	content, err := s.git(ctx, "for-each-ref", "--format=%(contents)", "refs/tags/"+tag)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("read deploy tag %s: %w", tag, err)

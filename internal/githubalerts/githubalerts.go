@@ -16,13 +16,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
@@ -61,14 +61,15 @@ func (c Client) remoteURL(ctx context.Context, repoPath, remote string) (string,
 	if c.RemoteURL != nil {
 		return c.RemoteURL(ctx, repoPath, remote)
 	}
-	cmd := exec.CommandContext(ctx, "git", "remote", "get-url", remote)
-	cmd.Dir = repoPath
-	out, err := cmd.CombinedOutput()
+	if err := gitexec.ValidateRemoteName(remote); err != nil {
+		return "", err
+	}
+	out, err := gitexec.Output(ctx, repoPath, "remote", "get-url", remote)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		return "", fmt.Errorf("get remote URL for %q: %w", remote, err)
+		return "", fmt.Errorf("get remote URL: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }

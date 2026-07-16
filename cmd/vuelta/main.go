@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/deployworker"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/tasks"
 )
@@ -346,22 +346,29 @@ func workspaceByProject(cfg config.Config, project string) (config.Workspace, er
 }
 
 func approvedCommit(ctx context.Context, ws config.Workspace, commit string) error {
-	if out, err := git(ctx, ws.Path, "rev-parse", "--verify", commit+"^{commit}"); err != nil || strings.TrimSpace(out) != commit {
+	if err := gitexec.ValidateCommitSHA(commit); err != nil {
+		return errors.New("commit must be a full, existing commit SHA")
+	}
+	if err := gitexec.ValidateRemoteName(ws.Remote); err != nil {
+		return err
+	}
+	if err := gitexec.ValidateBranch(ws.Branch); err != nil {
+		return err
+	}
+	if out, err := git(ctx, ws.Path, "rev-parse", "--verify", "--end-of-options", commit+"^{commit}"); err != nil || strings.TrimSpace(out) != commit {
 		return errors.New("commit must be a full, existing commit SHA")
 	}
 	if _, err := git(ctx, ws.Path, "fetch", "--prune", ws.Remote); err != nil {
 		return fmt.Errorf("fetch configured remote: %w", err)
 	}
-	if _, err := git(ctx, ws.Path, "merge-base", "--is-ancestor", commit, ws.Remote+"/"+ws.Branch); err != nil {
+	if _, err := git(ctx, ws.Path, "merge-base", "--is-ancestor", commit, "refs/remotes/"+ws.Remote+"/"+ws.Branch); err != nil {
 		return errors.New("commit is not merged into the configured protected branch")
 	}
 	return nil
 }
 
 func git(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	out, err := gitexec.Output(ctx, dir, args...)
 	if err != nil {
 		return "", err
 	}

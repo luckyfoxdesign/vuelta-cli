@@ -16,6 +16,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 )
 
 // SkipReason explains why Preflight decided a workspace should be skipped
@@ -73,9 +74,12 @@ func checkToolsWithDocker(tools []string, docker dockerexec.Runner) error {
 	var missing []string
 	for _, tool := range tools {
 		var err error
-		if tool == "docker" {
+		switch tool {
+		case "docker":
 			_, err = docker.Path()
-		} else {
+		case "git":
+			_, err = gitexec.Default().Path()
+		default:
 			_, err = exec.LookPath(tool)
 		}
 		if err != nil {
@@ -111,6 +115,9 @@ func Preflight(ctx context.Context, ws config.Workspace) (PreflightResult, error
 	}
 
 	if ws.Remote != "" {
+		if err := gitexec.ValidateRemoteName(ws.Remote); err != nil {
+			return PreflightResult{}, err
+		}
 		ok, err := hasRemote(ctx, canonical, ws.Remote)
 		if err != nil {
 			return PreflightResult{}, err
@@ -159,11 +166,16 @@ func IdentityForSnapshot(ctx context.Context, ws config.Workspace) (SnapshotIden
 }
 
 func isClean(ctx context.Context, path string) (bool, error) {
-	out, err := runGit(ctx, path, "status", "--porcelain")
+	out, err := runGit(ctx, path, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(out) == "", nil
+	head := strings.TrimSpace(out)
+	changes, err := gitexec.InspectWorktree(ctx, path, head)
+	if err != nil {
+		return false, err
+	}
+	return len(changes) == 0, nil
 }
 
 func hasRemote(ctx context.Context, path, remote string) (bool, error) {
@@ -180,14 +192,12 @@ func hasRemote(ctx context.Context, path, remote string) (bool, error) {
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	out, err := gitexec.Output(ctx, dir, args...)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return string(out), nil
 }

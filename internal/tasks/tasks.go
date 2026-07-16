@@ -13,13 +13,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 )
 
 const schemaVersion = 1
@@ -245,6 +245,15 @@ func (c Creator) createTag(ctx context.Context, in CreateInput) (Candidate, bool
 	if in.RepoPath == "" || in.Remote == "" {
 		return Candidate{}, false, errors.New("git_tag mode requires repo path and remote")
 	}
+	if err := gitexec.ValidateRemoteName(in.Remote); err != nil {
+		return Candidate{}, false, err
+	}
+	if err := gitexec.ValidateCommitSHA(in.CommitSHA); err != nil {
+		return Candidate{}, false, err
+	}
+	if err := gitexec.ValidateTag(strings.TrimSuffix(c.Config.TagPrefix, "/")); err != nil {
+		return Candidate{}, false, err
+	}
 	if existing, ok, err := findTagCandidate(ctx, in.RepoPath, c.Config.TagPrefix, in); err != nil || ok {
 		return existing, false, err
 	}
@@ -253,6 +262,9 @@ func (c Creator) createTag(ctx context.Context, in CreateInput) (Candidate, bool
 		return Candidate{}, false, err
 	}
 	tag := fmt.Sprintf("%s/%s-%s", strings.TrimSuffix(c.Config.TagPrefix, "/"), in.Project, candidate.Timestamp.Format("20060102T150405Z"))
+	if err := gitexec.ValidateTag(tag); err != nil {
+		return Candidate{}, false, err
+	}
 	payload, err := json.Marshal(candidate)
 	if err != nil {
 		return Candidate{}, false, fmt.Errorf("encode signed tag payload: %w", err)
@@ -267,6 +279,9 @@ func (c Creator) createTag(ctx context.Context, in CreateInput) (Candidate, bool
 }
 
 func findTagCandidate(ctx context.Context, repoPath, prefix string, in CreateInput) (Candidate, bool, error) {
+	if err := gitexec.ValidateTag(strings.TrimSuffix(prefix, "/")); err != nil {
+		return Candidate{}, false, err
+	}
 	pattern := "refs/tags/" + strings.TrimSuffix(prefix, "/") + "/" + in.Project + "-*"
 	out, err := git(ctx, repoPath, "for-each-ref", "--format=%(refname:short)", pattern)
 	if err != nil {
@@ -308,14 +323,12 @@ func ParseTaggedCandidate(content string) (Candidate, error) {
 }
 
 func git(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	out, err := gitexec.Output(ctx, dir, args...)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args[:min(3, len(args))], " "), err)
+		return nil, fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return out, nil
 }
@@ -332,11 +345,4 @@ func expandHome(path string) (string, error) {
 		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
 	}
 	return path, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

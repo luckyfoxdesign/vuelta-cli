@@ -15,6 +15,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
@@ -389,7 +390,7 @@ func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options s
 	if options.only != "vulnerabilities" {
 		for _, target := range targets {
 			if target.workspace != nil {
-				if _, err := exec.LookPath("git"); err != nil {
+				if _, err := gitexec.Default().Path(); err != nil {
 					return errors.New("git is required to bind registered project snapshots to their current revision")
 				}
 				break

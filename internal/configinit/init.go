@@ -1,16 +1,17 @@
 package configinit
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"gopkg.in/yaml.v3"
 )
@@ -177,9 +178,7 @@ func composeServices(path string) ([]string, error) {
 }
 
 func gitValues(root string, args ...string) []string {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = root
-	out, err := cmd.Output()
+	out, err := gitexec.Output(context.Background(), root, args...)
 	if err != nil {
 		return nil
 	}

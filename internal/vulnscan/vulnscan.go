@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -17,10 +16,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 )
 
 // Output bounds for untrusted scanner output (F5-MED-008). Scanner stdout is
@@ -30,9 +29,6 @@ import (
 const (
 	scannerStdoutMaxBytes  = 64 << 20
 	scannerStderrTailBytes = 64 << 10
-	// commandWaitDelay bounds how long Wait may block on inherited pipes
-	// after the context is cancelled.
-	commandWaitDelay = 10 * time.Second
 )
 
 // Finding is a normalized CVE/GHSA finding. It intentionally retains the
@@ -492,14 +488,8 @@ func loadPolicy(ctx context.Context, projectRoot, rel string, now time.Time) (po
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return policyFile{}, errors.New("vulnerability policy must be a regular file")
 	}
-	cmd := exec.CommandContext(ctx, "git", "ls-files", "--error-unmatch", "--", rel)
-	cmd.Dir = projectRoot
-	cmd.WaitDelay = commandWaitDelay
-	gitOut := capio.NewTail(4 << 10)
-	cmd.Stdout = gitOut
-	cmd.Stderr = gitOut
-	if err := cmd.Run(); err != nil {
-		return policyFile{}, fmt.Errorf("vulnerability policy must be tracked: %s", strings.TrimSpace(gitOut.String()))
+	if _, err := gitexec.Output(ctx, projectRoot, "ls-files", "--error-unmatch", "--", rel); err != nil {
+		return policyFile{}, errors.New("vulnerability policy must be tracked")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

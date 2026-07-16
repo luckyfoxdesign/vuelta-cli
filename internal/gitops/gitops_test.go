@@ -13,6 +13,32 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 )
 
+func TestMain(m *testing.M) {
+	base := filepath.Base(os.Args[0])
+	if base == "clean-helper" || base == "pre-receive" {
+		_ = os.WriteFile(filepath.Join(filepath.Dir(os.Args[0]), base+".marker"), []byte("executed\n"), 0o600)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func copyTestExecutable(t *testing.T, dir, name string) string {
+	t.Helper()
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -310,6 +336,8 @@ func TestCommitAndPushReviewBranch(t *testing.T) {
 
 	ws := config.Workspace{Remote: "origin", Branch: "main"}
 	git := config.GitConfig{PushMode: "review_branch"}
+	remotePath := strings.TrimSpace(run(t, work, "remote", "get-url", "origin"))
+	remoteHook := copyTestExecutable(t, filepath.Join(remotePath, "hooks"), "pre-receive")
 	branch, err := Push(context.Background(), landing, ws, git, "myproject", time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("Push: %v", err)
@@ -322,6 +350,31 @@ func TestCommitAndPushReviewBranch(t *testing.T) {
 	out := run(t, work, "ls-remote", "origin", "refs/heads/"+branch)
 	if strings.TrimSpace(out) == "" {
 		t.Fatalf("expected branch %s to exist on remote", branch)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(remoteHook), "pre-receive.marker")); !os.IsNotExist(err) {
+		t.Fatal("file-transport receive hook executed")
+	}
+}
+
+func TestDiffCheckAndCommitDoNotRunRepositoryCleanFilter(t *testing.T) {
+	work := newRepoWithRemote(t)
+	writeFile(t, work, ".gitattributes", "requirements.txt filter=owned\n")
+	run(t, work, "add", ".gitattributes")
+	run(t, work, "commit", "-q", "-m", "attributes without helper")
+	helperDir := t.TempDir()
+	helper := copyTestExecutable(t, helperDir, "clean-helper")
+	run(t, work, "config", "filter.owned.clean", helper)
+	run(t, work, "config", "filter.owned.required", "true")
+
+	writeFile(t, work, "requirements.txt", "flask==2.0.1\n")
+	if err := DiffCheck(context.Background(), work, []string{"requirements.txt"}); err != nil {
+		t.Fatalf("DiffCheck: %v", err)
+	}
+	if err := Commit(context.Background(), work, []string{"requirements.txt"}, CommitSummary{Date: time.Now()}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(helperDir, "clean-helper.marker")); !os.IsNotExist(err) {
+		t.Fatal("repository-controlled clean filter executed")
 	}
 }
 

@@ -9,9 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 )
 
 // Prepare creates a 0700 sandbox from exactly baseSHA. repoPath must already
@@ -23,8 +24,8 @@ import (
 // sandbox. Extraction is implemented here rather than delegated to tar so a
 // malicious tracked archive member cannot create a symlink or escape dir.
 func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup func() error, err error) {
-	if baseSHA == "" || strings.ContainsAny(baseSHA, " \t\r\n") {
-		return "", nil, fmt.Errorf("invalid base SHA")
+	if err := gitexec.ValidateCommitSHA(baseSHA); err != nil {
+		return "", nil, fmt.Errorf("verify base SHA: %w", err)
 	}
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
@@ -40,13 +41,11 @@ func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup
 
 	// Resolve the revision before creating a sandbox. This makes a malformed
 	// revision fail without leaving temporary state behind.
-	verify := exec.CommandContext(ctx, "git", "rev-parse", "--verify", baseSHA+"^{commit}")
-	verify.Dir = canonical
-	if out, verifyErr := verify.CombinedOutput(); verifyErr != nil {
+	if _, verifyErr := gitexec.Output(ctx, canonical, "rev-parse", "--verify", "--end-of-options", baseSHA+"^{commit}"); verifyErr != nil {
 		if ctx.Err() != nil {
 			return "", nil, ctx.Err()
 		}
-		return "", nil, fmt.Errorf("verify base SHA: %w: %s", verifyErr, strings.TrimSpace(string(out)))
+		return "", nil, fmt.Errorf("verify base SHA: %w", verifyErr)
 	}
 
 	// A separate local is load-bearing: error paths return `""` through the
@@ -66,22 +65,27 @@ func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup
 		return "", nil, fmt.Errorf("chmod sandbox dir: %w", err)
 	}
 
-	archive := exec.CommandContext(ctx, "git", "archive", "--format=tar", baseSHA)
-	archive.Dir = canonical
-	stdout, err := archive.StdoutPipe()
-	if err != nil {
-		return "", nil, fmt.Errorf("open git archive: %w", err)
-	}
-	if err := archive.Start(); err != nil {
-		return "", nil, fmt.Errorf("start git archive: %w", err)
-	}
+	archiveCtx, cancelArchive := context.WithCancel(ctx)
+	defer cancelArchive()
+	stdout, archiveWriter := io.Pipe()
+	archiveDone := make(chan error, 1)
+	go func() {
+		_, runErr := gitexec.Default().Run(archiveCtx, gitexec.Request{
+			Args: []string{"archive", "--format=tar", baseSHA}, Dir: canonical, Stdout: archiveWriter,
+		})
+		_ = archiveWriter.Close()
+		archiveDone <- runErr
+	}()
 	extractErr := extract(stdout, sandboxDir, defaultArchiveLimits)
 	if extractErr != nil {
-		// git may still be streaming a large archive into a pipe nobody
-		// reads anymore; without the kill, Wait can block forever.
-		_ = archive.Process.Kill()
+		cancelArchive()
+		_ = stdout.Close()
+	} else {
+		// archive/tar stops at the logical end marker; drain Git's remaining
+		// block padding so the child and os/exec copier can finish.
+		_, _ = io.Copy(io.Discard, stdout)
 	}
-	archiveErr := archive.Wait()
+	archiveErr := <-archiveDone
 	if extractErr != nil {
 		return "", nil, extractErr
 	}
