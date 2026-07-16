@@ -38,20 +38,27 @@ type Config struct {
 	ProductionWorker *ProductionWorkerConfig `yaml:"production_worker,omitempty"`
 	Workspaces       []Workspace             `yaml:"workspaces"`
 	Git              GitConfig               `yaml:"git"`
-
-	sourcePath string
-	sourceMode os.FileMode
 }
 
 type NotifyConfig struct {
-	WebhookURL string         `yaml:"webhook_url"`
-	Telegram   TelegramConfig `yaml:"telegram"`
+	WebhookURLEnv string         `yaml:"webhook_url_env"`
+	Telegram      TelegramConfig `yaml:"telegram"`
 }
 
 type TelegramConfig struct {
-	BotToken string `yaml:"bot_token"`
-	ChatID   string `yaml:"chat_id"`
+	BotTokenEnv string `yaml:"bot_token_env"`
+	ChatID      string `yaml:"chat_id"`
 }
+
+const (
+	// NotifyWebhookURLEnv is the only environment variable that may supply a
+	// webhook credential. Keeping the name fixed prevents a config file from
+	// routing an unrelated process secret into a notification request.
+	NotifyWebhookURLEnv = "VUELTA_NOTIFY_WEBHOOK_URL"
+	// NotifyTelegramBotTokenEnv is the only environment variable that may
+	// supply a Telegram bot credential.
+	NotifyTelegramBotTokenEnv = "VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN"
+)
 
 type VulnScanConfig struct {
 	// DependencySource selects the only source used for dependency and lock-file
@@ -269,14 +276,9 @@ func (p LocalPackagePolicy) Validate() error {
 
 // Load reads and parses the config file at path. It does not validate.
 func Load(path string) (*Config, error) {
-	info, err := os.Stat(path)
+	data, _, err := ReadSecureFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("stat config %s: %w", path, err)
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
+		return nil, err
 	}
 
 	cfg, err := Parse(data)
@@ -284,8 +286,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
-	cfg.sourcePath = path
-	cfg.sourceMode = info.Mode()
 	return cfg, nil
 }
 
@@ -308,15 +308,6 @@ func Parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
-}
-
-// PermissionWarning reports a non-fatal warning when the config file is not
-// restricted to owner read/write (0600).
-func (c *Config) PermissionWarning() (string, bool) {
-	if c.sourceMode.Perm() != 0o600 {
-		return fmt.Sprintf("warning: %s has permissions %04o, expected 0600", c.sourcePath, c.sourceMode.Perm()), true
-	}
-	return "", false
 }
 
 // WorkspaceName returns the persistent name when present and the legacy
@@ -418,6 +409,7 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, validateSecurityConfig(*c)...)
+	errs = append(errs, validateNotifyConfig(c.Notify)...)
 	errs = append(errs, validateDeployTask(c.DeployTask)...)
 	errs = append(errs, validateProductionWorker(c.ProductionWorker)...)
 	if c.Git.PushMode != "" && c.Git.PushMode != "review_branch" && c.Git.PushMode != "direct_branch" {
@@ -425,6 +417,20 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateNotifyConfig(c NotifyConfig) []error {
+	var errs []error
+	if c.WebhookURLEnv != "" && c.WebhookURLEnv != NotifyWebhookURLEnv {
+		errs = append(errs, fmt.Errorf("notify.webhook_url_env: must be %q when configured", NotifyWebhookURLEnv))
+	}
+	if c.Telegram.BotTokenEnv != "" && c.Telegram.BotTokenEnv != NotifyTelegramBotTokenEnv {
+		errs = append(errs, fmt.Errorf("notify.telegram.bot_token_env: must be %q when configured", NotifyTelegramBotTokenEnv))
+	}
+	if (c.Telegram.BotTokenEnv == "") != (c.Telegram.ChatID == "") {
+		errs = append(errs, errors.New("notify.telegram: bot_token_env and chat_id must be configured together"))
+	}
+	return errs
 }
 
 // SnapshotTTL returns the validated lifetime of a package update plan.

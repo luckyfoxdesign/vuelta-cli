@@ -1,11 +1,13 @@
-# Copy to ~/.config/vuelta/config.yaml, fill in real values, and chmod 0600 it.
+# Copy to ~/.config/vuelta/config.yaml and chmod 0600 it. The file must be a
+# regular, non-symlink file owned by the process uid. Notification credentials
+# are read from the fixed environment variables below only when sending.
 # Adhoc local execution uses scan-time gates and an optional standalone policy
 # supplied explicitly with `vuelta scan --policy`.
 notify:
-  webhook_url: "https://hooks.example.com/vuelta"   # optional
+  webhook_url_env: "" # to enable, set exactly "VUELTA_NOTIFY_WEBHOOK_URL"
   telegram:
-    bot_token: ""
-    chat_id: ""
+    bot_token_env: "" # to enable with chat_id, set exactly "VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN"
+    chat_id: ""       # not a credential
 
 vuln_scan:
   # Exactly one dependency/lock-file source: trivy | osv-scanner | github-dependabot.

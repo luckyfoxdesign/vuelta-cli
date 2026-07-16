@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
@@ -219,9 +218,6 @@ func setProjectInput(input *configinit.Input, flagName, value string) {
 
 func configWarnings(cfg *config.Config) []string {
 	warnings := make([]string, 0)
-	if warning, ok := cfg.PermissionWarning(); ok {
-		warnings = append(warnings, strings.TrimPrefix(warning, "warning: "))
-	}
 	warnings = append(warnings, cfg.WorkspaceWarnings()...)
 	return warnings
 }

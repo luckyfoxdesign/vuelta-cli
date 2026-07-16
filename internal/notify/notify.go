@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -57,11 +58,12 @@ func (s RunSummary) Counts() (updated, skipped, failed int) {
 type Notifier struct {
 	cfg    config.NotifyConfig
 	client *http.Client
+	lookup func(string) (string, bool)
 }
 
 // New builds a Notifier from the notify.* config block.
 func New(cfg config.NotifyConfig) *Notifier {
-	return &Notifier{cfg: cfg, client: &http.Client{Timeout: 10 * time.Second}}
+	return &Notifier{cfg: cfg, client: &http.Client{Timeout: 10 * time.Second}, lookup: os.LookupEnv}
 }
 
 // SendProjectResult delivers a single workspace's outcome.
@@ -82,56 +84,62 @@ func (n *Notifier) Send(message string) error {
 
 func (n *Notifier) send(ctx context.Context, payload any, text string) error {
 	var errs []error
-	if n.cfg.WebhookURL != "" {
-		if err := n.sendWebhook(ctx, payload); err != nil {
+	if n.cfg.WebhookURLEnv != "" {
+		webhookURL, ok := n.lookup(n.cfg.WebhookURLEnv)
+		if !ok || webhookURL == "" {
+			errs = append(errs, fmt.Errorf("webhook credential environment variable %s is not set", n.cfg.WebhookURLEnv))
+		} else if err := n.sendWebhook(ctx, payload, webhookURL); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if n.cfg.Telegram.BotToken != "" && n.cfg.Telegram.ChatID != "" {
-		if err := n.sendTelegram(ctx, text); err != nil {
+	if n.cfg.Telegram.BotTokenEnv != "" && n.cfg.Telegram.ChatID != "" {
+		botToken, ok := n.lookup(n.cfg.Telegram.BotTokenEnv)
+		if !ok || botToken == "" {
+			errs = append(errs, fmt.Errorf("telegram credential environment variable %s is not set", n.cfg.Telegram.BotTokenEnv))
+		} else if err := n.sendTelegram(ctx, text, botToken); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (n *Notifier) sendWebhook(ctx context.Context, payload any) error {
+func (n *Notifier) sendWebhook(ctx context.Context, payload any, webhookURL string) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal webhook payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.cfg.WebhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build webhook request to %s: %s", redactURL(n.cfg.WebhookURL), redactInMessage(err.Error(), n.cfg.WebhookURL))
+		return fmt.Errorf("build webhook request to %s: %s", redactURL(webhookURL), redactInMessage(err.Error(), webhookURL))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("deliver webhook to %s: %s", redactURL(n.cfg.WebhookURL), redactInMessage(err.Error(), n.cfg.WebhookURL))
+		return fmt.Errorf("deliver webhook to %s: %s", redactURL(webhookURL), redactInMessage(err.Error(), webhookURL))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook %s responded with status %d", redactURL(n.cfg.WebhookURL), resp.StatusCode)
+		return fmt.Errorf("webhook %s responded with status %d", redactURL(webhookURL), resp.StatusCode)
 	}
 	return nil
 }
 
-func (n *Notifier) sendTelegram(ctx context.Context, text string) error {
-	apiURL := telegramURL(n.cfg.Telegram.BotToken)
+func (n *Notifier) sendTelegram(ctx context.Context, text, botToken string) error {
+	apiURL := telegramURL(botToken)
 	form := telegramForm(n.cfg.Telegram.ChatID, text)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return fmt.Errorf("build telegram request: %s", redactInMessage(err.Error(), apiURL))
+		return fmt.Errorf("build telegram request: %s", redactInMessage(err.Error(), apiURL, botToken))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("deliver telegram message: %s", redactInMessage(err.Error(), apiURL))
+		return fmt.Errorf("deliver telegram message: %s", redactInMessage(err.Error(), apiURL, botToken))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -157,11 +165,13 @@ func telegramForm(chatID, text string) url.Values {
 // client wraps transport failures in a *url.Error that echoes the exact
 // request URL, so redacting our own error text is not enough — the
 // underlying error string carries the secret too.
-func redactInMessage(msg, secretURL string) string {
-	if secretURL == "" {
-		return msg
+func redactInMessage(msg string, secrets ...string) string {
+	for _, secret := range secrets {
+		if secret != "" {
+			msg = strings.ReplaceAll(msg, secret, redactURL(secret))
+		}
 	}
-	return strings.ReplaceAll(msg, secretURL, redactURL(secretURL))
+	return msg
 }
 
 // redactURL strips everything after the host so a webhook token embedded

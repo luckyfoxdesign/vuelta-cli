@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,15 @@ func TestSendProjectResultWebhook(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := New(config.NotifyConfig{WebhookURL: srv.URL})
+	lookups := 0
+	n := New(config.NotifyConfig{WebhookURLEnv: config.NotifyWebhookURLEnv})
+	n.lookup = func(name string) (string, bool) {
+		lookups++
+		return srv.URL, name == config.NotifyWebhookURLEnv
+	}
+	if lookups != 0 {
+		t.Fatalf("credential was resolved during notifier construction")
+	}
 	r := ProjectResult{Project: "api-service", Status: "updated", Branch: "vuelta/deps/api-service-2026-07-13"}
 	if err := n.SendProjectResult(context.Background(), r); err != nil {
 		t.Fatalf("SendProjectResult: %v", err)
@@ -30,10 +39,15 @@ func TestSendProjectResultWebhook(t *testing.T) {
 	if received.Project != "api-service" || received.Status != "updated" {
 		t.Fatalf("unexpected payload received: %+v", received)
 	}
+	if lookups != 1 {
+		t.Fatalf("credential lookups = %d, want one lookup at send time", lookups)
+	}
 }
 
 func TestSendWebhookErrorRedactsURL(t *testing.T) {
-	n := New(config.NotifyConfig{WebhookURL: "https://hooks.example.com/services/T000/B000/verysecrettoken"})
+	secretURL := "https://hooks.example.com/services/T000/B000/verysecrettoken"
+	n := New(config.NotifyConfig{WebhookURLEnv: config.NotifyWebhookURLEnv})
+	n.lookup = mapLookup(map[string]string{config.NotifyWebhookURLEnv: secretURL})
 	// No server listening on this port; the request will fail to deliver.
 	n.client.Timeout = 100 * time.Millisecond
 
@@ -52,10 +66,58 @@ func TestWebhookNon2xxIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := New(config.NotifyConfig{WebhookURL: srv.URL})
+	n := New(config.NotifyConfig{WebhookURLEnv: config.NotifyWebhookURLEnv})
+	n.lookup = mapLookup(map[string]string{config.NotifyWebhookURLEnv: srv.URL})
 	err := n.SendRunSummary(context.Background(), RunSummary{})
 	if err == nil {
 		t.Fatal("expected error for non-2xx webhook response")
+	}
+}
+
+func TestTransportErrorsRedactResolvedCredentials(t *testing.T) {
+	const (
+		webhookURL = "https://hooks.example.com/services/fake-webhook-secret"
+		botToken   = "123:fake-telegram-secret"
+	)
+	tests := []struct {
+		name   string
+		cfg    config.NotifyConfig
+		values map[string]string
+		secret string
+	}{
+		{
+			name: "webhook", cfg: config.NotifyConfig{WebhookURLEnv: config.NotifyWebhookURLEnv},
+			values: map[string]string{config.NotifyWebhookURLEnv: webhookURL}, secret: "fake-webhook-secret",
+		},
+		{
+			name: "telegram", cfg: config.NotifyConfig{Telegram: config.TelegramConfig{BotTokenEnv: config.NotifyTelegramBotTokenEnv, ChatID: "42"}},
+			values: map[string]string{config.NotifyTelegramBotTokenEnv: botToken}, secret: botToken,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			n := New(tc.cfg)
+			n.lookup = mapLookup(tc.values)
+			n.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("fake transport rejected %s", req.URL.String())
+			})
+			err := n.SendProjectResult(context.Background(), ProjectResult{Project: "x", Status: "failed"})
+			if err == nil {
+				t.Fatal("expected delivery error")
+			}
+			if strings.Contains(err.Error(), tc.secret) {
+				t.Fatalf("transport error leaked resolved credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestMissingCredentialErrorContainsOnlyVariableName(t *testing.T) {
+	n := New(config.NotifyConfig{WebhookURLEnv: config.NotifyWebhookURLEnv})
+	n.lookup = mapLookup(nil)
+	err := n.Send("summary")
+	if err == nil || !strings.Contains(err.Error(), config.NotifyWebhookURLEnv) {
+		t.Fatalf("missing credential error = %v", err)
 	}
 }
 
@@ -110,5 +172,18 @@ func TestTelegramURLDoesNotAppearInProjectText(t *testing.T) {
 	form := telegramForm("42", "hello")
 	if form.Get("chat_id") != "42" || form.Get("text") != "hello" {
 		t.Fatalf("unexpected telegram form: %v", form)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func mapLookup(values map[string]string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
 	}
 }

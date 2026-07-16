@@ -87,9 +87,6 @@ func loadConfig(path string) (*config.Config, error) {
 	if err != nil {
 		return nil, fail(exitConfig, "%v", err)
 	}
-	if warning, ok := cfg.PermissionWarning(); ok {
-		fmt.Fprintln(os.Stderr, warning)
-	}
 	for _, warning := range cfg.WorkspaceWarnings() {
 		fmt.Fprintln(os.Stderr, "warning:", warning)
 	}

@@ -43,6 +43,58 @@ func TestLoadDefaultsAutofixToNoShellTools(t *testing.T) {
 	}
 }
 
+func TestParseRejectsInlineNotificationCredentials(t *testing.T) {
+	const secret = "fake-inline-notification-secret"
+	for _, data := range []string{
+		"notify:\n  webhook_url: https://hooks.example/" + secret + "\n",
+		"notify:\n  telegram:\n    bot_token: " + secret + "\n",
+	} {
+		_, err := Parse([]byte(data))
+		if err == nil {
+			t.Fatal("expected inline credential field to be rejected")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("parse error leaked inline credential: %v", err)
+		}
+	}
+}
+
+func TestValidateNotifyConfigRequiresFixedEnvironmentReferences(t *testing.T) {
+	valid := NotifyConfig{
+		WebhookURLEnv: NotifyWebhookURLEnv,
+		Telegram:      TelegramConfig{BotTokenEnv: NotifyTelegramBotTokenEnv, ChatID: "42"},
+	}
+	if errs := validateNotifyConfig(valid); len(errs) != 0 {
+		t.Fatalf("valid notification config errors = %v", errs)
+	}
+	valid.WebhookURLEnv = "AWS_SECRET_ACCESS_KEY"
+	valid.Telegram.BotTokenEnv = "DATABASE_PASSWORD"
+	if errs := validateNotifyConfig(valid); len(errs) != 2 {
+		t.Fatalf("arbitrary environment references errors = %v", errs)
+	}
+	if errs := validateNotifyConfig(NotifyConfig{Telegram: TelegramConfig{ChatID: "42"}}); len(errs) != 1 {
+		t.Fatalf("incomplete Telegram config errors = %v", errs)
+	}
+}
+
+func TestNotificationReferencesDoNotAffectSnapshotPolicyHash(t *testing.T) {
+	workspace := Workspace{Name: "api", Path: "/projects/api"}
+	withoutNotify, err := (Config{}).SnapshotPolicyHash(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withNotify, err := (Config{Notify: NotifyConfig{
+		WebhookURLEnv: NotifyWebhookURLEnv,
+		Telegram:      TelegramConfig{BotTokenEnv: NotifyTelegramBotTokenEnv, ChatID: "42"},
+	}}).SnapshotPolicyHash(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withNotify != withoutNotify {
+		t.Fatal("notification references changed the snapshot policy hash")
+	}
+}
+
 func TestValidateProductionWorkerRejectsUnsafeOrIncompleteAdapter(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	valid := &ProductionWorkerConfig{

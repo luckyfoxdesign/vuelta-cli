@@ -212,27 +212,18 @@ func canonicalPath(path string) (string, error) {
 }
 
 func readConfigForWrite(path string) ([]byte, os.FileMode, bool, error) {
-	info, err := os.Lstat(path)
+	_, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, 0o600, false, nil
 	}
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("inspect config path: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, 0, false, errors.New("refusing to write config through a symlink")
-	}
-	if !info.Mode().IsRegular() {
-		return nil, 0, false, errors.New("config path is not a regular file")
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, 0, false, fmt.Errorf("config permissions %04o are broader than 0600", info.Mode().Perm())
-	}
-	data, err := os.ReadFile(path)
+	data, mode, err := config.ReadSecureFile(path)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("read config: %w", err)
+		return nil, 0, false, err
 	}
-	return data, info.Mode().Perm(), true, nil
+	return data, mode, true, nil
 }
 
 func workspaceSequence(document *yaml.Node) (*yaml.Node, error) {

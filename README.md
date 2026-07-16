@@ -10,6 +10,8 @@ which uses the same JSON `scan` → `update` workflow as a human operator.
 
 - Language: Go. Static `vuelta` and optional `vuelta-scheduler` binaries; no
   language runtime is required on target machines.
+- Supported targets are Darwin and Linux. Windows is not a build target because
+  config-file ownership and no-symlink checks use Unix filesystem semantics.
 - Runtime dependencies (not vendored, must exist in the environment): `git`
   and `docker`/`docker compose`. Trivy and OSV-Scanner always run from
   configured digest-pinned containers, never from the host PATH.
@@ -42,8 +44,13 @@ config.example.yaml
 
 ## Configuration
 
-Copy `config.example.yaml` to `~/.config/vuelta/config.yaml`, fill in real
-values, and set its permissions to `0600`. See the file for the full schema:
+Copy `config.example.yaml` to `~/.config/vuelta/config.yaml` and set its
+permissions to `0600`. The config must be a regular, non-symlink file owned by
+the process uid; loading fails closed if these checks do not pass. Webhook URLs
+and Telegram bot tokens are never stored in YAML: the config refers only to the
+fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
+environment variables, which are resolved only when a notification is sent.
+See the file for the full schema:
 notification targets, vulnerability scan settings, GitHub advisories,
 per-stack update pinning, autofix, deploy task mode, the list of
 `workspaces` to manage, and the git allowlist that gates which files an
