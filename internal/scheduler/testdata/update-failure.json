@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "command": "update",
+  "results": [
+    {"snapshot_id": "SNAPSHOT_ID", "status": "failed"}
+  ],
+  "summary": {"status": "failed"},
+  "warnings": [],
+  "errors": []
+}

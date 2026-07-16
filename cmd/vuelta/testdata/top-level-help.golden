@@ -6,10 +6,8 @@ Examples:
   vuelta project add . --name api
 
 Everyday commands:
-  run          run the configured update pipeline
   scan         find vulnerabilities and create read-only update snapshots
   update       apply exactly one validated update snapshot
-  package      inspect or apply dependency updates
 
 Configuration:
   project      list or add configured projects

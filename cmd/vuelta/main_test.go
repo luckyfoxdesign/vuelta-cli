@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -164,36 +163,6 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatal(err)
 	}
 	return string(output), runErr
-}
-
-func TestLocalPackageUpdateRejectsApplyAndDryRunTogether(t *testing.T) {
-	err := run([]string{"package", "local", "update", "--policy", "local.yaml", "--apply", "--dry-run"})
-	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
-		t.Fatalf("local update error = %v, want conflicting confirmation flags", err)
-	}
-}
-
-func TestLegacyPackageUpdateRejectsFormatOneWithSnapshotExitCode(t *testing.T) {
-	root := t.TempDir()
-	configPath := filepath.Join(root, "config.yaml")
-	stateDir := filepath.Join(root, "snapshots")
-	cfg := configinit.NewConfig()
-	cfg.Update.SnapshotStateDir = stateDir
-	if err := configinit.Write(cfg, configPath, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id := "abcdefghijklmnopqrstuv"
-	if err := os.WriteFile(filepath.Join(stateDir, id+".json"), []byte(`{"format":1,"id":"`+id+`"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := run([]string{"package", "update", "--snapshot", id, "--config", configPath})
-	var coded commandError
-	if !errors.As(err, &coded) || coded.code != exitSnapshot || !strings.Contains(err.Error(), "rerun vuelta scan") {
-		t.Fatalf("format-1 error = %#v", err)
-	}
 }
 
 func TestScanJSONTopLevelFailureIsAnEnvelope(t *testing.T) {

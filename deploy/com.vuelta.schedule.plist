@@ -3,11 +3,16 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.vuelta.run</string>
+  <string>com.vuelta.schedule</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/local/bin/vuelta-scheduler</string>
+    <string>--vuelta</string>
     <string>/usr/local/bin/vuelta</string>
-    <string>run</string>
+    <string>--failure-policy</string>
+    <string>continue</string>
+    <string>--findings-policy</string>
+    <string>report</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -17,8 +22,8 @@
     <integer>0</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/REPLACE_ME/.local/state/vuelta/launchd.out.log</string>
+  <string>/Users/REPLACE_ME/.local/state/vuelta/schedule.json.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/REPLACE_ME/.local/state/vuelta/launchd.err.log</string>
+  <string>/Users/REPLACE_ME/.local/state/vuelta/schedule.err.log</string>
 </dict>
 </plist>

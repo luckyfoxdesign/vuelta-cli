@@ -16,9 +16,10 @@
 ```text
 app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
-├── cmd/vuelta/          # main.go, CLI entrypoint
+├── cmd/vuelta/          # one-snapshot CLI entrypoint
+├── cmd/vuelta-scheduler/ # external JSON orchestration helper
 ├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
-│                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging
+│                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
 ├── config.example.yaml, Makefile
@@ -33,26 +34,27 @@ docker compose run --rm test   # go test ./...
 docker compose run --rm race   # go test -race ./...
 docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
-docker compose run --rm build  # go build -o bin/vuelta ./cmd/vuelta
+docker compose run --rm build  # go build ./...
 docker compose up -d egress-proxy # strict local package-registry proxy
-make build-mac                 # Docker cross-build for darwin/arm64
-make build-linux               # Docker cross-build for linux/amd64
+make build-mac                 # Docker cross-build both binaries for darwin/arm64
+make build-linux               # Docker cross-build both binaries for linux/amd64
 make build                     # both cross-build targets
 ```
 
 ## Entrypoints
 
+- `cmd/vuelta-scheduler/main.go` — `vuelta-scheduler` binary entrypoint.
 - `cmd/vuelta/main.go` — `vuelta` binary entrypoint.
 
 ## Config Files
 
 - `go.mod` — Go module definition.
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
-- `local.example.yaml` — standalone allowlist policy for `vuelta package local`.
+- `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
 - `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
-- `Makefile` — Docker-only cross-build targets for darwin/arm64 and linux/amd64.
+- `Makefile` — Docker-only cross-build targets for the CLI and scheduler.
 - `.golangci.yml` — lint rules.
 - `deploy/` — external launchd/systemd scheduling examples.
 - `scripts/update-project-map.sh` — updates this repo map generated block.
@@ -69,9 +71,10 @@ make build                     # both cross-build targets
 - `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
-- `internal/pipeline/` — orchestrates the main `vuelta run` sequence (part B §7): preflight, sandbox, security gate, update, diff/allowlist check, tests, optional autofix, commit, push, and notification — once per configured workspace, sequentially, under a process lock. The runner uses the hardened file/container isolation provided by sandbox, updater, and testrunner; CVE/GitHub-alerts/autofix remain stage seams.
+- `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, optional autofix, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
+- `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update still receives exactly one reviewed snapshot ID.
 - `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.

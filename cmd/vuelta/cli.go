@@ -38,20 +38,8 @@ var globalOptionDefinitions = []optionDefinition{
 }
 
 // commandDefinitions is the single catalog used for routing, parsing, and help.
-// Later CLI redesign phases can add commands without duplicating usage strings.
+// The final command surface and help are defined here without compatibility aliases.
 var commandDefinitions = []commandDefinition{
-	{
-		path: []string{"run"}, usage: "vuelta run [options] [config-path]",
-		description: "run the configured update pipeline", group: "Everyday commands",
-		examples: []string{"vuelta run --dry-run", "vuelta run --project api"},
-		options: []optionDefinition{
-			{names: []string{"--dry-run"}, description: "run without commit, push, or deploy candidate"},
-			{names: []string{"--project"}, valueName: "NAME", description: "run one configured project"},
-			{names: []string{"--lock"}, valueName: "PATH", description: "use an alternate process lock"},
-			{names: []string{"--json-logs"}, description: "write JSON log records"},
-		},
-		security: []string{"Dry-run still performs configured security and environment checks."}, takesConfig: true, handler: "run",
-	},
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
 		description: "find vulnerabilities and create read-only update snapshots", group: "Everyday commands",
@@ -85,57 +73,6 @@ var commandDefinitions = []commandDefinition{
 		},
 		security:    []string{"Every snapshot is validated before environment checks. Registered projects are container-only; all durable updates require confirmation."},
 		takesConfig: true, handler: "update",
-	},
-	{
-		path: []string{"package"}, usage: "vuelta package <command>",
-		description: "inspect or apply dependency updates", group: "Everyday commands",
-		examples: []string{"vuelta package scan", "vuelta package update --snapshot SNAPSHOT_ID"},
-	},
-	{
-		path: []string{"package", "scan"}, usage: "vuelta package scan [options] [config-path]",
-		description: "create package-update snapshots", examples: []string{"vuelta package scan", "vuelta package scan --project api --json"},
-		options: []optionDefinition{
-			{names: []string{"--project"}, valueName: "NAME", description: "scan one configured project"},
-			{names: []string{"--json"}, description: "write machine-readable snapshots"},
-		},
-		takesConfig: true, handler: "package scan",
-	},
-	{
-		path: []string{"package", "update"}, usage: "vuelta package update --snapshot ID [options] [config-path]",
-		description: "apply a validated package snapshot", examples: []string{"vuelta package update --snapshot abc123", "vuelta package update --snapshot abc123 --dry-run"},
-		options: []optionDefinition{
-			{names: []string{"--snapshot"}, valueName: "ID", description: "snapshot returned by package scan (required)"},
-			{names: []string{"--dry-run"}, description: "run checks and tests without commit or push"},
-		},
-		security: []string{"A snapshot is revalidated before any update runs."}, takesConfig: true, handler: "package update",
-	},
-	{
-		path: []string{"package", "local"}, usage: "vuelta package local <command>",
-		description: "inspect or update a project with explicitly local tools", examples: []string{"vuelta package local scan .", "vuelta package local update --policy local.yaml --package example@1.2.3 --dry-run ."},
-		security: []string{"Local mode is less isolated and never implies permission to write."},
-	},
-	{
-		path: []string{"package", "local", "scan"}, usage: "vuelta package local scan [options] <project-path>",
-		description: "scan one project with local package-manager tools", examples: []string{"vuelta package local scan .", "vuelta package local scan . --policy local.yaml --json"},
-		options: []optionDefinition{
-			{names: []string{"--policy"}, valueName: "PATH", description: "use a standalone local package policy"},
-			{names: []string{"--json"}, description: "write machine-readable candidates"},
-			{names: []string{"--allow-project-config"}, description: "honor reviewed project package-manager configuration"},
-		},
-		security: []string{"Local scan does not provide Docker isolation or run CVE scanners."}, handler: "package local scan",
-	},
-	{
-		path: []string{"package", "local", "update"}, usage: "vuelta package local update --policy PATH --package NAME@VERSION [options] <project-path>",
-		description: "apply selected updates with local package-manager tools", examples: []string{"vuelta package local update --policy local.yaml --package example@1.2.3 --dry-run ."},
-		options: []optionDefinition{
-			{names: []string{"--policy"}, valueName: "PATH", description: "use a standalone local package policy (required)"},
-			{names: []string{"--package"}, valueName: "NAME@VERSION", description: "select an update (repeatable)"},
-			{names: []string{"--apply"}, description: "explicitly permit manifest and lock-file writes"},
-			{names: []string{"--dry-run"}, description: "validate without writing"},
-			{names: []string{"--allow-project-config"}, description: "honor reviewed project package-manager configuration"},
-			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts on the host"},
-		},
-		security: []string{"--apply permits writes; --allow-scripts permits third-party code to run on the host."}, handler: "package local update",
 	},
 	{
 		path: []string{"project"}, usage: "vuelta project <command>",
@@ -222,7 +159,7 @@ var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"help"}, usage: "vuelta help [command] [--all]",
 		description: "show top-level or command-specific help", group: "Help",
-		examples: []string{"vuelta help scan", "vuelta help package update", "vuelta help --all"},
+		examples: []string{"vuelta help scan", "vuelta help update", "vuelta help --all"},
 		options:  []optionDefinition{{names: []string{"--all"}, description: "include CI and server commands"}}, handler: "help",
 	},
 }
@@ -534,20 +471,10 @@ func optionNames(options []optionDefinition) []string {
 
 func dispatchCommand(handler string, args []string) error {
 	switch handler {
-	case "run":
-		return runPipeline(args)
 	case "scan":
 		return runScan(args)
 	case "update":
 		return executeUpdate(args)
-	case "package scan":
-		return runPackage(append([]string{"scan"}, args...))
-	case "package update":
-		return runPackage(append([]string{"update"}, args...))
-	case "package local scan":
-		return runPackage(append([]string{"local", "scan"}, args...))
-	case "package local update":
-		return runPackage(append([]string{"local", "update"}, args...))
 	case "config validate":
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":

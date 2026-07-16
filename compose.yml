@@ -39,7 +39,7 @@ services:
     volumes:
       - .:/src
       - go-mod-cache:/go/pkg/mod
-    command: ["go", "build", "-o", "/src/bin/vuelta", "./cmd/vuelta"]
+    command: ["go", "build", "./..."]
 
   egress-proxy:
     build:

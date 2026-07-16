@@ -1,6 +1,6 @@
 # Copy to ~/.config/vuelta/config.yaml, fill in real values, and chmod 0600 it.
-# `vuelta package local` deliberately does not load this pipeline configuration:
-# copy local.example.yaml and pass it explicitly as `--policy` instead.
+# Adhoc local execution uses scan-time gates and an optional standalone policy
+# supplied explicitly with `vuelta scan --policy`.
 notify:
   webhook_url: "https://hooks.example.com/vuelta"   # optional
   telegram:
@@ -35,9 +35,9 @@ github_advisories:
 
 update:
   min_release_age_days: 7  # reject versions younger than N days — protects against freshly-published malicious releases
-  # `vuelta package scan` saves a read-only update plan for this period. The
-  # default is 24h; 1..168h is allowed. Set an absolute private directory only
-  # when the OS config-directory default is unsuitable.
+  # `vuelta scan` saves a read-only update plan for this period. `vuelta
+  # update SNAPSHOT_ID` rejects expired snapshots before environment checks.
+  # The default is 24h; 1..168h is allowed.
   snapshot_ttl_hours: 24
   # snapshot_state_dir: "/Users/you/.config/vuelta/update-snapshots"
   egress:

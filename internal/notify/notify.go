@@ -210,7 +210,7 @@ func runSummaryText(s RunSummary) string {
 		groups[result.Status] = append(groups[result.Status], result.Project)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "vuelta run завершён: %s", s.Finished.Format("02.01.2006 15:04"))
+	fmt.Fprintf(&b, "обновление vuelta завершено: %s", s.Finished.Format("02.01.2006 15:04"))
 	write := func(prefix, status string) {
 		if names := groups[status]; len(names) > 0 {
 			fmt.Fprintf(&b, "\n%s: %s", prefix, strings.Join(names, ", "))

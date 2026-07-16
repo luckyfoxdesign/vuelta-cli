@@ -71,6 +71,32 @@ func TestUnknownOptionGolden(t *testing.T) {
 	assertGolden(t, "unknown-option.golden", err.Error()+"\n")
 }
 
+func TestRemovedCommandsAndFlagsAreRejected(t *testing.T) {
+	tests := [][]string{
+		{"run"},
+		{"package", "scan"},
+		{"scan", "--skip-packages"},
+		{"scan", "--skip-vulnerabilities"},
+		{"scan", "--json-logs"},
+	}
+	for _, args := range tests {
+		_, _, command := testCLI(nil)
+		if err := command.run(args); err == nil {
+			t.Fatalf("removed invocation %v succeeded", args)
+		}
+	}
+
+	stdout, _, command := testCLI(nil)
+	if err := command.run([]string{"help", "--all"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, removed := range []string{"vuelta run", "vuelta package", "--skip-packages", "--skip-vulnerabilities", "--json-logs"} {
+		if strings.Contains(stdout.String(), removed) {
+			t.Fatalf("help still contains removed form %q", removed)
+		}
+	}
+}
+
 func TestVersionWorksBeforeOrAfterCommand(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"scan", "--version"}} {
 		stdout, _, command := testCLI(nil)

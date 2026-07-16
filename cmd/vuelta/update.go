@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -189,6 +190,16 @@ func executeUpdate(args []string) error {
 		return writeUpdateOutcome(options.jsonOutput, warnings, result, err)
 	}
 	return writeUpdateOutcome(options.jsonOutput, warnings, result, nil)
+}
+
+func workspaceForSnapshot(cfg config.Config, snapshot updatesnapshot.Snapshot) (config.Workspace, error) {
+	for _, workspace := range cfg.Workspaces {
+		canonical, err := filepath.EvalSymlinks(workspace.Path)
+		if err == nil && canonical == snapshot.Workspace.CanonicalPath {
+			return workspace, nil
+		}
+	}
+	return config.Workspace{}, errors.New("snapshot workspace is not configured")
 }
 
 func parseUpdateOptions(args []string) (updateOptions, string, error) {

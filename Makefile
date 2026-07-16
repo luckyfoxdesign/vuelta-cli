@@ -11,6 +11,8 @@ lint:
 # Cross-compile in the project Docker image so host Go tooling is never used.
 build-mac:
 	docker compose run --rm -e CGO_ENABLED=0 -e GOOS=darwin -e GOARCH=arm64 build go build -trimpath -o /src/bin/vuelta-darwin-arm64 ./cmd/vuelta
+	docker compose run --rm -e CGO_ENABLED=0 -e GOOS=darwin -e GOARCH=arm64 build go build -trimpath -o /src/bin/vuelta-scheduler-darwin-arm64 ./cmd/vuelta-scheduler
 
 build-linux:
 	docker compose run --rm -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 build go build -trimpath -o /src/bin/vuelta-linux-amd64 ./cmd/vuelta
+	docker compose run --rm -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 build go build -trimpath -o /src/bin/vuelta-scheduler-linux-amd64 ./cmd/vuelta-scheduler

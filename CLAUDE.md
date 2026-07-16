@@ -32,7 +32,12 @@ Use Docker for all runtime, test, lint, and dependency work. Git runs locally.
 
 ## Architecture
 
-`vuelta` is a one-shot CLI (Go), no resident daemon; external scheduler (launchd/systemd timer) triggers `vuelta run`. See `cmd/vuelta/` (entrypoint) and `internal/*` (one package per pipeline stage: config, scanner, updater, vulnscan, githubalerts, sandbox, testrunner, autofix, gitops, tasks, notify). Full spec: `../docs/done/short/13-07-26-app-init-a-core.md` once the task is complete, or `../docs/wip/13-07-26-app-init-a-core.md` while active.
+`vuelta` is a one-shot Go CLI with no resident daemon. Its public mutation
+surface accepts exactly one reviewed snapshot: `scan` creates snapshots and
+`update SNAPSHOT_ID` applies one. The separate `vuelta-scheduler` binary owns
+optional multi-project automation by parsing `scan --all --json` and invoking
+one `update --yes --json SNAPSHOT_ID` process per ready result. See
+`cmd/vuelta/`, `cmd/vuelta-scheduler/`, and `internal/*`.
 
 ## Code Quality
 

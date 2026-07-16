@@ -178,11 +178,10 @@ type GitConfig struct {
 	AllowedChangedPaths []string `yaml:"allowed_changed_paths"`
 }
 
-// LocalPackagePolicy is the deliberately narrow configuration for
-// `vuelta package local`. It is loaded from its own file rather than the
-// sandboxed-pipeline configuration, so a local project need not have Git or
-// Docker available. It never accepts commands, registries, proxies, or
-// credentials.
+// LocalPackagePolicy is the deliberately narrow configuration for an explicit
+// adhoc scan. It is loaded from its own file rather than the registered
+// workspace configuration, so a local project need not have Git or Docker
+// available. It never accepts commands, registries, proxies, or credentials.
 type LocalPackagePolicy struct {
 	AllowedPackages    []string `yaml:"allowed_packages"`
 	MinReleaseAgeDays  int      `yaml:"min_release_age_days"`

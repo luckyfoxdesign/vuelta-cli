@@ -1,15 +1,15 @@
 # vuelta
 
-A one-shot CLI that scans a list of configured project workspaces, updates
-their dependency versions inside sandboxed containers, runs each project's
-tests, scans for CVEs, and — on success — queues a deploy task. It has no
-resident daemon; an external scheduler (launchd/systemd timer) runs
-`vuelta run` on a cadence.
+A one-shot CLI that creates reviewable dependency-update snapshots, applies
+one explicitly selected snapshot inside a sandbox, runs the project's checks,
+and can queue an immutable deploy task. It has no resident daemon. Optional
+launchd/systemd automation invokes the separate `vuelta-scheduler` helper,
+which uses the same JSON `scan` → `update` workflow as a human operator.
 
 ## Stack
 
-- Language: Go. A single static binary, no runtime install required on
-  target machines (laptop or server).
+- Language: Go. Static `vuelta` and optional `vuelta-scheduler` binaries; no
+  language runtime is required on target machines.
 - Runtime dependencies (not vendored, must exist in the environment): `git`
   and `docker`/`docker compose`. Trivy and OSV-Scanner always run from
   configured digest-pinned containers, never from the host PATH.
@@ -21,6 +21,7 @@ resident daemon; an external scheduler (launchd/systemd timer) runs
 
 ```text
 cmd/vuelta/       # main.go, CLI entrypoint
+cmd/vuelta-scheduler/ # external JSON orchestration helper
 internal/
   config/         # config.yaml parsing and validation
   scanner/        # validates only explicitly configured project paths, detects stack
@@ -34,6 +35,8 @@ internal/
   gitops/         # commit, push, tags
   tasks/          # deploy task creation/reading
   notify/         # webhook/telegram notifications
+  scheduler/      # scan/update JSON orchestration and aggregate policy
+deploy/           # launchd/systemd scheduler examples
 config.example.yaml
 ```
 
@@ -44,7 +47,7 @@ values, and set its permissions to `0600`. See the file for the full schema:
 notification targets, vulnerability scan settings, GitHub advisories,
 per-stack update pinning, autofix, deploy task mode, the list of
 `workspaces` to manage, and the git allowlist that gates which files an
-update run is allowed to touch.
+update is allowed to touch.
 
 `vuelta` never scans parent directories or auto-discovers projects: only
 paths listed under `workspaces[]` are ever touched.
@@ -129,9 +132,9 @@ the real deployment adapter are owned by part G.
 docker compose run --rm test   # go test ./...
 docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
-docker compose run --rm build  # go build -o bin/vuelta ./cmd/vuelta
-make build-mac                 # darwin/arm64 binary via Docker
-make build-linux               # linux/amd64 binary via Docker
+docker compose run --rm build  # go build ./...
+make build-mac                 # darwin/arm64 CLI and scheduler via Docker
+make build-linux               # linux/amd64 CLI and scheduler via Docker
 make build                     # both targets
 ```
 
@@ -141,64 +144,60 @@ notes the remaining prerequisites for a full manual end-to-end run.
 
 ## Operations
 
-`vuelta run`, `vuelta scan`, and `vuelta config validate` use
-`~/.config/vuelta/config.yaml` by default; a config path remains accepted for
-automation. `vuelta run --project NAME` selects one configured workspace and
-`--dry-run` never commits, pushes, or creates a deploy candidate.
+`vuelta scan`, `vuelta update`, and `vuelta config validate` use
+`~/.config/vuelta/config.yaml` by default. Select another file with the global
+`--config PATH` option. The normal dependency workflow is deliberately two
+steps:
 
-`vuelta scan` remains the CVE/security scan. Package updates use a separate
-two-step interface: `vuelta package scan` performs a read-only package and
-digest check, stores an opaque local snapshot ID, and prints its candidates.
-Use `vuelta package update --snapshot <id>` before the configured TTL expires
-to apply exactly that plan through the normal sandbox, security checks, tests,
-and Git policy. Add `--json` to the scan command for scheduling/automation or
-`--dry-run` to the update command to stop before commit/push. Snapshots are
-stored in `~/.config/vuelta/update-snapshots` by default (or the absolute
-`update.snapshot_state_dir`); they contain only identity metadata, hashes of
-allowed manifests/locks, and candidate versions—never file contents, `.env`,
-tokens, or command logs. A missing, malformed, expired, reconfigured, dirty,
-rebased, or changed-input snapshot exits with code 3 before any package
+```bash
+vuelta scan --all
+vuelta update --yes SNAPSHOT_ID
+```
+
+`scan` is read-only. It reports vulnerabilities and package candidates and
+creates one short-lived snapshot for each ready project. With no selector it
+uses the registered project containing the current directory; use
+`--project NAME`, `--directory PATH`, or explicit `--all` for another scope.
+`update` accepts exactly one snapshot ID, revalidates it before environment
+checks or writes, displays its plan, and requires confirmation or `--yes`.
+Use `--dry-run` to run checks in a disposable copy without durable changes.
+
+Snapshots are stored in `~/.config/vuelta/update-snapshots` by default (or the
+absolute `update.snapshot_state_dir`). They contain only identity metadata,
+allowed-input hashes, gates, and candidate versions—never file contents,
+credentials, or command logs. A missing, malformed, expired, reconfigured,
+dirty, rebased, or changed-input snapshot exits with code 3 before any package
 manager runs; create a fresh scan instead.
 
-### Direct local package mode
+### Explicit adhoc local execution
 
-`vuelta package local` is deliberately separate from both `vuelta run` and
-snapshot-based package commands. It accepts one explicitly supplied directory,
-does not inspect Git metadata, and never starts Docker. It is useful for a
-small local project, but it is less isolated: it never creates a commit, push,
-or deployment candidate and does not run the Docker-based CVE scan or
-container tests.
-
-Copy `local.example.yaml` to a private local policy file and restrict
-`allowed_packages` to direct dependencies. Find candidates without writing:
+An unregistered directory can use local package tools only through an explicit
+scan and update mode. Copy `local.example.yaml` to a private policy file,
+restrict `allowed_packages`, and create the snapshot without writing:
 
 ```bash
-vuelta package local scan --policy ./vuelta-local.yaml /path/to/project
+vuelta scan --directory /path/to/project --execution local \
+  --policy ./vuelta-local.yaml --only packages
 ```
 
-Apply only a scanned, allowlisted candidate with an explicit write
-confirmation:
+After reviewing the returned snapshot, apply exactly that snapshot:
 
 ```bash
-vuelta package local update --policy ./vuelta-local.yaml \
-  --package example-package@2.3.4 --apply /path/to/project
+vuelta update --execution local --yes SNAPSHOT_ID
 ```
 
-`--dry-run` checks the requested candidate without writing. Manifests and
-locks must be regular root files and exactly one supported pair must exist:
-npm, pnpm, Bun, Poetry, uv, or pip-tools. Vuelta resolves the manager only
-from system `PATH`, rejects a manager inside the project, supplies a minimal
-environment without inherited credentials, and never runs a shell.
+Adhoc local execution never creates a commit, push, or deploy candidate and
+does not run project tests. Manifests and locks must be regular root files and
+exactly one supported pair must exist: npm, pnpm, Bun, Poetry, uv, or
+pip-tools. Vuelta resolves the manager only from system `PATH`, rejects a
+manager inside the project, supplies a minimal environment without inherited
+credentials, uses a private writable copy, and never runs a shell.
 
-Lifecycle/install scripts are disabled by default. `--allow-scripts` is an
-explicit warning-bearing opt-in to third-party code execution on the host.
-Project manager configuration is rejected by default; use
-`--allow-project-config` only after reviewing its registry, proxy,
-`script-shell`, and plugin settings. Vuelta backs up only the selected
-manifest/lock pair before an update and restores it if the manager fails or if
-the post-factum root allowlist check detects another change. That check is
-detection and recovery, not a sandbox: it cannot undo external side effects of
-a host process.
+Lifecycle/install scripts remain disabled unless update receives the explicit
+`--allow-scripts` gate. Project manager configuration is ignored unless scan
+records `--allow-project-config` in the snapshot. The final root allowlist
+check is detection and recovery, not process isolation, so local execution
+should be reserved for reviewed projects and policies.
 
 Deploy candidates are created explicitly after a protected merge:
 
@@ -214,15 +213,26 @@ branch names are refused. `queue_file` candidates can be inspected with
 the production worker received it.
 
 Operational records are written to `~/.local/state/vuelta/vuelta.log` with a
-0700 state directory and 0600 files; use `--json-logs` with `run` when a
-machine-readable stdout/file stream is needed. Do not put test logs, diffs,
-webhook URLs, or Telegram tokens in notification text or audit fields.
+0700 state directory and 0600 files. A command's `--json` option controls only
+its single result envelope on stdout; plans, progress, and diagnostics remain
+on stderr. Do not put test logs, diffs, webhook URLs, or Telegram tokens in
+notification text or audit fields.
 
-Scheduling is external. Templates live in `deploy/`: load
-`com.vuelta.run.plist` with `launchctl` on macOS after replacing `REPLACE_ME`,
-or install/enable `vuelta.service` and `vuelta.timer` on Linux. The systemd
-unit is an example and must be adjusted to the intended unprivileged user and
-binary path.
+Scheduling is external. `vuelta-scheduler` runs one `scan --all --json`,
+structurally selects only `status: ready` results, and invokes one
+`update --yes --json SNAPSHOT_ID` process per ready snapshot. It never parses
+human output or passes result fields through a shell. `--failure-policy` is
+explicitly `continue` or `stop`; `--findings-policy` is `report` or `fail`.
+The continue policy preserves successful independent updates while returning
+a non-zero aggregate result for partial scan or update failures. Findings-only
+policy failures return 5, and cancellation returns 130.
+
+Templates live in `deploy/`: load `com.vuelta.schedule.plist` with `launchctl`
+on macOS after replacing `REPLACE_ME`, or install both binaries plus
+`vuelta.service` and `vuelta.timer` on Linux. Scheduler stdout is one aggregate
+JSON document; child plans and diagnostics are kept on stderr. Adjust the
+example units to the intended unprivileged user, binary paths, and writable
+project paths.
 
 ### Verified production deploys
 

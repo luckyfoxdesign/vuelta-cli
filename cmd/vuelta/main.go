@@ -1,13 +1,12 @@
-// Command vuelta is a one-shot CLI: scan configured workspaces, update
-// dependency versions inside sandboxed containers, run each project's tests,
-// and create immutable deploy candidates only when explicitly requested.
+// Command vuelta is a one-shot CLI: scan explicit targets, apply one reviewed
+// snapshot inside a sandbox, and create immutable deploy candidates only when
+// explicitly requested.
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,20 +16,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luckyfoxdesign/vuelta/internal/autofix"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/deployworker"
-	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
-	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
-	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
-	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
-	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/tasks"
-	"github.com/luckyfoxdesign/vuelta/internal/updater"
-	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
-	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
 const (
@@ -76,303 +66,6 @@ func defaultConfigPath() (string, error) {
 		return "", fmt.Errorf("resolve config directory: %w", err)
 	}
 	return filepath.Join(dir, "vuelta", "config.yaml"), nil
-}
-
-func runPackage(args []string) error {
-	if len(args) < 1 {
-		return fail(exitConfig, packageUsage)
-	}
-	switch args[0] {
-	case "scan":
-		return runPackageScan(args[1:])
-	case "update":
-		return runPackageUpdate(args[1:])
-	case "local":
-		return runPackageLocal(args[1:])
-	default:
-		return fail(exitConfig, packageUsage)
-	}
-}
-
-const packageUsage = "usage: vuelta package scan [--project NAME] [--json] [config-path] | vuelta package update --snapshot ID [--dry-run] [config-path] | vuelta package local scan [--json] [--policy PATH] [--allow-project-config] <project-path> | vuelta package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>"
-
-func runPackageLocal(args []string) error {
-	if len(args) < 1 {
-		return fail(exitConfig, packageUsage)
-	}
-	switch args[0] {
-	case "scan":
-		return runPackageLocalScan(args[1:])
-	case "update":
-		return runPackageLocalUpdate(args[1:])
-	default:
-		return fail(exitConfig, packageUsage)
-	}
-}
-
-func runPackageLocalScan(args []string) error {
-	fs := flag.NewFlagSet("package local scan", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	policyPath := fs.String("policy", "", "standalone local package policy")
-	jsonOutput := fs.Bool("json", false, "write machine-readable candidates")
-	allowProjectConfig := fs.Bool("allow-project-config", false, "allow reviewed project package-manager config")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	if len(fs.Args()) != 1 {
-		return fail(exitConfig, "usage: vuelta package local scan [--json] [--policy PATH] [--allow-project-config] <project-path>")
-	}
-	policy := config.LocalPackagePolicy{}
-	if *policyPath != "" {
-		var err error
-		policy, err = config.LoadLocalPackagePolicy(*policyPath)
-		if err != nil {
-			return fail(exitConfig, "%v", err)
-		}
-	}
-	if *allowProjectConfig || policy.AllowProjectConfig {
-		fmt.Fprintln(os.Stderr, "warning: local mode will honor reviewed project package-manager configuration; registry, proxy, plugins, or script-shell settings can affect host execution")
-	}
-	result, err := localupdate.NewService().Scan(context.Background(), fs.Args()[0], policy, *allowProjectConfig)
-	if err != nil {
-		return fail(exitFailure, "%v", err)
-	}
-	if *jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(struct {
-			Path           string                  `json:"path"`
-			Manager        string                  `json:"manager"`
-			Candidates     []localupdate.Candidate `json:"candidates"`
-			ReleaseAgeUsed bool                    `json:"release_age_used"`
-		}{result.Project.Root, result.Project.Manager, result.Candidates, result.ReleaseAgeUsed})
-	}
-	fmt.Printf("local %s: %d candidate(s)\n", result.Project.Manager, len(result.Candidates))
-	for _, candidate := range result.Candidates {
-		fmt.Printf("  %s: %s -> %s\n", candidate.Name, candidate.Current, candidate.Target)
-	}
-	if policy.MinReleaseAgeDays > 0 && !result.ReleaseAgeUsed {
-		fmt.Printf("note: %s cannot enforce min_release_age_days locally; no age restriction was claimed\n", result.Project.Manager)
-	}
-	fmt.Fprintln(os.Stderr, "local mode did not run Git operations, Docker isolation, CVE scanning, or container tests")
-	return nil
-}
-
-func runPackageLocalUpdate(args []string) error {
-	fs := flag.NewFlagSet("package local update", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	policyPath := fs.String("policy", "", "standalone local package policy (required)")
-	apply := fs.Bool("apply", false, "explicitly permit writes to the manifest and lock file")
-	dryRun := fs.Bool("dry-run", false, "scan and validate the selected update without writing")
-	allowProjectConfig := fs.Bool("allow-project-config", false, "allow reviewed project package-manager config")
-	allowScripts := fs.Bool("allow-scripts", false, "allow package lifecycle/install scripts on the host")
-	var packages repeatedFlag
-	fs.Var(&packages, "package", "selected package update NAME@VERSION (repeatable)")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	if *policyPath == "" {
-		return fail(exitConfig, "--policy is required for local update")
-	}
-	if *apply && *dryRun {
-		return fail(exitConfig, "--apply and --dry-run cannot be used together")
-	}
-	if len(fs.Args()) != 1 {
-		return fail(exitConfig, "usage: vuelta package local update --policy PATH --package NAME@VERSION [--package NAME@VERSION] [--apply | --dry-run] [--allow-project-config] [--allow-scripts] <project-path>")
-	}
-	policy, err := config.LoadLocalPackagePolicy(*policyPath)
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	selected := make([]localupdate.Candidate, 0, len(packages))
-	for _, value := range packages {
-		name, version, ok := strings.Cut(strings.TrimSpace(value), "@")
-		if strings.HasPrefix(value, "@") {
-			index := strings.LastIndex(value, "@")
-			if index > 0 {
-				name, version, ok = value[:index], value[index+1:], true
-			}
-		}
-		if !ok || name == "" || version == "" {
-			return fail(exitConfig, "--package must be NAME@VERSION")
-		}
-		selected = append(selected, localupdate.Candidate{Name: name, Target: version})
-	}
-	if *allowProjectConfig || policy.AllowProjectConfig {
-		fmt.Fprintln(os.Stderr, "warning: local mode will honor reviewed project package-manager configuration; registry, proxy, plugins, or script-shell settings can affect host execution")
-	}
-	if *allowScripts {
-		fmt.Fprintln(os.Stderr, "warning: --allow-scripts permits third-party package lifecycle/install code to execute on this host")
-	}
-	result, err := localupdate.NewService().Update(context.Background(), fs.Args()[0], policy, selected, localupdate.UpdateOptions{Apply: *apply, DryRun: *dryRun, AllowProjectConfig: *allowProjectConfig, AllowScripts: *allowScripts})
-	if err != nil {
-		return fail(exitFailure, "%v", err)
-	}
-	if *dryRun {
-		fmt.Printf("local %s update dry-run accepted for %d selected package(s); no files were written\n", result.Project.Manager, len(selected))
-	} else {
-		fmt.Printf("local %s update applied for %d selected package(s)\n", result.Project.Manager, len(selected))
-	}
-	fmt.Fprintln(os.Stderr, "local mode did not run Git operations, Docker isolation, CVE scanning, or container tests; its allowlist check is post-factum detection, not isolation")
-	return nil
-}
-
-func runPackageScan(args []string) error {
-	fs := flag.NewFlagSet("package scan", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	project := fs.String("project", "", "scan only one configured project")
-	jsonOutput := fs.Bool("json", false, "write machine-readable snapshots")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	path, err := configPath(fs.Args())
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return err
-	}
-	if err := filterProject(cfg, *project); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	if err := scanner.CheckTools(); err != nil {
-		return fail(exitFailure, "%v", err)
-	}
-	stateDir, err := cfg.SnapshotStateDir()
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	store := updatesnapshot.Store{Dir: stateDir}
-	type result struct {
-		Project    string                     `json:"project"`
-		ID         string                     `json:"id"`
-		ExpiresAt  time.Time                  `json:"expires_at"`
-		Candidates []updatesnapshot.Candidate `json:"candidates"`
-	}
-	results := make([]result, 0, len(cfg.Workspaces))
-	for _, ws := range cfg.Workspaces {
-		identity, err := scanner.IdentityForSnapshot(context.Background(), ws)
-		if err != nil {
-			return fail(exitFailure, "%s: %v", config.WorkspaceName(ws), err)
-		}
-		candidateScanner, err := updater.ResolveCandidateScanner(ws, *cfg)
-		if err != nil {
-			return fail(exitConfig, "%s: %v", config.WorkspaceName(ws), err)
-		}
-		candidates, err := candidateScanner.Scan(context.Background(), identity.CanonicalPath)
-		if err != nil {
-			return fail(exitFailure, "%s: package scan: %v", config.WorkspaceName(ws), err)
-		}
-		if len(candidates) == 0 {
-			continue
-		}
-		policyHash, err := cfg.SnapshotPolicyHash(ws)
-		if err != nil {
-			return fail(exitConfig, "%s: %v", config.WorkspaceName(ws), err)
-		}
-		for index := range candidates {
-			candidates[index].ReleaseAgeVerified = candidates[index].Kind != "docker" && workspaceReleaseAgeVerified(ws, time.Duration(cfg.Update.MinReleaseAgeDays)*24*time.Hour)
-		}
-		policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
-		gates := updatesnapshot.ScanGates{MinReleaseAge: (time.Duration(cfg.Update.MinReleaseAgeDays) * 24 * time.Hour).String()}
-		effectiveHash, err := updatesnapshot.EffectivePolicyHash(policyHash, policyIdentity, gates)
-		if err != nil {
-			return fail(exitFailure, "%s: compute effective snapshot policy: %v", config.WorkspaceName(ws), err)
-		}
-		snapshot, err := updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), config.WorkspaceName(ws), updatesnapshot.WorkspaceIdentity{CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes}, policyIdentity, gates, policyHash, effectiveHash, candidates)
-		if err != nil {
-			return fail(exitFailure, "%s: create snapshot: %v", config.WorkspaceName(ws), err)
-		}
-		if err := store.Save(snapshot); err != nil {
-			return fail(exitFailure, "%s: save snapshot: %v", config.WorkspaceName(ws), err)
-		}
-		results = append(results, result{Project: config.WorkspaceName(ws), ID: snapshot.ID, ExpiresAt: snapshot.ExpiresAt, Candidates: snapshot.Candidates})
-	}
-	if *jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(results)
-	}
-	for _, result := range results {
-		fmt.Printf("%s: snapshot %s (%d candidate(s), expires %s)\n", result.Project, result.ID, len(result.Candidates), result.ExpiresAt.Format(time.RFC3339))
-		for _, candidate := range result.Candidates {
-			fmt.Printf("  %s %s: %s -> %s\n", candidate.Kind, candidate.Name, candidate.Current, candidate.Target)
-		}
-	}
-	return nil
-}
-
-func runPackageUpdate(args []string) error {
-	fs := flag.NewFlagSet("package update", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	id := fs.String("snapshot", "", "snapshot ID returned by package scan")
-	dryRun := fs.Bool("dry-run", false, "run security checks and tests without commit or push")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	if *id == "" {
-		return fail(exitConfig, "--snapshot is required")
-	}
-	path, err := configPath(fs.Args())
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return err
-	}
-	stateDir, err := cfg.SnapshotStateDir()
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	snapshot, err := (updatesnapshot.Store{Dir: stateDir}).Load(*id)
-	if err != nil {
-		return fail(exitSnapshot, "%v", err)
-	}
-	ws, err := workspaceForSnapshot(*cfg, snapshot)
-	if err != nil {
-		return fail(exitSnapshot, "%v", err)
-	}
-	if err := updatesnapshot.ValidateForWorkspace(context.Background(), snapshot, *cfg, ws, time.Now()); err != nil {
-		return fail(exitSnapshot, "%v", err)
-	}
-	recheck, err := updater.ResolveCandidateScanner(ws, *cfg)
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	logger, err := logging.New(false)
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	deps := pipeline.Deps{Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}}, Autofix: autofix.Runner{}, Notifier: notify.New(cfg.Notify), Logger: logger}
-	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
-		return updater.PlannedUpdater{Candidates: snapshot.Candidates, Workspace: ws, Config: *cfg, Recheck: recheck, Validate: func(ctx context.Context) error {
-			return updatesnapshot.ValidateForWorkspace(ctx, snapshot, *cfg, ws, time.Now())
-		}}, nil
-	}
-	filtered := *cfg
-	filtered.Workspaces = []config.Workspace{ws}
-	lock, err := pipeline.DefaultLockPath()
-	if err != nil {
-		return fail(exitConfig, "resolve default lock path: %v", err)
-	}
-	summary, err := pipeline.Run(context.Background(), deps, filtered, lock, *dryRun)
-	if err != nil {
-		return fail(exitFailure, "%v", err)
-	}
-	updated, skipped, failed := summary.Counts()
-	fmt.Printf("vuelta package update finished: %d updated, %d skipped, %d failed\n", updated, skipped, failed)
-	if failed > 0 {
-		return fail(exitFailure, "%d workspace(s) failed", failed)
-	}
-	return nil
-}
-
-func workspaceForSnapshot(cfg config.Config, snapshot updatesnapshot.Snapshot) (config.Workspace, error) {
-	for _, ws := range cfg.Workspaces {
-		canonical, err := filepath.EvalSymlinks(ws.Path)
-		if err == nil && canonical == snapshot.Workspace.CanonicalPath {
-			return ws, nil
-		}
-	}
-	return config.Workspace{}, fmt.Errorf("snapshot workspace is not configured")
 }
 
 func configPath(args []string) (string, error) {
@@ -508,54 +201,6 @@ func promptConfirmation(message string) (bool, error) {
 	}
 }
 
-func runPipeline(args []string) error {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	dryRun := fs.Bool("dry-run", false, "run without commit, push, or deploy candidate")
-	project := fs.String("project", "", "run only one configured project")
-	lockPath := fs.String("lock", "", "process lock path")
-	jsonLogs := fs.Bool("json-logs", false, "write JSON log records")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	path, err := configPath(fs.Args())
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return err
-	}
-	if err := filterProject(cfg, *project); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	lock := *lockPath
-	if lock == "" {
-		lock, err = pipeline.DefaultLockPath()
-		if err != nil {
-			return fail(exitConfig, "resolve default lock path: %v", err)
-		}
-	}
-	logger, err := logging.New(*jsonLogs)
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	deps := pipeline.Deps{
-		Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}},
-		Autofix: autofix.Runner{}, Notifier: notify.New(cfg.Notify), Logger: logger,
-	}
-	summary, err := pipeline.Run(context.Background(), deps, *cfg, lock, *dryRun)
-	if err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	updated, skipped, failed := summary.Counts()
-	fmt.Printf("vuelta run finished: %d updated, %d skipped, %d failed\n", updated, skipped, failed)
-	if failed > 0 {
-		return fail(exitFailure, "%d workspace(s) failed", failed)
-	}
-	return nil
-}
-
 func runScan(args []string) error {
 	return executeScan(args)
 }
@@ -688,18 +333,6 @@ func runDeployWorker(args []string) error {
 	for _, result := range results {
 		fmt.Printf("deploy candidate %s %s %s\n", result.CandidateID, result.Project, result.Status)
 	}
-	return nil
-}
-
-func filterProject(cfg *config.Config, project string) error {
-	if project == "" {
-		return nil
-	}
-	ws, err := workspaceByProject(*cfg, project)
-	if err != nil {
-		return err
-	}
-	cfg.Workspaces = []config.Workspace{ws}
 	return nil
 }
 

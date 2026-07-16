@@ -1,5 +1,5 @@
-# Policy for `vuelta package local`. Pass this file explicitly with --policy;
-# it is intentionally separate from config.yaml, so local mode does not need a
+# Policy for `vuelta scan --directory PATH --policy FILE`. It is intentionally
+# separate from config.yaml, so local mode does not need a
 # Git repository, Docker daemon, registry proxy, or notification credentials.
 # Keep this allowlist limited to direct dependencies you intend Vuelta to edit.
 allowed_packages:

@@ -1,9 +1,7 @@
-// Package pipeline orchestrates the main `vuelta run` sequence (part B §7):
-// preflight, sandbox, security gate, update, diff/allowlist check, tests,
-// optional autofix, commit, push, and notification — once per configured
-// workspace, sequentially, under a process lock. The runner uses the
-// hardened file/container isolation provided by sandbox, updater, and
-// testrunner; CVE/GitHub-alerts/autofix remain stage seams.
+// Package pipeline applies one selected workspace snapshot through preflight,
+// sandbox, security gates, update, diff/allowlist checks, tests, optional
+// autofix, commit, push, and notification. The runner uses the hardened
+// isolation provided by sandbox, updater, and testrunner.
 package pipeline
 
 import (
