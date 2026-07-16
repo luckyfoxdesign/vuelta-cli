@@ -8,9 +8,24 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
+)
+
+// Output bounds for untrusted container output (F5-MED-008). Discovery output
+// is parsed as JSON, so it gets a hard cap: exceeding it kills the container
+// client and fails the scan instead of parsing a truncated document. Apply
+// output is diagnostics only, so it gets a soft bounded tail with a
+// deterministic truncation marker.
+const (
+	discoveryOutputMaxBytes = 8 << 20
+	applyOutputTailBytes    = 128 << 10
+	// commandWaitDelay bounds how long Wait may block on inherited pipes
+	// after the context is cancelled.
+	commandWaitDelay = 10 * time.Second
 )
 
 // Updater updates dependency versions for a single project.
@@ -52,15 +67,24 @@ func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) DockerRunner {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		cmd := exec.CommandContext(ctx, "docker", dockerReadOnlyArgs(image, args, workDir, network, proxyURL)...)
-		out, err := cmd.CombinedOutput()
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		cmd := exec.CommandContext(runCtx, "docker", dockerReadOnlyArgs(image, args, workDir, network, proxyURL)...)
+		cmd.WaitDelay = commandWaitDelay
+		out := capio.NewLimit(discoveryOutputMaxBytes, cancel)
+		cmd.Stdout = out
+		cmd.Stderr = out
+		err = cmd.Run()
+		if out.Exceeded() {
+			return "", fmt.Errorf("docker read-only scan %s %s: output exceeded %d bytes", image, strings.Join(args, " "), discoveryOutputMaxBytes)
+		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return string(out), ctxErr
+				return string(out.Bytes()), ctxErr
 			}
-			return string(out), fmt.Errorf("docker read-only scan %s %s: %w: %s", image, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+			return string(out.Bytes()), fmt.Errorf("docker read-only scan %s %s: %w: %s", image, strings.Join(args, " "), err, errorTail(string(out.Bytes())))
 		}
-		return string(out), nil
+		return string(out.Bytes()), nil
 	}
 }
 
@@ -84,14 +108,28 @@ func runDocker(ctx context.Context, image string, args []string, workDir, networ
 
 	dockerArgs := dockerRunArgs(image, args, workDir, network, proxyURL)
 	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
-	out, err := cmd.CombinedOutput()
+	cmd.WaitDelay = commandWaitDelay
+	out := capio.NewTail(applyOutputTailBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err := cmd.Run()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return string(out), ctxErr
+			return out.String(), ctxErr
 		}
-		return string(out), fmt.Errorf("docker run %s %s: %w: %s", image, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return out.String(), fmt.Errorf("docker run %s %s: %w: %s", image, strings.Join(args, " "), err, errorTail(out.String()))
 	}
-	return string(out), nil
+	return out.String(), nil
+}
+
+// errorTail bounds the untrusted diagnostics embedded in an error message to
+// the most recent bytes; the caller still receives the full bounded output.
+func errorTail(s string) string {
+	const limit = 4 << 10
+	if len(s) > limit {
+		s = s[len(s)-limit:]
+	}
+	return strings.TrimSpace(s)
 }
 
 // dockerRunArgs builds the fixed security baseline for update containers.

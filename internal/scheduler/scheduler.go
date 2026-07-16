@@ -4,13 +4,15 @@
 package scheduler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"time"
+
+	"github.com/luckyfoxdesign/vuelta/internal/capio"
 )
 
 const (
@@ -52,15 +54,31 @@ type ExecRunner struct {
 	Stderr io.Writer
 }
 
+// stdoutMaxBytes is the hard cap on a child's JSON stdout (F5-MED-008). The
+// envelope is metadata-only, so exceeding this means a broken or hostile
+// child: the process is killed and the invocation fails deterministically
+// instead of decoding a truncated document.
+const stdoutMaxBytes = 8 << 20
+
+// commandWaitDelay bounds how long Wait may block on inherited pipes after
+// the context is cancelled.
+const commandWaitDelay = 10 * time.Second
+
 // Run executes one child process.
 func (r ExecRunner) Run(ctx context.Context, args []string) Invocation {
-	command := exec.CommandContext(ctx, r.Path, args...)
-	var stdout bytes.Buffer
-	command.Stdout = &stdout
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	command := exec.CommandContext(runCtx, r.Path, args...)
+	command.WaitDelay = commandWaitDelay
+	stdout := capio.NewLimit(stdoutMaxBytes, cancel)
+	command.Stdout = stdout
 	command.Stderr = r.Stderr
 	err := command.Run()
 	if ctx.Err() != nil {
 		return Invocation{Stdout: stdout.Bytes(), ExitCode: ExitInterrupted, Err: ctx.Err()}
+	}
+	if stdout.Exceeded() {
+		return Invocation{ExitCode: ExitFailure, Err: fmt.Errorf("child stdout exceeded %d bytes", stdoutMaxBytes)}
 	}
 	if err == nil {
 		return Invocation{Stdout: stdout.Bytes(), ExitCode: ExitOK}

@@ -3,7 +3,6 @@
 package testrunner
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,16 +15,29 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 )
 
 // DefaultTimeout is used when a workspace's test profile does not set one.
 const DefaultTimeout = 15 * time.Minute
 
+// outputTailBytes bounds host memory spent on untrusted test output
+// (F5-MED-008). Truncation is soft: the run continues until it finishes or
+// times out, only the most recent bytes are retained, and a deterministic
+// marker records the drop. The retained tail stays well under autofix's
+// 1 MiB prompt cap.
+const outputTailBytes = 256 << 10
+
+// waitDelay bounds how long Wait may block on inherited pipes after the
+// context is cancelled, so a timed-out run cannot hang the pipeline.
+const waitDelay = 10 * time.Second
+
 // Result is the outcome of one test run.
 type Result struct {
 	Passed bool
-	// Output is the combined stdout+stderr of the test command. It is
+	// Output is the combined stdout+stderr tail of the test command,
+	// bounded to outputTailBytes and marked when truncated. It is
 	// intended for a local 0600 log file only — never forward it to
 	// notify as-is (part C §15: no raw logs in webhook/Telegram summaries).
 	Output string
@@ -60,9 +72,13 @@ func Run(ctx context.Context, workDir string, profile config.TestProfile, timeou
 
 	cmd := exec.CommandContext(runCtx, "docker", args...)
 	cmd.Dir = workDir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.WaitDelay = waitDelay
+	// On timeout only the docker compose client is killed here; the
+	// container itself is bounded by the compose policy above (cpus,
+	// mem_limit, pids_limit) and Docker's own run lifecycle.
+	out := capio.NewTail(outputTailBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	runErr := cmd.Run()
 	result := Result{Output: out.String()}

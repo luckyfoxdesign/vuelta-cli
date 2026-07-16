@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 )
@@ -696,20 +697,33 @@ func cleanEnvironment() []string {
 	return []string{"PATH=" + path, "HOME=" + os.TempDir(), "NO_COLOR=1"}
 }
 
+// commandOutputTailBytes bounds host memory spent on package-manager output
+// (F5-MED-008): only the most recent bytes are retained during the stream and
+// a deterministic marker records any drop.
+const commandOutputTailBytes = 128 << 10
+
+// commandWaitDelay bounds how long Wait may block on inherited pipes after
+// the context is cancelled.
+const commandWaitDelay = 10 * time.Second
+
 func runCommand(ctx context.Context, binary, dir string, args, env []string) (CommandResult, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	cmd.WaitDelay = commandWaitDelay
+	out := capio.NewTail(commandOutputTailBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err := cmd.Run()
 	if err == nil {
-		return CommandResult{Output: string(out)}, nil
+		return CommandResult{Output: out.String()}, nil
 	}
 	if ctx.Err() != nil {
 		return CommandResult{}, ctx.Err()
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return CommandResult{Output: string(out), ExitCode: exitErr.ExitCode()}, nil
+		return CommandResult{Output: out.String(), ExitCode: exitErr.ExitCode()}, nil
 	}
 	return CommandResult{}, err
 }

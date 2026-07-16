@@ -3,7 +3,6 @@
 package vulnscan
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,8 +17,21 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
+)
+
+// Output bounds for untrusted scanner output (F5-MED-008). Scanner stdout is
+// a JSON report that must be parsed in full, so it gets a generous hard cap:
+// exceeding it kills the docker client and fails the scan instead of parsing
+// a truncated document. Stderr is diagnostics only and keeps a bounded tail.
+const (
+	scannerStdoutMaxBytes  = 64 << 20
+	scannerStderrTailBytes = 64 << 10
+	// commandWaitDelay bounds how long Wait may block on inherited pipes
+	// after the context is cancelled.
+	commandWaitDelay = 10 * time.Second
 )
 
 // Finding is a normalized CVE/GHSA finding. It intentionally retains the
@@ -81,17 +93,25 @@ func dockerCommand(ctx context.Context, dir, image string, egressConfig config.E
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "docker", dockerRunArgs(image, dir, network, proxyURL, name, args)...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "docker", dockerRunArgs(image, dir, network, proxyURL, name, args)...)
+	cmd.WaitDelay = commandWaitDelay
+	stdout := capio.NewLimit(scannerStdoutMaxBytes, cancel)
+	stderr := capio.NewTail(scannerStderrTailBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err = cmd.Run()
+	if stdout.Exceeded() {
+		return nil, fmt.Errorf("docker run %s %s: report exceeded %d bytes", name, strings.Join(args, " "), scannerStdoutMaxBytes)
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("docker run %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return out, nil
+	return stdout.Bytes(), nil
 }
 
 func dockerRunArgs(image, dir, network, proxyURL, name string, args []string) []string {
@@ -467,8 +487,12 @@ func loadPolicy(ctx context.Context, projectRoot, rel string, now time.Time) (po
 	}
 	cmd := exec.CommandContext(ctx, "git", "ls-files", "--error-unmatch", "--", rel)
 	cmd.Dir = projectRoot
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return policyFile{}, fmt.Errorf("vulnerability policy must be tracked: %s", strings.TrimSpace(string(out)))
+	cmd.WaitDelay = commandWaitDelay
+	gitOut := capio.NewTail(4 << 10)
+	cmd.Stdout = gitOut
+	cmd.Stderr = gitOut
+	if err := cmd.Run(); err != nil {
+		return policyFile{}, fmt.Errorf("vulnerability policy must be tracked: %s", strings.TrimSpace(gitOut.String()))
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
