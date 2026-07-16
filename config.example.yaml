@@ -28,8 +28,8 @@ vuln_scan:
     vex: auto            # apply verified VEX attestations if the registry/DHI publishes them
 
 github_advisories:
-  api_url: "https://api.github.com"  # swap for a GitHub Enterprise URL if needed
-  token_env: "GITHUB_TOKEN"          # optional for public repos; read-only token, never passed into containers
+  api_url: "https://api.github.com"  # swap for a GitHub Enterprise URL if needed; https on port 443 only, no credentials in the URL
+  token_env: "GITHUB_TOKEN"          # optional for public repos; read-only token, never passed into containers; allowed names: GITHUB_TOKEN, GH_TOKEN, VUELTA_GITHUB_TOKEN
   # Used only when dependency_source is github-dependabot. That selected source
   # is always fail-closed; private repositories need Dependabot alerts: read.
 

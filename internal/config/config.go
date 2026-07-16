@@ -79,6 +79,27 @@ type GithubAdvisoriesConfig struct {
 	TokenEnv string `yaml:"token_env"`
 }
 
+// githubTokenEnvNames is the fixed allowlist for github_advisories.token_env.
+// Restricting the variable name keeps a hostile config from routing arbitrary
+// environment credentials into an Authorization header.
+var githubTokenEnvNames = []string{"GITHUB_TOKEN", "GH_TOKEN", "VUELTA_GITHUB_TOKEN"}
+
+// GithubTokenEnvNames returns the allowed github_advisories.token_env names.
+func GithubTokenEnvNames() []string {
+	return append([]string(nil), githubTokenEnvNames...)
+}
+
+// AllowedGithubTokenEnv reports whether name is an allowed
+// github_advisories.token_env variable name.
+func AllowedGithubTokenEnv(name string) bool {
+	for _, allowed := range githubTokenEnvNames {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 type UpdateConfig struct {
 	MinReleaseAgeDays int               `yaml:"min_release_age_days"`
 	SnapshotTTLHours  int               `yaml:"snapshot_ttl_hours"`
@@ -548,6 +569,7 @@ func validateSecurityConfig(c Config) []error {
 		if c.VulnScan.Image != "" {
 			errs = append(errs, errors.New("vuln_scan.image: must be empty when dependency_source is github-dependabot; use vuln_scan.image_scan.image for image scanning"))
 		}
+		errs = append(errs, validateGithubAdvisories(c.GithubAdvisories)...)
 	default:
 		errs = append(errs, fmt.Errorf("vuln_scan.dependency_source: %q is not supported (trivy|osv-scanner|github-dependabot)", c.VulnScan.DependencySource))
 	}
@@ -573,6 +595,30 @@ func validateSecurityConfig(c Config) []error {
 		if !allowedAutofixTools(c.Autofix.AllowedTools) {
 			errs = append(errs, errors.New("autofix.allowed_tools: must be a non-empty subset of Read,Edit,Grep; Bash is prohibited"))
 		}
+	}
+	return errs
+}
+
+// validateGithubAdvisories rejects api_url values that could redirect a
+// GitHub token to an unapproved destination. Errors never echo the raw URL,
+// which could embed credentials in userinfo.
+func validateGithubAdvisories(c GithubAdvisoriesConfig) []error {
+	var errs []error
+	if c.APIURL != "" {
+		u, err := url.Parse(c.APIURL)
+		switch {
+		case err != nil || u.Scheme != "https" || u.Hostname() == "":
+			errs = append(errs, errors.New("github_advisories.api_url: must be an https URL with a host"))
+		case u.User != nil:
+			errs = append(errs, errors.New("github_advisories.api_url: must not contain userinfo credentials"))
+		case u.Port() != "" && u.Port() != "443":
+			errs = append(errs, errors.New("github_advisories.api_url: must use the default https port"))
+		case u.RawQuery != "" || u.Fragment != "":
+			errs = append(errs, errors.New("github_advisories.api_url: must not contain a query or fragment"))
+		}
+	}
+	if c.TokenEnv != "" && !AllowedGithubTokenEnv(c.TokenEnv) {
+		errs = append(errs, fmt.Errorf("github_advisories.token_env: %q is not an allowed token variable (%s)", c.TokenEnv, strings.Join(githubTokenEnvNames, "|")))
 	}
 	return errs
 }

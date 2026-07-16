@@ -42,13 +42,13 @@ func TestSetupProjectCreatesIndependentGitRepositories(t *testing.T) {
 }
 
 func TestGitHubAlertsHandlerPaginatesWithoutRetainingToken(t *testing.T) {
-	server := httptest.NewServer(GitHubAlertsHandler{RequireToken: true, Token: "fixture-token"})
+	server := httptest.NewTLSServer(GitHubAlertsHandler{RequireToken: true, Token: "fixture-token"})
 	defer server.Close()
-	t.Setenv("VUELTA_FIXTURE_GITHUB_TOKEN", "fixture-token")
-	client := githubalerts.Client{HTTPClient: server.Client(), RemoteURL: func(context.Context, string, string) (string, error) {
+	t.Setenv("VUELTA_GITHUB_TOKEN", "fixture-token")
+	client := githubalerts.Client{Transport: server.Client().Transport, RemoteURL: func(context.Context, string, string) (string, error) {
 		return "git@github.com:acme/widget.git", nil
 	}}
-	findings, err := client.Scan(context.Background(), config.Workspace{Path: t.TempDir(), Remote: "origin"}, config.GithubAdvisoriesConfig{APIURL: server.URL, TokenEnv: "VUELTA_FIXTURE_GITHUB_TOKEN"})
+	findings, err := client.Scan(context.Background(), config.Workspace{Path: t.TempDir(), Remote: "origin"}, config.GithubAdvisoriesConfig{APIURL: server.URL, TokenEnv: "VUELTA_GITHUB_TOKEN"})
 	if err != nil || len(findings) != 2 {
 		t.Fatalf("Scan() = %+v, %v", findings, err)
 	}

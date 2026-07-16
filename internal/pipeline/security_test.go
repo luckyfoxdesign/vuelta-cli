@@ -46,7 +46,7 @@ func TestDefaultSecurityGateRunsOnlySelectedLocalDependencySource(t *testing.T) 
 
 func TestDefaultSecurityGateRunsDependabotWithoutLocalDependencyScan(t *testing.T) {
 	githubCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/acme/widget/dependabot/alerts" {
 			http.NotFound(w, r)
 			return
@@ -63,8 +63,8 @@ func TestDefaultSecurityGateRunsDependabotWithoutLocalDependencyScan(t *testing.
 			return nil, errors.New("local scanner must not run for Dependabot")
 		}},
 		GitHub: githubalerts.Client{
-			HTTPClient: server.Client(),
-			RemoteURL:  func(context.Context, string, string) (string, error) { return "git@github.com:acme/widget.git", nil },
+			Transport: server.Client().Transport,
+			RemoteURL: func(context.Context, string, string) (string, error) { return "git@github.com:acme/widget.git", nil },
 		},
 	}
 	cfg := config.Config{

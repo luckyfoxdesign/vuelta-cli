@@ -111,6 +111,42 @@ func TestValidateSecurityConfigRequiresOneCompatibleDependencySource(t *testing.
 	}
 }
 
+func TestValidateSecurityConfigConstrainsGithubAdvisories(t *testing.T) {
+	base := Config{VulnScan: VulnScanConfig{
+		DependencySource: "github-dependabot", FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
+	}}
+	base.GithubAdvisories = GithubAdvisoriesConfig{APIURL: "https://api.github.com", TokenEnv: "GITHUB_TOKEN"}
+	if errs := validateSecurityConfig(base); len(errs) != 0 {
+		t.Fatalf("valid github_advisories config errors = %v", errs)
+	}
+	cases := []struct {
+		name string
+		cfg  GithubAdvisoriesConfig
+		want string
+	}{
+		{"http downgrade", GithubAdvisoriesConfig{APIURL: "http://api.github.com"}, "https"},
+		{"userinfo", GithubAdvisoriesConfig{APIURL: "https://user:fake-secret@api.github.com"}, "userinfo"},
+		{"unexpected port", GithubAdvisoriesConfig{APIURL: "https://api.github.com:8443"}, "port"},
+		{"query", GithubAdvisoriesConfig{APIURL: "https://api.github.com?x=1"}, "query"},
+		{"token env", GithubAdvisoriesConfig{TokenEnv: "AWS_SECRET_ACCESS_KEY"}, "token_env"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.GithubAdvisories = tc.cfg
+			errs := validateSecurityConfig(cfg)
+			if len(errs) == 0 || !strings.Contains(errs[0].Error(), tc.want) {
+				t.Fatalf("expected %s rejection, got %v", tc.name, errs)
+			}
+			for _, err := range errs {
+				if strings.Contains(err.Error(), "fake-secret") {
+					t.Fatalf("error leaks URL credentials: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateWorkspaceNamesAndCanonicalPaths(t *testing.T) {
 	project := t.TempDir()
 	if err := os.Mkdir(filepath.Join(project, ".git"), 0o755); err != nil {
