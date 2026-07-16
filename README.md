@@ -62,8 +62,9 @@ original working tree is never mounted into an update or test container.
 Package-manager updates require the checked-in local egress proxy. Start it
 with `docker compose up -d egress-proxy`: update containers attach only to the
 internal `vuelta-update-egress` network and receive the proxy through explicit
-`HTTP(S)_PROXY` variables. The proxy allowlists only the registries in
-`egress/main.go`; Docker's default bridge is not an acceptable substitute.
+`HTTP(S)_PROXY` variables. The proxy permits only the exact scheme, hostname,
+and port endpoints declared by `VUELTA_EGRESS_ALLOW_RULES` in `compose.yml`;
+Docker's default bridge is not an acceptable substitute.
 Vuelta inspects the network and proxy container before starting an updater and
 fails closed with an actionable diagnostic if either is unavailable. No host
 environment variable or GitHub token is passed to a runner.
