@@ -107,5 +107,5 @@ make build                     # both cross-build targets
 
 - `config.example.yaml` uses real arm64 image digests. Refresh them deliberately with `docker manifest inspect --verbose` when upgrading an image or toolchain.
 - A real package-manager update needs `docker compose up -d egress-proxy`; Vuelta rejects an unavailable proxy/network before an updater starts.
-- `.golangci.yml` targets golangci-lint v2's config schema (`version: "2"`), matching the pinned `golangci/golangci-lint:v2.12.2-alpine` image in `compose.yml`.
+- `.golangci.yml` targets golangci-lint v2's config schema (`version: "2"`), matching the tag-and-digest-pinned `golangci/golangci-lint:v2.12.2-alpine` image in `compose.yml`; refresh its multi-platform index digest with the controlled process in `README.md`.
 <!-- manual:end -->

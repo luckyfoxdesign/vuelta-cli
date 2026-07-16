@@ -139,6 +139,30 @@ make build-linux               # linux/amd64 CLI and scheduler via Docker
 make build                     # both targets
 ```
 
+### Development image provenance
+
+Every service in the repository `compose.yml` that is not built locally must
+use a reviewable `<repository>:<tag>@sha256:<digest>` reference. The repository
+policy test parses the complete services map and rejects mutable tags, missing
+images, placeholder digests, and digests that are not 64 lowercase hex
+characters.
+
+The current lint pin was resolved from the official Docker Hub repository on
+2026-07-17. `golangci/golangci-lint:v2.12.2-alpine` published an OCI image
+index for `linux/amd64` and `linux/arm64` with digest
+`sha256:91b27804074a0bacea298707f016911e60cf0cdbc6c7bf5ccacb5f0606d18d60`.
+
+Refresh an external development image only as a controlled image upgrade:
+
+1. Inspect the intended tag with
+   `docker buildx imagetools inspect <repository>:<tag>` and confirm the
+   registry/repository, index media type, and required platforms.
+2. With shell pipe failure enabled, hash
+   `docker buildx imagetools inspect --raw <repository>:<tag>` using SHA-256
+   and confirm it matches the reported top-level index digest.
+3. Update the tag and digest together, run `docker compose run --rm test` and
+   `docker compose run --rm lint`, and review the reference change in the diff.
+
 This command is also the repeatable local verification of the fixture suite.
 `docs/runbook-local.md` maps every acceptance criterion to its fixture and
 notes the remaining prerequisites for a full manual end-to-end run.

@@ -18,7 +18,7 @@ services:
     command: ["go", "test", "-race", "./..."]
 
   lint:
-    image: golangci/golangci-lint:v2.12.2-alpine
+    image: golangci/golangci-lint:v2.12.2-alpine@sha256:91b27804074a0bacea298707f016911e60cf0cdbc6c7bf5ccacb5f0606d18d60
     working_dir: /src
     volumes:
       - .:/src
