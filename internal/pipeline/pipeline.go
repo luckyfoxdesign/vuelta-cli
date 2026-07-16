@@ -212,7 +212,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "base SHA changed", err)
 	}
 	summary := gitops.CommitSummary{Date: now, CVERefs: post.Findings}
-	if err := gitops.Commit(ctx, landingDir, summary); err != nil {
+	if err := gitops.Commit(ctx, landingDir, cfg.AllowedChangedPaths(ws), summary); err != nil {
 		return failResult(project, "commit", err)
 	}
 	if commitSHA, err := gitops.HeadSHA(ctx, landingDir); err != nil {
@@ -251,7 +251,7 @@ func finishAfterAutofix(ctx context.Context, project string, ws config.Workspace
 		return dryRunResult(project, post, true)
 	}
 	summary := gitops.CommitSummary{Date: now, CVERefs: post.Findings}
-	if err := gitops.Commit(ctx, landingDir, summary); err != nil {
+	if err := gitops.Commit(ctx, landingDir, cfg.AllowedChangedPaths(ws), summary); err != nil {
 		return failResult(project, "autofix commit", err)
 	}
 	if commitSHA, err := gitops.HeadSHA(ctx, landingDir); err != nil {

@@ -110,6 +110,8 @@ workspaces:
       run_args: ["--rm"]
     branch: main
     remote: origin
+    # Git-style repository-relative patterns. A root name is root-only; *, ?,
+    # and [] match within one slash-delimited segment. Recursive ** is unsupported.
     allowed_changed_paths:       # project-scoped allowlist used for update diff checks
       - "Dockerfile*"
     docker_images:                 # only these project-relative files are analyzed/updated

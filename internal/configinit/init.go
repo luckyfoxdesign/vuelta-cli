@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"gopkg.in/yaml.v3"
 )
 
@@ -279,8 +280,8 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 		return config.Workspace{}, &MissingValueError{Flag: "--allow-path"}
 	}
 	for _, path := range allowed {
-		if !safeProjectPath(path) {
-			return config.Workspace{}, fmt.Errorf("--allow-path %q escapes the selected project", path)
+		if err := gitpath.ValidatePattern(path); err != nil {
+			return config.Workspace{}, fmt.Errorf("--allow-path %q is invalid: %w", path, err)
 		}
 	}
 	name := input.Name
@@ -363,14 +364,6 @@ func contains(values []string, wanted string) bool {
 		}
 	}
 	return false
-}
-
-func safeProjectPath(path string) bool {
-	if path == "" || filepath.IsAbs(path) {
-		return false
-	}
-	cleaned := filepath.Clean(path)
-	return cleaned != ".." && !strings.HasPrefix(cleaned, ".."+string(filepath.Separator))
 }
 
 // Write plans and atomically applies creation or replacement of a config.

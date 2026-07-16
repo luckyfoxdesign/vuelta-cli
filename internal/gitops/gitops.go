@@ -3,6 +3,7 @@ package gitops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -12,11 +13,19 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 )
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitEnv(ctx, dir, nil, args...)
+}
+
+func runGitEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -189,45 +198,52 @@ func copyFile(src, dst string) error {
 // allowlisted, is a plain-file modification (no rename/delete/symlink/mode
 // change), and passes `git diff --check`.
 func DiffCheck(ctx context.Context, repoPath string, allowedPaths []string) error {
-	out, err := runGit(ctx, repoPath, "status", "--porcelain")
+	if err := gitpath.ValidatePatterns(allowedPaths); err != nil {
+		return fmt.Errorf("validate git.allowed_changed_paths: %w", err)
+	}
+	out, err := runGit(ctx, repoPath, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
 	if err != nil {
 		return err
 	}
-	out = strings.TrimRight(out, "\n")
-	if out == "" {
+	statuses, err := parsePorcelainStatus(out)
+	if err != nil {
+		return err
+	}
+	if len(statuses) == 0 {
 		return nil
 	}
-	for _, line := range strings.Split(out, "\n") {
-		if line == "" {
-			continue
+	for _, change := range statuses {
+		if !workingStatusAllowed(change.status) {
+			return fmt.Errorf("changed path %q has unsupported git status %q", change.path, change.status)
 		}
-		if len(line) < 4 {
-			return fmt.Errorf("unexpected git status line: %q", line)
+		allowed, matchErr := gitpath.Allowed(change.path, allowedPaths)
+		if matchErr != nil {
+			return fmt.Errorf("validate changed path %q: %w", change.path, matchErr)
 		}
-		status := line[:2]
-		rel := strings.TrimSpace(line[3:])
-		if strings.Contains(rel, " -> ") {
-			return fmt.Errorf("path rename is not allowed: %q", rel)
-		}
-		if strings.Contains(status, "D") {
-			return fmt.Errorf("path deletion is not allowed: %s", rel)
-		}
-		if !pathAllowed(rel, allowedPaths) {
+		if !allowed {
+			rel := change.path
 			return fmt.Errorf("changed path %q is outside git.allowed_changed_paths", rel)
 		}
-		full := filepath.Join(repoPath, rel)
+		full := filepath.Join(repoPath, filepath.FromSlash(change.path))
 		info, err := os.Lstat(full)
 		if err != nil {
-			return fmt.Errorf("stat changed path %s: %w", rel, err)
+			return fmt.Errorf("stat changed path %q: %w", change.path, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("changed path %q is a symlink, not allowed", rel)
+			return fmt.Errorf("changed path %q is a symlink, not allowed", change.path)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("changed path %q is not a regular file", rel)
+			return fmt.Errorf("changed path %q is not a regular file", change.path)
 		}
 	}
-	if _, err := runGit(ctx, repoPath, "diff", "--check"); err != nil {
+	raw, err := runGit(ctx, repoPath, "diff", "--raw", "-z", "--no-abbrev", "--no-ext-diff", "--find-renames", "HEAD", "--")
+	if err != nil {
+		return err
+	}
+	if _, err := validateRawChanges(raw, allowedPaths); err != nil {
+		return fmt.Errorf("working tree policy: %w", err)
+	}
+	if _, err := runGit(ctx, repoPath, "diff", "--check", "HEAD", "--"); err != nil {
 		return fmt.Errorf("git diff --check: %w", err)
 	}
 	return nil
@@ -241,8 +257,7 @@ func AllowlistedDiff(ctx context.Context, repoPath string, allowedPaths []string
 	if err := DiffCheck(ctx, repoPath, allowedPaths); err != nil {
 		return "", err
 	}
-	args := append([]string{"diff", "--no-ext-diff", "--"}, allowedPaths...)
-	out, err := runGit(ctx, repoPath, args...)
+	out, err := runGit(ctx, repoPath, "diff", "--no-ext-diff", "HEAD", "--")
 	if err != nil {
 		return "", err
 	}
@@ -250,16 +265,8 @@ func AllowlistedDiff(ctx context.Context, repoPath string, allowedPaths []string
 }
 
 func pathAllowed(rel string, patterns []string) bool {
-	base := filepath.Base(rel)
-	for _, p := range patterns {
-		if ok, _ := filepath.Match(p, rel); ok {
-			return true
-		}
-		if ok, _ := filepath.Match(p, base); ok {
-			return true
-		}
-	}
-	return false
+	allowed, err := gitpath.Allowed(rel, patterns)
+	return err == nil && allowed
 }
 
 // CommitSummary holds only the allowlisted content that may appear in a
@@ -291,14 +298,56 @@ func (s CommitSummary) Message() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// Commit stages every change in repoPath and commits it with summary's
-// message. Callers must run DiffCheck first: Commit does not re-validate
-// the allowlist itself.
-func Commit(ctx context.Context, repoPath string, summary CommitSummary) error {
-	if _, err := runGit(ctx, repoPath, "add", "-A"); err != nil {
+// Commit stages the current working tree in a private index, validates the
+// resulting immutable tree with the same allowlist and file-type policy as
+// DiffCheck, and advances HEAD to a commit containing exactly that tree. The
+// private index and commit-tree plumbing prevent a shared-index or working-tree
+// mutation between the final policy check and commit from changing its content.
+func Commit(ctx context.Context, repoPath string, allowedPaths []string, summary CommitSummary) error {
+	if err := gitpath.ValidatePatterns(allowedPaths); err != nil {
+		return fmt.Errorf("validate git.allowed_changed_paths: %w", err)
+	}
+	head, err := HeadSHA(ctx, repoPath)
+	if err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repoPath, "commit", "-q", "-m", summary.Message()); err != nil {
+	indexDir, err := os.MkdirTemp("", "vuelta-git-index-*")
+	if err != nil {
+		return fmt.Errorf("create private Git index directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(indexDir) }()
+	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(indexDir, "index")}
+	if _, err := runGitEnv(ctx, repoPath, indexEnv, "read-tree", head); err != nil {
+		return err
+	}
+	if _, err := runGitEnv(ctx, repoPath, indexEnv, "add", "--all", "--", "."); err != nil {
+		return err
+	}
+	tree, err := runGitEnv(ctx, repoPath, indexEnv, "write-tree")
+	if err != nil {
+		return err
+	}
+	tree = strings.TrimSpace(tree)
+	raw, err := runGit(ctx, repoPath, "diff-tree", "--raw", "-z", "--no-commit-id", "--no-abbrev", "-r", "--find-renames", head, tree)
+	if err != nil {
+		return err
+	}
+	count, err := validateRawChanges(raw, allowedPaths)
+	if err != nil {
+		return fmt.Errorf("final staged tree policy: %w", err)
+	}
+	if count == 0 {
+		return errors.New("nothing to commit")
+	}
+	if _, err := runGit(ctx, repoPath, "diff-tree", "--check", "-r", head, tree); err != nil {
+		return fmt.Errorf("final staged tree git diff --check: %w", err)
+	}
+	commit, err := runGit(ctx, repoPath, "commit-tree", tree, "-p", head, "-m", summary.Message())
+	if err != nil {
+		return err
+	}
+	commit = strings.TrimSpace(commit)
+	if _, err := runGit(ctx, repoPath, "update-ref", "HEAD", commit, head); err != nil {
 		return err
 	}
 	return nil
@@ -313,14 +362,148 @@ func HeadSHA(ctx context.Context, repoPath string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// ChangedPaths returns the policy-checked paths staged for the next commit.
-// Callers must run DiffCheck first; this function is only an audit helper.
+// ChangedPaths returns the policy-checked working-tree paths for the next
+// commit. Callers must run DiffCheck first; this function is only an audit helper.
 func ChangedPaths(ctx context.Context, repoPath string) ([]string, error) {
-	out, err := runGit(ctx, repoPath, "diff", "--name-only", "--no-ext-diff")
+	out, err := runGit(ctx, repoPath, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
 	if err != nil {
 		return nil, err
 	}
-	return strings.Fields(out), nil
+	changes, err := parsePorcelainStatus(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse changed paths: %w", err)
+	}
+	paths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		paths = append(paths, change.path)
+	}
+	return paths, nil
+}
+
+type porcelainChange struct {
+	status string
+	path   string
+}
+
+func parsePorcelainStatus(out string) ([]porcelainChange, error) {
+	fields, err := splitNUL(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse git status: %w", err)
+	}
+	changes := make([]porcelainChange, 0, len(fields))
+	for _, field := range fields {
+		if len(field) < 4 || field[2] != ' ' {
+			return nil, fmt.Errorf("unexpected NUL-delimited git status entry: %q", field)
+		}
+		status, rel := field[:2], field[3:]
+		if strings.ContainsAny(status, "RC") {
+			return nil, fmt.Errorf("path rename or copy is not allowed: status %q path %q", status, rel)
+		}
+		if err := gitpath.ValidatePath(rel); err != nil {
+			return nil, err
+		}
+		changes = append(changes, porcelainChange{status: status, path: rel})
+	}
+	return changes, nil
+}
+
+func workingStatusAllowed(status string) bool {
+	switch status {
+	case " M", "M ", "MM", "A ", "AM", "??":
+		return true
+	default:
+		return false
+	}
+}
+
+type rawChange struct {
+	oldMode string
+	newMode string
+	status  string
+	paths   []string
+}
+
+func parseRawChanges(out string) ([]rawChange, error) {
+	fields, err := splitNUL(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse raw Git diff: %w", err)
+	}
+	changes := make([]rawChange, 0)
+	for i := 0; i < len(fields); {
+		header := fields[i]
+		i++
+		parts := strings.Fields(header)
+		if len(parts) != 5 || !strings.HasPrefix(parts[0], ":") || len(parts[0]) != 7 {
+			return nil, fmt.Errorf("unexpected raw Git diff header: %q", header)
+		}
+		status := parts[4]
+		pathCount := 1
+		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+			pathCount = 2
+		}
+		if i+pathCount > len(fields) {
+			return nil, fmt.Errorf("raw Git diff entry %q is missing a path", header)
+		}
+		paths := append([]string(nil), fields[i:i+pathCount]...)
+		i += pathCount
+		for _, rel := range paths {
+			if err := gitpath.ValidatePath(rel); err != nil {
+				return nil, err
+			}
+		}
+		changes = append(changes, rawChange{oldMode: strings.TrimPrefix(parts[0], ":"), newMode: parts[1], status: status, paths: paths})
+	}
+	return changes, nil
+}
+
+func validateRawChanges(out string, allowedPaths []string) (int, error) {
+	changes, err := parseRawChanges(out)
+	if err != nil {
+		return 0, err
+	}
+	for _, change := range changes {
+		if len(change.paths) != 1 || strings.HasPrefix(change.status, "R") || strings.HasPrefix(change.status, "C") {
+			return 0, fmt.Errorf("rename or copy is not allowed: status %q paths %q", change.status, change.paths)
+		}
+		rel := change.paths[0]
+		allowed, err := gitpath.Allowed(rel, allowedPaths)
+		if err != nil {
+			return 0, err
+		}
+		if !allowed {
+			return 0, fmt.Errorf("changed path %q is outside git.allowed_changed_paths", rel)
+		}
+		switch change.status {
+		case "A":
+			if change.oldMode != "000000" || !regularGitMode(change.newMode) {
+				return 0, fmt.Errorf("added path %q is not a regular file: modes %s -> %s", rel, change.oldMode, change.newMode)
+			}
+		case "M":
+			if !regularGitMode(change.oldMode) || !regularGitMode(change.newMode) {
+				return 0, fmt.Errorf("changed path %q is not a regular file: modes %s -> %s", rel, change.oldMode, change.newMode)
+			}
+			if change.oldMode != change.newMode {
+				return 0, fmt.Errorf("mode change is not allowed for %q: %s -> %s", rel, change.oldMode, change.newMode)
+			}
+		default:
+			return 0, fmt.Errorf("changed path %q has unsupported staged status %q", rel, change.status)
+		}
+	}
+	return len(changes), nil
+}
+
+func regularGitMode(mode string) bool {
+	return mode == "100644" || mode == "100755"
+}
+
+func splitNUL(out string) ([]string, error) {
+	if out == "" {
+		return nil, nil
+	}
+	if out[len(out)-1] != 0 {
+		return nil, errors.New("output is not NUL-terminated")
+	}
+	return strings.Split(out[:len(out)-1], "\x00"), nil
 }
 
 // AutofixBranch returns the fixed review-branch name for an autofix commit,

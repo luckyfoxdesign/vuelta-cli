@@ -183,6 +183,57 @@ func TestDiffCheckRejectsDisallowedPath(t *testing.T) {
 	}
 }
 
+func TestPathAllowedUsesRepositoryRelativePath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		path     string
+		patterns []string
+		want     bool
+	}{
+		{name: "root exact", path: "package.json", patterns: []string{"package.json"}, want: true},
+		{name: "root exact rejects nested", path: "nested/package.json", patterns: []string{"package.json"}},
+		{name: "nested exact", path: "nested/package.json", patterns: []string{"nested/package.json"}, want: true},
+		{name: "nested glob", path: "nested/package.json", patterns: []string{"nested/*.json"}, want: true},
+		{name: "glob does not cross slash", path: "nested/deeper/package.json", patterns: []string{"nested/*.json"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pathAllowed(tt.path, tt.patterns); got != tt.want {
+				t.Fatalf("pathAllowed(%q, %q) = %v, want %v", tt.path, tt.patterns, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiffCheckRootPatternRejectsNestedSameBasename(t *testing.T) {
+	work := newRepoWithRemote(t)
+	writeFile(t, work, "nested/package.json", "{}\n")
+
+	if err := DiffCheck(context.Background(), work, []string{"package.json"}); err == nil {
+		t.Fatal("expected root-only package.json pattern to reject nested/package.json")
+	}
+	if err := DiffCheck(context.Background(), work, []string{"nested/*.json"}); err != nil {
+		t.Fatalf("explicit nested glob should allow the path: %v", err)
+	}
+}
+
+func TestNULDelimitedPathParsingPreservesQuotedAndNewlinePath(t *testing.T) {
+	t.Parallel()
+	path := "deps/\n\"quoted\".lock"
+	changes, err := parsePorcelainStatus("?? " + path + "\x00")
+	if err != nil {
+		t.Fatalf("parsePorcelainStatus: %v", err)
+	}
+	if len(changes) != 1 || changes[0].path != path {
+		t.Fatalf("changes = %#v, want exact path %q", changes, path)
+	}
+	if _, err := parsePorcelainStatus("?? " + path); err == nil {
+		t.Fatal("expected non-NUL-terminated status to fail closed")
+	}
+}
+
 func TestDiffCheckRejectsSymlink(t *testing.T) {
 	work := newRepoWithRemote(t)
 	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
@@ -253,7 +304,7 @@ func TestCommitAndPushReviewBranch(t *testing.T) {
 	}
 
 	summary := CommitSummary{Date: time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC), Packages: []string{"flask 2.0.0 -> 2.0.1"}}
-	if err := Commit(context.Background(), landing, summary); err != nil {
+	if err := Commit(context.Background(), landing, []string{"requirements.txt"}, summary); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -271,6 +322,111 @@ func TestCommitAndPushReviewBranch(t *testing.T) {
 	out := run(t, work, "ls-remote", "origin", "refs/heads/"+branch)
 	if strings.TrimSpace(out) == "" {
 		t.Fatalf("expected branch %s to exist on remote", branch)
+	}
+}
+
+func TestChangedPathsPreservesQuotedAndNewlinePath(t *testing.T) {
+	work := newRepoWithRemote(t)
+	name := "deps/\n\"quoted\".lock"
+	writeFile(t, work, name, "lock\n")
+
+	if err := DiffCheck(context.Background(), work, []string{name}); err != nil {
+		t.Fatalf("DiffCheck: %v", err)
+	}
+	paths, err := ChangedPaths(context.Background(), work)
+	if err != nil {
+		t.Fatalf("ChangedPaths: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != name {
+		t.Fatalf("ChangedPaths = %q, want exact path %q", paths, name)
+	}
+	if err := Commit(context.Background(), work, []string{name}, CommitSummary{Date: time.Now()}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	committed := run(t, work, "diff-tree", "--name-only", "-z", "--no-commit-id", "-r", "HEAD^", "HEAD")
+	if committed != name+"\x00" {
+		t.Fatalf("committed paths = %q, want exact path %q", committed, name)
+	}
+}
+
+func TestCommitRechecksPostDiffMutation(t *testing.T) {
+	work := newRepoWithRemote(t)
+	writeFile(t, work, "requirements.txt", "flask==2.0.1\n")
+	if err := DiffCheck(context.Background(), work, []string{"requirements.txt"}); err != nil {
+		t.Fatalf("DiffCheck: %v", err)
+	}
+	writeFile(t, work, "nested/requirements.txt", "malicious\n")
+	headBefore := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
+
+	err := Commit(context.Background(), work, []string{"requirements.txt"}, CommitSummary{Date: time.Now()})
+	if err == nil || !strings.Contains(err.Error(), "outside git.allowed_changed_paths") {
+		t.Fatalf("Commit error = %v, want final allowlist rejection", err)
+	}
+	headAfter := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
+	if headAfter != headBefore {
+		t.Fatalf("HEAD changed after rejected final policy check: %s -> %s", headBefore, headAfter)
+	}
+}
+
+func TestCommitRejectsUnsupportedStagedChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+		allow  []string
+	}{
+		{
+			name: "delete",
+			mutate: func(t *testing.T, work string) {
+				if err := os.Remove(filepath.Join(work, "requirements.txt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			allow: []string{"requirements.txt"},
+		},
+		{
+			name: "rename",
+			mutate: func(t *testing.T, work string) {
+				if err := os.Rename(filepath.Join(work, "requirements.txt"), filepath.Join(work, "requirements.lock")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			allow: []string{"requirements.txt", "requirements.lock"},
+		},
+		{
+			name: "symlink",
+			mutate: func(t *testing.T, work string) {
+				if err := os.Remove(filepath.Join(work, "requirements.txt")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("README.md", filepath.Join(work, "requirements.txt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			allow: []string{"requirements.txt"},
+		},
+		{
+			name: "mode",
+			mutate: func(t *testing.T, work string) {
+				if err := os.Chmod(filepath.Join(work, "requirements.txt"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			allow: []string{"requirements.txt"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			work := newRepoWithRemote(t)
+			tt.mutate(t, work)
+			headBefore := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
+			if err := Commit(context.Background(), work, tt.allow, CommitSummary{Date: time.Now()}); err == nil {
+				t.Fatalf("Commit accepted %s change", tt.name)
+			}
+			headAfter := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
+			if headAfter != headBefore {
+				t.Fatalf("HEAD changed after rejected %s", tt.name)
+			}
+		})
 	}
 }
 

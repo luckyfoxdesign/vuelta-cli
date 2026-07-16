@@ -75,6 +75,14 @@ func TestValidateRejectsUnsafeTestRunArgument(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidChangedPathPattern(t *testing.T) {
+	t.Parallel()
+	cfg := Config{Git: GitConfig{AllowedChangedPaths: []string{`nested\package.json`}}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "git.allowed_changed_paths[0]") {
+		t.Fatalf("expected invalid Git path pattern rejection, got %v", err)
+	}
+}
+
 func TestValidateSecurityConfigRequiresPinnedScannerImages(t *testing.T) {
 	validDigest := "scanner@sha256:" + strings.Repeat("a", 64)
 	cfg := Config{VulnScan: VulnScanConfig{

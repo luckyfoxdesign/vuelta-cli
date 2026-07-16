@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"gopkg.in/yaml.v3"
 )
 
@@ -189,7 +190,9 @@ type Workspace struct {
 	Branch         string      `yaml:"branch"`
 	Remote         string      `yaml:"remote"`
 	// AllowedChangedPaths overrides the legacy config-wide Git allowlist for
-	// this workspace. Older configs continue to use git.allowed_changed_paths.
+	// this workspace. Patterns are normalized repository-relative Git paths:
+	// slash is the only separator and *, ?, and [] never match across a slash.
+	// Older configs continue to use git.allowed_changed_paths.
 	AllowedChangedPaths []string          `yaml:"allowed_changed_paths,omitempty"`
 	DockerImages        *DockerImagesSpec `yaml:"docker_images,omitempty"`
 }
@@ -358,6 +361,11 @@ func (c *Config) Validate() error {
 	seenPaths := make(map[string]int, len(c.Workspaces))
 	for i, ws := range c.Workspaces {
 		errs = append(errs, validateWorkspace(i, ws)...)
+		for j, pattern := range ws.AllowedChangedPaths {
+			if err := gitpath.ValidatePattern(pattern); err != nil {
+				errs = append(errs, fmt.Errorf("workspaces[%d].allowed_changed_paths[%d]: %w", i, j, err))
+			}
+		}
 		name := WorkspaceName(ws)
 		if previous, ok := seenNames[name]; ok {
 			errs = append(errs, fmt.Errorf("workspaces[%d].name: %q duplicates workspaces[%d]", i, name, previous))
@@ -371,6 +379,11 @@ func (c *Config) Validate() error {
 			} else {
 				seenPaths[canonical] = i
 			}
+		}
+	}
+	for i, pattern := range c.Git.AllowedChangedPaths {
+		if err := gitpath.ValidatePattern(pattern); err != nil {
+			errs = append(errs, fmt.Errorf("git.allowed_changed_paths[%d]: %w", i, err))
 		}
 	}
 

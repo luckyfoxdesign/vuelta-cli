@@ -40,6 +40,9 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	if got := strings.Join(cfg.Workspaces[0].AllowedChangedPaths, ","); got != "package-lock.json,package.json" {
+		t.Fatalf("default root-only allowed paths = %q", got)
+	}
 	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
 	if err := Write(cfg, path, false); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -69,9 +72,11 @@ func TestBuildRejectsPathsOutsideSelectedProject(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Compose file") {
 		t.Fatalf("outside compose path error = %v", err)
 	}
-	_, err = discovery.Build(Input{Branch: "main", Remote: "origin", AllowedPaths: []string{"../secrets"}})
-	if err == nil || !strings.Contains(err.Error(), "escapes") {
-		t.Fatalf("outside allowed path error = %v", err)
+	for _, pattern := range []string{"../secrets", `nested\package.json`, "C:/package.json", "nested/../package.json", "**/package.json"} {
+		_, err = discovery.Build(Input{Branch: "main", Remote: "origin", AllowedPaths: []string{pattern}})
+		if err == nil || !strings.Contains(err.Error(), "git pattern") {
+			t.Fatalf("invalid allow path %q error = %v", pattern, err)
+		}
 	}
 }
 
