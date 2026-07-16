@@ -2,12 +2,12 @@ vuelta — checks and safely updates dependencies
 
 Examples:
   vuelta scan
-  vuelta package scan --project api
-  vuelta run --dry-run
+  vuelta scan --all --json
+  vuelta project add . --name api
 
 Everyday commands:
   run          run the configured update pipeline
-  scan         scan configured projects for security findings
+  scan         find vulnerabilities and create read-only update snapshots
   package      inspect or apply dependency updates
 
 Configuration:

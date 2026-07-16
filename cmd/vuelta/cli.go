@@ -53,10 +53,22 @@ var commandDefinitions = []commandDefinition{
 		security: []string{"Dry-run still performs configured security and environment checks."}, takesConfig: true, handler: "run",
 	},
 	{
-		path: []string{"scan"}, usage: "vuelta scan [options] [config-path]",
-		description: "scan configured projects for security findings", group: "Everyday commands",
-		examples:    []string{"vuelta scan", "vuelta scan --project api"},
-		options:     []optionDefinition{{names: []string{"--project"}, valueName: "NAME", description: "scan one configured project"}},
+		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
+		description: "find vulnerabilities and create read-only update snapshots", group: "Everyday commands",
+		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory . --execution local", "vuelta scan --all --json"},
+		options: []optionDefinition{
+			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
+			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
+			{names: []string{"--all"}, description: "scan every configured project"},
+			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
+			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
+			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
+			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
+			{names: []string{"--execution"}, valueName: "MODE", description: "container or explicit adhoc local execution"},
+			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
+			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
+		},
+		security:    []string{"Scan is read-only. Registered projects are container-only; local execution is allowed only for an explicit unregistered directory."},
 		takesConfig: true, handler: "scan",
 	},
 	{
@@ -275,6 +287,9 @@ func (c *cli) run(args []string) error {
 	}
 	normalized, err := normalizeCommandArgs(definition, commandArgs)
 	if err != nil {
+		if definition.handler == "scan" && scanJSONRequested(commandArgs) {
+			return scanTopLevelFailure(true, "invalid_invocation", err, "Run vuelta help scan for usage")
+		}
 		return err
 	}
 	return dispatchCommand(definition.handler, normalized)
@@ -564,8 +579,8 @@ func (c *cli) writeTopLevelHelp(showAll bool) error {
 	writer.println()
 	writer.println("Examples:")
 	writer.println("  vuelta scan")
-	writer.println("  vuelta package scan --project api")
-	writer.println("  vuelta run --dry-run")
+	writer.println("  vuelta scan --all --json")
+	writer.println("  vuelta project add . --name api")
 	writer.println()
 	groups := []string{"Everyday commands", "Configuration", "Operations", "Help", "CI and server commands"}
 	for _, group := range groups {

@@ -280,7 +280,7 @@ func Parse(data []byte) (*Config, error) {
 		ClaudeBin:    "claude",
 		MaxTurns:     10,
 		AllowedTools: "Read,Edit,Grep",
-	}, Update: UpdateConfig{SnapshotTTLHours: 24}}
+	}, Update: UpdateConfig{MinReleaseAgeDays: 7, SnapshotTTLHours: 24}}
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 )
 
 func TestConfigInitNonInteractive(t *testing.T) {
@@ -168,5 +170,48 @@ func TestLocalPackageUpdateRejectsApplyAndDryRunTogether(t *testing.T) {
 	err := run([]string{"package", "local", "update", "--policy", "local.yaml", "--apply", "--dry-run"})
 	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
 		t.Fatalf("local update error = %v, want conflicting confirmation flags", err)
+	}
+}
+
+func TestLegacyPackageUpdateRejectsFormatOneWithSnapshotExitCode(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	stateDir := filepath.Join(root, "snapshots")
+	cfg := configinit.NewConfig()
+	cfg.Update.SnapshotStateDir = stateDir
+	if err := configinit.Write(cfg, configPath, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := "abcdefghijklmnopqrstuv"
+	if err := os.WriteFile(filepath.Join(stateDir, id+".json"), []byte(`{"format":1,"id":"`+id+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"package", "update", "--snapshot", id, "--config", configPath})
+	var coded commandError
+	if !errors.As(err, &coded) || coded.code != exitSnapshot || !strings.Contains(err.Error(), "rerun vuelta scan") {
+		t.Fatalf("format-1 error = %#v", err)
+	}
+}
+
+func TestScanJSONTopLevelFailureIsAnEnvelope(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(configinit.NewConfig(), configPath, false); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr := captureStdout(t, func() error {
+		return run([]string{"scan", "--json", "--config", configPath})
+	})
+	if runErr == nil {
+		t.Fatal("unregistered cwd scan unexpectedly succeeded")
+	}
+	var envelope jsonCommandEnvelope
+	if err := json.Unmarshal([]byte(output), &envelope); err != nil {
+		t.Fatalf("invalid JSON %q: %v", output, err)
+	}
+	if envelope.Command != "scan" || len(envelope.Errors) != 1 || envelope.Errors[0].Code != "target_invalid" {
+		t.Fatalf("envelope = %#v", envelope)
 	}
 }

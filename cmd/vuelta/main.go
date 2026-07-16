@@ -262,11 +262,23 @@ func runPackageScan(args []string) error {
 		if err != nil {
 			return fail(exitFailure, "%s: package scan: %v", config.WorkspaceName(ws), err)
 		}
+		if len(candidates) == 0 {
+			continue
+		}
 		policyHash, err := cfg.SnapshotPolicyHash(ws)
 		if err != nil {
 			return fail(exitConfig, "%s: %v", config.WorkspaceName(ws), err)
 		}
-		snapshot, err := updatesnapshot.New(time.Now(), cfg.SnapshotTTL(), updatesnapshot.WorkspaceIdentity{CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes}, policyHash, candidates)
+		for index := range candidates {
+			candidates[index].ReleaseAgeVerified = candidates[index].Kind != "docker" && workspaceReleaseAgeVerified(ws, time.Duration(cfg.Update.MinReleaseAgeDays)*24*time.Hour)
+		}
+		policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
+		gates := updatesnapshot.ScanGates{MinReleaseAge: (time.Duration(cfg.Update.MinReleaseAgeDays) * 24 * time.Hour).String()}
+		effectiveHash, err := updatesnapshot.EffectivePolicyHash(policyHash, policyIdentity, gates)
+		if err != nil {
+			return fail(exitFailure, "%s: compute effective snapshot policy: %v", config.WorkspaceName(ws), err)
+		}
+		snapshot, err := updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), config.WorkspaceName(ws), updatesnapshot.WorkspaceIdentity{CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes}, policyIdentity, gates, policyHash, effectiveHash, candidates)
 		if err != nil {
 			return fail(exitFailure, "%s: create snapshot: %v", config.WorkspaceName(ws), err)
 		}
@@ -545,38 +557,7 @@ func runPipeline(args []string) error {
 }
 
 func runScan(args []string) error {
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	project := fs.String("project", "", "scan only one configured project")
-	if err := fs.Parse(args); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	path, err := configPath(fs.Args())
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(path)
-	if err != nil {
-		return err
-	}
-	if err := filterProject(cfg, *project); err != nil {
-		return fail(exitConfig, "%v", err)
-	}
-	gate := pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}}
-	failed := 0
-	for _, ws := range cfg.Workspaces {
-		report, err := gate.Baseline(context.Background(), ws, *cfg)
-		if err != nil {
-			failed++
-			fmt.Printf("%s: failed\n", config.WorkspaceName(ws))
-			continue
-		}
-		fmt.Printf("%s: ok (%d finding(s))\n", config.WorkspaceName(ws), len(report.Findings))
-	}
-	if failed > 0 {
-		return fail(exitFailure, "%d workspace(s) failed scan", failed)
-	}
-	return nil
+	return executeScan(args)
 }
 
 func runTasks(args []string) error {
