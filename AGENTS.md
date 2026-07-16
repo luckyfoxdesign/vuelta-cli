@@ -49,7 +49,8 @@ Use the full algorithm in workspace `../AGENTS.md`.
 
 - Language: Go. One package per pipeline stage under `internal/`; `cmd/vuelta` stays a thin entrypoint.
 - The CLI is one-shot, no daemon; scheduling is external.
-- Package managers (`poetry`/`uv`/`npm`/`pnpm`) run only inside sandboxed containers, never on the host — see `internal/sandbox`.
+- Registered workspaces are container-only: package managers (`poetry`/`uv`/`npm`/`pnpm`/`bun`) run inside sandboxed containers, never on the host.
+- The only host package-manager exception is an explicit format-2 adhoc snapshot created by `scan --directory PATH` and applied with `update --execution local SNAPSHOT_ID`. That path runs the resolved system manager in a private writable copy, disables project tests, rejects every change outside the recognized manifest/lock pair, and atomically copies back only those files after confirmation. There is no automatic local fallback.
 
 ## Testing
 

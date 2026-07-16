@@ -81,7 +81,9 @@ func NewLandingCopy(ctx context.Context, repoPath, baseSHA string) (dir string, 
 		return "", nil, err
 	}
 	cleanup = func() error {
-		_, rmErr := runGit(ctx, repoPath, "worktree", "remove", "--force", tmp)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, rmErr := runGit(cleanupCtx, repoPath, "worktree", "remove", "--force", tmp)
 		return rmErr
 	}
 	return tmp, cleanup, nil

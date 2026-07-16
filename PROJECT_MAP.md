@@ -66,7 +66,7 @@ make build                     # both cross-build targets
 - `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
-- `internal/localupdate/` — implements the explicitly less-isolated local package mode. It never calls Git or Docker, and is intentionally separate from the normal snapshot and pipeline packages.
+- `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
 - `internal/pipeline/` — orchestrates the main `vuelta run` sequence (part B §7): preflight, sandbox, security gate, update, diff/allowlist check, tests, optional autofix, commit, push, and notification — once per configured workspace, sequentially, under a process lock. The runner uses the hardened file/container isolation provided by sandbox, updater, and testrunner; CVE/GitHub-alerts/autofix remain stage seams.
@@ -84,6 +84,7 @@ make build                     # both cross-build targets
 ## Architecture Notes
 
 - One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
+- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-2 snapshot before environment checks. Registered updates remain container-only; explicit adhoc `--execution local` is the sole narrow host-manager exception and never runs project tests.
 - One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.
 - Deploy candidates are immutable handoffs. `internal/deployworker` verifies signed queue/manifest delivery, records state atomically, and rolls back a failed digest-pinned Compose rollout.

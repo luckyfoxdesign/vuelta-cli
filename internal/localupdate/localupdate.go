@@ -1,6 +1,7 @@
-// Package localupdate implements the explicitly less-isolated local package
-// mode. It never calls Git or Docker, and is intentionally separate from the
-// normal snapshot and pipeline packages.
+// Package localupdate implements explicit adhoc host package-manager updates
+// in a minimal private writable copy. It never calls Git or Docker, rejects
+// changes outside the recognized manifest/lock pair, and is intentionally
+// separate from the registered-workspace pipeline.
 package localupdate
 
 import (
@@ -50,6 +51,7 @@ type ScanResult struct {
 	Project        Project     `json:"-"`
 	Candidates     []Candidate `json:"candidates"`
 	ReleaseAgeUsed bool        `json:"release_age_used"`
+	ChangedFiles   []string    `json:"changed_files,omitempty"`
 }
 
 // UpdateOptions carries the explicit opt-ins that weaken local-mode defaults.
@@ -193,17 +195,14 @@ func (s Service) Update(ctx context.Context, path string, policy config.LocalPac
 	if !options.Apply && !options.DryRun {
 		return ScanResult{}, errors.New("local update requires --apply; use --dry-run to inspect without writing")
 	}
-	scan, err := s.Scan(ctx, path, policy, options.AllowProjectConfig)
+	project, err := Detect(path)
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if err := validateSelection(policy, scan.Candidates, selected); err != nil {
+	if err := rejectProjectConfig(project, options.AllowProjectConfig || policy.AllowProjectConfig); err != nil {
 		return ScanResult{}, err
 	}
-	if options.DryRun {
-		return scan, nil
-	}
-	lockPath, err := s.lockPath()(scan.Project.Root)
+	lockPath, err := s.lockPath()(project.Root)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -213,48 +212,239 @@ func (s Service) Update(ctx context.Context, path string, policy config.LocalPac
 	}
 	defer func() { _ = lock.Release() }() // a failed release cannot hide an update failure
 
-	binary, err := s.systemManager(scan.Project)
+	binary, err := s.systemManager(project)
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if err := s.verifyConsistent(ctx, binary, scan.Project, options.AllowScripts); err != nil {
-		return ScanResult{}, err
-	}
-	before, err := projectState(scan.Project)
-	if err != nil {
-		return ScanResult{}, err
-	}
-	backup, err := backupFiles(scan.Project)
-	if err != nil {
-		return ScanResult{}, err
-	}
-	defer func() { _ = os.RemoveAll(backup.dir) }()
-	succeeded := false
-	defer func() {
-		if !succeeded {
-			_ = backup.restore()
+	var scan ScanResult
+	changed, err := InPrivateCopy(project.Root, options.AllowProjectConfig || policy.AllowProjectConfig, options.Apply, func(copyProject Project) error {
+		var scanErr error
+		scan, scanErr = s.scanProject(ctx, copyProject, binary, policy)
+		if scanErr != nil {
+			return scanErr
 		}
-	}()
-
-	for _, candidate := range selected {
-		args := updateArgs(scan.Project.Manager, candidate, options.AllowScripts)
-		result, runErr := s.runner()(ctx, binary, scan.Project.Root, args, cleanEnvironment())
-		if runErr != nil {
-			return ScanResult{}, fmt.Errorf("run local %s update for %s: %w", scan.Project.Manager, candidate.Name, runErr)
+		if err := validateSelection(policy, scan.Candidates, selected); err != nil {
+			return err
 		}
-		if result.ExitCode != 0 {
-			return ScanResult{}, fmt.Errorf("local %s update for %s failed (exit %d): %s", scan.Project.Manager, candidate.Name, result.ExitCode, safeText(result.Output))
+		if err := s.verifyConsistent(ctx, binary, copyProject, options.AllowScripts); err != nil {
+			return err
 		}
-	}
-	after, err := projectState(scan.Project)
+		for _, candidate := range selected {
+			args := updateArgs(copyProject.Manager, candidate, options.AllowScripts)
+			result, runErr := s.runner()(ctx, binary, copyProject.Root, args, cleanEnvironment())
+			if runErr != nil {
+				return fmt.Errorf("run local %s update for %s: %w", copyProject.Manager, candidate.Name, runErr)
+			}
+			if result.ExitCode != 0 {
+				return fmt.Errorf("local %s update for %s failed (exit %d): %s", copyProject.Manager, candidate.Name, result.ExitCode, safeText(result.Output))
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if err := before.onlyAllowedChanges(after, scan.Project); err != nil {
-		return ScanResult{}, err
-	}
-	succeeded = true
+	scan.Project = project
+	scan.ChangedFiles = changed
 	return scan, nil
+}
+
+func (s Service) scanProject(ctx context.Context, project Project, binary string, policy config.LocalPackagePolicy) (ScanResult, error) {
+	scanBinary := binary
+	var err error
+	if project.Manager == "pip-tools" {
+		scanBinary, err = s.systemBinary(project.Root, "pip")
+		if err != nil {
+			return ScanResult{}, err
+		}
+	}
+	args, ageUsed := scanArgs(project.Manager, policy.MinReleaseAgeDays, time.Now())
+	result, err := s.runner()(ctx, scanBinary, project.Root, args, cleanEnvironment())
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("run local %s scan: %w", project.Manager, err)
+	}
+	if result.ExitCode != 0 && result.ExitCode != 1 {
+		return ScanResult{}, fmt.Errorf("local %s scan failed (exit %d): %s", project.Manager, result.ExitCode, safeText(result.Output))
+	}
+	candidates, err := parseCandidates(result.Output)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("parse local %s scan: %w", project.Manager, err)
+	}
+	return ScanResult{Project: project, Candidates: candidates, ReleaseAgeUsed: ageUsed}, nil
+}
+
+// InPrivateCopy runs one update operation against a minimal private copy that
+// contains only the recognized dependency files and explicitly approved
+// package-manager configuration. Only manifest and lock-file changes can be
+// copied back to the host target.
+func InPrivateCopy(path string, allowProjectConfig, apply bool, operation func(Project) error) ([]string, error) {
+	project, err := Detect(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectProjectConfig(project, allowProjectConfig); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp("", "vuelta-adhoc-update-")
+	if err != nil {
+		return nil, fmt.Errorf("create private update copy: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("restrict private update copy: %w", err)
+	}
+	files := []string{project.Manifest, project.Lock}
+	if allowProjectConfig {
+		for _, name := range project.ConfigFiles {
+			if regularFile(project.Root, name) {
+				files = append(files, name)
+			}
+		}
+	}
+	for _, name := range files {
+		if err := copyRegularFile(project.Root, dir, name); err != nil {
+			return nil, err
+		}
+	}
+	copyProject := project
+	copyProject.Root = dir
+	before, err := privateProjectState(copyProject)
+	if err != nil {
+		return nil, err
+	}
+	if err := operation(copyProject); err != nil {
+		return nil, err
+	}
+	after, err := privateProjectState(copyProject)
+	if err != nil {
+		return nil, err
+	}
+	if err := before.onlyAllowedChanges(after, copyProject); err != nil {
+		return nil, fmt.Errorf("private update copy security check: %w", err)
+	}
+	changed := changedDependencyFiles(before, after, copyProject)
+	if apply && len(changed) > 0 {
+		if err := copyBackAtomically(project, copyProject, before, changed); err != nil {
+			return nil, err
+		}
+	}
+	return changed, nil
+}
+
+func privateProjectState(project Project) (state, error) {
+	result, err := projectState(project)
+	if err != nil {
+		return nil, err
+	}
+	for name, item := range result {
+		if !item.mode.IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(project.Root, name))
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(data)
+		item.digest = fmt.Sprintf("%x", sum)
+		result[name] = item
+	}
+	return result, nil
+}
+
+func copyRegularFile(sourceRoot, destinationRoot, name string) error {
+	info, err := os.Lstat(filepath.Join(sourceRoot, name))
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("copy dependency input %s: not a regular file", name)
+	}
+	data, err := os.ReadFile(filepath.Join(sourceRoot, name))
+	if err != nil {
+		return fmt.Errorf("read dependency input %s: %w", name, err)
+	}
+	if err := os.WriteFile(filepath.Join(destinationRoot, name), data, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write private dependency input %s: %w", name, err)
+	}
+	return nil
+}
+
+func changedDependencyFiles(before, after state, project Project) []string {
+	var changed []string
+	for _, name := range []string{project.Manifest, project.Lock} {
+		if before[name] != after[name] {
+			changed = append(changed, name)
+		}
+	}
+	return changed
+}
+
+func copyBackAtomically(host, private Project, expected state, changed []string) error {
+	hostState, err := projectState(host)
+	if err != nil {
+		return fmt.Errorf("revalidate host dependency inputs: %w", err)
+	}
+	for _, name := range []string{host.Manifest, host.Lock} {
+		if hostState[name].digest != expected[name].digest || hostState[name].mode.Perm() != expected[name].mode.Perm() {
+			return fmt.Errorf("host dependency input %s changed during private update", name)
+		}
+	}
+	original := make(map[string][]byte, len(changed))
+	modes := make(map[string]fs.FileMode, len(changed))
+	for _, name := range changed {
+		info, err := os.Lstat(filepath.Join(host.Root, name))
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("copy back %s: host input is no longer a regular file", name)
+		}
+		data, err := os.ReadFile(filepath.Join(host.Root, name))
+		if err != nil {
+			return fmt.Errorf("read host input %s before copy back: %w", name, err)
+		}
+		original[name], modes[name] = data, info.Mode().Perm()
+	}
+	var replaced []string
+	for _, name := range changed {
+		data, err := os.ReadFile(filepath.Join(private.Root, name))
+		if err == nil {
+			err = atomicWrite(filepath.Join(host.Root, name), data, modes[name])
+		}
+		if err != nil {
+			var restoreErrs []error
+			for _, restore := range replaced {
+				if restoreErr := atomicWrite(filepath.Join(host.Root, restore), original[restore], modes[restore]); restoreErr != nil {
+					restoreErrs = append(restoreErrs, fmt.Errorf("restore %s: %w", restore, restoreErr))
+				}
+			}
+			if restoreErr := errors.Join(restoreErrs...); restoreErr != nil {
+				return fmt.Errorf("atomically copy back %s: %w; rollback incomplete: %v", name, err, restoreErr)
+			}
+			return fmt.Errorf("atomically copy back %s: %w", name, err)
+		}
+		replaced = append(replaced, name)
+	}
+	return nil
+}
+
+func atomicWrite(path string, data []byte, mode fs.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vuelta-update-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(mode.Perm()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (s Service) verifyConsistent(ctx context.Context, binary string, project Project, allowScripts bool) error {
@@ -597,51 +787,4 @@ func (before state) onlyAllowedChanges(after state, project Project) error {
 		return fmt.Errorf("local package manager removed lock file %s", project.Lock)
 	}
 	return nil
-}
-
-type backup struct {
-	dir   string
-	root  string
-	files map[string]fileState
-}
-
-func backupFiles(project Project) (backup, error) {
-	dir, err := os.MkdirTemp("", "vuelta-local-backup-")
-	if err != nil {
-		return backup{}, err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return backup{}, err
-	}
-	files := make(map[string]fileState, 2)
-	for _, name := range []string{project.Manifest, project.Lock} {
-		info, err := os.Lstat(filepath.Join(project.Root, name))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return backup{}, fmt.Errorf("backup local dependency file %s: not a regular file", name)
-		}
-		data, err := os.ReadFile(filepath.Join(project.Root, name))
-		if err != nil {
-			return backup{}, err
-		}
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
-			return backup{}, err
-		}
-		files[name] = fileState{mode: info.Mode()}
-	}
-	return backup{dir: dir, root: project.Root, files: files}, nil
-}
-
-func (b backup) restore() error {
-	var errs []error
-	for name, saved := range b.files {
-		data, err := os.ReadFile(filepath.Join(b.dir, name))
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(b.root, name), data, saved.mode.Perm()); err != nil {
-			errs = append(errs, fmt.Errorf("restore %s: %w", name, err))
-		}
-	}
-	return errors.Join(errs...)
 }

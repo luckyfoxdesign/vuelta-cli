@@ -139,6 +139,101 @@ func TestUpdateRestoresDependencyFilesWhenManagerFails(t *testing.T) {
 	}
 }
 
+func TestUpdateAppliesOnlyDependencyFilesFromPrivateCopy(t *testing.T) {
+	root := npmProject(t)
+	writeLocalFile(t, root, "README.md", "host")
+	calls := 0
+	s := testService(t, func(_ context.Context, _ string, dir string, _ []string, _ []string) (CommandResult, error) {
+		calls++
+		if calls == 1 {
+			return CommandResult{Output: `{"example":{"current":"1.0.0","latest":"2.0.0"}}`, ExitCode: 1}, nil
+		}
+		if calls == 3 {
+			writeLocalFile(t, dir, "package.json", `{"dependencies":{"example":"2.0.0"}}`)
+			writeLocalFile(t, dir, "package-lock.json", `changed`)
+		}
+		return CommandResult{}, nil
+	})
+	_, err := s.Update(context.Background(), root, config.LocalPackagePolicy{AllowedPackages: []string{"example"}}, []Candidate{{Name: "example", Target: "2.0.0"}}, UpdateOptions{Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := os.ReadFile(filepath.Join(root, "package.json"))
+	readme, _ := os.ReadFile(filepath.Join(root, "README.md"))
+	if !strings.Contains(string(manifest), "2.0.0") || string(readme) != "host" {
+		t.Fatalf("host result manifest=%q README=%q", manifest, readme)
+	}
+}
+
+func TestUpdateDryRunExecutesInPrivateCopyWithoutHostWrites(t *testing.T) {
+	root := npmProject(t)
+	before, _ := os.ReadFile(filepath.Join(root, "package.json"))
+	calls := 0
+	s := testService(t, func(_ context.Context, _ string, dir string, _ []string, _ []string) (CommandResult, error) {
+		calls++
+		if calls == 1 {
+			return CommandResult{Output: `{"example":{"current":"1.0.0","latest":"2.0.0"}}`, ExitCode: 1}, nil
+		}
+		if calls == 3 {
+			writeLocalFile(t, dir, "package.json", `{"dependencies":{"example":"2.0.0"}}`)
+			writeLocalFile(t, dir, "package-lock.json", `changed`)
+		}
+		return CommandResult{}, nil
+	})
+	_, err := s.Update(context.Background(), root, config.LocalPackagePolicy{AllowedPackages: []string{"example"}}, []Candidate{{Name: "example", Target: "2.0.0"}}, UpdateOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(filepath.Join(root, "package.json"))
+	if string(after) != string(before) || calls != 3 {
+		t.Fatalf("dry-run host manifest=%q calls=%d", after, calls)
+	}
+}
+
+func TestPrivateCopyRejectsApprovedConfigMutationWithoutTouchingHost(t *testing.T) {
+	root := t.TempDir()
+	writeLocalFile(t, root, "package.json", `{"dependencies":{"example":"1.0.0"}}`)
+	writeLocalFile(t, root, "bun.lock", "lock")
+	writeLocalFile(t, root, "bunfig.toml", "telemetry = false")
+	calls := 0
+	s := testService(t, func(_ context.Context, _ string, dir string, _ []string, _ []string) (CommandResult, error) {
+		calls++
+		if calls == 1 {
+			return CommandResult{Output: `{"example":{"current":"1.0.0","latest":"2.0.0"}}`, ExitCode: 1}, nil
+		}
+		if calls == 3 {
+			writeLocalFile(t, dir, "package.json", `{"dependencies":{"example":"2.0.0"}}`)
+			writeLocalFile(t, dir, "bun.lock", `changed`)
+			writeLocalFile(t, dir, "bunfig.toml", "telemetry = true!")
+		}
+		return CommandResult{}, nil
+	})
+	_, err := s.Update(context.Background(), root, config.LocalPackagePolicy{AllowedPackages: []string{"example"}}, []Candidate{{Name: "example", Target: "2.0.0"}}, UpdateOptions{Apply: true, AllowProjectConfig: true})
+	if err == nil || !strings.Contains(err.Error(), "unallowlisted") {
+		t.Fatalf("Update error = %v, want config mutation rejection", err)
+	}
+	configData, _ := os.ReadFile(filepath.Join(root, "bunfig.toml"))
+	if string(configData) != "telemetry = false" {
+		t.Fatalf("host package-manager config changed: %q", configData)
+	}
+}
+
+func TestPrivateCopyRefusesToOverwriteConcurrentHostInputChange(t *testing.T) {
+	root := npmProject(t)
+	changed, err := InPrivateCopy(root, false, true, func(project Project) error {
+		writeLocalFile(t, project.Root, "package.json", `{"dependencies":{"example":"2.0.0"}}`)
+		writeLocalFile(t, root, "package.json", `{"dependencies":{"external":"3.0.0"}}`)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed during private update") {
+		t.Fatalf("InPrivateCopy changed=%v error=%v", changed, err)
+	}
+	host, _ := os.ReadFile(filepath.Join(root, "package.json"))
+	if !strings.Contains(string(host), "external") {
+		t.Fatalf("concurrent host change was overwritten: %q", host)
+	}
+}
+
 func TestUpdateDetectsUnallowlistedChangeAndRestoresDependencies(t *testing.T) {
 	root := npmProject(t)
 	writeLocalFile(t, root, "README.md", "before")
@@ -165,8 +260,8 @@ func TestUpdateDetectsUnallowlistedChangeAndRestoresDependencies(t *testing.T) {
 		t.Fatalf("manifest was not restored: %q", afterManifest)
 	}
 	readme, _ := os.ReadFile(filepath.Join(root, "README.md"))
-	if string(readme) != "changed" {
-		t.Fatalf("unallowlisted change = %q, want preserved for review", readme)
+	if string(readme) != "before" {
+		t.Fatalf("host unallowlisted file = %q, want untouched private-copy isolation", readme)
 	}
 }
 

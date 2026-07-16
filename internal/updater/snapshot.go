@@ -226,11 +226,12 @@ func imageReferences(content string) []imageReference {
 // in a validated snapshot. Validate and Recheck are run before the first
 // mutable command; a failed check therefore leaves the sandbox untouched.
 type PlannedUpdater struct {
-	Candidates []updatesnapshot.Candidate
-	Workspace  config.Workspace
-	Config     config.Config
-	Validate   func(context.Context) error
-	Recheck    CandidateScanner
+	Candidates   []updatesnapshot.Candidate
+	Workspace    config.Workspace
+	Config       config.Config
+	AllowScripts bool
+	Validate     func(context.Context) error
+	Recheck      CandidateScanner
 }
 
 func (u PlannedUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
@@ -288,7 +289,7 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		if candidate.Kind == "docker" {
 			continue
 		}
-		args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config)
+		args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, u.AllowScripts)
 		if err != nil {
 			return false, err
 		}
@@ -297,10 +298,18 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		}
 	}
 	if u.Workspace.PackageManager == "npm" {
-		_, err = runner(ctx, image, []string{"npm", "install"}, projectPath)
+		args := []string{"npm", "install", "--package-lock-only"}
+		if !u.AllowScripts {
+			args = append(args, "--ignore-scripts")
+		}
+		_, err = runner(ctx, image, args, projectPath)
 	}
 	if u.Workspace.PackageManager == "bun" {
-		_, err = runner(ctx, image, []string{"bun", "install"}, projectPath)
+		args := []string{"bun", "install", "--lockfile-only"}
+		if !u.AllowScripts {
+			args = append(args, "--ignore-scripts")
+		}
+		_, err = runner(ctx, image, args, projectPath)
 	}
 	if err != nil {
 		return false, err
@@ -312,7 +321,7 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 	return changed || before != after, nil
 }
 
-func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.Config) ([]string, error) {
+func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.Config, allowScripts bool) ([]string, error) {
 	if !validCandidate(candidate) {
 		return nil, errors.New("invalid snapshot candidate")
 	}
@@ -330,7 +339,11 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 		}
 		return []string{"npx", "npm-check-updates@" + version, "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
 	case "pnpm":
-		return []string{"pnpm", "update", candidate.Name + "@" + candidate.Target}, nil
+		args := []string{"pnpm", "update", "--lockfile-only"}
+		if !allowScripts {
+			args = append(args, "--ignore-scripts")
+		}
+		return append(args, candidate.Name+"@"+candidate.Target), nil
 	case "bun":
 		version, err := requireTool(cfg, "npm_check_updates")
 		if err != nil {

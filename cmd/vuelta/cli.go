@@ -72,6 +72,21 @@ var commandDefinitions = []commandDefinition{
 		takesConfig: true, handler: "scan",
 	},
 	{
+		path: []string{"update"}, usage: "vuelta update [options] SNAPSHOT_ID",
+		description: "apply exactly one validated update snapshot", group: "Everyday commands",
+		examples: []string{"vuelta update abc123", "vuelta update --dry-run abc123", "vuelta update abc123 --yes --json"},
+		options: []optionDefinition{
+			{names: []string{"--dry-run"}, description: "run in a disposable copy without durable changes"},
+			{names: []string{"--yes"}, description: "confirm the displayed plan"},
+			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
+			{names: []string{"--execution"}, valueName: "MODE", description: "container or explicit adhoc local execution"},
+			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts"},
+			{names: []string{"--allow-unverified-release-age"}, description: "allow candidates whose release age was not verified"},
+		},
+		security:    []string{"Every snapshot is validated before environment checks. Registered projects are container-only; all durable updates require confirmation."},
+		takesConfig: true, handler: "update",
+	},
+	{
 		path: []string{"package"}, usage: "vuelta package <command>",
 		description: "inspect or apply dependency updates", group: "Everyday commands",
 		examples: []string{"vuelta package scan", "vuelta package update --snapshot SNAPSHOT_ID"},
@@ -278,7 +293,7 @@ func (c *cli) run(args []string) error {
 	if globals.noInput && (definition.handler == "config init" || definition.handler == "project add") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
-	if globals.config != "" && definition.takesConfig {
+	if globals.config != "" && definition.takesConfig && definition.handler != "update" {
 		if containsArgument(commandArgs, "--") {
 			commandArgs = append(commandArgs, globals.config)
 		} else {
@@ -291,6 +306,12 @@ func (c *cli) run(args []string) error {
 			return scanTopLevelFailure(true, "invalid_invocation", err, "Run vuelta help scan for usage")
 		}
 		return err
+	}
+	if globals.noInput && definition.handler == "update" {
+		normalized = append([]string{"--non-interactive"}, normalized...)
+	}
+	if globals.config != "" && definition.handler == "update" {
+		normalized = append([]string{"--internal-config", globals.config}, normalized...)
 	}
 	return dispatchCommand(definition.handler, normalized)
 }
@@ -517,6 +538,8 @@ func dispatchCommand(handler string, args []string) error {
 		return runPipeline(args)
 	case "scan":
 		return runScan(args)
+	case "update":
+		return executeUpdate(args)
 	case "package scan":
 		return runPackage(append([]string{"scan"}, args...))
 	case "package update":

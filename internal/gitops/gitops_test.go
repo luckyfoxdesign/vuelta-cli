@@ -83,6 +83,26 @@ func TestRunGitHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestLandingCleanupUsesBoundedContextAfterParentCancellation(t *testing.T) {
+	work := newRepoWithRemote(t)
+	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	landing, cleanup, err := NewLandingCopy(ctx, work, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup after cancellation: %v", err)
+	}
+	if _, err := os.Stat(landing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("landing copy still exists after cleanup: %v", err)
+	}
+}
+
 func TestVerifyBaseSHAUnchangedDetectsDrift(t *testing.T) {
 	work := newRepoWithRemote(t)
 	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
