@@ -34,10 +34,33 @@ func installDockerInvocationMarker(t *testing.T, marker string) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "docker")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n: > \"$FAKE_DOCKER_MARKER\"\n"), 0o755); err != nil {
+	script := fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("FAKE_DOCKER_MARKER", marker)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installCapturingFakeDocker(t *testing.T, argsPath, modelPath string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker shell script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$@" > %q
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "-f" ]; then
+    cp "$argument" %q
+  fi
+  previous="$argument"
+done
+`, argsPath, modelPath)
+	path := filepath.Join(dir, "docker")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
@@ -86,6 +109,63 @@ func TestRunPassesWithValidCompose(t *testing.T) {
 	}
 	if !res.Passed {
 		t.Fatalf("expected pass, got fail: %s", res.Output)
+	}
+}
+
+func TestValidateComposeAcceptsDigestPinnedMinimalService(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "docker-compose.test.yml")
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+
+	normalized, err := validateCompose(dir, composePath, "test")
+	if err != nil {
+		t.Fatalf("validateCompose: %v", err)
+	}
+	serialized := string(normalized)
+	if strings.Contains(serialized, "build:") || !strings.Contains(serialized, "@sha256:") {
+		t.Fatalf("unexpected normalized model:\n%s", serialized)
+	}
+}
+
+func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "args")
+	modelPath := filepath.Join(t.TempDir(), "validated-compose.yml")
+	installCapturingFakeDocker(t, argsPath, modelPath)
+	t.Setenv("COMPOSE_FILE", "host-controlled-compose.yml")
+	t.Setenv("HOST_SECRET_SENTINEL", "must-not-be-inherited")
+	writeCompose(t, dir, "repository-compose.yml", validCompose+"\n# repository-only-marker\n")
+
+	result, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "repository-compose.yml", Service: "test"}, time.Second)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected pass, got fail: %s", result.Output)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), "repository-compose.yml") {
+		t.Fatalf("docker received the repository compose path: %s", args)
+	}
+	if !strings.Contains(string(args), "--env-file") || !strings.Contains(string(args), "-f") {
+		t.Fatalf("docker did not receive normalized compose and empty env files: %s", args)
+	}
+	model, err := os.ReadFile(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(model), "repository-only-marker") || strings.Contains(string(model), "build:") {
+		t.Fatalf("docker received repository-only data instead of the validated model:\n%s", model)
+	}
+	for _, entry := range sanitizedDockerEnvironment() {
+		name, _, _ := strings.Cut(entry, "=")
+		if name == "COMPOSE_FILE" || name == "HOST_SECRET_SENTINEL" {
+			t.Fatalf("host environment variable %s was inherited", name)
+		}
 	}
 }
 
@@ -202,6 +282,39 @@ func TestRunRejectsUnknownService(t *testing.T) {
 	}
 }
 
+func TestRunRejectsUnsafeRunArgumentBeforeDocker(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "docker-invoked")
+	installDockerInvocationMarker(t, marker)
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+
+	_, err := Run(context.Background(), dir, config.TestProfile{
+		ComposeFile: "docker-compose.test.yml",
+		Service:     "test",
+		RunArgs:     []string{"--volume", "/:/host"},
+	}, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "run argument") {
+		t.Fatalf("expected run argument policy error, got %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("docker was invoked before run argument rejection: %v", err)
+	}
+}
+
+func TestInterpolationErrorDoesNotRevealHostValue(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir, "bad-compose-interpolation-user")
+	t.Setenv("HOST_UID", "sensitive-host-value")
+
+	_, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "interpolation is not allowed") {
+		t.Fatalf("expected interpolation policy error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "sensitive-host-value") {
+		t.Fatal("policy error disclosed an inherited host value")
+	}
+}
+
 func TestRunRejectsComposePolicyBypassBeforeDocker(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink fixture requires a POSIX filesystem")
@@ -248,11 +361,26 @@ func TestRunRejectsComposePolicyBypassBeforeDocker(t *testing.T) {
 			want: "resolves outside the sandbox",
 		},
 		{
+			name: "bind source symlink",
+			compose: `
+services:
+  test:
+    volumes:
+      - ./linked-source:/data:ro
+`,
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(outside, "outside.txt"), filepath.Join(dir, "linked-source")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "symlink",
+		},
+		{
 			name: "undeclared named volume",
 			compose: `
 services:
   test:
-    build: .
     volumes:
       - cache:/cache
 `,
@@ -261,7 +389,7 @@ services:
 		{
 			name:    "external named volume",
 			fixture: "bad-compose-external-volume",
-			want:    "must be local",
+			want:    "declared empty",
 		},
 		{
 			name:    "dependency privileged",
@@ -286,17 +414,17 @@ services:
 		{
 			name:    "host network fixture",
 			fixture: "bad-compose-network-host",
-			want:    "network_mode host is not allowed",
+			want:    "network_mode is not allowed",
 		},
 		{
 			name:    "host pid fixture",
 			fixture: "bad-compose-pid-host",
-			want:    "pid host is not allowed",
+			want:    "pid is not allowed",
 		},
 		{
 			name:    "host ipc fixture",
 			fixture: "bad-compose-ipc-host",
-			want:    "ipc host is not allowed",
+			want:    "ipc is not allowed",
 		},
 		{
 			name:    "docker socket fixture",
@@ -317,6 +445,46 @@ services:
 			name:    "mutable image fixture",
 			fixture: "bad-compose-mutable-image",
 			want:    "must be pinned by digest",
+		},
+		{
+			name:    "build-only service",
+			fixture: "bad-compose-build-only",
+			want:    "build is not allowed",
+		},
+		{
+			name:    "detailed build attributes",
+			fixture: "bad-compose-build-detailed",
+			want:    "build is not allowed",
+		},
+		{
+			name:    "build ssh socket",
+			fixture: "bad-compose-build-ssh",
+			want:    "build is not allowed",
+		},
+		{
+			name:    "build additional context",
+			fixture: "bad-compose-build-additional-context",
+			want:    "build is not allowed",
+		},
+		{
+			name:    "pid interpolation",
+			fixture: "bad-compose-interpolation-pid",
+			want:    "interpolation is not allowed",
+		},
+		{
+			name:    "user interpolation",
+			fixture: "bad-compose-interpolation-user",
+			want:    "interpolation is not allowed",
+		},
+		{
+			name:    "extra security option",
+			fixture: "bad-compose-security-opt",
+			want:    "security_opt",
+		},
+		{
+			name:    "unknown service field",
+			fixture: "bad-compose-unknown-service-field",
+			want:    "mystery_escape_hatch",
 		},
 	}
 
@@ -410,8 +578,12 @@ func TestRunRejectsMissingRunnerHardening(t *testing.T) {
 		want string
 	}{
 		{"root user", "user: \"65532:65532\"", "user: \"0\"", "non-root UID"},
+		{"named user", "user: \"65532:65532\"", "user: \"nobody\"", "non-root UID"},
+		{"root group", "user: \"65532:65532\"", "user: \"65532:0\"", "non-root UID"},
 		{"cap drop", "cap_drop: [\"ALL\"]", "cap_drop: []", "cap_drop"},
 		{"no new privileges", "security_opt: [\"no-new-privileges:true\"]", "security_opt: []", "no-new-privileges"},
+		{"cpu limit", "cpus: \"1\"", "cpus: \"0\"", "cpus"},
+		{"memory limit", "mem_limit: 1g", "mem_limit: 0", "mem_limit"},
 		{"pids limit", "pids_limit: 256", "pids_limit: 0", "pids_limit"},
 		{"external network", "networks: [testnet]", "networks: [outside]", "network \"outside\""},
 	}

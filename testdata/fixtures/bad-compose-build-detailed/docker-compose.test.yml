@@ -1,0 +1,11 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      ssh:
+        - default
+      secrets:
+        - build_token
+      additional_contexts:
+        host: ../outside

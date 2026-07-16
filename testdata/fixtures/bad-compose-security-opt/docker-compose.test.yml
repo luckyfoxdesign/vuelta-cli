@@ -1,0 +1,13 @@
+services:
+  test:
+    image: example.invalid/test@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true", "seccomp=unconfined"]
+    cpus: "1"
+    mem_limit: 1g
+    pids_limit: 256
+    networks: [testnet]
+networks:
+  testnet:
+    internal: true

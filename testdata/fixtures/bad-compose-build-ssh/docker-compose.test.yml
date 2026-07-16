@@ -1,0 +1,6 @@
+services:
+  test:
+    build:
+      context: .
+      ssh:
+        - default=/run/host-services/ssh-auth.sock

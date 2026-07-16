@@ -1,5 +1,4 @@
 services:
   test:
-    build: .
     volumes:
       - ../outside:/data:ro

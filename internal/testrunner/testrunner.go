@@ -3,13 +3,18 @@
 package testrunner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,35 +48,73 @@ type Result struct {
 	Output string
 }
 
-// Run executes the configured test profile against workDir using
-// `docker compose -f <compose_file> run --rm <run_args...> <service>`. The
-// compose file is policy-checked first (§8): privileged, host
-// network/pid/ipc, docker socket, absolute host mounts, env_file/implicit
-// .env, and mutable (non-digest) image tags on the target service are
-// rejected before the command ever runs. The deeper sandbox
+// Run executes the configured test profile against workDir with
+// `docker compose run --rm <run_args...> <service>`. The repository compose
+// file is validated against a strict fail-closed allowlist (§8,
+// F5-CRIT-002): unknown fields anywhere, YAML anchors/aliases, any "$"
+// interpolation, build, env files, host namespaces, sockets, and weakened
+// hardening are rejected before Docker is invoked. Docker Compose is then
+// given a serialization of the validated model — never the repository YAML —
+// so it cannot see fields the policy did not approve. The deeper sandbox
 // network-egress/isolation policy belongs to part F; this is the baseline
 // this package's own execution path is responsible for.
 func Run(ctx context.Context, workDir string, profile config.TestProfile, timeout time.Duration) (Result, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	if !composeName.MatchString(profile.Service) {
+		return Result{}, errors.New("test compose policy: service must be a Compose service name")
+	}
+	if err := checkRunArgs(profile.RunArgs); err != nil {
+		return Result{}, fmt.Errorf("test compose policy: %w", err)
+	}
 
-	composePath, composeFile, err := resolveComposeFile(workDir, profile.ComposeFile)
+	root, composePath, err := resolveComposeFile(workDir, profile.ComposeFile)
 	if err != nil {
 		return Result{}, fmt.Errorf("test compose policy: %w", err)
 	}
-	if err := checkPolicy(workDir, composePath, profile.Service); err != nil {
+	normalized, err := validateCompose(root, composePath, profile.Service)
+	if err != nil {
 		return Result{}, fmt.Errorf("test compose policy: %w", err)
+	}
+
+	// The normalized model lives outside the sandbox so it can never be
+	// bind-mounted into the test container or picked up as a sandbox change.
+	tmpDir, err := os.MkdirTemp("", "vuelta-compose-")
+	if err != nil {
+		return Result{}, fmt.Errorf("write validated compose model: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	normalizedPath := filepath.Join(tmpDir, "compose.yaml")
+	if err := os.WriteFile(normalizedPath, normalized, 0o600); err != nil {
+		return Result{}, fmt.Errorf("write validated compose model: %w", err)
+	}
+	emptyEnvPath := filepath.Join(tmpDir, "compose.env")
+	if err := os.WriteFile(emptyEnvPath, nil, 0o600); err != nil {
+		return Result{}, fmt.Errorf("write empty compose environment: %w", err)
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := append([]string{"compose", "-f", composeFile, "run", "--rm", "--no-TTY"}, profile.RunArgs...)
+	// --project-directory pins relative bind sources and the implicit .env
+	// lookup to the sandbox root — the same base the policy validated
+	// against. The normalized model contains no interpolation or host
+	// inheritance, so the compose client's environment cannot change what
+	// runs.
+	args := []string{
+		"compose",
+		"--project-directory", root,
+		"--env-file", emptyEnvPath,
+		"-f", normalizedPath,
+		"run", "--rm", "--no-TTY",
+	}
+	args = append(args, profile.RunArgs...)
 	args = append(args, profile.Service)
 
 	cmd := exec.CommandContext(runCtx, "docker", args...)
-	cmd.Dir = workDir
+	cmd.Dir = root
+	cmd.Env = sanitizedDockerEnvironment()
 	cmd.WaitDelay = waitDelay
 	// On timeout only the docker compose client is killed here; the
 	// container itself is bounded by the compose policy above (cpus,
@@ -96,45 +139,485 @@ func Run(ctx context.Context, workDir string, profile config.TestProfile, timeou
 	return result, nil
 }
 
-var digestPinned = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+var (
+	digestPinned = regexp.MustCompile(`^[^\s@]+@sha256:[0-9a-f]{64}$`)
+	composeName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+)
 
-type composeFile struct {
-	Services composeServices               `yaml:"services"`
-	Volumes  map[string]composeNamedVolume `yaml:"volumes"`
-	Networks map[string]composeNetwork     `yaml:"networks"`
-	Include  interface{}                   `yaml:"include"`
-	Configs  interface{}                   `yaml:"configs"`
-	Secrets  interface{}                   `yaml:"secrets"`
+func checkRunArgs(args []string) error {
+	for i, arg := range args {
+		if arg != "--rm" && arg != "--no-TTY" {
+			return fmt.Errorf("run argument %d is not allowed", i)
+		}
+	}
+	return nil
 }
 
-type composeServices map[string]composeService
+// validateCompose parses the compose file under the strict allowlist and
+// returns the YAML serialization of the validated model. Everything Docker
+// Compose will execute comes from this serialization.
+func validateCompose(root, composePath, service string) ([]byte, error) {
+	if err := checkNoImplicitEnvFile(root); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", composePath, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", composePath, err)
+	}
+	if err := checkNodeSafety(&doc); err != nil {
+		return nil, err
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var cf composeFile
+	if err := dec.Decode(&cf); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("parse %s: empty compose file", composePath)
+		}
+		return nil, fmt.Errorf("parse %s: %w", composePath, err)
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("parse %s: multiple YAML documents are not allowed", composePath)
+		}
+		return nil, fmt.Errorf("parse %s: invalid trailing YAML document", composePath)
+	}
+	model, err := buildModel(root, cf, service)
+	if err != nil {
+		return nil, err
+	}
+	out, err := yaml.Marshal(model)
+	if err != nil {
+		return nil, fmt.Errorf("serialize validated compose model: %w", err)
+	}
+	return out, nil
+}
+
+// checkNodeSafety rejects YAML features the allowlist cannot reason about:
+// anchors/aliases (content that is validated in one place but expanded into
+// another) and any scalar containing "$" (Compose interpolation and host
+// environment references). Scalar values are deliberately never echoed so a
+// policy error cannot leak environment-like values.
+func checkNodeSafety(node *yaml.Node) error {
+	if node.Anchor != "" || node.Kind == yaml.AliasNode {
+		return fmt.Errorf("line %d: YAML anchors and aliases are not allowed", node.Line)
+	}
+	if node.Kind == yaml.ScalarNode && strings.Contains(node.Value, "$") {
+		return fmt.Errorf("line %d: interpolation is not allowed", node.Line)
+	}
+	for _, child := range node.Content {
+		if err := checkNodeSafety(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// composeFile is the strict decode target: with KnownFields enabled, any
+// top-level or service-level field outside this allowlist fails the parse.
+// The banned forbiddenField values exist only to record presence and produce
+// precise errors; their values are deliberately discarded.
+type composeFile struct {
+	Services map[string]composeService     `yaml:"services"`
+	Volumes  map[string]composeNamedVolume `yaml:"volumes"`
+	Networks map[string]composeNetwork     `yaml:"networks"`
+
+	Include forbiddenField `yaml:"include"`
+	Configs forbiddenField `yaml:"configs"`
+	Secrets forbiddenField `yaml:"secrets"`
+}
 
 type composeService struct {
-	Privileged        bool                `yaml:"privileged"`
-	NetworkMode       string              `yaml:"network_mode"`
-	Pid               string              `yaml:"pid"`
-	Ipc               string              `yaml:"ipc"`
-	EnvFile           interface{}         `yaml:"env_file"`
-	Image             string              `yaml:"image"`
-	Volumes           []composeVolume     `yaml:"volumes"`
-	DependsOn         composeDependencies `yaml:"depends_on"`
-	Devices           []interface{}       `yaml:"devices"`
-	DeviceCgroupRules []string            `yaml:"device_cgroup_rules"`
-	CapAdd            []string            `yaml:"cap_add"`
-	CapDrop           []string            `yaml:"cap_drop"`
-	SecurityOpt       []string            `yaml:"security_opt"`
-	User              string              `yaml:"user"`
-	CPUs              string              `yaml:"cpus"`
-	MemLimit          string              `yaml:"mem_limit"`
-	PidsLimit         int                 `yaml:"pids_limit"`
-	Networks          interface{}         `yaml:"networks"`
-	Environment       interface{}         `yaml:"environment"`
-	Build             interface{}         `yaml:"build"`
-	Extends           interface{}         `yaml:"extends"`
-	VolumesFrom       interface{}         `yaml:"volumes_from"`
-	Configs           interface{}         `yaml:"configs"`
-	Secrets           interface{}         `yaml:"secrets"`
-	UseAPISocket      bool                `yaml:"use_api_socket"`
+	Image       string                 `yaml:"image"`
+	User        string                 `yaml:"user"`
+	ReadOnly    bool                   `yaml:"read_only"`
+	WorkingDir  string                 `yaml:"working_dir"`
+	Entrypoint  composeCommand         `yaml:"entrypoint"`
+	Command     composeCommand         `yaml:"command"`
+	Environment composeEnvironment     `yaml:"environment"`
+	Tmpfs       composeStringList      `yaml:"tmpfs"`
+	CapDrop     []string               `yaml:"cap_drop"`
+	SecurityOpt []string               `yaml:"security_opt"`
+	CPUs        composeScalar          `yaml:"cpus"`
+	MemLimit    composeScalar          `yaml:"mem_limit"`
+	PidsLimit   int                    `yaml:"pids_limit"`
+	Networks    composeServiceNetworks `yaml:"networks"`
+	Volumes     []composeVolume        `yaml:"volumes"`
+	DependsOn   composeDependencies    `yaml:"depends_on"`
+
+	// Banned fields: presence alone is a policy violation, regardless of
+	// value. Kept in the schema so the error names the field instead of
+	// surfacing a generic unknown-field parse error.
+	Build             forbiddenField `yaml:"build"`
+	Privileged        forbiddenField `yaml:"privileged"`
+	NetworkMode       forbiddenField `yaml:"network_mode"`
+	Pid               forbiddenField `yaml:"pid"`
+	Ipc               forbiddenField `yaml:"ipc"`
+	EnvFile           forbiddenField `yaml:"env_file"`
+	Devices           forbiddenField `yaml:"devices"`
+	DeviceCgroupRules forbiddenField `yaml:"device_cgroup_rules"`
+	CapAdd            forbiddenField `yaml:"cap_add"`
+	UseAPISocket      forbiddenField `yaml:"use_api_socket"`
+	Extends           forbiddenField `yaml:"extends"`
+	VolumesFrom       forbiddenField `yaml:"volumes_from"`
+	Configs           forbiddenField `yaml:"configs"`
+	Secrets           forbiddenField `yaml:"secrets"`
+	Ports             forbiddenField `yaml:"ports"`
+	Expose            forbiddenField `yaml:"expose"`
+}
+
+type forbiddenField struct {
+	present bool
+}
+
+func (f *forbiddenField) UnmarshalYAML(*yaml.Node) error {
+	f.present = true
+	return nil
+}
+
+// normalizedFile is the exact model handed to Docker Compose. It is built
+// only from validated data, so Compose never sees fields, interpolation, or
+// values the policy did not approve.
+type normalizedFile struct {
+	Services map[string]normalizedService  `yaml:"services"`
+	Volumes  map[string]composeNamedVolume `yaml:"volumes,omitempty"`
+	Networks map[string]normalizedNetwork  `yaml:"networks,omitempty"`
+}
+
+type normalizedService struct {
+	Image       string                 `yaml:"image"`
+	User        string                 `yaml:"user"`
+	ReadOnly    bool                   `yaml:"read_only,omitempty"`
+	WorkingDir  string                 `yaml:"working_dir,omitempty"`
+	Entrypoint  composeCommand         `yaml:"entrypoint,omitempty"`
+	Command     composeCommand         `yaml:"command,omitempty"`
+	Environment composeEnvironment     `yaml:"environment,omitempty"`
+	Tmpfs       composeStringList      `yaml:"tmpfs,omitempty"`
+	CapDrop     []string               `yaml:"cap_drop"`
+	SecurityOpt []string               `yaml:"security_opt"`
+	CPUs        composeScalar          `yaml:"cpus"`
+	MemLimit    composeScalar          `yaml:"mem_limit"`
+	PidsLimit   int                    `yaml:"pids_limit"`
+	Networks    composeServiceNetworks `yaml:"networks"`
+	Volumes     []composeVolume        `yaml:"volumes,omitempty"`
+	DependsOn   composeDependencies    `yaml:"depends_on,omitempty"`
+}
+
+type normalizedNetwork struct {
+	Internal bool `yaml:"internal"`
+}
+
+func buildModel(root string, cf composeFile, service string) (*normalizedFile, error) {
+	if cf.Include.present {
+		return nil, errors.New("top-level include is not allowed")
+	}
+	if cf.Configs.present || cf.Secrets.present {
+		return nil, errors.New("top-level configs and secrets are not allowed")
+	}
+	if len(cf.Services) == 0 {
+		return nil, errors.New("no services defined")
+	}
+	for name := range cf.Services {
+		if !composeName.MatchString(name) {
+			return nil, errors.New("service name is not allowed")
+		}
+	}
+	if _, ok := cf.Services[service]; !ok {
+		return nil, fmt.Errorf("service %q not found", service)
+	}
+	for _, name := range sortedNetworkNames(cf.Networks) {
+		if !cf.Networks[name].Internal {
+			return nil, fmt.Errorf("network %q must be an unnamed internal test network", name)
+		}
+	}
+
+	model := &normalizedFile{Services: make(map[string]normalizedService, len(cf.Services))}
+	if len(cf.Volumes) > 0 {
+		model.Volumes = cf.Volumes
+	}
+	if len(cf.Networks) > 0 {
+		model.Networks = make(map[string]normalizedNetwork, len(cf.Networks))
+		for name := range cf.Networks {
+			model.Networks[name] = normalizedNetwork{Internal: true}
+		}
+	}
+
+	// Every service in the file is validated and serialized: `compose run`
+	// starts dependencies, and a fail-closed policy has no notion of an
+	// unchecked bystander service.
+	for _, name := range sortedServiceNames(cf.Services) {
+		normalized, err := checkService(root, cf, name, cf.Services[name])
+		if err != nil {
+			return nil, err
+		}
+		model.Services[name] = normalized
+	}
+	return model, nil
+}
+
+func checkService(root string, cf composeFile, name string, svc composeService) (normalizedService, error) {
+	var zero normalizedService
+
+	for _, banned := range []struct {
+		field forbiddenField
+		msg   string
+	}{
+		{svc.Build, "build is not allowed; use a digest-pinned prebuilt image"},
+		{svc.Privileged, "privileged is not allowed"},
+		{svc.NetworkMode, "network_mode is not allowed"},
+		{svc.Pid, "pid is not allowed"},
+		{svc.Ipc, "ipc is not allowed"},
+		{svc.EnvFile, "env_file is not allowed"},
+		{svc.Devices, "devices are not allowed"},
+		{svc.DeviceCgroupRules, "devices are not allowed"},
+		{svc.CapAdd, "cap_add is not allowed"},
+		{svc.UseAPISocket, "use_api_socket is not allowed"},
+		{svc.Extends, "extends is not allowed"},
+		{svc.VolumesFrom, "volumes_from is not allowed"},
+		{svc.Configs, "configs are not allowed"},
+		{svc.Secrets, "secrets are not allowed"},
+		{svc.Ports, "ports are not allowed"},
+		{svc.Expose, "expose is not allowed"},
+	} {
+		if banned.field.present {
+			return zero, fmt.Errorf("service %q: %s", name, banned.msg)
+		}
+	}
+
+	var volumes []composeVolume
+	for _, v := range svc.Volumes {
+		checked, err := checkVolume(root, cf.Volumes, name, v)
+		if err != nil {
+			return zero, err
+		}
+		volumes = append(volumes, checked)
+	}
+
+	if svc.Image == "" {
+		return zero, fmt.Errorf("service %q: a digest-pinned prebuilt image is required", name)
+	}
+	if !digestPinned.MatchString(svc.Image) {
+		return zero, fmt.Errorf("service %q: image %q must be pinned by digest", name, svc.Image)
+	}
+	if !isExplicitNonRootUser(svc.User) {
+		return zero, fmt.Errorf("service %q: user must be an explicit non-root UID", name)
+	}
+	if !hasAllCapabilityDrop(svc.CapDrop) {
+		return zero, fmt.Errorf("service %q: cap_drop must include ALL", name)
+	}
+	for _, opt := range svc.SecurityOpt {
+		if opt != "no-new-privileges" && opt != "no-new-privileges:true" {
+			return zero, fmt.Errorf("service %q: security_opt %q is not allowed", name, opt)
+		}
+	}
+	if !hasNoNewPrivileges(svc.SecurityOpt) {
+		return zero, fmt.Errorf("service %q: security_opt must include no-new-privileges", name)
+	}
+	if !isPositiveCPU(svc.CPUs) || !isPositiveMemoryLimit(svc.MemLimit) || svc.PidsLimit <= 0 {
+		return zero, fmt.Errorf("service %q: cpus, mem_limit, and pids_limit are required", name)
+	}
+	if err := checkInternalNetworks(cf.Networks, name, svc.Networks); err != nil {
+		return zero, err
+	}
+	for _, dependency := range svc.DependsOn {
+		if _, ok := cf.Services[dependency]; !ok {
+			return zero, fmt.Errorf("service %q: dependency %q not found", name, dependency)
+		}
+	}
+
+	return normalizedService{
+		Image:       svc.Image,
+		User:        svc.User,
+		ReadOnly:    svc.ReadOnly,
+		WorkingDir:  svc.WorkingDir,
+		Entrypoint:  svc.Entrypoint,
+		Command:     svc.Command,
+		Environment: svc.Environment,
+		Tmpfs:       svc.Tmpfs,
+		CapDrop:     svc.CapDrop,
+		SecurityOpt: svc.SecurityOpt,
+		CPUs:        svc.CPUs,
+		MemLimit:    svc.MemLimit,
+		PidsLimit:   svc.PidsLimit,
+		Networks:    svc.Networks,
+		Volumes:     volumes,
+		DependsOn:   svc.DependsOn,
+	}, nil
+}
+
+func sortedServiceNames(services map[string]composeService) []string {
+	names := make([]string, 0, len(services))
+	for name := range services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedNetworkNames(networks map[string]composeNetwork) []string {
+	names := make([]string, 0, len(networks))
+	for name := range networks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// composeCommand accepts Compose's string and list forms for command and
+// entrypoint and re-serializes the same form.
+type composeCommand struct {
+	shell string
+	args  []string
+}
+
+func (c *composeCommand) UnmarshalYAML(value *yaml.Node) error {
+	switch {
+	case value.Kind == yaml.ScalarNode && value.Tag == "!!null":
+		return nil
+	case value.Kind == yaml.ScalarNode:
+		c.shell = value.Value
+		return nil
+	case value.Kind == yaml.SequenceNode:
+		c.args = []string{}
+		for _, item := range value.Content {
+			if item.Kind != yaml.ScalarNode {
+				return errors.New("command entries must be strings")
+			}
+			c.args = append(c.args, item.Value)
+		}
+		return nil
+	}
+	return errors.New("command must be a string or a list of strings")
+}
+
+func (c composeCommand) MarshalYAML() (interface{}, error) {
+	if c.args != nil {
+		return c.args, nil
+	}
+	return c.shell, nil
+}
+
+func (c composeCommand) IsZero() bool { return c.shell == "" && c.args == nil }
+
+// composeStringList accepts a scalar or a list of scalars (tmpfs).
+type composeStringList []string
+
+func (l *composeStringList) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if value.Tag == "!!null" {
+			return nil
+		}
+		*l = composeStringList{value.Value}
+		return nil
+	case yaml.SequenceNode:
+		for _, item := range value.Content {
+			if item.Kind != yaml.ScalarNode {
+				return errors.New("entries must be strings")
+			}
+			*l = append(*l, item.Value)
+		}
+		return nil
+	}
+	return errors.New("must be a string or a list of strings")
+}
+
+// composeEnvironment accepts only concrete values: list entries must be
+// explicit KEY=value pairs and map values must be non-null scalars. Bare
+// keys (host inheritance) fail closed; "$" interpolation is already
+// rejected document-wide before decoding.
+type composeEnvironment struct {
+	list []string
+	kv   map[string]string
+}
+
+func (e *composeEnvironment) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		for _, item := range value.Content {
+			if item.Kind != yaml.ScalarNode || !strings.Contains(item.Value, "=") || strings.HasPrefix(item.Value, "=") {
+				return errors.New("environment must use explicit KEY=value entries")
+			}
+			e.list = append(e.list, item.Value)
+		}
+		return nil
+	case yaml.MappingNode:
+		e.kv = make(map[string]string, len(value.Content)/2)
+		for i := 0; i < len(value.Content); i += 2 {
+			key, val := value.Content[i], value.Content[i+1]
+			if key.Kind != yaml.ScalarNode || key.Value == "" {
+				return errors.New("environment keys must be non-empty strings")
+			}
+			if val.Kind != yaml.ScalarNode || val.Tag == "!!null" {
+				return fmt.Errorf("environment %q must have a concrete scalar value", key.Value)
+			}
+			e.kv[key.Value] = val.Value
+		}
+		return nil
+	case yaml.ScalarNode:
+		if value.Tag == "!!null" {
+			return nil
+		}
+	}
+	return errors.New("invalid environment configuration")
+}
+
+func (e composeEnvironment) MarshalYAML() (interface{}, error) {
+	if e.list != nil {
+		return e.list, nil
+	}
+	return e.kv, nil
+}
+
+func (e composeEnvironment) IsZero() bool { return e.list == nil && len(e.kv) == 0 }
+
+// composeScalar accepts any non-null YAML scalar (quoted or bare number) and
+// serializes its literal text as a string.
+type composeScalar string
+
+func (s *composeScalar) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode || value.Tag == "!!null" {
+		return errors.New("must be a scalar value")
+	}
+	*s = composeScalar(value.Value)
+	return nil
+}
+
+// composeServiceNetworks accepts the list form and the map form with no
+// per-network options: aliases, static addresses, and priorities widen the
+// runner's authority and fail closed.
+type composeServiceNetworks []string
+
+func (n *composeServiceNetworks) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		for _, item := range value.Content {
+			if item.Kind != yaml.ScalarNode || item.Value == "" || item.Tag == "!!null" {
+				return errors.New("invalid network entry")
+			}
+			*n = append(*n, item.Value)
+		}
+		return nil
+	case yaml.MappingNode:
+		for i := 0; i < len(value.Content); i += 2 {
+			key, val := value.Content[i], value.Content[i+1]
+			if key.Kind != yaml.ScalarNode || key.Value == "" {
+				return errors.New("invalid network entry")
+			}
+			if val.Tag != "!!null" {
+				return errors.New("per-network service options are not allowed")
+			}
+			*n = append(*n, key.Value)
+		}
+		sort.Strings(*n)
+		return nil
+	}
+	return errors.New("invalid networks configuration")
 }
 
 // composeDependencies accepts both Compose forms: a list of service names and
@@ -152,33 +635,70 @@ func (d *composeDependencies) UnmarshalYAML(value *yaml.Node) error {
 			}
 			*d = append(*d, item.Value)
 		}
+		return nil
 	case yaml.MappingNode:
 		for i := 0; i < len(value.Content); i += 2 {
-			name := value.Content[i]
+			name, options := value.Content[i], value.Content[i+1]
 			if name.Kind != yaml.ScalarNode || name.Value == "" {
 				return errors.New("depends_on keys must be service names")
 			}
+			if err := checkDependencyOptions(options); err != nil {
+				return fmt.Errorf("depends_on %q: %w", name.Value, err)
+			}
 			*d = append(*d, name.Value)
 		}
-	default:
-		return errors.New("depends_on must be a list or map")
+		return nil
+	}
+	return errors.New("depends_on must be a list or map")
+}
+
+// checkDependencyOptions allows only the default start condition: the
+// normalized model serializes dependencies in list form, which Compose
+// treats as service_started, so any other condition would silently change
+// semantics (and healthcheck-based conditions are unusable here anyway,
+// because healthcheck is outside the allowlist).
+func checkDependencyOptions(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return errors.New("options must be a mapping")
+	}
+	for i := 0; i < len(value.Content); i += 2 {
+		key, val := value.Content[i], value.Content[i+1]
+		if key.Value != "condition" || val.Kind != yaml.ScalarNode || val.Value != "service_started" {
+			return errors.New("only condition service_started is allowed")
+		}
 	}
 	return nil
 }
 
+// composeVolume accepts short syntax with at most a ro/rw option and long
+// syntax restricted to type, source, target, and read_only. It always
+// re-serializes in long syntax.
 type composeVolume struct {
 	Type     string
 	Source   string
+	Target   string
 	ReadOnly bool
 }
 
 func (v *composeVolume) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind == yaml.ScalarNode {
-		parts := strings.SplitN(value.Value, ":", 3)
-		if len(parts) < 2 || parts[0] == "" {
+		parts := strings.Split(value.Value, ":")
+		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
 			return fmt.Errorf("invalid short volume syntax %q", value.Value)
 		}
-		v.Source = parts[0]
+		v.Source, v.Target = parts[0], parts[1]
+		if len(parts) == 3 {
+			switch parts[2] {
+			case "ro":
+				v.ReadOnly = true
+			case "rw":
+			default:
+				return fmt.Errorf("volume option %q is not allowed", parts[2])
+			}
+		}
 		if isBindSource(v.Source) {
 			v.Type = "bind"
 		} else {
@@ -189,142 +709,67 @@ func (v *composeVolume) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.MappingNode {
 		return errors.New("volume must use short or long syntax")
 	}
-	var raw struct {
-		Type     string `yaml:"type"`
-		Source   string `yaml:"source"`
-		ReadOnly bool   `yaml:"read_only"`
+	for i := 0; i < len(value.Content); i += 2 {
+		key, val := value.Content[i], value.Content[i+1]
+		switch key.Value {
+		case "type", "source", "target":
+			if val.Kind != yaml.ScalarNode || val.Tag == "!!null" {
+				return fmt.Errorf("volume %s must be a string", key.Value)
+			}
+			switch key.Value {
+			case "type":
+				v.Type = val.Value
+			case "source":
+				v.Source = val.Value
+			case "target":
+				v.Target = val.Value
+			}
+		case "read_only":
+			if err := val.Decode(&v.ReadOnly); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("volume field %q is not allowed", key.Value)
+		}
 	}
-	if err := value.Decode(&raw); err != nil {
-		return err
+	if v.Type == "" {
+		return errors.New("long volume syntax requires type")
 	}
-	if raw.Type == "" || raw.Source == "" {
-		return errors.New("long volume syntax requires type and source")
-	}
-	v.Type, v.Source, v.ReadOnly = raw.Type, raw.Source, raw.ReadOnly
 	return nil
 }
 
-type composeNamedVolume struct {
-	External   bool        `yaml:"external"`
-	Name       string      `yaml:"name"`
-	DriverOpts interface{} `yaml:"driver_opts"`
+func (v composeVolume) MarshalYAML() (interface{}, error) {
+	type longVolume struct {
+		Type     string `yaml:"type"`
+		Source   string `yaml:"source,omitempty"`
+		Target   string `yaml:"target"`
+		ReadOnly bool   `yaml:"read_only,omitempty"`
+	}
+	return longVolume(v), nil
 }
 
-type composeNetwork struct {
-	Internal   bool        `yaml:"internal"`
-	External   bool        `yaml:"external"`
-	Name       string      `yaml:"name"`
-	DriverOpts interface{} `yaml:"driver_opts"`
-}
+// composeNamedVolume accepts only an empty declaration: local driver, no
+// name, no options.
+type composeNamedVolume struct{}
 
-func checkPolicy(workDir, composePath, service string) error {
-	if err := checkNoImplicitEnvFile(filepath.Dir(composePath)); err != nil {
-		return err
-	}
-	data, err := os.ReadFile(composePath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", composePath, err)
-	}
-	var cf composeFile
-	if err := yaml.Unmarshal(data, &cf); err != nil {
-		return fmt.Errorf("parse %s: %w", composePath, err)
-	}
-	if cf.Include != nil {
-		return errors.New("top-level include is not allowed")
-	}
-	if cf.Configs != nil || cf.Secrets != nil {
-		return errors.New("top-level configs and secrets are not allowed")
-	}
-	if _, ok := cf.Services[service]; !ok {
-		return fmt.Errorf("service %q not found in %s", service, composePath)
-	}
-	for name, volume := range cf.Volumes {
-		if volume.External || volume.Name != "" || volume.DriverOpts != nil {
-			return fmt.Errorf("named volume %q must be local and have no name or driver_opts", name)
-		}
-	}
-	for name, network := range cf.Networks {
-		if !network.Internal || network.External || network.Name != "" || network.DriverOpts != nil {
-			return fmt.Errorf("network %q must be an unnamed internal test network", name)
-		}
-	}
-
-	return checkServicePolicy(workDir, cf, service, make(map[string]bool))
-}
-
-func checkServicePolicy(workDir string, cf composeFile, service string, checked map[string]bool) error {
-	if checked[service] {
+func (v *composeNamedVolume) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.MappingNode && len(value.Content) == 0 {
 		return nil
 	}
-	checked[service] = true
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+		return nil
+	}
+	return errors.New("named volumes must be declared empty: local driver, no name or options")
+}
 
-	svc := cf.Services[service]
+func (v composeNamedVolume) MarshalYAML() (interface{}, error) {
+	return map[string]string{}, nil
+}
 
-	if svc.Privileged {
-		return fmt.Errorf("service %q: privileged is not allowed", service)
-	}
-	if svc.NetworkMode == "host" {
-		return fmt.Errorf("service %q: network_mode host is not allowed", service)
-	}
-	if svc.Pid == "host" {
-		return fmt.Errorf("service %q: pid host is not allowed", service)
-	}
-	if svc.Ipc == "host" {
-		return fmt.Errorf("service %q: ipc host is not allowed", service)
-	}
-	if svc.EnvFile != nil {
-		return fmt.Errorf("service %q: env_file is not allowed", service)
-	}
-	if len(svc.Devices) != 0 || len(svc.DeviceCgroupRules) != 0 {
-		return fmt.Errorf("service %q: devices are not allowed", service)
-	}
-	if len(svc.CapAdd) != 0 {
-		return fmt.Errorf("service %q: cap_add is not allowed", service)
-	}
-	if svc.UseAPISocket {
-		return fmt.Errorf("service %q: use_api_socket is not allowed", service)
-	}
-	if svc.Extends != nil || svc.VolumesFrom != nil || svc.Configs != nil || svc.Secrets != nil {
-		return fmt.Errorf("service %q: extends, volumes_from, configs, and secrets are not allowed", service)
-	}
-	if svc.Image != "" && !digestPinned.MatchString(svc.Image) {
-		return fmt.Errorf("service %q: image %q must be pinned by digest", service, svc.Image)
-	}
-	for _, v := range svc.Volumes {
-		if err := checkVolume(workDir, cf.Volumes, service, v); err != nil {
-			return err
-		}
-	}
-	if err := checkBuildContext(workDir, service, svc.Build); err != nil {
-		return err
-	}
-	for _, dependency := range svc.DependsOn {
-		if _, ok := cf.Services[dependency]; !ok {
-			return fmt.Errorf("service %q: dependency %q not found", service, dependency)
-		}
-		if err := checkServicePolicy(workDir, cf, dependency, checked); err != nil {
-			return err
-		}
-	}
-	if !hasAllCapabilityDrop(svc.CapDrop) {
-		return fmt.Errorf("service %q: cap_drop must include ALL", service)
-	}
-	if !hasNoNewPrivileges(svc.SecurityOpt) {
-		return fmt.Errorf("service %q: security_opt must include no-new-privileges", service)
-	}
-	if isRootUser(svc.User) {
-		return fmt.Errorf("service %q: user must be an explicit non-root UID", service)
-	}
-	if svc.CPUs == "" || svc.MemLimit == "" || svc.PidsLimit <= 0 {
-		return fmt.Errorf("service %q: cpus, mem_limit, and pids_limit are required", service)
-	}
-	if err := checkInternalNetworks(cf.Networks, service, svc.Networks); err != nil {
-		return err
-	}
-	if err := checkEnvironment(service, svc.Environment); err != nil {
-		return err
-	}
-	return nil
+// composeNetwork allows only the internal marker; every other network
+// option is outside the allowlist and fails the strict parse.
+type composeNetwork struct {
+	Internal bool `yaml:"internal"`
 }
 
 func hasAllCapabilityDrop(values []string) bool {
@@ -345,120 +790,87 @@ func hasNoNewPrivileges(values []string) bool {
 	return false
 }
 
-func isRootUser(user string) bool {
-	if user == "" {
-		return true
+func isExplicitNonRootUser(user string) bool {
+	parts := strings.Split(user, ":")
+	if len(parts) == 0 || len(parts) > 2 {
+		return false
 	}
-	uid := strings.SplitN(user, ":", 2)[0]
-	return uid == "0" || strings.EqualFold(uid, "root")
+	for _, part := range parts {
+		value, err := strconv.ParseUint(part, 10, 32)
+		if err != nil || value == 0 {
+			return false
+		}
+	}
+	return true
 }
 
-func checkInternalNetworks(networks map[string]composeNetwork, service string, value interface{}) error {
-	var names []string
-	switch configured := value.(type) {
-	case []interface{}:
-		for _, network := range configured {
-			name, ok := network.(string)
-			if !ok || name == "" {
-				return fmt.Errorf("service %q: invalid network entry", service)
-			}
-			names = append(names, name)
-		}
-	case map[string]interface{}:
-		for name := range configured {
-			names = append(names, name)
-		}
-	case nil:
-		return fmt.Errorf("service %q: an explicit internal test network is required", service)
-	default:
-		return fmt.Errorf("service %q: invalid networks configuration", service)
-	}
+func isPositiveCPU(value composeScalar) bool {
+	parsed, err := strconv.ParseFloat(string(value), 64)
+	return err == nil && parsed > 0 && !math.IsInf(parsed, 0) && !math.IsNaN(parsed)
+}
+
+var positiveMemoryLimit = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?(?:[kmgtpe](?:i?b)?|b)?$`)
+
+func isPositiveMemoryLimit(value composeScalar) bool {
+	return positiveMemoryLimit.MatchString(string(value))
+}
+
+func checkInternalNetworks(networks map[string]composeNetwork, service string, names composeServiceNetworks) error {
 	if len(names) == 0 {
 		return fmt.Errorf("service %q: an explicit internal test network is required", service)
 	}
 	for _, name := range names {
 		network, ok := networks[name]
-		if !ok || !network.Internal || network.External {
+		if !ok || !network.Internal {
 			return fmt.Errorf("service %q: network %q must be declared internal", service, name)
 		}
 	}
 	return nil
 }
 
-func checkEnvironment(service string, value interface{}) error {
-	if value == nil {
-		return nil
+func checkVolume(root string, volumes map[string]composeNamedVolume, service string, v composeVolume) (composeVolume, error) {
+	if v.Target == "" || !strings.HasPrefix(v.Target, "/") {
+		return v, fmt.Errorf("service %q: volume target must be an absolute container path", service)
 	}
-	// A bare key asks Compose to inherit a host variable. Interpolation also
-	// reads host state, so only concrete sandbox test values are permitted.
-	text := fmt.Sprint(value)
-	if strings.Contains(text, "${") || strings.Contains(text, "$${") {
-		return fmt.Errorf("service %q: environment interpolation is not allowed", service)
-	}
-	switch env := value.(type) {
-	case []interface{}:
-		for _, item := range env {
-			entry, ok := item.(string)
-			if !ok || !strings.Contains(entry, "=") {
-				return fmt.Errorf("service %q: environment must use explicit KEY=value entries", service)
-			}
-		}
-	case map[string]interface{}:
-		for key, item := range env {
-			if key == "" || item == nil {
-				return fmt.Errorf("service %q: environment must use concrete values", service)
-			}
-		}
-	default:
-		return fmt.Errorf("service %q: invalid environment configuration", service)
-	}
-	return nil
-}
-
-func checkVolume(workDir string, volumes map[string]composeNamedVolume, service string, v composeVolume) error {
 	switch v.Type {
 	case "bind":
 		if strings.Contains(v.Source, "docker.sock") {
-			return fmt.Errorf("service %q: docker socket mount is not allowed", service)
+			return v, fmt.Errorf("service %q: docker socket mount is not allowed", service)
 		}
-		if err := checkSandboxPath(workDir, v.Source); err != nil {
-			return fmt.Errorf("service %q: bind mount %q: %w", service, v.Source, err)
+		if err := checkSandboxPath(root, v.Source); err != nil {
+			return v, fmt.Errorf("service %q: bind mount %q: %w", service, v.Source, err)
 		}
+		v.Source = normalizeBindSource(v.Source)
 	case "volume":
+		if v.Source == "" {
+			return v, fmt.Errorf("service %q: named volume source is required", service)
+		}
 		if _, ok := volumes[v.Source]; !ok {
-			return fmt.Errorf("service %q: named volume %q must be declared", service, v.Source)
+			return v, fmt.Errorf("service %q: named volume %q must be declared", service, v.Source)
 		}
 	case "tmpfs":
-		return nil
-	default:
-		return fmt.Errorf("service %q: volume type %q is not allowed", service, v.Type)
-	}
-	return nil
-}
-
-func checkBuildContext(workDir, service string, build interface{}) error {
-	if build == nil {
-		return nil
-	}
-	switch value := build.(type) {
-	case string:
-		if err := checkSandboxPath(workDir, value); err != nil {
-			return fmt.Errorf("service %q: build context %q: %w", service, value, err)
-		}
-	case map[string]interface{}:
-		contextPath, ok := value["context"].(string)
-		if !ok || contextPath == "" {
-			return fmt.Errorf("service %q: build context is required", service)
-		}
-		if err := checkSandboxPath(workDir, contextPath); err != nil {
-			return fmt.Errorf("service %q: build context %q: %w", service, contextPath, err)
+		if v.Source != "" {
+			return v, fmt.Errorf("service %q: tmpfs volumes must not set source", service)
 		}
 	default:
-		return fmt.Errorf("service %q: invalid build configuration", service)
+		return v, fmt.Errorf("service %q: volume type %q is not allowed", service, v.Type)
 	}
-	return nil
+	return v, nil
 }
 
+// normalizeBindSource pins the serialized source to an explicitly relative
+// form so Compose resolves it against --project-directory (the sandbox
+// root), the same base checkSandboxPath validated.
+func normalizeBindSource(source string) string {
+	cleaned := filepath.ToSlash(filepath.Clean(source))
+	if cleaned == "." {
+		return "./"
+	}
+	return "./" + cleaned
+}
+
+// resolveComposeFile validates the profile's compose path and returns the
+// absolute sandbox root and the absolute, symlink-free compose file path.
 func resolveComposeFile(workDir, file string) (string, string, error) {
 	if file == "" {
 		return "", "", errors.New("compose file is required")
@@ -473,6 +885,17 @@ func resolveComposeFile(workDir, file string) (string, string, error) {
 	root, err := filepath.Abs(workDir)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve sandbox path: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve sandbox path: %w", err)
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect sandbox path: %w", err)
+	}
+	if !rootInfo.IsDir() {
+		return "", "", errors.New("sandbox path is not a directory")
 	}
 	full := filepath.Join(root, cleaned)
 	rel, err := filepath.Rel(root, full)
@@ -497,7 +920,7 @@ func resolveComposeFile(workDir, file string) (string, string, error) {
 	if !info.Mode().IsRegular() {
 		return "", "", fmt.Errorf("compose file %q is not a regular file", file)
 	}
-	return full, cleaned, nil
+	return root, full, nil
 }
 
 func checkSandboxPath(workDir, source string) error {
@@ -508,16 +931,52 @@ func checkSandboxPath(workDir, source string) error {
 	if err != nil {
 		return fmt.Errorf("resolve sandbox path: %w", err)
 	}
-	path := filepath.Join(root, source)
-	canonical, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return fmt.Errorf("resolve canonical path: %w", err)
-	}
-	rel, err := filepath.Rel(root, canonical)
+	cleaned := filepath.Clean(source)
+	path := filepath.Join(root, cleaned)
+	rel, err := filepath.Rel(root, path)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return errors.New("resolves outside the sandbox")
 	}
+	current := root
+	var info os.FileInfo
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err = os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("inspect sandbox path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("symlink bind sources are not allowed")
+		}
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return errors.New("must resolve to a regular file or directory; sockets and devices are not allowed")
+	}
 	return nil
+}
+
+// sanitizedDockerEnvironment lets the Docker client find its daemon and
+// credential store while preventing arbitrary host and COMPOSE_* variables
+// from influencing Compose execution. Service environment values come only
+// from the validated model.
+func sanitizedDockerEnvironment() []string {
+	allowed := map[string]bool{
+		"PATH": true, "HOME": true, "XDG_CONFIG_HOME": true,
+		"TMPDIR": true, "TMP": true, "TEMP": true,
+		"DOCKER_API_VERSION": true, "DOCKER_AUTH_CONFIG": true,
+		"DOCKER_CERT_PATH": true, "DOCKER_CONFIG": true,
+		"DOCKER_CONTEXT": true, "DOCKER_HOST": true,
+		"DOCKER_TLS_VERIFY": true, "SSH_AUTH_SOCK": true,
+	}
+	result := make([]string, 0, len(allowed))
+	for _, entry := range os.Environ() {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && allowed[name] {
+			result = append(result, entry)
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func checkNoImplicitEnvFile(dir string) error {

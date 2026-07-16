@@ -1,6 +1,5 @@
 services:
   test:
-    build: .
     volumes:
       - cache:/cache
 volumes:

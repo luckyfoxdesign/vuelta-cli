@@ -1,0 +1,4 @@
+services:
+  test:
+    image: example.invalid/test@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    user: "${HOST_UID}"

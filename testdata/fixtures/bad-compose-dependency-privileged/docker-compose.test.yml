@@ -1,9 +1,7 @@
 services:
   test:
-    build: .
     depends_on:
       helper:
         condition: service_started
   helper:
-    build: .
     privileged: true
