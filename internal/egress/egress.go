@@ -6,10 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 // ErrPolicyUnavailable means the required registry allowlist policy could not
@@ -19,13 +19,18 @@ var ErrPolicyUnavailable = errors.New("egress policy unavailable")
 // Resolve verifies the configured internal network and its running proxy, then
 // returns the only Docker network and proxy URL a caller may use for egress.
 func Resolve(ctx context.Context, cfg config.EgressConfig) (network, proxyURL string, err error) {
+	return ResolveWith(ctx, cfg, dockerexec.Default())
+}
+
+// ResolveWith verifies the egress policy through the supplied Docker boundary.
+func ResolveWith(ctx context.Context, cfg config.EgressConfig, docker dockerexec.Runner) (network, proxyURL string, err error) {
 	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
-	if err := dockerInspect(ctx, "network", cfg.Network); err != nil {
+	if err := dockerInspect(ctx, docker, "network", cfg.Network); err != nil {
 		return "", "", fmt.Errorf("%w: network %q is unavailable; run `docker compose up -d egress-proxy`: %v", ErrPolicyUnavailable, cfg.Network, err)
 	}
-	if err := dockerContainerRunning(ctx, cfg.ProxyContainer); err != nil {
+	if err := dockerContainerRunning(ctx, docker, cfg.ProxyContainer); err != nil {
 		return "", "", fmt.Errorf("%w: proxy container %q is unavailable; run `docker compose up -d egress-proxy`: %v", ErrPolicyUnavailable, cfg.ProxyContainer, err)
 	}
 	if cfg.ProxyURL == "" {
@@ -34,21 +39,24 @@ func Resolve(ctx context.Context, cfg config.EgressConfig) (network, proxyURL st
 	return cfg.Network, cfg.ProxyURL, nil
 }
 
-func dockerInspect(ctx context.Context, kind, name string) error {
-	cmd := exec.CommandContext(ctx, "docker", kind, "inspect", name)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("docker %s inspect: %w: %s", kind, err, strings.TrimSpace(string(out)))
+func dockerInspect(ctx context.Context, docker dockerexec.Runner, kind, name string) error {
+	if _, err := docker.Run(ctx, dockerexec.Request{
+		Args: []string{kind, "inspect", name}, Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	}); err != nil {
+		return fmt.Errorf("docker %s inspect: %w", kind, err)
 	}
 	return nil
 }
 
-func dockerContainerRunning(ctx context.Context, name string) error {
-	cmd := exec.CommandContext(ctx, "docker", "container", "inspect", "--format", "{{.State.Running}}", name)
-	out, err := cmd.CombinedOutput()
+func dockerContainerRunning(ctx context.Context, docker dockerexec.Runner, name string) error {
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:     []string{"container", "inspect", "--format", "{{.State.Running}}", name},
+		Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
 	if err != nil {
-		return fmt.Errorf("docker container inspect: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("docker container inspect: %w", err)
 	}
-	if strings.TrimSpace(string(out)) != "true" {
+	if strings.TrimSpace(string(result.Combined)) != "true" {
 		return errors.New("container is not running")
 	}
 	return nil

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
@@ -381,7 +382,7 @@ func effectiveMinReleaseAge(value string, configuredDays, policyDays int) (time.
 
 func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options scanOptions) error {
 	if options.execution == "container" {
-		if _, err := exec.LookPath("docker"); err != nil {
+		if _, err := dockerexec.Default().Path(); err != nil {
 			return errors.New("docker is required for container execution; for an adhoc directory, explicitly choose --execution local")
 		}
 	}

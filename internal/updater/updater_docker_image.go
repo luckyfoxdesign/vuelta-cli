@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 // DigestResolver resolves the current registry digest for an image
@@ -19,19 +20,29 @@ type DigestResolver func(ctx context.Context, ref string) (digest string, err er
 // <ref>` and extracts the manifest digest. It only reads registry metadata
 // — it never pulls or executes the image.
 func ResolveDigestViaManifest(ctx context.Context, ref string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "manifest", "inspect", "--verbose", ref)
-	out, err := cmd.Output()
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+	return DigestResolverWithDocker(dockerexec.Default())(ctx, ref)
+}
+
+// DigestResolverWithDocker returns a manifest resolver bound to docker.
+func DigestResolverWithDocker(docker dockerexec.Runner) DigestResolver {
+	return func(ctx context.Context, ref string) (string, error) {
+		result, err := docker.Run(ctx, dockerexec.Request{
+			Args:   []string{"manifest", "inspect", "--verbose", ref},
+			Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
+			Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+		})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			return "", fmt.Errorf("docker manifest inspect %s: %w", ref, err)
 		}
-		return "", fmt.Errorf("docker manifest inspect %s: %w", ref, err)
+		digest, err := parseManifestDigest(result.Stdout)
+		if err != nil {
+			return "", fmt.Errorf("docker manifest inspect %s: %w", ref, err)
+		}
+		return digest, nil
 	}
-	digest, err := parseManifestDigest(out)
-	if err != nil {
-		return "", fmt.Errorf("docker manifest inspect %s: %w", ref, err)
-	}
-	return digest, nil
 }
 
 func parseManifestDigest(data []byte) (string, error) {

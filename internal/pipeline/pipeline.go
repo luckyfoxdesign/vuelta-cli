@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitops"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
@@ -62,6 +63,7 @@ type Deps struct {
 	Autofix  Autofixer
 	Notifier *notify.Notifier
 	Logger   *logging.Logger
+	Docker   dockerexec.Runner
 	// Now returns the current time; defaults to time.Now when nil. Tests
 	// override it for deterministic branch names and commit messages.
 	Now func() time.Time
@@ -82,7 +84,14 @@ func (d Deps) resolveUpdater(ws config.Workspace, cfg config.Config) (updater.Up
 	if d.ResolveUpdater != nil {
 		return d.ResolveUpdater(ws, cfg)
 	}
-	return updater.Resolve(ws, cfg)
+	return updater.ResolveWithDocker(ws, cfg, d.docker())
+}
+
+func (d Deps) docker() dockerexec.Runner {
+	if d.Docker != nil {
+		return d.Docker
+	}
+	return dockerexec.Default()
 }
 
 // RunWorkspace executes pipeline steps 1-10 for a single workspace. It
@@ -94,7 +103,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	label := config.WorkspaceName(ws)
 
 	// Step 1: preflight.
-	if err := scanner.CheckTools(); err != nil {
+	if err := scanner.CheckToolsWithDocker(deps.docker()); err != nil {
 		return failResult(label, "preflight", err)
 	}
 	pre, err := scanner.Preflight(ctx, ws)
@@ -174,7 +183,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 
 	// Step 6: tests, with one optional autofix retry (step 7).
 	testTimeout := time.Duration(ws.Test.TimeoutMinutes) * time.Minute
-	result, err := testrunner.Run(ctx, sandboxDir, ws.Test, testTimeout)
+	result, err := testrunner.RunWithDocker(ctx, deps.docker(), sandboxDir, ws.Test, testTimeout)
 	if err != nil {
 		return failResult(project, "test run", err)
 	}
@@ -190,7 +199,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		}
 		if attempted {
 			autofixApplied = true
-			result, err = testrunner.Run(ctx, sandboxDir, ws.Test, testTimeout)
+			result, err = testrunner.RunWithDocker(ctx, deps.docker(), sandboxDir, ws.Test, testTimeout)
 			if err != nil {
 				return failResult(project, "test run after autofix", err)
 			}

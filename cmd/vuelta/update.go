@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -16,6 +15,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/autofix"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
@@ -447,7 +447,7 @@ func executeLocalAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapsh
 }
 
 func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, cfg config.Config, project localupdate.Project, plan updatePlan, options updateOptions) (updateResult, error) {
-	if _, err := exec.LookPath("docker"); err != nil {
+	if _, err := dockerexec.Default().Path(); err != nil {
 		return updateResult{}, fail(exitEnv, "docker is required for container execution: %v", err)
 	}
 	if _, _, err := egress.Resolve(ctx, cfg.Update.Egress); err != nil {

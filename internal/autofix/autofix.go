@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 const maxPromptBytes = 1 << 20
@@ -31,6 +31,7 @@ type ExecuteContainer func(ctx context.Context, args []string, stdin io.Reader) 
 // prepared image and the limited Claude settings.
 type Runner struct {
 	Execute ExecuteContainer
+	Docker  dockerexec.Runner
 }
 
 // Attempt implements pipeline.Autofixer. It never retries. The caller runs
@@ -142,9 +143,12 @@ func (r Runner) execute(ctx context.Context, args []string, stdin io.Reader) err
 	if r.Execute != nil {
 		return r.Execute(ctx, args, stdin)
 	}
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Stdin = stdin
+	docker := r.Docker
+	if docker == nil {
+		docker = dockerexec.Default()
+	}
 	// Never connect agent stdout/stderr to the parent process: it may echo
 	// injected text or test output. A concise wrapped error is enough.
-	return cmd.Run()
+	_, err := docker.Run(ctx, dockerexec.Request{Args: args, Stdin: stdin})
+	return err
 }

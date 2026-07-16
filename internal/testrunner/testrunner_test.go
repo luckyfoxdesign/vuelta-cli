@@ -11,9 +11,15 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
-func installFakeDocker(t *testing.T, exitCode int) {
+func fakeDockerExecutor(t *testing.T, path string) dockerexec.Runner {
+	t.Helper()
+	return dockerexec.New(dockerexec.Options{Resolver: func(string) (string, error) { return path, nil }})
+}
+
+func installFakeDocker(t *testing.T, exitCode int) dockerexec.Runner {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker shell script requires a POSIX shell")
@@ -24,10 +30,10 @@ func installFakeDocker(t *testing.T, exitCode int) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return fakeDockerExecutor(t, path)
 }
 
-func installDockerInvocationMarker(t *testing.T, marker string) {
+func installDockerInvocationMarker(t *testing.T, marker string) dockerexec.Runner {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker shell script requires a POSIX shell")
@@ -38,10 +44,10 @@ func installDockerInvocationMarker(t *testing.T, marker string) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return fakeDockerExecutor(t, path)
 }
 
-func installCapturingFakeDocker(t *testing.T, argsPath, modelPath string) {
+func installCapturingFakeDocker(t *testing.T, argsPath, modelPath string) dockerexec.Runner {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker shell script requires a POSIX shell")
@@ -52,7 +58,7 @@ printf '%%s\n' "$@" > %q
 previous=
 for argument in "$@"; do
   if [ "$previous" = "-f" ]; then
-    cp "$argument" %q
+    /bin/cp "$argument" %q
   fi
   previous="$argument"
 done
@@ -61,7 +67,7 @@ done
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return fakeDockerExecutor(t, path)
 }
 
 func writeCompose(t *testing.T, dir, name, content string) {
@@ -98,12 +104,12 @@ networks:
 `, strings.Repeat("1", 64))
 
 func TestRunPassesWithValidCompose(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
 	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
-	res, err := Run(context.Background(), dir, profile, time.Second)
+	res, err := RunWithDocker(context.Background(), docker, dir, profile, time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -131,12 +137,12 @@ func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.
 	dir := t.TempDir()
 	argsPath := filepath.Join(t.TempDir(), "args")
 	modelPath := filepath.Join(t.TempDir(), "validated-compose.yml")
-	installCapturingFakeDocker(t, argsPath, modelPath)
+	docker := installCapturingFakeDocker(t, argsPath, modelPath)
 	t.Setenv("COMPOSE_FILE", "host-controlled-compose.yml")
 	t.Setenv("HOST_SECRET_SENTINEL", "must-not-be-inherited")
 	writeCompose(t, dir, "repository-compose.yml", validCompose+"\n# repository-only-marker\n")
 
-	result, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "repository-compose.yml", Service: "test"}, time.Second)
+	result, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: "repository-compose.yml", Service: "test"}, time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -161,21 +167,15 @@ func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.
 	if strings.Contains(string(model), "repository-only-marker") || strings.Contains(string(model), "build:") {
 		t.Fatalf("docker received repository-only data instead of the validated model:\n%s", model)
 	}
-	for _, entry := range sanitizedDockerEnvironment() {
-		name, _, _ := strings.Cut(entry, "=")
-		if name == "COMPOSE_FILE" || name == "HOST_SECRET_SENTINEL" {
-			t.Fatalf("host environment variable %s was inherited", name)
-		}
-	}
 }
 
 func TestRunFailsWhenComposeCommandFails(t *testing.T) {
-	installFakeDocker(t, 1)
+	docker := installFakeDocker(t, 1)
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
 	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
-	res, err := Run(context.Background(), dir, profile, time.Second)
+	res, err := RunWithDocker(context.Background(), docker, dir, profile, time.Second)
 	if err != nil {
 		t.Fatalf("Run should not return a Go error for a failing test suite: %v", err)
 	}
@@ -285,10 +285,10 @@ func TestRunRejectsUnknownService(t *testing.T) {
 func TestRunRejectsUnsafeRunArgumentBeforeDocker(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "docker-invoked")
-	installDockerInvocationMarker(t, marker)
+	docker := installDockerInvocationMarker(t, marker)
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
-	_, err := Run(context.Background(), dir, config.TestProfile{
+	_, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{
 		ComposeFile: "docker-compose.test.yml",
 		Service:     "test",
 		RunArgs:     []string{"--volume", "/:/host"},
@@ -492,7 +492,7 @@ services:
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			marker := filepath.Join(t.TempDir(), "docker-invoked")
-			installDockerInvocationMarker(t, marker)
+			docker := installDockerInvocationMarker(t, marker)
 			if tt.setup != nil {
 				tt.setup(t, dir)
 			}
@@ -506,7 +506,7 @@ services:
 			if composeFile == "" {
 				composeFile = "docker-compose.test.yml"
 			}
-			_, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: composeFile, Service: "test"}, time.Second)
+			_, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: composeFile, Service: "test"}, time.Second)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("expected policy error containing %q, got %v", tt.want, err)
 			}
@@ -518,7 +518,7 @@ services:
 }
 
 func TestRunAllowsDeclaredLocalNamedVolume(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", `
 services:
@@ -540,7 +540,7 @@ networks:
     internal: true
 `)
 
-	res, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
+	res, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -560,11 +560,11 @@ func TestRunTimesOut(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	docker := fakeDockerExecutor(t, path)
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
 	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
-	_, err := Run(context.Background(), dir, profile, 50*time.Millisecond)
+	_, err := RunWithDocker(context.Background(), docker, dir, profile, 50*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected timeout error, got %v", err)
 	}

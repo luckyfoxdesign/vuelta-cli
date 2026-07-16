@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,8 +19,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 // DefaultTimeout is used when a workspace's test profile does not set one.
@@ -59,6 +58,11 @@ type Result struct {
 // network-egress/isolation policy belongs to part F; this is the baseline
 // this package's own execution path is responsible for.
 func Run(ctx context.Context, workDir string, profile config.TestProfile, timeout time.Duration) (Result, error) {
+	return RunWithDocker(ctx, dockerexec.Default(), workDir, profile, timeout)
+}
+
+// RunWithDocker executes a test profile through the supplied Docker boundary.
+func RunWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string, profile config.TestProfile, timeout time.Duration) (Result, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
@@ -112,19 +116,14 @@ func Run(ctx context.Context, workDir string, profile config.TestProfile, timeou
 	args = append(args, profile.RunArgs...)
 	args = append(args, profile.Service)
 
-	cmd := exec.CommandContext(runCtx, "docker", args...)
-	cmd.Dir = root
-	cmd.Env = sanitizedDockerEnvironment()
-	cmd.WaitDelay = waitDelay
 	// On timeout only the docker compose client is killed here; the
 	// container itself is bounded by the compose policy above (cpus,
 	// mem_limit, pids_limit) and Docker's own run lifecycle.
-	out := capio.NewTail(outputTailBytes)
-	cmd.Stdout = out
-	cmd.Stderr = out
-
-	runErr := cmd.Run()
-	result := Result{Output: out.String()}
+	commandResult, runErr := docker.Run(runCtx, dockerexec.Request{
+		Args: args, Dir: root, WaitDelay: waitDelay,
+		Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: outputTailBytes},
+	})
+	result := Result{Output: string(commandResult.Combined)}
 
 	if runCtx.Err() == context.DeadlineExceeded {
 		return result, fmt.Errorf("test profile timed out after %s", timeout)
@@ -953,30 +952,6 @@ func checkSandboxPath(workDir, source string) error {
 		return errors.New("must resolve to a regular file or directory; sockets and devices are not allowed")
 	}
 	return nil
-}
-
-// sanitizedDockerEnvironment lets the Docker client find its daemon and
-// credential store while preventing arbitrary host and COMPOSE_* variables
-// from influencing Compose execution. Service environment values come only
-// from the validated model.
-func sanitizedDockerEnvironment() []string {
-	allowed := map[string]bool{
-		"PATH": true, "HOME": true, "XDG_CONFIG_HOME": true,
-		"TMPDIR": true, "TMP": true, "TEMP": true,
-		"DOCKER_API_VERSION": true, "DOCKER_AUTH_CONFIG": true,
-		"DOCKER_CERT_PATH": true, "DOCKER_CONFIG": true,
-		"DOCKER_CONTEXT": true, "DOCKER_HOST": true,
-		"DOCKER_TLS_VERIFY": true, "SSH_AUTH_SOCK": true,
-	}
-	result := make([]string, 0, len(allowed))
-	for _, entry := range os.Environ() {
-		name, _, ok := strings.Cut(entry, "=")
-		if ok && allowed[name] {
-			result = append(result, entry)
-		}
-	}
-	sort.Strings(result)
-	return result
 }
 
 func checkNoImplicitEnvFile(dir string) error {

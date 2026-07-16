@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/testfixture"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 )
@@ -81,7 +82,7 @@ func baseConfig() config.Config {
 // exit 0; passOnCall < 0 means always exit 1; passOnCall > 0 makes the
 // script fail every call before the Nth and succeed from then on
 // (simulating a test failure fixed by autofix).
-func installFakeDocker(t *testing.T, passOnCall int) {
+func installFakeDocker(t *testing.T, passOnCall int) dockerexec.Runner {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker shell script requires a POSIX shell")
@@ -99,7 +100,7 @@ func installFakeDocker(t *testing.T, passOnCall int) {
 			t.Fatal(err)
 		}
 		script = fmt.Sprintf(`#!/bin/sh
-n=$(cat %q)
+n=$(/bin/cat %q)
 n=$((n+1))
 echo "$n" > %q
 if [ "$n" -lt %d ]; then
@@ -112,7 +113,7 @@ exit 0
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dockerexec.New(dockerexec.Options{Resolver: func(string) (string, error) { return path, nil }})
 }
 
 type fakeSecurityGate struct {
@@ -145,12 +146,13 @@ func (f fakeAutofixer) Attempt(context.Context, string, string, string, config.A
 
 func fixedNow() time.Time { return time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC) }
 
-func baseDeps(changed bool) Deps {
+func baseDeps(changed bool, docker dockerexec.Runner) Deps {
 	return Deps{
 		Sandbox:  BasicSandbox{},
 		Security: fakeSecurityGate{},
 		Autofix:  NotConfiguredAutofixer{},
 		Now:      fixedNow,
+		Docker:   docker,
 		ResolveUpdater: func(config.Workspace, config.Config) (updater.Updater, error) {
 			return fakeUpdater{changed: changed}, nil
 		},
@@ -158,11 +160,11 @@ func baseDeps(changed bool) Deps {
 }
 
 func TestRunWorkspaceUpdatesAndPushesReviewBranch(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "updated" {
@@ -179,12 +181,12 @@ func TestRunWorkspaceUpdatesAndPushesReviewBranch(t *testing.T) {
 }
 
 func TestRunWorkspaceSkipsWhenDirty(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	writeFile(t, work, "requirements.txt", "uncommitted change\n")
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "skipped" {
@@ -193,11 +195,11 @@ func TestRunWorkspaceSkipsWhenDirty(t *testing.T) {
 }
 
 func TestRunWorkspaceSkipsWhenNoChange(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(false)
+	deps := baseDeps(false, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "skipped" || result.Reason != "no dependency changes" {
@@ -206,11 +208,11 @@ func TestRunWorkspaceSkipsWhenNoChange(t *testing.T) {
 }
 
 func TestRunWorkspaceFailsClosedOnSecurityBaselineError(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 	deps.Security = fakeSecurityGate{baselineErr: fmt.Errorf("trivy database unreachable")}
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
@@ -220,11 +222,11 @@ func TestRunWorkspaceFailsClosedOnSecurityBaselineError(t *testing.T) {
 }
 
 func TestRunWorkspaceRejectsDisallowedChange(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
 		return fakeUpdaterWritingFile{name: "README.md"}, nil
 	}
@@ -242,11 +244,11 @@ func (f fakeUpdaterWritingFile) Update(_ context.Context, projectPath string) (b
 }
 
 func TestRunWorkspaceDryRunSkipsCommitAndPush(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, true)
 	if result.Status != "dry_run" {
@@ -259,11 +261,11 @@ func TestRunWorkspaceDryRunSkipsCommitAndPush(t *testing.T) {
 }
 
 func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
-	installFakeDocker(t, -1) // never passes
+	docker := installFakeDocker(t, -1) // never passes
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "failed" || result.Reason != "tests failed" {
@@ -272,12 +274,12 @@ func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
 }
 
 func TestRunWorkspaceAutofixSucceedsPushesAutofixBranch(t *testing.T) {
-	installFakeDocker(t, 2) // fails first call, passes from the second
+	docker := installFakeDocker(t, 2) // fails first call, passes from the second
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	cfg.Autofix.Enabled = true
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 	deps.Autofix = fakeAutofixer{attempted: true}
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
@@ -298,12 +300,12 @@ func TestRunWorkspaceAutofixSucceedsPushesAutofixBranch(t *testing.T) {
 }
 
 func TestRunWorkspaceDryRunAutofixDoesNotCommitOrPush(t *testing.T) {
-	installFakeDocker(t, 2) // fails first call, passes after autofix
+	docker := installFakeDocker(t, 2) // fails first call, passes after autofix
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	cfg.Autofix.Enabled = true
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 	deps.Autofix = fakeAutofixer{attempted: true}
 
 	beforeHead := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
@@ -326,12 +328,12 @@ func TestRunWorkspaceDryRunAutofixDoesNotCommitOrPush(t *testing.T) {
 }
 
 func TestRunWorkspaceAutofixStillFails(t *testing.T) {
-	installFakeDocker(t, -1) // never passes, even after "autofix"
+	docker := installFakeDocker(t, -1) // never passes, even after "autofix"
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	cfg.Autofix.Enabled = true
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 	deps.Autofix = fakeAutofixer{attempted: true}
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
@@ -341,12 +343,12 @@ func TestRunWorkspaceAutofixStillFails(t *testing.T) {
 }
 
 func TestRunAggregatesResultsUnderLock(t *testing.T) {
-	installFakeDocker(t, 0)
+	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	cfg.Workspaces = []config.Workspace{ws}
-	deps := baseDeps(true)
+	deps := baseDeps(true, docker)
 
 	lockPath := filepath.Join(t.TempDir(), "vuelta.lock")
 	summary, err := Run(context.Background(), deps, cfg, lockPath, false)
@@ -371,7 +373,7 @@ func TestRunFailsWhenLockAlreadyHeld(t *testing.T) {
 	defer func() { _ = held.Release() }()
 
 	cfg := baseConfig()
-	deps := baseDeps(true)
+	deps := baseDeps(true, nil)
 	if _, err := Run(context.Background(), deps, cfg, lockPath, false); err == nil {
 		t.Fatal("expected Run to fail while the lock is already held")
 	}

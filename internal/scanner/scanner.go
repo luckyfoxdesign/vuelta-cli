@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 // SkipReason explains why Preflight decided a workspace should be skipped
@@ -55,13 +56,29 @@ var RequiredTools = []string{"git", "docker"}
 
 // CheckTools verifies every required host tool is on PATH.
 func CheckTools() error {
-	return checkTools(RequiredTools)
+	return CheckToolsWithDocker(dockerexec.Default())
+}
+
+// CheckToolsWithDocker verifies host tools while binding Docker checks to the
+// same approved executable that later commands will use.
+func CheckToolsWithDocker(docker dockerexec.Runner) error {
+	return checkToolsWithDocker(RequiredTools, docker)
 }
 
 func checkTools(tools []string) error {
+	return checkToolsWithDocker(tools, dockerexec.Default())
+}
+
+func checkToolsWithDocker(tools []string, docker dockerexec.Runner) error {
 	var missing []string
 	for _, tool := range tools {
-		if _, err := exec.LookPath(tool); err != nil {
+		var err error
+		if tool == "docker" {
+			_, err = docker.Path()
+		} else {
+			_, err = exec.LookPath(tool)
+		}
+		if err != nil {
 			missing = append(missing, tool)
 		}
 	}

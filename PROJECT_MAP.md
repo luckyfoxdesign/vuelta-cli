@@ -66,9 +66,11 @@ make build                     # both cross-build targets
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
 - `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
 - `internal/deployworker/` — applies authenticated, immutable deployment candidates and restores the previous digest when a rollout is unhealthy.
+- `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and runs them with a minimal environment and bounded output collectors.
 - `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
-- `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.
+- `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
+- `internal/gitpath/` — defines platform-independent matching for Git repository paths.
 - `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.

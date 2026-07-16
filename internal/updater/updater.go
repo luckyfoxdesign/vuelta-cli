@@ -5,13 +5,12 @@ package updater
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
-	"time"
 
-	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 )
 
@@ -23,9 +22,6 @@ import (
 const (
 	discoveryOutputMaxBytes = 8 << 20
 	applyOutputTailBytes    = 128 << 10
-	// commandWaitDelay bounds how long Wait may block on inherited pipes
-	// after the context is cancelled.
-	commandWaitDelay = 10 * time.Second
 )
 
 // Updater updates dependency versions for a single project.
@@ -46,12 +42,17 @@ var ErrEgressPolicyUnavailable = egress.ErrPolicyUnavailable
 // NewDockerRunner returns a runner bound to the strict local egress policy.
 // It never falls back to Docker's default bridge network.
 func NewDockerRunner(egressConfig config.EgressConfig) DockerRunner {
+	return NewDockerRunnerWith(dockerexec.Default(), egressConfig)
+}
+
+// NewDockerRunnerWith returns an update runner using the supplied boundary.
+func NewDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) DockerRunner {
 	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
-		network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
 			return "", err
 		}
-		return runDocker(ctx, image, args, workDir, network, proxyURL)
+		return runDocker(ctx, docker, image, args, workDir, network, proxyURL)
 	}
 }
 
@@ -59,32 +60,34 @@ func NewDockerRunner(egressConfig config.EgressConfig) DockerRunner {
 // egress environment as updates, but makes both the container root filesystem
 // and project mount read-only. Tools can use /tmp only for ephemeral caches.
 func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) DockerRunner {
+	return NewReadOnlyDockerRunnerWith(dockerexec.Default(), egressConfig)
+}
+
+// NewReadOnlyDockerRunnerWith returns a discovery runner using the supplied boundary.
+func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) DockerRunner {
 	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
-		network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
 			return "", err
 		}
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		runCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		cmd := exec.CommandContext(runCtx, "docker", dockerReadOnlyArgs(image, args, workDir, network, proxyURL)...)
-		cmd.WaitDelay = commandWaitDelay
-		out := capio.NewLimit(discoveryOutputMaxBytes, cancel)
-		cmd.Stdout = out
-		cmd.Stderr = out
-		err = cmd.Run()
-		if out.Exceeded() {
+		result, err := docker.Run(ctx, dockerexec.Request{
+			Args:     dockerReadOnlyArgs(image, args, workDir, network, proxyURL),
+			Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
+		})
+		var limitErr *dockerexec.OutputLimitError
+		if errors.As(err, &limitErr) {
 			return "", fmt.Errorf("docker read-only scan %s %s: output exceeded %d bytes", image, strings.Join(args, " "), discoveryOutputMaxBytes)
 		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return string(out.Bytes()), ctxErr
+				return string(result.Combined), ctxErr
 			}
-			return string(out.Bytes()), fmt.Errorf("docker read-only scan %s %s: %w: %s", image, strings.Join(args, " "), err, errorTail(string(out.Bytes())))
+			return string(result.Combined), fmt.Errorf("docker read-only scan %s %s: %w", image, strings.Join(args, " "), err)
 		}
-		return string(out.Bytes()), nil
+		return string(result.Combined), nil
 	}
 }
 
@@ -101,35 +104,22 @@ func RunDocker(ctx context.Context, image string, args []string, workDir string)
 // runDocker starts a hardened update container using the network supplied by
 // policy. It is kept separate from the policy adapter so every updater shares
 // the same container baseline.
-func runDocker(ctx context.Context, image string, args []string, workDir, network, proxyURL string) (string, error) {
+func runDocker(ctx context.Context, docker dockerexec.Runner, image string, args []string, workDir, network, proxyURL string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
-	dockerArgs := dockerRunArgs(image, args, workDir, network, proxyURL)
-	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
-	cmd.WaitDelay = commandWaitDelay
-	out := capio.NewTail(applyOutputTailBytes)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	err := cmd.Run()
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:     dockerRunArgs(image, args, workDir, network, proxyURL),
+		Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: applyOutputTailBytes},
+	})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return out.String(), ctxErr
+			return string(result.Combined), ctxErr
 		}
-		return out.String(), fmt.Errorf("docker run %s %s: %w: %s", image, strings.Join(args, " "), err, errorTail(out.String()))
+		return string(result.Combined), fmt.Errorf("docker run %s %s: %w", image, strings.Join(args, " "), err)
 	}
-	return out.String(), nil
-}
-
-// errorTail bounds the untrusted diagnostics embedded in an error message to
-// the most recent bytes; the caller still receives the full bounded output.
-func errorTail(s string) string {
-	const limit = 4 << 10
-	if len(s) > limit {
-		s = s[len(s)-limit:]
-	}
-	return strings.TrimSpace(s)
+	return string(result.Combined), nil
 }
 
 // dockerRunArgs builds the fixed security baseline for update containers.
@@ -200,8 +190,13 @@ func (c CompositeUpdater) Update(ctx context.Context, projectPath string) (bool,
 // unpinned images; Resolve only fails on missing config.update entries that
 // a chosen updater needs (e.g. no pinned image for the stack).
 func Resolve(ws config.Workspace, cfg config.Config) (Updater, error) {
+	return ResolveWithDocker(ws, cfg, dockerexec.Default())
+}
+
+// ResolveWithDocker binds every updater command to the supplied Docker boundary.
+func ResolveWithDocker(ws config.Workspace, cfg config.Config, docker dockerexec.Runner) (Updater, error) {
 	var updaters []Updater
-	runner := NewDockerRunner(cfg.Update.Egress)
+	runner := NewDockerRunnerWith(docker, cfg.Update.Egress)
 
 	switch {
 	case ws.Stack == config.StackPython && ws.PackageManager == "poetry":
@@ -255,7 +250,7 @@ func Resolve(ws config.Workspace, cfg config.Config) (Updater, error) {
 	}
 
 	if ws.DockerImages != nil {
-		updaters = append(updaters, DockerImageUpdater{Files: ws.DockerImages.Files, Resolve: ResolveDigestViaManifest})
+		updaters = append(updaters, DockerImageUpdater{Files: ws.DockerImages.Files, Resolve: DigestResolverWithDocker(docker)})
 	}
 
 	switch len(updaters) {

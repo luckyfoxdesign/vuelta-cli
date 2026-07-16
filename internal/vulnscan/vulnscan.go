@@ -19,6 +19,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 )
 
@@ -72,6 +73,7 @@ type Command func(ctx context.Context, dir, name string, args ...string) ([]byte
 // Scanner invokes Trivy/OSV and validates their structured output.
 type Scanner struct {
 	Command Command
+	Docker  dockerexec.Runner
 	Now     func() time.Time
 }
 
@@ -79,39 +81,44 @@ func (s Scanner) command(ctx context.Context, dir, image string, egressConfig co
 	if s.Command != nil {
 		return s.Command(ctx, dir, name, args...)
 	}
-	return dockerCommand(ctx, dir, image, egressConfig, name, args...)
+	docker := s.Docker
+	if docker == nil {
+		docker = dockerexec.Default()
+	}
+	return dockerCommandWith(ctx, docker, dir, image, egressConfig, name, args...)
 }
 
 // dockerCommand runs a scanner in its pinned image. The scanned directory is
 // the sole host mount and is read-only; vulnerability data lives in tmpfs and
 // is fetched only through the configured registry allowlist proxy.
 func dockerCommand(ctx context.Context, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+	return dockerCommandWith(ctx, dockerexec.Default(), dir, image, egressConfig, name, args...)
+}
+
+func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
 	if !exactDigest.MatchString(image) {
 		return nil, fmt.Errorf("scanner image %q is not pinned to an exact digest", image)
 	}
-	network, proxyURL, err := egress.Resolve(ctx, egressConfig)
+	network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 	if err != nil {
 		return nil, err
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, "docker", dockerRunArgs(image, dir, network, proxyURL, name, args)...)
-	cmd.WaitDelay = commandWaitDelay
-	stdout := capio.NewLimit(scannerStdoutMaxBytes, cancel)
-	stderr := capio.NewTail(scannerStderrTailBytes)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err = cmd.Run()
-	if stdout.Exceeded() {
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:   dockerRunArgs(image, dir, network, proxyURL, name, args),
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: scannerStdoutMaxBytes},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: scannerStderrTailBytes},
+	})
+	var limitErr *dockerexec.OutputLimitError
+	if errors.As(err, &limitErr) {
 		return nil, fmt.Errorf("docker run %s %s: report exceeded %d bytes", name, strings.Join(args, " "), scannerStdoutMaxBytes)
 	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("docker run %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("docker run %s %s: %w", name, strings.Join(args, " "), err)
 	}
-	return stdout.Bytes(), nil
+	return result.Stdout, nil
 }
 
 func dockerRunArgs(image, dir, network, proxyURL, name string, args []string) []string {

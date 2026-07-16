@@ -9,10 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 // ProjectCompose extends an allowlisted project with its pre-approved Compose
@@ -33,6 +33,7 @@ type ProjectCompose struct {
 type ComposeAdapter struct {
 	Projects map[string]ProjectCompose
 	Run      func(context.Context, string, ...string) (string, error)
+	Docker   dockerexec.Runner
 	Client   *http.Client
 }
 
@@ -40,15 +41,25 @@ func (a ComposeAdapter) command(ctx context.Context, name string, args ...string
 	if a.Run != nil {
 		return a.Run(ctx, name, args...)
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.Output()
+	if name != "docker" {
+		return "", errors.New("compose adapter command is not allowlisted")
+	}
+	docker := a.Docker
+	if docker == nil {
+		docker = dockerexec.Default()
+	}
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:   args,
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 1 << 20},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 16 << 10},
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", fmt.Errorf("%s failed", name)
 	}
-	return string(out), nil
+	return string(result.Stdout), nil
 }
 
 func (a ComposeAdapter) target(project Project) (ProjectCompose, error) {
@@ -132,9 +143,11 @@ func (a ComposeAdapter) Deploy(ctx context.Context, project Project, digest stri
 		}
 		return nil
 	}
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Env = append(os.Environ(), "VUELTA_IMAGE="+ref)
-	if err := cmd.Run(); err != nil {
+	docker := a.Docker
+	if docker == nil {
+		docker = dockerexec.Default()
+	}
+	if _, err := docker.Run(ctx, dockerexec.Request{Args: args, Env: map[string]string{"VUELTA_IMAGE": ref}}); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
