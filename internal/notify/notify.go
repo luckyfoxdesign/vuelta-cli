@@ -36,13 +36,6 @@ type RunSummary struct {
 	Results  []ProjectResult `json:"results"`
 }
 
-// Sender is the common, message-only notification boundary. A notifier may
-// have zero configured transports; Send still succeeds so local logging
-// remains the sole delivery mechanism.
-type Sender interface {
-	Send(message string) error
-}
-
 // Counts tallies results by status.
 func (s RunSummary) Counts() (updated, skipped, failed int) {
 	for _, r := range s.Results {

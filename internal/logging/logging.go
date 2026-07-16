@@ -117,9 +117,12 @@ func (l *Logger) write(level, message string, fields map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
 	if _, err := io.WriteString(f, line); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write log file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close log file: %w", err)
 	}
 	return nil
 }

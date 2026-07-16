@@ -180,7 +180,7 @@ func (w Worker) Recover(ctx context.Context) error {
 			return err
 		}
 		err = w.rollback(ctx, project, &state, "recovery")
-		unlock()
+		warnCleanupFailure(fmt.Sprintf("project deploy lock release (%s)", project.Name), unlock())
 		if err != nil {
 			return err
 		}
@@ -213,7 +213,7 @@ func (w Worker) process(ctx context.Context, delivery Delivery) (Result, error) 
 	if err != nil {
 		return Result{}, err
 	}
-	defer unlock()
+	defer func() { warnCleanupFailure(fmt.Sprintf("project deploy lock release (%s)", project.Name), unlock()) }()
 	if _, exists, err := w.loadState(candidate.ID); err != nil {
 		return Result{}, err
 	} else if exists {
@@ -455,7 +455,11 @@ func (w Worker) saveState(state State) error {
 	return os.Chmod(w.statePath(state.CandidateID), 0o600)
 }
 
-func (w Worker) lock(project string) (func(), error) {
+// lock returns a release func that reports both the unlock and the close
+// error instead of discarding them: a project lock that fails to release can
+// make every subsequent delivery for that project think one is already
+// running (mirrors pipeline.ProcessLock.Release).
+func (w Worker) lock(project string) (func() error, error) {
 	path := filepath.Join(w.StateDir, "lock-"+project)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -469,10 +473,20 @@ func (w Worker) lock(project string) (func(), error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("deploy already running for project %q", project)
 	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
+	return func() error {
+		unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		closeErr := f.Close()
+		return errors.Join(unlockErr, closeErr)
 	}, nil
+}
+
+// warnCleanupFailure reports a best-effort release/cleanup failure to stderr
+// rather than discarding it; it never overrides the error the caller is
+// already returning for the operation itself.
+func warnCleanupFailure(what string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "vuelta: warning: %s: %v\n", what, err)
+	}
 }
 
 func (w Worker) notify(state State) {

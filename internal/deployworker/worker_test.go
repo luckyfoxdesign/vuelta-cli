@@ -136,7 +136,11 @@ func TestWorkerHonorsProjectLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unlock()
+	defer func() {
+		if err := unlock(); err != nil {
+			t.Errorf("unlock: %v", err)
+		}
+	}()
 	if _, err := w.Run(context.Background()); err == nil {
 		t.Fatal("expected an existing project lock to stop the worker")
 	}
