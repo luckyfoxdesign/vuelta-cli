@@ -49,17 +49,20 @@ func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup
 		return "", nil, fmt.Errorf("verify base SHA: %w: %s", verifyErr, strings.TrimSpace(string(out)))
 	}
 
-	dir, err = os.MkdirTemp("", "vuelta-sandbox-*")
+	// A separate local is load-bearing: error paths return `""` through the
+	// named result dir, which would otherwise empty the path the deferred
+	// cleanup removes.
+	sandboxDir, err := os.MkdirTemp("", "vuelta-sandbox-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("create sandbox dir: %w", err)
 	}
 	failed := true
 	defer func() {
 		if failed {
-			_ = os.RemoveAll(dir)
+			_ = os.RemoveAll(sandboxDir)
 		}
 	}()
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(sandboxDir, 0o700); err != nil {
 		return "", nil, fmt.Errorf("chmod sandbox dir: %w", err)
 	}
 
@@ -72,7 +75,12 @@ func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup
 	if err := archive.Start(); err != nil {
 		return "", nil, fmt.Errorf("start git archive: %w", err)
 	}
-	extractErr := extract(stdout, dir)
+	extractErr := extract(stdout, sandboxDir, defaultArchiveLimits)
+	if extractErr != nil {
+		// git may still be streaming a large archive into a pipe nobody
+		// reads anymore; without the kill, Wait can block forever.
+		_ = archive.Process.Kill()
+	}
 	archiveErr := archive.Wait()
 	if extractErr != nil {
 		return "", nil, extractErr
@@ -85,11 +93,38 @@ func Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup
 	}
 
 	failed = false
-	return dir, func() error { return os.RemoveAll(dir) }, nil
+	return sandboxDir, func() error { return os.RemoveAll(sandboxDir) }, nil
 }
 
-func extract(r io.Reader, root string) error {
+// archiveLimits bounds resource consumption while extracting an untrusted
+// git archive. Limits are internal policy: compiled in, never read from the
+// repository or user configuration, so a hostile tracked tree cannot raise
+// its own budget.
+type archiveLimits struct {
+	maxFileBytes  int64 // declared size of one regular file
+	maxTotalBytes int64 // sum of declared regular-file sizes
+	maxEntries    int   // tar members, including PAX metadata entries
+	maxPathDepth  int   // components in the cleaned relative path
+	maxPathBytes  int   // bytes in the raw member name
+}
+
+// defaultArchiveLimits comfortably fits normal supported repositories while
+// keeping a hostile archive from exhausting disk space or inodes.
+var defaultArchiveLimits = archiveLimits{
+	maxFileBytes:  512 << 20, // 512 MiB
+	maxTotalBytes: 2 << 30,   // 2 GiB
+	maxEntries:    200_000,
+	maxPathDepth:  32,
+	maxPathBytes:  512,
+}
+
+// extract materializes the tar stream under root, enforcing lim and failing
+// closed on malformed or inconsistent metadata. The caller removes root on
+// error.
+func extract(r io.Reader, root string, lim archiveLimits) error {
 	tr := tar.NewReader(r)
+	entries := 0
+	var totalBytes int64
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
@@ -98,21 +133,34 @@ func extract(r io.Reader, root string) error {
 		if err != nil {
 			return fmt.Errorf("read git archive: %w", err)
 		}
-		rel, err := safeArchivePath(h.Name)
+		entries++
+		if entries > lim.maxEntries {
+			return fmt.Errorf("archive exceeds %d entries", lim.maxEntries)
+		}
+		if h.Typeflag == tar.TypeXGlobalHeader || h.Typeflag == tar.TypeXHeader {
+			// Git may emit PAX metadata. archive/tar applies it to the next
+			// member; it is not a filesystem entry, but it still spends
+			// entry budget above.
+			continue
+		}
+		rel, err := safeArchivePath(h.Name, lim)
 		if err != nil {
 			return err
 		}
 		path := filepath.Join(root, rel)
 		switch h.Typeflag {
-		case tar.TypeXGlobalHeader, tar.TypeXHeader:
-			// Git may emit PAX metadata. archive/tar applies it to the next
-			// member; it is not a filesystem entry.
-			continue
 		case tar.TypeDir:
 			if err := os.MkdirAll(path, 0o700); err != nil {
 				return fmt.Errorf("create archive directory %s: %w", rel, err)
 			}
 		case tar.TypeReg:
+			if h.Size < 0 || h.Size > lim.maxFileBytes {
+				return fmt.Errorf("archive file %s declares %d bytes, per-file limit is %d", rel, h.Size, lim.maxFileBytes)
+			}
+			totalBytes += h.Size
+			if totalBytes > lim.maxTotalBytes {
+				return fmt.Errorf("archive exceeds %d total bytes", lim.maxTotalBytes)
+			}
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				return fmt.Errorf("create archive parent %s: %w", rel, err)
 			}
@@ -124,7 +172,10 @@ func extract(r io.Reader, root string) error {
 			if err != nil {
 				return fmt.Errorf("create archive file %s: %w", rel, err)
 			}
-			_, copyErr := io.Copy(f, tr)
+			n, copyErr := io.Copy(f, io.LimitReader(tr, h.Size))
+			if copyErr == nil && n != h.Size {
+				copyErr = fmt.Errorf("declared %d bytes, got %d", h.Size, n)
+			}
 			closeErr := f.Close()
 			if copyErr != nil {
 				return fmt.Errorf("extract archive file %s: %w", rel, copyErr)
@@ -138,7 +189,11 @@ func extract(r io.Reader, root string) error {
 	}
 }
 
-func safeArchivePath(name string) (string, error) {
+func safeArchivePath(name string, lim archiveLimits) (string, error) {
+	if len(name) > lim.maxPathBytes {
+		// Deliberately not echoing the name: errors must stay bounded.
+		return "", fmt.Errorf("archive path length %d exceeds %d bytes", len(name), lim.maxPathBytes)
+	}
 	if name == "" || filepath.IsAbs(name) {
 		return "", fmt.Errorf("archive path %q is invalid", name)
 	}
@@ -146,6 +201,9 @@ func safeArchivePath(name string) (string, error) {
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) ||
 		clean == ".git" || strings.HasPrefix(clean, ".git"+string(filepath.Separator)) {
 		return "", fmt.Errorf("archive path %q is not allowed", name)
+	}
+	if strings.Count(clean, string(filepath.Separator))+1 > lim.maxPathDepth {
+		return "", fmt.Errorf("archive path %q exceeds depth %d", name, lim.maxPathDepth)
 	}
 	return clean, nil
 }

@@ -1,6 +1,8 @@
 package sandbox
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -144,6 +146,142 @@ func TestPrepareRejectsTrackedSymlinkArchiveMember(t *testing.T) {
 	}
 	if dir != "" {
 		t.Fatalf("Prepare returned a sandbox path %q on failure", dir)
+	}
+}
+
+// addFile writes one regular-file member. The declared size may deliberately
+// disagree with the body: extract must fail closed on the metadata alone.
+func addFile(t *testing.T, tw *tar.Writer, name string, size int64, body []byte) {
+	t.Helper()
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: size}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractEnforcesArchiveLimits(t *testing.T) {
+	lim := archiveLimits{
+		maxFileBytes:  8,
+		maxTotalBytes: 12,
+		maxEntries:    4,
+		maxPathDepth:  3,
+		maxPathBytes:  32,
+	}
+	cases := []struct {
+		name    string
+		build   func(t *testing.T, tw *tar.Writer)
+		wantErr string
+	}{
+		{
+			name: "per-file size limit",
+			build: func(t *testing.T, tw *tar.Writer) {
+				addFile(t, tw, "big.bin", lim.maxFileBytes+1, nil)
+			},
+			wantErr: "per-file limit",
+		},
+		{
+			name: "total size limit",
+			build: func(t *testing.T, tw *tar.Writer) {
+				addFile(t, tw, "a.bin", 8, bytes.Repeat([]byte("x"), 8))
+				addFile(t, tw, "b.bin", 8, nil)
+			},
+			wantErr: "total bytes",
+		},
+		{
+			name: "entry count limit",
+			build: func(t *testing.T, tw *tar.Writer) {
+				for _, name := range []string{"a", "b", "c", "d", "e"} {
+					addFile(t, tw, name, 0, nil)
+				}
+			},
+			wantErr: "entries",
+		},
+		{
+			name: "path depth limit",
+			build: func(t *testing.T, tw *tar.Writer) {
+				addFile(t, tw, "a/b/c/d", 0, nil)
+			},
+			wantErr: "depth",
+		},
+		{
+			name: "path length limit",
+			build: func(t *testing.T, tw *tar.Writer) {
+				addFile(t, tw, strings.Repeat("a", lim.maxPathBytes+1), 0, nil)
+			},
+			wantErr: "path length",
+		},
+		{
+			name: "declared size exceeds actual data",
+			build: func(t *testing.T, tw *tar.Writer) {
+				addFile(t, tw, "short.bin", 8, []byte("abc"))
+			},
+			wantErr: "extract archive file short.bin",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			// The stream is left unterminated on purpose: every case must
+			// fail before extract needs a well-formed end-of-archive marker.
+			tc.build(t, tar.NewWriter(&buf))
+			err := extract(&buf, t.TempDir(), lim)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("extract error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPrepareRejectsDeepPathAndLeavesNoSandbox(t *testing.T) {
+	repoPath, _ := repo(t)
+	deep := filepath.Join(strings.Split(strings.TrimSuffix(strings.Repeat("d/", 33), "/"), "/")...)
+	if err := os.MkdirAll(filepath.Join(repoPath, deep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, deep, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repoPath, "add", ".")
+	git(t, repoPath, "commit", "-q", "-m", "deep path")
+	sha := strings.TrimSpace(git(t, repoPath, "rev-parse", "HEAD"))
+
+	// Redirect sandbox creation so leftovers are detectable in isolation.
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	dir, cleanup, err := Prepare(context.Background(), repoPath, sha)
+	if err == nil {
+		_ = cleanup()
+		t.Fatalf("Prepare accepted an over-deep archive path; sandbox at %s", dir)
+	}
+	if !strings.Contains(err.Error(), "depth") {
+		t.Fatalf("Prepare error = %v, want depth rejection", err)
+	}
+	if dir != "" {
+		t.Fatalf("Prepare returned a sandbox path %q on failure", dir)
+	}
+	leftovers, globErr := filepath.Glob(filepath.Join(tmp, "vuelta-sandbox-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("partial sandbox left behind: %v", leftovers)
+	}
+}
+
+func TestPrepareCleanupRemovesSandbox(t *testing.T) {
+	repoPath, sha := repo(t)
+	dir, cleanup, err := Prepare(context.Background(), repoPath, sha)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("sandbox still exists after cleanup: %v", err)
 	}
 }
 
