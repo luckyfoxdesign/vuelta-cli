@@ -72,6 +72,7 @@ make build                     # both cross-build targets
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
 - `internal/gitpath/` — defines platform-independent matching for Git repository paths.
+- `internal/localexec/` — is the process boundary for the explicit host-local tools. It resolves only allowlisted executables, gives every child a private state tree and minimal environment, and bounds all captured output.
 - `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.

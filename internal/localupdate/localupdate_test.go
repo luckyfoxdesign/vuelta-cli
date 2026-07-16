@@ -61,6 +61,50 @@ func TestScanRejectsManagerInsideProject(t *testing.T) {
 	}
 }
 
+func TestScanUsesPrivateMinimalEnvironmentAndCleansItUp(t *testing.T) {
+	t.Setenv("PATH", "/hostile/bin")
+	t.Setenv("HTTPS_PROXY", "http://hostile.invalid")
+	t.Setenv("NPM_CONFIG_USERCONFIG", "/hostile/npmrc")
+	t.Setenv("GITHUB_TOKEN", "must-not-leak")
+	root := npmProject(t)
+	var privateRoot string
+	s := testService(t, func(_ context.Context, binary, dir string, _ []string, env []string) (CommandResult, error) {
+		if !filepath.IsAbs(binary) || dir != root {
+			t.Fatalf("runner binary=%q dir=%q", binary, dir)
+		}
+		values := make(map[string]string, len(env))
+		for _, item := range env {
+			name, value, ok := strings.Cut(item, "=")
+			if !ok {
+				t.Fatalf("invalid environment entry %q", item)
+			}
+			values[name] = value
+		}
+		for _, forbidden := range []string{"HTTPS_PROXY", "NPM_CONFIG_USERCONFIG", "GITHUB_TOKEN"} {
+			if _, ok := values[forbidden]; ok {
+				t.Fatalf("hostile variable %s was inherited", forbidden)
+			}
+		}
+		if values["PATH"] == "/hostile/bin" {
+			t.Fatal("caller PATH was inherited")
+		}
+		privateRoot = filepath.Dir(values["HOME"])
+		for _, path := range []string{privateRoot, values["HOME"], values["XDG_CACHE_HOME"], values["XDG_CONFIG_HOME"], values["TMPDIR"]} {
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != 0o700 {
+				t.Fatalf("private path %q info=%v error=%v", path, info, err)
+			}
+		}
+		return CommandResult{Output: "{}"}, nil
+	})
+	if _, err := s.Scan(context.Background(), root, config.LocalPackagePolicy{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(privateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private invocation root still exists: %v", err)
+	}
+}
+
 func TestPipToolsScanRequiresSystemPipCompileAndPip(t *testing.T) {
 	root := t.TempDir()
 	writeLocalFile(t, root, "requirements.in", "example==1.0.0\n")

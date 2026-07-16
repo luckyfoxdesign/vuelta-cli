@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luckyfoxdesign/vuelta/internal/capio"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 )
 
@@ -167,7 +167,7 @@ func (s Service) Scan(ctx context.Context, path string, policy config.LocalPacka
 		}
 	}
 	args, ageUsed := scanArgs(project.Manager, policy.MinReleaseAgeDays, time.Now())
-	result, err := s.runner()(ctx, binary, project.Root, args, cleanEnvironment())
+	result, err := s.run(ctx, binary, project.Root, args)
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("run local %s scan: %w", project.Manager, err)
 	}
@@ -232,7 +232,7 @@ func (s Service) Update(ctx context.Context, path string, policy config.LocalPac
 		}
 		for _, candidate := range selected {
 			args := updateArgs(copyProject.Manager, candidate, options.AllowScripts)
-			result, runErr := s.runner()(ctx, binary, copyProject.Root, args, cleanEnvironment())
+			result, runErr := s.run(ctx, binary, copyProject.Root, args)
 			if runErr != nil {
 				return fmt.Errorf("run local %s update for %s: %w", copyProject.Manager, candidate.Name, runErr)
 			}
@@ -260,7 +260,7 @@ func (s Service) scanProject(ctx context.Context, project Project, binary string
 		}
 	}
 	args, ageUsed := scanArgs(project.Manager, policy.MinReleaseAgeDays, time.Now())
-	result, err := s.runner()(ctx, scanBinary, project.Root, args, cleanEnvironment())
+	result, err := s.run(ctx, scanBinary, project.Root, args)
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("run local %s scan: %w", project.Manager, err)
 	}
@@ -450,7 +450,7 @@ func atomicWrite(path string, data []byte, mode fs.FileMode) error {
 
 func (s Service) verifyConsistent(ctx context.Context, binary string, project Project, allowScripts bool) error {
 	args := consistencyArgs(project.Manager, allowScripts)
-	result, err := s.runner()(ctx, binary, project.Root, args, cleanEnvironment())
+	result, err := s.run(ctx, binary, project.Root, args)
 	if err != nil {
 		return fmt.Errorf("check manifest and lock consistency: %w", err)
 	}
@@ -469,19 +469,19 @@ func (s Service) systemManager(project Project) (string, error) {
 }
 
 func (s Service) systemBinary(root, name string) (string, error) {
-	path, err := s.lookPath()(name)
+	return localexec.Resolve(root, name, s.lookPath())
+}
+
+func (s Service) run(ctx context.Context, binary, dir string, args []string) (CommandResult, error) {
+	environment, err := cleanEnvironment()
 	if err != nil {
-		return "", fmt.Errorf("local %s manager is not available on the system PATH: %w", name, err)
+		return CommandResult{}, err
 	}
-	canonical, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve local %s manager: %w", name, err)
+	result, runErr := s.runner()(ctx, binary, dir, args, environment.Variables())
+	if cleanupErr := environment.Close(); cleanupErr != nil {
+		return result, errors.Join(runErr, fmt.Errorf("remove private local-tool state: %w", cleanupErr))
 	}
-	rel, err := filepath.Rel(root, canonical)
-	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("local %s manager resolves inside the target project and is not allowed", name)
-	}
-	return canonical, nil
+	return result, runErr
 }
 
 func (s Service) runner() Runner {
@@ -689,12 +689,8 @@ func safeText(value string) string {
 	}, value)
 }
 
-func cleanEnvironment() []string {
-	path := os.Getenv("PATH")
-	if path == "" {
-		path = "/usr/local/bin:/usr/bin:/bin"
-	}
-	return []string{"PATH=" + path, "HOME=" + os.TempDir(), "NO_COLOR=1"}
+func cleanEnvironment() (*localexec.Environment, error) {
+	return localexec.NewEnvironment()
 }
 
 // commandOutputTailBytes bounds host memory spent on package-manager output
@@ -702,30 +698,9 @@ func cleanEnvironment() []string {
 // a deterministic marker records any drop.
 const commandOutputTailBytes = 128 << 10
 
-// commandWaitDelay bounds how long Wait may block on inherited pipes after
-// the context is cancelled.
-const commandWaitDelay = 10 * time.Second
-
 func runCommand(ctx context.Context, binary, dir string, args, env []string) (CommandResult, error) {
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	cmd.WaitDelay = commandWaitDelay
-	out := capio.NewTail(commandOutputTailBytes)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	err := cmd.Run()
-	if err == nil {
-		return CommandResult{Output: out.String()}, nil
-	}
-	if ctx.Err() != nil {
-		return CommandResult{}, ctx.Err()
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return CommandResult{Output: out.String(), ExitCode: exitErr.ExitCode()}, nil
-	}
-	return CommandResult{}, err
+	result, err := localexec.RunTail(ctx, binary, dir, args, env, commandOutputTailBytes)
+	return CommandResult{Output: string(result.Output), ExitCode: result.ExitCode}, err
 }
 
 func defaultLockPath(root string) (string, error) {

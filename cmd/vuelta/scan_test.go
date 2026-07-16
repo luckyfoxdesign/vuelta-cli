@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -116,6 +118,98 @@ func TestValidateScanExecutionAllowsLocalOnlyForAdhoc(t *testing.T) {
 	}
 	if err := validateScanExecution([]scanTarget{{origin: updatesnapshot.OriginWorkspace, name: "api"}}, local); err == nil || !strings.Contains(err.Error(), "container-only") {
 		t.Fatalf("workspace local error = %v", err)
+	}
+}
+
+func TestLocalScannerUsesCanonicalBinaryAndPrivateEnvironment(t *testing.T) {
+	t.Setenv("PATH", "/hostile/bin")
+	t.Setenv("HTTPS_PROXY", "http://hostile.invalid")
+	t.Setenv("TRIVY_CONFIG", "/hostile/trivy.yaml")
+	t.Setenv("GITHUB_TOKEN", "must-not-leak")
+	project := t.TempDir()
+	toolRoot := t.TempDir()
+	target := filepath.Join(toolRoot, "trusted-trivy")
+	if err := os.WriteFile(target, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(toolRoot, "trivy")
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		t.Fatal(err)
+	}
+	wantBinary, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var privateRoot string
+	command := localScannerCommandWith(
+		func(name string) (string, error) {
+			if name != "trivy" {
+				t.Fatalf("resolver name = %q", name)
+			}
+			return link, nil
+		},
+		func(_ context.Context, binary, dir string, args, env []string, stdoutBytes, stderrBytes int) (localexec.Result, error) {
+			if binary != wantBinary || !filepath.IsAbs(binary) || dir != project {
+				t.Fatalf("runner binary=%q dir=%q", binary, dir)
+			}
+			if len(args) == 0 || args[len(args)-1] != project {
+				t.Fatalf("scanner args = %q", args)
+			}
+			if stdoutBytes != localScannerStdoutMaxBytes || stderrBytes != localScannerStderrTailMaxBytes {
+				t.Fatalf("scanner caps = %d/%d", stdoutBytes, stderrBytes)
+			}
+			values := make(map[string]string, len(env))
+			for _, item := range env {
+				name, value, ok := strings.Cut(item, "=")
+				if !ok {
+					t.Fatalf("invalid environment entry %q", item)
+				}
+				values[name] = value
+			}
+			for _, forbidden := range []string{"HTTPS_PROXY", "TRIVY_CONFIG", "GITHUB_TOKEN"} {
+				if _, ok := values[forbidden]; ok {
+					t.Fatalf("hostile variable %s was inherited", forbidden)
+				}
+			}
+			if values["PATH"] == "/hostile/bin" {
+				t.Fatal("caller PATH was inherited")
+			}
+			privateRoot = filepath.Dir(values["HOME"])
+			for _, path := range []string{privateRoot, values["HOME"], values["XDG_CACHE_HOME"], values["XDG_CONFIG_HOME"], values["TMPDIR"]} {
+				info, statErr := os.Stat(path)
+				if statErr != nil || info.Mode().Perm() != 0o700 {
+					t.Fatalf("private path %q info=%v error=%v", path, info, statErr)
+				}
+			}
+			return localexec.Result{Output: []byte("{}")}, nil
+		},
+	)
+	output, err := command(context.Background(), project, "trivy", "fs", "/project")
+	if err != nil || string(output) != "{}" {
+		t.Fatalf("scanner output=%q error=%v", output, err)
+	}
+	if _, err := os.Stat(privateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private invocation root still exists: %v", err)
+	}
+}
+
+func TestPreflightRejectsWritableLocalScanner(t *testing.T) {
+	project := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "trivy")
+	if err := os.WriteFile(binary, []byte("test executable"), 0o722); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(binary, 0o722); err != nil {
+		t.Fatal(err)
+	}
+	err := preflightScanEnvironmentWith(
+		config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy"}},
+		[]scanTarget{{path: project, origin: updatesnapshot.OriginAdhoc}},
+		scanOptions{execution: "local", only: "vulnerabilities"},
+		func(string) (string, error) { return binary, nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Fatalf("preflight error = %v", err)
 	}
 }
 

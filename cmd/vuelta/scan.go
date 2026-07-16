@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
+	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	exitEnv      = 4
-	exitFindings = 5
+	exitEnv                        = 4
+	exitFindings                   = 5
+	localScannerStdoutMaxBytes     = 64 << 20
+	localScannerStderrTailMaxBytes = 64 << 10
 )
 
 type scanTarget struct {
@@ -382,6 +384,10 @@ func effectiveMinReleaseAge(value string, configuredDays, policyDays int) (time.
 }
 
 func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options scanOptions) error {
+	return preflightScanEnvironmentWith(cfg, targets, options, nil)
+}
+
+func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, options scanOptions, resolve localexec.Resolver) error {
 	if options.execution == "container" {
 		if _, err := dockerexec.Default().Path(); err != nil {
 			return errors.New("docker is required for container execution; for an adhoc directory, explicitly choose --execution local")
@@ -401,8 +407,10 @@ func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options s
 		if cfg.VulnScan.DependencySource != "trivy" && cfg.VulnScan.DependencySource != "osv-scanner" {
 			return fmt.Errorf("local vulnerability scanning does not support %q", cfg.VulnScan.DependencySource)
 		}
-		if _, err := exec.LookPath(cfg.VulnScan.DependencySource); err != nil {
-			return fmt.Errorf("requested vulnerability scanner %q is not available on PATH", cfg.VulnScan.DependencySource)
+		for _, target := range targets {
+			if _, err := localexec.Resolve(target.path, cfg.VulnScan.DependencySource, resolve); err != nil {
+				return fmt.Errorf("requested vulnerability scanner %q is unavailable or untrusted: %w", cfg.VulnScan.DependencySource, err)
+			}
 		}
 	}
 	return nil
@@ -513,23 +521,40 @@ func scanVulnerabilities(ctx context.Context, cfg config.Config, target scanTarg
 }
 
 func localScannerCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
-	binary, err := exec.LookPath(name)
-	if err != nil {
-		return nil, fmt.Errorf("scanner %s is not available on PATH", name)
-	}
-	localArgs := append([]string(nil), args...)
-	for index, argument := range localArgs {
-		if argument == "/project" {
-			localArgs[index] = dir
+	return localScannerCommandWith(nil, localexec.RunStructured)(ctx, dir, name, args...)
+}
+
+type localScannerRunner func(context.Context, string, string, []string, []string, int, int) (localexec.Result, error)
+
+func localScannerCommandWith(resolve localexec.Resolver, run localScannerRunner) vulnscan.Command {
+	return func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		binary, err := localexec.Resolve(dir, name, resolve)
+		if err != nil {
+			return nil, fmt.Errorf("resolve local scanner %s: %w", name, err)
 		}
+		environment, err := localexec.NewEnvironment()
+		if err != nil {
+			return nil, fmt.Errorf("prepare local scanner %s: %w", name, err)
+		}
+
+		localArgs := append([]string(nil), args...)
+		for index, argument := range localArgs {
+			if argument == "/project" {
+				localArgs[index] = dir
+			}
+		}
+		result, err := run(ctx, binary, dir, localArgs, environment.Variables(), localScannerStdoutMaxBytes, localScannerStderrTailMaxBytes)
+		if cleanupErr := environment.Close(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove private local-scanner state: %w", cleanupErr))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("run local %s scanner: %w: %s", name, err, strings.TrimSpace(string(result.Stderr)))
+		}
+		if result.ExitCode != 0 {
+			return nil, fmt.Errorf("run local %s scanner: exit %d: %s", name, result.ExitCode, strings.TrimSpace(string(result.Stderr)))
+		}
+		return result.Output, nil
 	}
-	command := exec.CommandContext(ctx, binary, localArgs...)
-	command.Dir = dir
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("run local %s scanner: %w: %s", name, err, strings.TrimSpace(string(output)))
-	}
-	return output, nil
 }
 
 func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, minAge time.Duration) ([]updatesnapshot.Candidate, map[string]string, string, bool, error) {
