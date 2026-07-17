@@ -24,6 +24,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
+	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -115,6 +116,12 @@ func executeUpdate(args []string) error {
 		selected, selectErr := workspaceForSnapshot(*cfg, snapshot)
 		if selectErr != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", selectErr), "Run vuelta scan again")
+		}
+		if selected.Verification.State != config.VerificationReady {
+			return updateTopLevelFailure(options.jsonOutput, "verification_required", fail(exitConfig, "project %q is scan-only; update and update --dry-run are disabled", config.WorkspaceName(selected)), "Configure a ready versioned verification profile and run vuelta scan again")
+		}
+		if validationErr := testrunner.ValidateProfile(selected.Path, selected.Verification); validationErr != nil {
+			return updateTopLevelFailure(options.jsonOutput, "verification_invalid", fail(exitConfig, "%v", validationErr), "Fix the verification profile and run vuelta scan again")
 		}
 		if validateErr := updatesnapshot.ValidateForWorkspace(context.Background(), snapshot, *cfg, selected, time.Now()); validateErr != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", validateErr), "Run vuelta scan again")
@@ -240,14 +247,14 @@ func updateJSONRequested(args []string) bool {
 func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspace, project localupdate.Project, cfg config.Config, options updateOptions) updatePlan {
 	target := snapshot.AdhocPath
 	files := []string{project.Manifest, project.Lock}
-	tests := []string{"disabled: adhoc snapshots have no trusted TestProfile"}
+	tests := []string{"disabled: adhoc snapshots have no trusted verification profile"}
 	checks := []string{"snapshot identity and input hashes", "policy identity", "candidate admissibility", "private-copy changed-file allowlist"}
 	commit, push := false, "disabled"
 	if workspace != nil {
 		target = config.WorkspaceName(*workspace)
 		files = intendedWorkspaceFiles(snapshot, *workspace)
-		tests = []string{fmt.Sprintf("docker compose: %s/%s", workspace.Test.ComposeFile, workspace.Test.Service)}
-		checks = []string{"snapshot identity and input hashes", "policy identity", "candidate admissibility", "security baseline and post-check", "configured tests"}
+		tests = config.VerificationPlan(*workspace)
+		checks = []string{"snapshot identity and input hashes", "policy identity", "verification profile identity", "candidate admissibility", "security baseline and post-check", "configured verification"}
 		commit = !options.dryRun
 		push = cfg.Git.PushMode
 		if options.dryRun {
@@ -283,6 +290,7 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 			"lifecycle_scripts":   scripts,
 			"project_config":      fmt.Sprintf("scan decision: %t", snapshot.Gates.AllowProjectConfig),
 			"minimum_release_age": snapshot.Gates.MinReleaseAge,
+			"verification_hash":   snapshot.VerificationHash,
 			"release_age":         releaseAge,
 			"execution":           options.execution,
 			"durable_writes":      writeGate,
@@ -387,7 +395,7 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		result.Push = pipelineResult.Branch
 	}
 	if pipelineResult.Status == "failed" || pipelineResult.Status == "blocked" {
-		if pipelineResult.Reason == "tests failed" || strings.HasPrefix(pipelineResult.Reason, "test run") {
+		if pipelineResult.Reason == "verification failed" || strings.HasPrefix(pipelineResult.Reason, "verification run") {
 			result.Tests = "failed"
 		}
 		switch pipelineResult.Reason {

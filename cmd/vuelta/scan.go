@@ -59,6 +59,7 @@ type scanResult struct {
 	Tools           []scanToolResult           `json:"tools"`
 	InputCategories []string                   `json:"input_categories"`
 	Warnings        []string                   `json:"warnings"`
+	Verification    []string                   `json:"verification"`
 	Error           *jsonCommandError          `json:"error,omitempty"`
 }
 
@@ -67,6 +68,7 @@ type scanSummary struct {
 	Failed          int `json:"failed"`
 	Ready           int `json:"ready"`
 	Clean           int `json:"clean"`
+	ScanOnly        int `json:"scan_only"`
 	Candidates      int `json:"candidates"`
 	Vulnerabilities int `json:"vulnerabilities"`
 }
@@ -95,6 +97,9 @@ func executeScan(args []string) error {
 	}
 	warnings := configWarnings(cfg)
 	if validateErr := cfg.Validate(); validateErr != nil {
+		return scanTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", validateErr), "Run vuelta config validate for details")
+	}
+	if validateErr := validateVerificationPolicies(*cfg); validateErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", validateErr), "Run vuelta config validate for details")
 	}
 	targets, targetErr := resolveScanTargets(*cfg, options, currentDirectory)
@@ -422,7 +427,14 @@ func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, optio
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, InputCategories: []string{}, Warnings: []string{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{},
+	}
+	if target.workspace != nil {
+		result.Verification = config.VerificationPlan(*target.workspace)
+		if target.workspace.Verification.State == config.VerificationScanOnly {
+			result.Status = config.VerificationScanOnly
+			result.Warnings = append(result.Warnings, "updates and update --dry-run are disabled until a ready verification profile is configured")
+		}
 	}
 	identityConfig := cfg
 	var identityWorkspace config.Workspace
@@ -500,12 +512,20 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	if len(result.Candidates) == 0 {
 		return result
 	}
+	if target.workspace != nil && target.workspace.Verification.State == config.VerificationScanOnly {
+		return result
+	}
 
 	configHash := "adhoc"
+	verificationHash := ""
 	if target.workspace != nil {
 		configHash, err = cfg.SnapshotPolicyHash(*target.workspace)
 		if err != nil {
 			return failedScanResult(result, "snapshot_failed", err, "Validate the project configuration")
+		}
+		verificationHash, err = config.VerificationProfileHash(*target.workspace)
+		if err != nil {
+			return failedScanResult(result, "snapshot_failed", err, "Validate the verification profile")
 		}
 	}
 	gates := updatesnapshot.ScanGates{AllowProjectConfig: options.allowProjectConfig, MinReleaseAge: minAge.String()}
@@ -525,7 +545,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		snapshot, err = updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), target.name, updatesnapshot.WorkspaceIdentity{
 			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
 			Input: updatesnapshot.InputIdentity{Stages: identity.InputStages, ManifestHash: identity.InputManifestHash, Hashes: identity.InputHashes},
-		}, policyIdentity, gates, configHash, effectiveHash, result.Candidates)
+		}, policyIdentity, gates, configHash, verificationHash, effectiveHash, result.Candidates)
 	} else {
 		identity, identityErr := adhocInputIdentity(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
@@ -805,6 +825,9 @@ func summarizeScan(results []scanResult) scanSummary {
 		case "ready":
 			summary.Succeeded++
 			summary.Ready++
+		case config.VerificationScanOnly:
+			summary.Succeeded++
+			summary.ScanOnly++
 		default:
 			summary.Succeeded++
 			summary.Clean++
@@ -822,6 +845,9 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 		fmt.Printf("%s: %s (%d vulnerabilities, %d package candidates)\n", label, result.Status, len(result.Vulnerabilities), len(result.Candidates))
 		if len(result.InputCategories) > 0 {
 			fmt.Printf("  scan inputs: %s\n", strings.Join(result.InputCategories, ", "))
+		}
+		for _, step := range result.Verification {
+			fmt.Printf("  verification: %s\n", step)
 		}
 		for _, finding := range result.Vulnerabilities {
 			fmt.Printf("  vulnerability: %s\n", finding)

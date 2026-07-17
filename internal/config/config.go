@@ -171,14 +171,33 @@ type ProductionProject struct {
 	SmokeURL        string `yaml:"smoke_url"`
 }
 
-// TestProfile is a structured, allowlisted test command — never a raw shell string.
-type TestProfile struct {
-	ComposeFile string   `yaml:"compose_file"`
-	Service     string   `yaml:"service"`
-	RunArgs     []string `yaml:"run_args"`
-	// TimeoutMinutes bounds the test run (part B §7 step 6); 0 means the
-	// pipeline's default of 15 minutes.
-	TimeoutMinutes int `yaml:"timeout_minutes,omitempty"`
+const (
+	VerificationVersion  = 1
+	VerificationReady    = "ready"
+	VerificationScanOnly = "scan_only"
+)
+
+// VerificationProfile is the versioned, explicit update gate for one
+// workspace. A scan-only workspace is intentionally unable to create an
+// update snapshot. Ready profiles contain only bounded argv commands; Compose
+// service commands are never inherited as verification commands.
+type VerificationProfile struct {
+	Version int                `yaml:"version"`
+	State   string             `yaml:"state"`
+	Steps   []VerificationStep `yaml:"steps,omitempty"`
+}
+
+// VerificationStep is one containerized verification command. Command is an
+// argv vector, not a shell string. SuccessExitCodes makes success semantics
+// explicit instead of relying on a runner default.
+type VerificationStep struct {
+	Name             string   `yaml:"name"`
+	ComposeFile      string   `yaml:"compose_file"`
+	Service          string   `yaml:"service"`
+	Command          []string `yaml:"command"`
+	TimeoutSeconds   int      `yaml:"timeout_seconds"`
+	Required         bool     `yaml:"required"`
+	SuccessExitCodes []int    `yaml:"success_exit_codes"`
 }
 
 // DockerImagesSpec restricts docker-stack analysis to explicit project-relative files.
@@ -189,13 +208,13 @@ type DockerImagesSpec struct {
 }
 
 type Workspace struct {
-	Name           string      `yaml:"name,omitempty"`
-	Path           string      `yaml:"path"`
-	Stack          string      `yaml:"stack"`
-	PackageManager string      `yaml:"package_manager"`
-	Test           TestProfile `yaml:"test"`
-	Branch         string      `yaml:"branch"`
-	Remote         string      `yaml:"remote"`
+	Name           string              `yaml:"name,omitempty"`
+	Path           string              `yaml:"path"`
+	Stack          string              `yaml:"stack"`
+	PackageManager string              `yaml:"package_manager"`
+	Verification   VerificationProfile `yaml:"verification"`
+	Branch         string              `yaml:"branch"`
+	Remote         string              `yaml:"remote"`
 	// AllowedChangedPaths overrides the legacy config-wide Git allowlist for
 	// this workspace. Patterns are normalized repository-relative Git paths:
 	// slash is the only separator and *, ?, and [] never match across a slash.
@@ -293,7 +312,7 @@ func Load(path string) (*Config, error) {
 // checking as Load, without reading from the filesystem.
 func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
-	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a test profile
+	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a verification profile
 
 	// Security-sensitive autofix defaults are safe even when an older config
 	// omits the whole block: it stays disabled and, if later enabled, grants no
@@ -327,8 +346,35 @@ func (c *Config) WorkspaceWarnings() []string {
 		if ws.Name == "" {
 			warnings = append(warnings, fmt.Sprintf("workspaces[%d] has no name; using %q from the path without rewriting the config", i, WorkspaceName(ws)))
 		}
+		if ws.Verification.State == VerificationScanOnly {
+			warnings = append(warnings, fmt.Sprintf("project %q is scan-only; configure verification.steps before running update or update --dry-run", WorkspaceName(ws)))
+		}
 	}
 	return warnings
+}
+
+// VerificationProfileHash returns the stable identity stored in update
+// snapshots. It deliberately excludes the workspace path and update policy so
+// profile drift can be diagnosed independently.
+func VerificationProfileHash(ws Workspace) (string, error) {
+	data, err := json.Marshal(ws.Verification)
+	if err != nil {
+		return "", fmt.Errorf("encode verification profile: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum), nil
+}
+
+// VerificationPlan returns a concise, non-shell rendering for CLI output.
+func VerificationPlan(ws Workspace) []string {
+	if ws.Verification.State == VerificationScanOnly {
+		return []string{"scan_only: updates are disabled until verification steps are configured"}
+	}
+	plan := make([]string, 0, len(ws.Verification.Steps))
+	for _, step := range ws.Verification.Steps {
+		plan = append(plan, fmt.Sprintf("%s: %s/%s argv=%q timeout=%ds required=%t success=%v", step.Name, step.ComposeFile, step.Service, step.Command, step.TimeoutSeconds, step.Required, step.SuccessExitCodes))
+	}
+	return plan
 }
 
 // AllowedChangedPaths returns the workspace-scoped allowlist when present,
@@ -707,19 +753,7 @@ func validateWorkspace(i int, ws Workspace) []error {
 		errs = append(errs, fmt.Errorf("%s.package_manager: %q is not valid for stack %q", label, ws.PackageManager, ws.Stack))
 	}
 
-	if ws.Test.ComposeFile == "" {
-		errs = append(errs, fmt.Errorf("%s.test.compose_file: required", label))
-	}
-	if ws.Test.Service == "" {
-		errs = append(errs, fmt.Errorf("%s.test.service: required", label))
-	} else if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`).MatchString(ws.Test.Service) {
-		errs = append(errs, fmt.Errorf("%s.test.service: must be a compose service name", label))
-	}
-	for _, arg := range ws.Test.RunArgs {
-		if arg != "--rm" && arg != "--no-TTY" {
-			errs = append(errs, fmt.Errorf("%s.test.run_args: %q is not allowlisted", label, arg))
-		}
-	}
+	errs = append(errs, validateVerificationProfile(label, ws)...)
 
 	if ws.Stack == StackDocker && ws.DockerImages == nil {
 		errs = append(errs, fmt.Errorf("%s.docker_images: required for docker stack CVE scanning", label))
@@ -742,6 +776,192 @@ func validateWorkspace(i int, ws Workspace) []error {
 	}
 
 	return errs
+}
+
+func validateVerificationProfile(label string, ws Workspace) []error {
+	profile := ws.Verification
+	var errs []error
+	if profile.Version != VerificationVersion {
+		return []error{fmt.Errorf("%s.verification.version: must be %d", label, VerificationVersion)}
+	}
+	switch profile.State {
+	case VerificationScanOnly:
+		if len(profile.Steps) != 0 {
+			errs = append(errs, fmt.Errorf("%s.verification.steps: must be empty for scan_only", label))
+		}
+		return errs
+	case VerificationReady:
+		if len(profile.Steps) == 0 {
+			return []error{fmt.Errorf("%s.verification.steps: at least one explicit step is required for ready", label)}
+		}
+		if len(profile.Steps) > 16 {
+			return []error{fmt.Errorf("%s.verification.steps: at most 16 steps are allowed", label)}
+		}
+	default:
+		return []error{fmt.Errorf("%s.verification.state: must be ready or scan_only", label)}
+	}
+
+	seenNames := make(map[string]bool, len(profile.Steps))
+	for index, step := range profile.Steps {
+		stepLabel := fmt.Sprintf("%s.verification.steps[%d]", label, index)
+		if !projectNamePattern.MatchString(step.Name) || seenNames[step.Name] {
+			errs = append(errs, fmt.Errorf("%s.name: must be a unique verification step name", stepLabel))
+		}
+		seenNames[step.Name] = true
+		if !projectNamePattern.MatchString(step.Service) {
+			errs = append(errs, fmt.Errorf("%s.service: must be a Compose service name", stepLabel))
+		}
+		if err := validateVerificationCommand(step.Command); err != nil {
+			errs = append(errs, fmt.Errorf("%s.command: %w", stepLabel, err))
+		}
+		if ws.Stack == StackNode && len(step.Command) > 0 && (step.Command[0] == "npm" || step.Command[0] == "pnpm" || step.Command[0] == "bun") && step.Command[0] != ws.PackageManager {
+			errs = append(errs, fmt.Errorf("%s.command: package factory %q does not match workspace package_manager %q", stepLabel, step.Command[0], ws.PackageManager))
+		}
+		if err := validatePackageVerificationCommand(ws.Path, step.Command); err != nil {
+			errs = append(errs, fmt.Errorf("%s.command: %w", stepLabel, err))
+		}
+		if step.TimeoutSeconds <= 0 || step.TimeoutSeconds > int((2*time.Hour)/time.Second) {
+			errs = append(errs, fmt.Errorf("%s.timeout_seconds: must be between 1 and 7200", stepLabel))
+		}
+		if err := validateSuccessExitCodes(step.SuccessExitCodes); err != nil {
+			errs = append(errs, fmt.Errorf("%s.success_exit_codes: %w", stepLabel, err))
+		}
+		if err := validateVerificationComposeFile(ws.Path, step.ComposeFile, step.Service); err != nil {
+			errs = append(errs, fmt.Errorf("%s.compose_file: %w", stepLabel, err))
+		}
+	}
+	return errs
+}
+
+func validateVerificationCommand(command []string) error {
+	if len(command) == 0 {
+		return errors.New("explicit argv is required; inherited service commands are not allowed")
+	}
+	if len(command) > 128 {
+		return errors.New("argv exceeds 128 entries")
+	}
+	unsafePrograms := map[string]bool{"sh": true, "bash": true, "zsh": true, "fish": true, "cmd": true, "cmd.exe": true, "powershell": true, "pwsh": true}
+	unsafeArguments := map[string]bool{"dev": true, "serve": true, "server": true, "start": true, "preview": true, "watch": true, "--watch": true, "-w": true, "--interactive": true, "--tty": true}
+	total := 0
+	for index, arg := range command {
+		total += len(arg)
+		if arg == "" || strings.ContainsAny(arg, "\x00\r\n") {
+			return fmt.Errorf("argv[%d] must be a non-empty single-line value", index)
+		}
+		if len(arg) > 4096 || total > 64<<10 {
+			return errors.New("argv exceeds the configured size limit")
+		}
+		lower := strings.ToLower(arg)
+		if index == 0 && unsafePrograms[filepath.Base(lower)] {
+			return errors.New("shell executables are not allowed")
+		}
+		if unsafeArguments[lower] || strings.HasPrefix(lower, "--watch=") {
+			return fmt.Errorf("interactive, dev, preview, and watch arguments are not allowed (%s)", lower)
+		}
+	}
+	return nil
+}
+
+// ValidateVerificationCommand exposes the same fail-closed argv policy to
+// declarative onboarding discovery without executing project code.
+func ValidateVerificationCommand(command []string) error {
+	return validateVerificationCommand(command)
+}
+
+func validatePackageVerificationCommand(root string, command []string) error {
+	if len(command) == 0 || (command[0] != "npm" && command[0] != "pnpm" && command[0] != "bun") {
+		return nil
+	}
+	script := ""
+	if command[0] == "npm" && len(command) >= 2 && command[1] == "test" {
+		script = "test"
+	} else if len(command) >= 3 && command[1] == "run" {
+		script = command[2]
+	}
+	if script == "" {
+		return nil
+	}
+	path := filepath.Join(root, "package.json")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.New("package.json is required for the selected package verification factory")
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("package.json must be a non-symlink regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read package verification metadata: %w", err)
+	}
+	var document struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return fmt.Errorf("parse package verification metadata: %w", err)
+	}
+	body, ok := document.Scripts[script]
+	if !ok || !safePackageVerificationScript(body) {
+		return fmt.Errorf("package script %q is missing or contains shell, dev, preview, watch, or interactive behavior", script)
+	}
+	return nil
+}
+
+func safePackageVerificationScript(body string) bool {
+	if body == "" || strings.ContainsAny(body, "\r\n;&|`$><") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "--watch") || strings.Contains(lower, " -w") {
+		return false
+	}
+	unsafeWord := regexp.MustCompile(`(?i)(^|[^a-z0-9_-])(dev|watch|serve|server|start|preview|interactive)([^a-z0-9_-]|$)`)
+	return !unsafeWord.MatchString(body)
+}
+
+func validateSuccessExitCodes(codes []int) error {
+	if len(codes) == 0 {
+		return errors.New("at least one explicit exit code is required")
+	}
+	seen := make(map[int]bool, len(codes))
+	for _, code := range codes {
+		if code < 0 || code > 125 || seen[code] {
+			return errors.New("codes must be unique values between 0 and 125")
+		}
+		seen[code] = true
+	}
+	return nil
+}
+
+func validateVerificationComposeFile(root, name, service string) error {
+	if name == "" || filepath.IsAbs(name) {
+		return errors.New("must be a project-relative regular file")
+	}
+	cleaned := filepath.Clean(name)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return errors.New("must stay inside the workspace")
+	}
+	path := filepath.Join(root, cleaned)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("cannot inspect selected Compose file: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("must be a non-symlink regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("cannot read selected Compose file: %w", err)
+	}
+	var document struct {
+		Services map[string]yaml.Node `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return fmt.Errorf("cannot parse selected Compose file: %w", err)
+	}
+	if _, ok := document.Services[service]; !ok {
+		return fmt.Errorf("service %q does not exist", service)
+	}
+	return nil
 }
 
 func canonicalWorkspacePath(path string) (string, error) {

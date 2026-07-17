@@ -112,18 +112,65 @@ func TestValidateProductionWorkerRejectsUnsafeOrIncompleteAdapter(t *testing.T) 
 	}
 }
 
-func TestValidateRejectsUnsafeTestRunArgument(t *testing.T) {
+func TestValidateRejectsUnsafeVerificationCommand(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg := Config{Workspaces: []Workspace{{
 		Path: dir, Stack: StackDocker,
-		Test:         TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test", RunArgs: []string{"--privileged"}},
+		Verification: VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
+			Name: "test", ComposeFile: "docker-compose.test.yml", Service: "test", Command: []string{"npm", "run", "dev"},
+			TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+		}}},
 		DockerImages: &DockerImagesSpec{Files: []string{}, RuntimeImages: []string{"registry.example/test@sha256:" + strings.Repeat("a", 64)}},
 	}}, Git: GitConfig{AllowedChangedPaths: []string{"package-lock.json"}}}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "run_args") {
-		t.Fatalf("expected run_args rejection, got %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "dev") {
+		t.Fatalf("expected unsafe verification command rejection, got %v", err)
+	}
+}
+
+func TestPackageVerificationCommandRejectsScriptDriftToWatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePackageVerificationCommand(dir, []string{"npm", "test"}); err != nil {
+		t.Fatalf("safe test script rejected: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"vitest --watch"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePackageVerificationCommand(dir, []string{"npm", "test"}); err == nil || !strings.Contains(err.Error(), "watch") {
+		t.Fatalf("watch drift was not rejected: %v", err)
+	}
+}
+
+func TestVerificationProfileIdentityChangesWithCommandAndTimeout(t *testing.T) {
+	workspace := Workspace{Verification: VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
+		Name: "test", ComposeFile: "compose.yml", Service: "verify", Command: []string{"go", "test", "./..."},
+		TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+	}}}}
+	first, err := VerificationProfileHash(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace.Verification.Steps[0].TimeoutSeconds++
+	second, err := VerificationProfileHash(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("timeout drift did not change verification identity")
+	}
+	workspace.Verification.Steps[0].Command = []string{"go", "build", "./..."}
+	third, err := VerificationProfileHash(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == third {
+		t.Fatal("command drift did not change verification identity")
 	}
 }
 
@@ -214,7 +261,7 @@ func TestValidateRejectsDuplicateWorkspaceNamesAndCanonicalPaths(t *testing.T) {
 	}
 	workspace := Workspace{
 		Name: "api", Path: project, Stack: StackNode, PackageManager: "npm",
-		Test:                TestProfile{ComposeFile: "compose.yml", Service: "test", RunArgs: []string{"--rm"}},
+		Verification:        VerificationProfile{Version: VerificationVersion, State: VerificationScanOnly},
 		AllowedChangedPaths: []string{"package.json"},
 	}
 	cfg := Config{Workspaces: []Workspace{workspace, workspace}}

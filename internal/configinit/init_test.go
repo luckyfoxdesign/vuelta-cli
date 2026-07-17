@@ -68,9 +68,9 @@ func TestBuildRejectsPathsOutsideSelectedProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = discovery.Build(Input{Branch: "main", Remote: "origin", ComposeFile: "../compose.yml", TestService: "test"})
-	if err == nil || !strings.Contains(err.Error(), "Compose file") {
-		t.Fatalf("outside compose path error = %v", err)
+	_, err = discovery.Build(Input{Branch: "main", Remote: "origin", VerificationNames: []string{"unknown"}})
+	if err == nil || !strings.Contains(err.Error(), "declarative verification candidate") {
+		t.Fatalf("unknown verification candidate error = %v", err)
 	}
 	for _, pattern := range []string{"../secrets", `nested\package.json`, "C:/package.json", "nested/../package.json", "**/package.json"} {
 		_, err = discovery.Build(Input{Branch: "main", Remote: "origin", AllowedPaths: []string{pattern}})
@@ -92,6 +92,61 @@ func TestBuildRequiresFlagsForAmbiguousDetection(t *testing.T) {
 	if !errors.As(err, &missing) || missing.Flag != "--package-manager" {
 		t.Fatalf("Build error = %v, want missing package manager", err)
 	}
+}
+
+func TestDetectDoesNotOfferSingleDevServerAsVerification(t *testing.T) {
+	project := nodeProject(t)
+	writeProjectFile(t, project, "package.json", `{"scripts":{"build":"vite build"}}`+"\n")
+	writeProjectFile(t, project, "compose.yml", "services:\n  s_svelteapp:\n    command: npm i && npm run dev\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.VerificationCandidates) != 0 {
+		t.Fatalf("dev server candidates = %#v, want none", discovery.VerificationCandidates)
+	}
+	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Verification.State != "scan_only" {
+		t.Fatalf("verification state = %q, want scan_only", workspace.Verification.State)
+	}
+}
+
+func TestBuildExplicitMultiStepVerificationFromDeclarativeMetadata(t *testing.T) {
+	project := nodeProject(t)
+	writeProjectFile(t, project, "package.json", `{"scripts":{"test":"vitest run","build":"vite build","dev":"vite dev"}}`+"\n")
+	writeProjectFile(t, project, "compose.yml", validVerificationCompose("verify"))
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.VerificationCandidates) != 2 {
+		t.Fatalf("verification candidates = %#v, want test and build only", discovery.VerificationCandidates)
+	}
+	names := []string{discovery.VerificationCandidates[0].Name, discovery.VerificationCandidates[1].Name}
+	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin", VerificationNames: names})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Verification.State != "ready" || len(workspace.Verification.Steps) != 2 {
+		t.Fatalf("verification profile = %#v", workspace.Verification)
+	}
+	for _, step := range workspace.Verification.Steps {
+		if len(step.Command) == 0 || step.TimeoutSeconds <= 0 || !step.Required || len(step.SuccessExitCodes) != 1 {
+			t.Fatalf("unbounded or implicit verification step = %#v", step)
+		}
+	}
+}
+
+func validVerificationCompose(service string) string {
+	return "services:\n  " + service + ":\n" +
+		"    image: node:22@sha256:" + strings.Repeat("1", 64) + "\n" +
+		"    user: \"65532:65532\"\n    cap_drop: [\"ALL\"]\n" +
+		"    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n" +
+		"    mem_limit: 1g\n    pids_limit: 128\n    networks: [verify]\n" +
+		"networks:\n  verify:\n    internal: true\n"
 }
 
 func nodeProject(t *testing.T) string {

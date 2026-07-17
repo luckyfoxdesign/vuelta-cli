@@ -66,7 +66,10 @@ func baseWorkspace(path string) config.Workspace {
 		PackageManager: "poetry",
 		Remote:         "origin",
 		Branch:         "main",
-		Test:           config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"},
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
+			Name: "test", ComposeFile: "docker-compose.test.yml", Service: "test", Command: []string{"pytest"},
+			TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+		}}},
 	}
 }
 
@@ -93,13 +96,16 @@ func installFakeDocker(t *testing.T, passOnCall int) dockerexec.Runner {
 	case passOnCall == 0:
 		script = "#!/bin/sh\nexit 0\n"
 	case passOnCall < 0:
-		script = "#!/bin/sh\nexit 1\n"
+		script = "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\nexit 1\n"
 	default:
 		counter := filepath.Join(dir, "calls")
 		if err := os.WriteFile(counter, []byte("0"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		script = fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+  [ "$arg" = down ] && exit 0
+done
 n=$(/bin/cat %q)
 n=$((n+1))
 echo "$n" > %q
@@ -268,8 +274,18 @@ func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
 	deps := baseDeps(true, docker)
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
-	if result.Status != "failed" || result.Reason != "tests failed" {
-		t.Fatalf("expected failed/tests failed, got %+v", result)
+	if result.Status != "failed" || result.Reason != "verification failed" {
+		t.Fatalf("expected failed/verification failed, got %+v", result)
+	}
+}
+
+func TestRunWorkspaceScanOnlyFailsBeforeSandboxMutation(t *testing.T) {
+	workspace := config.Workspace{Name: "docs", Verification: config.VerificationProfile{
+		Version: config.VerificationVersion, State: config.VerificationScanOnly,
+	}}
+	result := RunWorkspace(context.Background(), Deps{}, config.Config{}, workspace, true)
+	if result.Status != "failed" || result.Reason != "verification preflight" {
+		t.Fatalf("scan-only update did not fail closed: %+v", result)
 	}
 }
 
@@ -337,8 +353,8 @@ func TestRunWorkspaceAutofixStillFails(t *testing.T) {
 	deps.Autofix = fakeAutofixer{attempted: true}
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
-	if result.Status != "failed" || result.Reason != "tests failed" {
-		t.Fatalf("expected failed/tests failed, got %+v", result)
+	if result.Status != "failed" || result.Reason != "verification failed" {
+		t.Fatalf("expected failed/verification failed, got %+v", result)
 	}
 }
 

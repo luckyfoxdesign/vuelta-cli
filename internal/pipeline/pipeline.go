@@ -6,6 +6,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,6 +104,12 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	label := config.WorkspaceName(ws)
 
 	// Step 1: preflight.
+	if ws.Verification.State != config.VerificationReady {
+		return failResult(label, "verification preflight", errors.New("project is scan-only; configure a ready verification profile before update or update --dry-run"))
+	}
+	if err := testrunner.ValidateProfile(ws.Path, ws.Verification); err != nil {
+		return failResult(label, "verification preflight", err)
+	}
 	if err := scanner.CheckToolsWithDocker(deps.docker()); err != nil {
 		return failResult(label, "preflight", err)
 	}
@@ -181,11 +188,10 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "security post-check", err)
 	}
 
-	// Step 6: tests, with one optional autofix retry (step 7).
-	testTimeout := time.Duration(ws.Test.TimeoutMinutes) * time.Minute
-	result, err := testrunner.RunWithDocker(ctx, deps.docker(), sandboxDir, ws.Test, testTimeout)
+	// Step 6: explicit verification, with one optional autofix retry (step 7).
+	result, err := testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
 	if err != nil {
-		return failResult(project, "test run", err)
+		return failResult(project, "verification run", err)
 	}
 	autofixApplied := false
 	if !result.Passed && cfg.Autofix.Enabled {
@@ -199,9 +205,9 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		}
 		if attempted {
 			autofixApplied = true
-			result, err = testrunner.RunWithDocker(ctx, deps.docker(), sandboxDir, ws.Test, testTimeout)
+			result, err = testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
 			if err != nil {
-				return failResult(project, "test run after autofix", err)
+				return failResult(project, "verification run after autofix", err)
 			}
 			if result.Passed {
 				return finishAfterAutofix(ctx, project, ws, cfg, sandboxDir, landingDir, now, post, dryRun, &audit)
@@ -209,7 +215,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		}
 	}
 	if !result.Passed {
-		return notify.ProjectResult{Project: project, Status: "failed", Reason: "tests failed", CVERefs: post.Findings}
+		return notify.ProjectResult{Project: project, Status: "failed", Reason: "verification failed", CVERefs: post.Findings}
 	}
 
 	if dryRun {

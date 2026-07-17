@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -22,9 +23,6 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
-
-// DefaultTimeout is used when a workspace's test profile does not set one.
-const DefaultTimeout = 15 * time.Minute
 
 // outputTailBytes bounds host memory spent on untrusted test output
 // (F5-MED-008). Truncation is soft: the run continues until it finishes or
@@ -47,8 +45,60 @@ type Result struct {
 	Output string
 }
 
-// Run executes the configured test profile against workDir with
-// `docker compose run --rm <run_args...> <service>`. The repository compose
+// ValidateProfile performs the complete read-only Compose and command-policy
+// validation used before an update is allowed to create a sandbox.
+func ValidateProfile(workDir string, profile config.VerificationProfile) error {
+	if profile.Version != config.VerificationVersion || profile.State != config.VerificationReady || len(profile.Steps) == 0 || len(profile.Steps) > 16 {
+		return errors.New("verification profile is not ready for update")
+	}
+	for _, step := range profile.Steps {
+		if step.TimeoutSeconds <= 0 || step.TimeoutSeconds > 7200 {
+			return fmt.Errorf("verification step %q: timeout must be between 1 and 7200 seconds", step.Name)
+		}
+		if !validSuccessExitCodes(step.SuccessExitCodes) {
+			return fmt.Errorf("verification step %q: success exit codes must be unique values between 0 and 125", step.Name)
+		}
+		if err := config.ValidateVerificationCommand(step.Command); err != nil {
+			return fmt.Errorf("verification step %q: %w", step.Name, err)
+		}
+		root, composePath, err := resolveComposeFile(workDir, step.ComposeFile)
+		if err != nil {
+			return fmt.Errorf("verification step %q: %w", step.Name, err)
+		}
+		if _, err := validateCompose(root, composePath, step.Service); err != nil {
+			return fmt.Errorf("verification step %q: %w", step.Name, err)
+		}
+	}
+	return nil
+}
+
+// RunProfileWithDocker runs every explicit step in order. Optional failures
+// are retained in the bounded diagnostic output; a required failure stops the
+// profile and fails the gate.
+func RunProfileWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string, profile config.VerificationProfile) (Result, error) {
+	if err := ValidateProfile(workDir, profile); err != nil {
+		return Result{}, err
+	}
+	combined := strings.Builder{}
+	for _, step := range profile.Steps {
+		result, err := RunWithDocker(ctx, docker, workDir, step, time.Duration(step.TimeoutSeconds)*time.Second)
+		if result.Output != "" {
+			fmt.Fprintf(&combined, "[%s]\n%s", step.Name, result.Output)
+			if !strings.HasSuffix(result.Output, "\n") {
+				combined.WriteByte('\n')
+			}
+		}
+		if err != nil {
+			return Result{Output: combined.String()}, fmt.Errorf("verification step %q: %w", step.Name, err)
+		}
+		if !result.Passed && step.Required {
+			return Result{Passed: false, Output: combined.String()}, nil
+		}
+	}
+	return Result{Passed: true, Output: combined.String()}, nil
+}
+
+// Run executes one explicit verification step against workDir. The repository compose
 // file is validated against a strict fail-closed allowlist (§8,
 // F5-CRIT-002): unknown fields anywhere, YAML anchors/aliases, any "$"
 // interpolation, build, env files, host namespaces, sockets, and weakened
@@ -57,27 +107,33 @@ type Result struct {
 // so it cannot see fields the policy did not approve. The deeper sandbox
 // network-egress/isolation policy belongs to part F; this is the baseline
 // this package's own execution path is responsible for.
-func Run(ctx context.Context, workDir string, profile config.TestProfile, timeout time.Duration) (Result, error) {
-	return RunWithDocker(ctx, dockerexec.Default(), workDir, profile, timeout)
+func Run(ctx context.Context, workDir string, step config.VerificationStep, timeout time.Duration) (Result, error) {
+	return RunWithDocker(ctx, dockerexec.Default(), workDir, step, timeout)
 }
 
-// RunWithDocker executes a test profile through the supplied Docker boundary.
-func RunWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string, profile config.TestProfile, timeout time.Duration) (Result, error) {
+// RunWithDocker executes one verification step through the supplied Docker boundary.
+func RunWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string, step config.VerificationStep, timeout time.Duration) (Result, error) {
 	if timeout <= 0 {
-		timeout = DefaultTimeout
+		timeout = time.Duration(step.TimeoutSeconds) * time.Second
 	}
-	if !composeName.MatchString(profile.Service) {
+	if timeout <= 0 {
+		return Result{}, errors.New("verification timeout must be positive")
+	}
+	if !composeName.MatchString(step.Service) {
 		return Result{}, errors.New("test compose policy: service must be a Compose service name")
 	}
-	if err := checkRunArgs(profile.RunArgs); err != nil {
-		return Result{}, fmt.Errorf("test compose policy: %w", err)
+	if err := config.ValidateVerificationCommand(step.Command); err != nil {
+		return Result{}, fmt.Errorf("verification command policy: %w", err)
+	}
+	if !validSuccessExitCodes(step.SuccessExitCodes) {
+		return Result{}, errors.New("verification success exit codes must be unique values between 0 and 125")
 	}
 
-	root, composePath, err := resolveComposeFile(workDir, profile.ComposeFile)
+	root, composePath, err := resolveComposeFile(workDir, step.ComposeFile)
 	if err != nil {
 		return Result{}, fmt.Errorf("test compose policy: %w", err)
 	}
-	normalized, err := validateCompose(root, composePath, profile.Service)
+	normalized, err := validateCompose(root, composePath, step.Service)
 	if err != nil {
 		return Result{}, fmt.Errorf("test compose policy: %w", err)
 	}
@@ -107,34 +163,45 @@ func RunWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string
 	// inheritance, so the compose client's environment cannot change what
 	// runs.
 	args := []string{
-		"compose",
+		"compose", "--project-name", filepath.Base(tmpDir),
 		"--project-directory", root,
 		"--env-file", emptyEnvPath,
 		"-f", normalizedPath,
-		"run", "--rm", "--no-TTY",
+		"run", "--rm", "--no-TTY", "--entrypoint", step.Command[0],
 	}
-	args = append(args, profile.RunArgs...)
-	args = append(args, profile.Service)
+	args = append(args, step.Service)
+	args = append(args, step.Command[1:]...)
 
-	// On timeout only the docker compose client is killed here; the
-	// container itself is bounded by the compose policy above (cpus,
-	// mem_limit, pids_limit) and Docker's own run lifecycle.
+	// The client and container are resource-bounded. A separately bounded
+	// `compose down` below runs even after cancellation so a timed-out client
+	// cannot leave the verification container or its project volumes behind.
 	commandResult, runErr := docker.Run(runCtx, dockerexec.Request{
 		Args: args, Dir: root, WaitDelay: waitDelay,
 		Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: outputTailBytes},
 	})
 	result := Result{Output: string(commandResult.Combined)}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), waitDelay)
+	_, cleanupErr := docker.Run(cleanupCtx, dockerexec.Request{Args: []string{
+		"compose", "--project-name", filepath.Base(tmpDir), "--project-directory", root,
+		"--env-file", emptyEnvPath, "-f", normalizedPath, "down", "--remove-orphans", "--volumes",
+	}, Dir: root, WaitDelay: waitDelay})
+	cleanupCancel()
+	if cleanupErr != nil {
+		return result, fmt.Errorf("verification container cleanup failed: %w", cleanupErr)
+	}
 
 	if runCtx.Err() == context.DeadlineExceeded {
-		return result, fmt.Errorf("test profile timed out after %s", timeout)
+		return result, fmt.Errorf("verification step %q timed out after %s", step.Name, timeout)
 	}
 	if runErr != nil {
-		// A failing test suite is a normal pipeline outcome, not a Go
-		// error: the caller decides whether to retry via autofix or skip.
-		result.Passed = false
+		var exitError *exec.ExitError
+		if !errors.As(runErr, &exitError) {
+			return result, runErr
+		}
+		result.Passed = containsExitCode(step.SuccessExitCodes, exitError.ExitCode())
 		return result, nil
 	}
-	result.Passed = true
+	result.Passed = containsExitCode(step.SuccessExitCodes, 0)
 	return result, nil
 }
 
@@ -143,13 +210,27 @@ var (
 	composeName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 )
 
-func checkRunArgs(args []string) error {
-	for i, arg := range args {
-		if arg != "--rm" && arg != "--no-TTY" {
-			return fmt.Errorf("run argument %d is not allowed", i)
+func containsExitCode(codes []int, wanted int) bool {
+	for _, code := range codes {
+		if code == wanted {
+			return true
 		}
 	}
-	return nil
+	return false
+}
+
+func validSuccessExitCodes(codes []int) bool {
+	if len(codes) == 0 {
+		return false
+	}
+	seen := make(map[int]bool, len(codes))
+	for _, code := range codes {
+		if code < 0 || code > 125 || seen[code] {
+			return false
+		}
+		seen[code] = true
+	}
+	return true
 }
 
 // validateCompose parses the compose file under the strict allowlist and
@@ -353,6 +434,13 @@ func buildModel(root string, cf composeFile, service string) (*normalizedFile, e
 		normalized, err := checkService(root, cf, name, cf.Services[name])
 		if err != nil {
 			return nil, err
+		}
+		if name == service {
+			// The CLI supplies an explicit --entrypoint and argv. An empty
+			// command prevents an image or service CMD from being inherited
+			// when the configured argv contains only the executable.
+			normalized.Entrypoint = composeCommand{}
+			normalized.Command = composeCommand{args: []string{}}
 		}
 		model.Services[name] = normalized
 	}

@@ -106,10 +106,32 @@ workspaces:
   - name: vuelta-app             # stable project name used by CLI selectors and output
     path: .                      # canonicalized when added with `vuelta project add`
     stack: docker
-    test:
-      compose_file: compose.yml
-      service: test
-      run_args: ["--rm"]
+    # This repository's development Compose file builds local images, so the
+    # example is deliberately scan-only. Updates and update --dry-run fail
+    # closed until a strict, digest-pinned verification Compose service exists.
+    verification:
+      version: 1
+      state: scan_only
+    # A ready multi-step profile uses explicit argv and never inherits a
+    # service command:
+    # verification:
+    #   version: 1
+    #   state: ready
+    #   steps:
+    #     - name: test
+    #       compose_file: compose.verify.yml
+    #       service: verify
+    #       command: ["npm", "test"]
+    #       timeout_seconds: 900
+    #       required: true
+    #       success_exit_codes: [0]
+    #     - name: build
+    #       compose_file: compose.verify.yml
+    #       service: verify
+    #       command: ["npm", "run", "build"]
+    #       timeout_seconds: 1200
+    #       required: true
+    #       success_exit_codes: [0]
     branch: main
     remote: origin
     # Git-style repository-relative patterns. A root name is root-only; *, ?,

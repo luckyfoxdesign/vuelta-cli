@@ -250,6 +250,7 @@ func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 func TestScanJSONEnvelopeRepresentsCleanReadyAndPartialFailure(t *testing.T) {
 	results := []scanResult{
 		{Project: "clean", Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{"CVE-1"}, Tools: []scanToolResult{}, Warnings: []string{}},
+		{Project: "docs", Status: config.VerificationScanOnly, Candidates: []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
 		{Project: "ready", Status: "ready", SnapshotID: "snapshot", Candidates: []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
 		{Project: "failed", Status: "failed", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}, Error: &jsonCommandError{Code: "scan_failed", Message: "failed"}},
 	}
@@ -262,7 +263,7 @@ func TestScanJSONEnvelopeRepresentsCleanReadyAndPartialFailure(t *testing.T) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if summary.Clean != 1 || summary.Ready != 1 || summary.Failed != 1 || summary.Vulnerabilities != 1 {
+	if summary.Clean != 1 || summary.ScanOnly != 1 || summary.Ready != 1 || summary.Failed != 1 || summary.Vulnerabilities != 1 {
 		t.Fatalf("summary = %#v", summary)
 	}
 }

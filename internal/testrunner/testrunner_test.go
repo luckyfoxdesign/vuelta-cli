@@ -25,7 +25,7 @@ func installFakeDocker(t *testing.T, exitCode int) dockerexec.Runner {
 		t.Skip("fake docker shell script requires a POSIX shell")
 	}
 	dir := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\necho fake docker invoked: \"$@\"\nexit %d\n", exitCode)
+	script := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\necho fake docker invoked: \"$@\"\nexit %d\n", exitCode)
 	path := filepath.Join(dir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -54,7 +54,9 @@ func installCapturingFakeDocker(t *testing.T, argsPath, modelPath string) docker
 	}
 	dir := t.TempDir()
 	script := fmt.Sprintf(`#!/bin/sh
-printf '%%s\n' "$@" > %q
+case " $* " in
+*" run "*) printf '%%s\n' "$@" > %q ;;
+esac
 previous=
 for argument in "$@"; do
   if [ "$previous" = "-f" ]; then
@@ -103,12 +105,20 @@ networks:
     internal: true
 `, strings.Repeat("1", 64))
 
+func verificationStep(composeFile, service string) config.VerificationStep {
+	return config.VerificationStep{
+		Name: "test", ComposeFile: composeFile, Service: service,
+		Command: []string{"go", "test", "./..."}, TimeoutSeconds: 60,
+		Required: true, SuccessExitCodes: []int{0},
+	}
+}
+
 func TestRunPassesWithValidCompose(t *testing.T) {
 	docker := installFakeDocker(t, 0)
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	res, err := RunWithDocker(context.Background(), docker, dir, profile, time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -142,7 +152,9 @@ func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.
 	t.Setenv("HOST_SECRET_SENTINEL", "must-not-be-inherited")
 	writeCompose(t, dir, "repository-compose.yml", validCompose+"\n# repository-only-marker\n")
 
-	result, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: "repository-compose.yml", Service: "test"}, time.Second)
+	step := verificationStep("repository-compose.yml", "test")
+	step.Command = []string{"go", "test", "./explicit"}
+	result, err := RunWithDocker(context.Background(), docker, dir, step, time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -160,12 +172,18 @@ func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.
 	if !strings.Contains(string(args), "--env-file") || !strings.Contains(string(args), "-f") {
 		t.Fatalf("docker did not receive normalized compose and empty env files: %s", args)
 	}
+	if !strings.Contains(string(args), "--entrypoint\ngo\ntest\ntest\n./explicit") {
+		t.Fatalf("docker did not receive the explicit entrypoint and argv override: %s", args)
+	}
 	model, err := os.ReadFile(modelPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(model), "repository-only-marker") || strings.Contains(string(model), "build:") {
 		t.Fatalf("docker received repository-only data instead of the validated model:\n%s", model)
+	}
+	if strings.Contains(string(model), "./...") {
+		t.Fatalf("normalized model retained the inherited service command:\n%s", model)
 	}
 }
 
@@ -174,13 +192,42 @@ func TestRunFailsWhenComposeCommandFails(t *testing.T) {
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	res, err := RunWithDocker(context.Background(), docker, dir, profile, time.Second)
 	if err != nil {
 		t.Fatalf("Run should not return a Go error for a failing test suite: %v", err)
 	}
 	if res.Passed {
 		t.Fatal("expected Passed=false")
+	}
+}
+
+func TestRunUsesExplicitSuccessExitCodes(t *testing.T) {
+	docker := installFakeDocker(t, 1)
+	dir := t.TempDir()
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+	step := verificationStep("docker-compose.test.yml", "test")
+	step.SuccessExitCodes = []int{1}
+	result, err := RunWithDocker(context.Background(), docker, dir, step, time.Second)
+	if err != nil || !result.Passed {
+		t.Fatalf("explicit success exit code was not honored: result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunProfileExecutesMultipleRequiredSteps(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	dir := t.TempDir()
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+	first := verificationStep("docker-compose.test.yml", "test")
+	first.Name = "test"
+	second := verificationStep("docker-compose.test.yml", "test")
+	second.Name = "build"
+	second.Command = []string{"go", "build", "./..."}
+	result, err := RunProfileWithDocker(context.Background(), docker, dir, config.VerificationProfile{
+		Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{first, second},
+	})
+	if err != nil || !result.Passed {
+		t.Fatalf("multi-step profile failed: result=%+v err=%v", result, err)
 	}
 }
 
@@ -192,7 +239,7 @@ services:
     build: .
     privileged: true
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected privileged service to be rejected")
 	}
@@ -206,7 +253,7 @@ services:
     build: .
     network_mode: host
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected network_mode host to be rejected")
 	}
@@ -221,7 +268,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected docker.sock mount to be rejected")
 	}
@@ -236,7 +283,7 @@ services:
     volumes:
       - /etc/passwd:/etc/passwd
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected absolute host mount to be rejected")
 	}
@@ -250,7 +297,7 @@ services:
     build: .
     env_file: .env
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected env_file to be rejected")
 	}
@@ -263,7 +310,7 @@ services:
   test:
     image: golang:latest
 `)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	if _, err := Run(context.Background(), dir, profile, time.Second); err == nil {
 		t.Fatal("expected mutable image tag to be rejected")
 	}
@@ -272,7 +319,7 @@ services:
 func TestRunRejectsUnknownService(t *testing.T) {
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "does-not-exist"}
+	profile := verificationStep("docker-compose.test.yml", "does-not-exist")
 	err := func() error {
 		_, err := Run(context.Background(), dir, profile, time.Second)
 		return err
@@ -282,19 +329,17 @@ func TestRunRejectsUnknownService(t *testing.T) {
 	}
 }
 
-func TestRunRejectsUnsafeRunArgumentBeforeDocker(t *testing.T) {
+func TestRunRejectsUnsafeCommandBeforeDocker(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "docker-invoked")
 	docker := installDockerInvocationMarker(t, marker)
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
-	_, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{
-		ComposeFile: "docker-compose.test.yml",
-		Service:     "test",
-		RunArgs:     []string{"--volume", "/:/host"},
-	}, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "run argument") {
-		t.Fatalf("expected run argument policy error, got %v", err)
+	step := verificationStep("docker-compose.test.yml", "test")
+	step.Command = []string{"sh", "-c", "go test ./..."}
+	_, err := RunWithDocker(context.Background(), docker, dir, step, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "shell executables") {
+		t.Fatalf("expected explicit command policy error, got %v", err)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("docker was invoked before run argument rejection: %v", err)
@@ -306,7 +351,7 @@ func TestInterpolationErrorDoesNotRevealHostValue(t *testing.T) {
 	writeFixture(t, dir, "bad-compose-interpolation-user")
 	t.Setenv("HOST_UID", "sensitive-host-value")
 
-	_, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
+	_, err := Run(context.Background(), dir, verificationStep("docker-compose.test.yml", "test"), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "interpolation is not allowed") {
 		t.Fatalf("expected interpolation policy error, got %v", err)
 	}
@@ -506,7 +551,7 @@ services:
 			if composeFile == "" {
 				composeFile = "docker-compose.test.yml"
 			}
-			_, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: composeFile, Service: "test"}, time.Second)
+			_, err := RunWithDocker(context.Background(), docker, dir, verificationStep(composeFile, "test"), time.Second)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("expected policy error containing %q, got %v", tt.want, err)
 			}
@@ -540,7 +585,7 @@ networks:
     internal: true
 `)
 
-	res, err := RunWithDocker(context.Background(), docker, dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
+	res, err := RunWithDocker(context.Background(), docker, dir, verificationStep("docker-compose.test.yml", "test"), time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -554,7 +599,8 @@ func TestRunTimesOut(t *testing.T) {
 		t.Skip("fake docker shell script requires a POSIX shell")
 	}
 	dir := t.TempDir()
-	script := "#!/bin/sh\nsleep 5\n"
+	cleanupMarker := filepath.Join(t.TempDir(), "cleanup")
+	script := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && { : > %q; exit 0; }; done\nsleep 5\n", cleanupMarker)
 	scriptDir := t.TempDir()
 	path := filepath.Join(scriptDir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -563,10 +609,13 @@ func TestRunTimesOut(t *testing.T) {
 	docker := fakeDockerExecutor(t, path)
 	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
 
-	profile := config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}
+	profile := verificationStep("docker-compose.test.yml", "test")
 	_, err := RunWithDocker(context.Background(), docker, dir, profile, 50*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if _, statErr := os.Stat(cleanupMarker); statErr != nil {
+		t.Fatalf("timed-out verification did not run cleanup: %v", statErr)
 	}
 }
 
@@ -591,7 +640,7 @@ func TestRunRejectsMissingRunnerHardening(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeCompose(t, dir, "docker-compose.test.yml", strings.Replace(validCompose, tt.old, tt.new, 1))
-			_, err := Run(context.Background(), dir, config.TestProfile{ComposeFile: "docker-compose.test.yml", Service: "test"}, time.Second)
+			_, err := Run(context.Background(), dir, verificationStep("docker-compose.test.yml", "test"), time.Second)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("expected %q, got %v", tt.want, err)
 			}

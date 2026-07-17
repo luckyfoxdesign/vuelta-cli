@@ -33,9 +33,10 @@ var (
 )
 
 const (
-	// FormatVersion 3 adds a typed, hashed input manifest. Earlier snapshots did
-	// not prove which stage received each file and are intentionally invalid.
-	FormatVersion = 3
+	// FormatVersion 4 binds registered updates to an explicit verification
+	// profile identity. Earlier snapshots could inherit a changed service
+	// command and are intentionally invalid.
+	FormatVersion = 4
 
 	OriginWorkspace = "workspace"
 	OriginAdhoc     = "adhoc"
@@ -89,36 +90,38 @@ type ScanGates struct {
 
 // Snapshot is the on-disk plan. It is intentionally a small, strict schema.
 type Snapshot struct {
-	Format     int               `json:"format"`
-	ID         string            `json:"id"`
-	CreatedAt  time.Time         `json:"created_at"`
-	ExpiresAt  time.Time         `json:"expires_at"`
-	Origin     string            `json:"origin"`
-	Project    string            `json:"project,omitempty"`
-	AdhocPath  string            `json:"adhoc_path,omitempty"`
-	Workspace  WorkspaceIdentity `json:"workspace,omitempty"`
-	Input      InputIdentity     `json:"input,omitempty"`
-	Policy     PolicyIdentity    `json:"policy"`
-	Gates      ScanGates         `json:"scan_gates"`
-	ConfigHash string            `json:"config_hash,omitempty"`
-	PolicyHash string            `json:"policy_hash"`
-	Candidates []Candidate       `json:"candidates"`
+	Format           int               `json:"format"`
+	ID               string            `json:"id"`
+	CreatedAt        time.Time         `json:"created_at"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	Origin           string            `json:"origin"`
+	Project          string            `json:"project,omitempty"`
+	AdhocPath        string            `json:"adhoc_path,omitempty"`
+	Workspace        WorkspaceIdentity `json:"workspace,omitempty"`
+	Input            InputIdentity     `json:"input,omitempty"`
+	Policy           PolicyIdentity    `json:"policy"`
+	Gates            ScanGates         `json:"scan_gates"`
+	ConfigHash       string            `json:"config_hash,omitempty"`
+	VerificationHash string            `json:"verification_hash,omitempty"`
+	PolicyHash       string            `json:"policy_hash"`
+	Candidates       []Candidate       `json:"candidates"`
 }
 
 // New creates an opaque-ID snapshot. ttl must be positive and is validated by
 // config before this point.
-func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHash string, candidates []Candidate) (Snapshot, error) {
+func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHash, verificationHash string, candidates []Candidate) (Snapshot, error) {
 	policy := PolicyIdentity{Path: PolicyNone, Hash: PolicyNone}
 	gates := ScanGates{MinReleaseAge: "0s"}
 	effectiveHash, err := EffectivePolicyHash(policyHash, policy, gates)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, effectiveHash, candidates)
+	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, verificationHash, effectiveHash, candidates)
 }
 
-// NewWorkspace creates a format-3 plan bound to a registered workspace.
-func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
+// NewWorkspace creates a format-4 plan bound to a registered workspace and
+// the exact verification profile reviewed during scan.
+func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, verificationHash, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
 		return Snapshot{}, err
@@ -126,7 +129,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	snapshot := Snapshot{
 		Format: FormatVersion, ID: id, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl),
 		Origin: OriginWorkspace, Project: project, Workspace: identity, Policy: policy,
-		Gates: gates, ConfigHash: configHash, PolicyHash: effectivePolicyHash,
+		Gates: gates, ConfigHash: configHash, VerificationHash: verificationHash, PolicyHash: effectivePolicyHash,
 		Candidates: append([]Candidate(nil), candidates...),
 	}
 	if ttl <= 0 {
@@ -138,7 +141,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	return snapshot, nil
 }
 
-// NewAdhoc creates a format-3 plan bound to an explicit unregistered path.
+// NewAdhoc creates a format-4 plan bound to an explicit unregistered path.
 func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input InputIdentity, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
@@ -290,6 +293,13 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 	}
 	if policyHash != snapshot.ConfigHash {
 		return fmt.Errorf("%w: update policy or workspace configuration changed", ErrStale)
+	}
+	verificationHash, err := config.VerificationProfileHash(ws)
+	if err != nil {
+		return fmt.Errorf("compute verification profile identity: %w", err)
+	}
+	if verificationHash != snapshot.VerificationHash {
+		return fmt.Errorf("%w: verification profile changed", ErrStale)
 	}
 	if err := validatePolicyIdentity(snapshot.Policy); err != nil {
 		return err
@@ -470,14 +480,14 @@ func validateSnapshot(snapshot Snapshot) error {
 	switch snapshot.Origin {
 	case OriginWorkspace:
 		if snapshot.Project == "" || snapshot.AdhocPath != "" || !filepath.IsAbs(snapshot.Workspace.CanonicalPath) || snapshot.Workspace.BaseRevision == "" ||
-			!hashPattern.MatchString(snapshot.ConfigHash) || !reflect.DeepEqual(snapshot.Input, InputIdentity{}) {
+			!hashPattern.MatchString(snapshot.ConfigHash) || !hashPattern.MatchString(snapshot.VerificationHash) || !reflect.DeepEqual(snapshot.Input, InputIdentity{}) {
 			return fmt.Errorf("%w: incomplete workspace identity", ErrInvalid)
 		}
 		if err := validateInputIdentity(snapshot.Workspace.Input); err != nil {
 			return err
 		}
 	case OriginAdhoc:
-		if snapshot.Project != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
+		if snapshot.Project != "" || snapshot.VerificationHash != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
 			return fmt.Errorf("%w: incomplete adhoc identity", ErrInvalid)
 		}
 		if err := validateInputIdentity(snapshot.Input); err != nil {

@@ -21,7 +21,7 @@ func testSnapshot(t *testing.T) Snapshot {
 		CanonicalPath: "/projects/example", BaseRevision: "abc123", Input: InputIdentity{
 			Stages: []string{"package-candidates"}, ManifestHash: strings.Repeat("c", 64), Hashes: map[string]string{"package.json": strings.Repeat("b", 64)},
 		},
-	}, strings.Repeat("a", 64), []Candidate{{Kind: "npm", Name: "example", Target: "1.2.3"}})
+	}, strings.Repeat("a", 64), strings.Repeat("d", 64), []Candidate{{Kind: "npm", Name: "example", Target: "1.2.3"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,9 +51,9 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFormatThreeRecordsRequiredSecurityIdentity(t *testing.T) {
+func TestFormatFourRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
-	if snapshot.Format != 3 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" {
+	if snapshot.Format != 4 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
 		t.Fatalf("snapshot identity = %#v", snapshot)
 	}
 	if snapshot.Policy.Path != PolicyNone || snapshot.Policy.Hash != PolicyNone || snapshot.Gates.MinReleaseAge == "" {
@@ -69,7 +69,7 @@ func TestFormatThreeRecordsRequiredSecurityIdentity(t *testing.T) {
 }
 
 func TestStoreRejectsOlderFormatsWithRerunHint(t *testing.T) {
-	for _, format := range []int{1, 2} {
+	for _, format := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("format-%d", format), func(t *testing.T) {
 			store := Store{Dir: filepath.Join(t.TempDir(), "snapshots")}
 			if err := ensureDir(store.Dir); err != nil {

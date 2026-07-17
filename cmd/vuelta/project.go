@@ -10,6 +10,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
+	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 )
 
 type jsonCommandError struct {
@@ -28,8 +29,9 @@ type jsonCommandEnvelope struct {
 }
 
 type projectListResult struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
+	Name         string   `json:"name"`
+	Path         string   `json:"path"`
+	Verification []string `json:"verification"`
 }
 
 func runConfigValidate(args []string) error {
@@ -51,10 +53,17 @@ func runConfigValidate(args []string) error {
 	if validateErr := cfg.Validate(); validateErr != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
 	}
+	if validateErr := validateVerificationPolicies(*cfg); validateErr != nil {
+		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
+	}
 	if *jsonOutput {
+		plans := make([]map[string]any, 0, len(cfg.Workspaces))
+		for _, workspace := range cfg.Workspaces {
+			plans = append(plans, map[string]any{"project": config.WorkspaceName(workspace), "verification": config.VerificationPlan(workspace)})
+		}
 		return writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "config validate",
-			Results:  []any{map[string]any{"path": path, "valid": true, "projects": len(cfg.Workspaces)}},
+			Results:  []any{map[string]any{"path": path, "valid": true, "projects": len(cfg.Workspaces), "verification_plans": plans}},
 			Summary:  map[string]any{"valid": true, "projects": len(cfg.Workspaces)},
 			Warnings: warnings, Errors: []jsonCommandError{},
 		})
@@ -63,6 +72,11 @@ func runConfigValidate(args []string) error {
 		fmt.Fprintln(os.Stderr, "warning:", warning)
 	}
 	fmt.Printf("ok: %s is valid (%d workspace(s))\n", path, len(cfg.Workspaces))
+	for _, workspace := range cfg.Workspaces {
+		for _, step := range config.VerificationPlan(workspace) {
+			fmt.Printf("verification %s: %s\n", config.WorkspaceName(workspace), step)
+		}
+	}
 	return nil
 }
 
@@ -95,7 +109,7 @@ func runProjectList(args []string) error {
 		if canonicalErr != nil {
 			return jsonCommandFailure(*jsonOutput, "project list", "config_invalid", fail(exitConfig, "canonicalize workspace %s: %v", workspace.Path, canonicalErr), warnings)
 		}
-		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical})
+		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical, Verification: config.VerificationPlan(workspace)})
 	}
 	if *jsonOutput {
 		return writeJSONEnvelope(jsonCommandEnvelope{
@@ -112,6 +126,9 @@ func runProjectList(args []string) error {
 	}
 	for _, result := range results {
 		fmt.Printf("%s\t%s\n", result.Name, result.Path)
+		for _, step := range result.Verification {
+			fmt.Printf("  verification: %s\n", step)
+		}
 	}
 	return nil
 }
@@ -122,16 +139,16 @@ func runProjectAdd(args []string) error {
 	name := fs.String("name", "", "persistent project name")
 	stack := fs.String("stack", "", "selected stack: python, node, or docker")
 	manager := fs.String("package-manager", "", "selected package manager for python or node")
-	composeFile := fs.String("compose-file", "", "project-relative Compose file for the test profile")
-	service := fs.String("test-service", "", "Compose test service")
 	branch := fs.String("branch", "", "protected branch")
 	remote := fs.String("remote", "", "Git remote")
+	scanOnly := fs.Bool("scan-only", false, "register the project for read-only scans without update authority")
 	yes := fs.Bool("yes", false, "confirm the displayed config diff")
 	nonInteractive := fs.Bool("non-interactive", false, "fail instead of prompting")
-	var allowPaths, dockerFiles, runtimeImages repeatedFlag
+	var allowPaths, dockerFiles, runtimeImages, verificationNames repeatedFlag
 	fs.Var(&allowPaths, "allow-path", "allowed changed path (repeatable)")
 	fs.Var(&dockerFiles, "docker-file", "project-relative Dockerfile for docker stack (repeatable)")
 	fs.Var(&runtimeImages, "runtime-image", "immutable runtime image digest for docker stack (repeatable)")
+	fs.Var(&verificationNames, "verification", "declarative verification candidate (repeatable for a multi-step profile)")
 	if err := fs.Parse(args); err != nil {
 		return fail(exitConfig, "%v", err)
 	}
@@ -148,9 +165,9 @@ func runProjectAdd(args []string) error {
 		return fail(exitConfig, "%v", err)
 	}
 	input := configinit.Input{
-		Name: *name, Stack: *stack, PackageManager: *manager, ComposeFile: *composeFile,
-		TestService: *service, Branch: *branch, Remote: *remote,
+		Name: *name, Stack: *stack, PackageManager: *manager, Branch: *branch, Remote: *remote,
 		AllowedPaths: allowPaths, DockerFiles: dockerFiles, RuntimeImages: runtimeImages,
+		VerificationNames: verificationNames, ScanOnly: *scanOnly,
 	}
 	interactive := !*nonInteractive && configinit.IsTerminal(os.Stdin)
 	var workspace config.Workspace
@@ -176,6 +193,9 @@ func runProjectAdd(args []string) error {
 	if !plan.Changed {
 		fmt.Printf("project %s is already configured at %s\n", workspace.Name, workspace.Path)
 		return nil
+	}
+	for _, step := range config.VerificationPlan(workspace) {
+		fmt.Fprintf(os.Stderr, "verification plan: %s\n", step)
 	}
 	fmt.Fprint(os.Stderr, plan.Diff(configFile))
 	if !*yes {
@@ -203,10 +223,8 @@ func setProjectInput(input *configinit.Input, flagName, value string) {
 		input.Stack = value
 	case "--package-manager":
 		input.PackageManager = value
-	case "--compose-file":
-		input.ComposeFile = value
-	case "--test-service":
-		input.TestService = value
+	case "--verification":
+		input.VerificationNames = append(input.VerificationNames, value)
 	case "--branch":
 		input.Branch = value
 	case "--remote":
@@ -220,6 +238,19 @@ func configWarnings(cfg *config.Config) []string {
 	warnings := make([]string, 0)
 	warnings = append(warnings, cfg.WorkspaceWarnings()...)
 	return warnings
+}
+
+func validateVerificationPolicies(cfg config.Config) error {
+	var errs []error
+	for _, workspace := range cfg.Workspaces {
+		if workspace.Verification.State != config.VerificationReady {
+			continue
+		}
+		if err := testrunner.ValidateProfile(workspace.Path, workspace.Verification); err != nil {
+			errs = append(errs, fmt.Errorf("project %q verification policy: %w", config.WorkspaceName(workspace), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func jsonCommandFailure(enabled bool, command, code string, commandErr error, warnings []string) error {

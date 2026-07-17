@@ -2,6 +2,8 @@ package configinit
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
+	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,22 +28,25 @@ var (
 // Discovery contains only values found in allowlisted, project-root files or
 // Git metadata explicitly associated with Root.
 type Discovery struct {
-	Root            string
-	Stacks          []string
-	PackageManagers map[string][]string
-	ComposeFiles    []string
-	Services        map[string][]string
-	Branches        []string
-	Remotes         []string
-	DockerFiles     []string
-	RuntimeImages   []string
+	Root                   string
+	Stacks                 []string
+	PackageManagers        map[string][]string
+	ComposeFiles           []string
+	Services               map[string][]string
+	Branches               []string
+	Remotes                []string
+	DockerFiles            []string
+	RuntimeImages          []string
+	VerificationCandidates []config.VerificationStep
 }
 
 // Input supplies choices that could not be made deterministically. Repeated
 // fields correspond to repeatable CLI flags.
 type Input struct {
-	Name, Stack, PackageManager, ComposeFile, TestService, Branch, Remote string
-	AllowedPaths, DockerFiles, RuntimeImages                              []string
+	Name, Stack, PackageManager, Branch, Remote string
+	AllowedPaths, DockerFiles, RuntimeImages    []string
+	VerificationNames                           []string
+	ScanOnly                                    bool
 }
 
 // MissingValueError identifies a required flag when detection is ambiguous or
@@ -122,6 +128,10 @@ func Detect(selectedRoot string) (Discovery, error) {
 		}
 		d.Services[name] = services
 	}
+	d.VerificationCandidates, err = verificationCandidates(root, d)
+	if err != nil {
+		return Discovery{}, err
+	}
 	d.Branches = gitValues(root, "branch", "--show-current")
 	d.Remotes = gitValues(root, "remote")
 	sort.Strings(d.Stacks)
@@ -175,6 +185,125 @@ func composeServices(path string) ([]string, error) {
 	}
 	sort.Strings(services)
 	return services, nil
+}
+
+var verificationFactories = []string{"test", "lint", "typecheck", "check", "build"}
+
+func verificationCandidates(root string, discovery Discovery) ([]config.VerificationStep, error) {
+	var candidates []config.VerificationStep
+	scripts, err := packageScripts(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, composeFile := range discovery.ComposeFiles {
+		for _, service := range discovery.Services[composeFile] {
+			for _, factory := range verificationFactories {
+				body, ok := scripts[factory]
+				if !ok || !safePackageScript(body) || !verificationService(service, factory) {
+					continue
+				}
+				for _, manager := range discovery.PackageManagers[config.StackNode] {
+					command := []string{manager, "run", factory}
+					if factory == "test" && manager == "npm" {
+						command = []string{"npm", "test"}
+					}
+					candidates = append(candidates, newVerificationCandidate(factory, composeFile, service, command))
+				}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		for _, composeFile := range discovery.ComposeFiles {
+			steps, detectErr := composeCommandCandidates(filepath.Join(root, composeFile), composeFile)
+			if detectErr != nil {
+				return nil, fmt.Errorf("read verification metadata from %s: %w", composeFile, detectErr)
+			}
+			candidates = append(candidates, steps...)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
+	return candidates, nil
+}
+
+func packageScripts(root string) (map[string]string, error) {
+	if !regular(root, "package.json") {
+		return map[string]string{}, nil
+	}
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read package.json verification metadata: %w", err)
+	}
+	var document struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("parse package.json verification metadata: %w", err)
+	}
+	return document.Scripts, nil
+}
+
+func safePackageScript(body string) bool {
+	if body == "" || strings.ContainsAny(body, "\r\n;&|`$><") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "--watch") || strings.Contains(lower, " -w") {
+		return false
+	}
+	unsafeWord := regexp.MustCompile(`(?i)(^|[^a-z0-9_-])(dev|watch|serve|server|start|preview|interactive)([^a-z0-9_-]|$)`)
+	return !unsafeWord.MatchString(body)
+}
+
+func verificationService(service, factory string) bool {
+	if service == factory {
+		return true
+	}
+	return service == "verify" || service == "verification" || service == "ci"
+}
+
+func newVerificationCandidate(factory, composeFile, service string, command []string) config.VerificationStep {
+	fileID := strings.TrimSuffix(strings.TrimSuffix(composeFile, filepath.Ext(composeFile)), filepath.Ext(strings.TrimSuffix(composeFile, filepath.Ext(composeFile))))
+	name := factory + "-" + strings.ReplaceAll(fileID, ".", "-") + "-" + service
+	return config.VerificationStep{
+		Name: name, ComposeFile: composeFile, Service: service, Command: command,
+		TimeoutSeconds: 900, Required: true, SuccessExitCodes: []int{0},
+	}
+}
+
+func composeCommandCandidates(path, composeFile string) ([]config.VerificationStep, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var document struct {
+		Services map[string]struct {
+			Command yaml.Node `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, err
+	}
+	var candidates []config.VerificationStep
+	for _, factory := range verificationFactories {
+		service, ok := document.Services[factory]
+		if !ok || service.Command.Kind != yaml.SequenceNode {
+			continue
+		}
+		command := make([]string, 0, len(service.Command.Content))
+		valid := true
+		for _, item := range service.Command.Content {
+			if item.Kind != yaml.ScalarNode || item.Tag == "!!null" {
+				valid = false
+				break
+			}
+			command = append(command, item.Value)
+		}
+		if !valid || config.ValidateVerificationCommand(command) != nil {
+			continue
+		}
+		candidates = append(candidates, newVerificationCandidate(factory, composeFile, factory, command))
+	}
+	return candidates, nil
 }
 
 func gitValues(root string, args ...string) []string {
@@ -248,19 +377,9 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 			return config.Workspace{}, fmt.Errorf("--package-manager %q was not detected for stack %q", manager, stack)
 		}
 	}
-	composeFile, err := choose("--compose-file", input.ComposeFile, d.ComposeFiles)
+	verification, err := d.buildVerification(input, manager)
 	if err != nil {
 		return config.Workspace{}, err
-	}
-	if !contains(d.ComposeFiles, composeFile) {
-		return config.Workspace{}, fmt.Errorf("--compose-file %q is not a detected project-root Compose file", composeFile)
-	}
-	service, err := choose("--test-service", input.TestService, d.Services[composeFile])
-	if err != nil {
-		return config.Workspace{}, err
-	}
-	if !contains(d.Services[composeFile], service) {
-		return config.Workspace{}, fmt.Errorf("--test-service %q is not a service in %s", service, composeFile)
 	}
 	branch, err := choose("--branch", input.Branch, d.Branches)
 	if err != nil {
@@ -288,8 +407,7 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 		name = filepath.Base(d.Root)
 	}
 	ws := config.Workspace{Name: name, Path: d.Root, Stack: stack, PackageManager: manager, Branch: branch, Remote: remote,
-		AllowedChangedPaths: uniqueSorted(allowed),
-		Test:                config.TestProfile{ComposeFile: composeFile, Service: service, RunArgs: []string{"--rm"}}}
+		AllowedChangedPaths: uniqueSorted(allowed), Verification: verification}
 	if stack == config.StackDocker {
 		files := input.DockerFiles
 		if len(files) == 0 {
@@ -311,7 +429,68 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 	if err := cfg.Validate(); err != nil {
 		return config.Workspace{}, fmt.Errorf("generated workspace is invalid: %w", err)
 	}
+	if ws.Verification.State == config.VerificationReady {
+		if err := testrunner.ValidateProfile(ws.Path, ws.Verification); err != nil {
+			return config.Workspace{}, fmt.Errorf("generated verification profile is not allowed by the Compose policy: %w", err)
+		}
+	}
 	return ws, nil
+}
+
+func (d Discovery) buildVerification(input Input, manager string) (config.VerificationProfile, error) {
+	if input.ScanOnly {
+		if len(input.VerificationNames) != 0 {
+			return config.VerificationProfile{}, errors.New("--scan-only cannot be combined with --verification")
+		}
+		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
+	}
+	candidates := d.verificationCandidatesForManager(manager)
+	names := append([]string(nil), input.VerificationNames...)
+	if len(names) == 0 {
+		switch len(candidates) {
+		case 0:
+			return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
+		case 1:
+			names = []string{candidates[0].Name}
+		default:
+			options := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				options = append(options, candidate.Name)
+			}
+			return config.VerificationProfile{}, &MissingValueError{Flag: "--verification", Options: options}
+		}
+	}
+	selected := make([]config.VerificationStep, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			return config.VerificationProfile{}, fmt.Errorf("--verification %q was selected more than once", name)
+		}
+		seen[name] = true
+		found := false
+		for _, candidate := range candidates {
+			if candidate.Name == name {
+				selected = append(selected, candidate)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return config.VerificationProfile{}, fmt.Errorf("--verification %q is not a declarative verification candidate", name)
+		}
+	}
+	return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: selected}, nil
+}
+
+func (d Discovery) verificationCandidatesForManager(manager string) []config.VerificationStep {
+	candidates := make([]config.VerificationStep, 0, len(d.VerificationCandidates))
+	for _, candidate := range d.VerificationCandidates {
+		if len(candidate.Command) > 0 && (candidate.Command[0] == "npm" || candidate.Command[0] == "pnpm" || candidate.Command[0] == "bun") && candidate.Command[0] != manager {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
 }
 
 func choose(flag, supplied string, options []string) (string, error) {
