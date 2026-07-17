@@ -509,9 +509,9 @@ func rejectProjectConfig(project Project, allowed bool) error {
 	}
 	for _, name := range project.ConfigFiles {
 		if _, err := os.Lstat(filepath.Join(project.Root, name)); err == nil {
-			return fmt.Errorf("local %s project config %s is present; pass --allow-project-config (or set allow_project_config) only after reviewing registry, proxy, script-shell, and plugin settings", project.Manager, name)
+			return fmt.Errorf("local %s package-manager config is present; pass --allow-project-config (or set allow_project_config) only after reviewing registry, proxy, script-shell, and plugin settings", project.Manager)
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("stat local project config %s: %w", name, err)
+			return fmt.Errorf("stat local %s package-manager config: %w", project.Manager, err)
 		}
 	}
 	return nil

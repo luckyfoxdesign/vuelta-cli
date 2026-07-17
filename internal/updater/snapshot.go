@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -27,27 +28,44 @@ type CandidateScanner interface {
 // workspace. Package manager discovery always uses a read-only container; the
 // Docker implementation only reads registry manifests and explicit files.
 func ResolveCandidateScanner(ws config.Workspace, cfg config.Config) (CandidateScanner, error) {
+	return ResolveCandidateScannerWithOptions(ws, cfg, CandidateScannerOptions{RequireTracked: true})
+}
+
+// CandidateScannerOptions binds package discovery to the registered Git
+// worktree or to an explicit adhoc input contract.
+type CandidateScannerOptions struct {
+	AllowProjectConfig bool
+	RequireTracked     bool
+}
+
+// ResolveCandidateScannerWithOptions selects scanners with exact input
+// contracts. Registered callers must leave RequireTracked enabled.
+func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, options CandidateScannerOptions) (CandidateScanner, error) {
 	var scanners []CandidateScanner
 	run := NewReadOnlyDockerRunner(cfg.Update.Egress)
+	packageContract, err := scaninput.PackageContract(ws, options.AllowProjectConfig)
+	if err != nil {
+		return nil, err
+	}
 	switch ws.Stack + "/" + ws.PackageManager {
 	case "python/poetry":
 		image, err := requireImage(cfg, "python-poetry")
 		if err != nil {
 			return nil, err
 		}
-		scanners = append(scanners, packageScanner{Kind: "poetry", Image: image, Args: []string{"poetry", "show", "--outdated", "--format", "json"}, Run: run})
+		scanners = append(scanners, packageScanner{Kind: "poetry", Image: image, Args: []string{"poetry", "show", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 	case "python/uv":
 		image, err := requireImage(cfg, "python-uv")
 		if err != nil {
 			return nil, err
 		}
-		scanners = append(scanners, packageScanner{Kind: "uv", Image: image, Args: []string{"uv", "tree", "--outdated", "--format", "json"}, Run: run})
+		scanners = append(scanners, packageScanner{Kind: "uv", Image: image, Args: []string{"uv", "tree", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 	case "python/pip-tools":
 		image, err := requireImage(cfg, "python-pip-tools")
 		if err != nil {
 			return nil, err
 		}
-		scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"pip", "list", "--outdated", "--format=json"}, Run: run})
+		scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"pip", "list", "--outdated", "--format=json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 	case "node/npm", "node/bun":
 		key := "node"
 		launcher := "npx"
@@ -63,20 +81,23 @@ func ResolveCandidateScanner(ws config.Workspace, cfg config.Config) (CandidateS
 			return nil, err
 		}
 		args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
-		scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run})
+		scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 	case "node/pnpm":
 		image, err := requireImage(cfg, "node")
 		if err != nil {
 			return nil, err
 		}
 		args := []string{"pnpm", "outdated", "--format", "json", "--config.minimumReleaseAge=" + strconv.Itoa(cfg.Update.MinReleaseAgeDays)}
-		scanners = append(scanners, packageScanner{Kind: "pnpm", Image: image, Args: args, Run: run})
+		scanners = append(scanners, packageScanner{Kind: "pnpm", Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 	case "docker/":
 	default:
 		return nil, fmt.Errorf("no snapshot scanner for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
 	}
 	if ws.DockerImages != nil {
-		scanners = append(scanners, dockerCandidateScanner{Files: ws.DockerImages.Files, Resolve: ResolveDigestViaManifest})
+		scanners = append(scanners, dockerCandidateScanner{
+			Files: ws.DockerImages.Files, Resolve: ResolveDigestViaManifest,
+			Contract: scaninput.DockerContract(ws), RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
+		})
 	}
 	return combinedScanner(scanners), nil
 }
@@ -99,13 +120,21 @@ func (s combinedScanner) Scan(ctx context.Context, projectPath string) ([]update
 }
 
 type packageScanner struct {
-	Kind, Image string
-	Args        []string
-	Run         DockerRunner
+	Kind, Image    string
+	Args           []string
+	Run            ReadOnlyDockerRunner
+	Contract       scaninput.Contract
+	RepositoryRoot string
+	RequireTracked bool
 }
 
 func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
-	out, err := s.Run(ctx, s.Image, s.Args, projectPath)
+	bundle, err := scaninput.Build(ctx, projectPath, s.RepositoryRoot, scaninput.Options{RequireTracked: s.RequireTracked}, s.Contract)
+	if err != nil {
+		return nil, err
+	}
+	defer bundle.Destroy()
+	out, err := s.Run(ctx, s.Image, s.Args, bundle)
 	if err != nil {
 		return nil, err
 	}
@@ -182,16 +211,24 @@ func validCandidate(candidate updatesnapshot.Candidate) bool {
 }
 
 type dockerCandidateScanner struct {
-	Files   []string
-	Resolve DigestResolver
+	Files          []string
+	Resolve        DigestResolver
+	Contract       scaninput.Contract
+	RepositoryRoot string
+	RequireTracked bool
 }
 
 func (s dockerCandidateScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
+	bundle, err := scaninput.Build(ctx, projectPath, s.RepositoryRoot, scaninput.Options{RequireTracked: s.RequireTracked}, s.Contract)
+	if err != nil {
+		return nil, err
+	}
+	defer bundle.Destroy()
 	var candidates []updatesnapshot.Candidate
 	for _, rel := range s.Files {
-		data, err := os.ReadFile(filepath.Join(projectPath, rel))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", rel, err)
+		data, ok := bundle.Content(rel)
+		if !ok {
+			return nil, fmt.Errorf("validated Docker scan input %s is unavailable", rel)
 		}
 		for _, match := range imageReferences(string(data)) {
 			digest, err := s.Resolve(ctx, match.ref)

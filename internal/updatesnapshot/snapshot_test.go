@@ -18,7 +18,9 @@ import (
 func testSnapshot(t *testing.T) Snapshot {
 	t.Helper()
 	snapshot, err := New(time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC), time.Hour, WorkspaceIdentity{
-		CanonicalPath: "/projects/example", BaseRevision: "abc123", InputHashes: map[string]string{"package.json": strings.Repeat("b", 64)},
+		CanonicalPath: "/projects/example", BaseRevision: "abc123", Input: InputIdentity{
+			Stages: []string{"package-candidates"}, ManifestHash: strings.Repeat("c", 64), Hashes: map[string]string{"package.json": strings.Repeat("b", 64)},
+		},
 	}, strings.Repeat("a", 64), []Candidate{{Kind: "npm", Name: "example", Target: "1.2.3"}})
 	if err != nil {
 		t.Fatal(err)
@@ -49,9 +51,9 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFormatTwoRecordsRequiredSecurityIdentity(t *testing.T) {
+func TestFormatThreeRecordsRequiredSecurityIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
-	if snapshot.Format != 2 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" {
+	if snapshot.Format != 3 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" {
 		t.Fatalf("snapshot identity = %#v", snapshot)
 	}
 	if snapshot.Policy.Path != PolicyNone || snapshot.Policy.Hash != PolicyNone || snapshot.Gates.MinReleaseAge == "" {
@@ -66,20 +68,23 @@ func TestFormatTwoRecordsRequiredSecurityIdentity(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsFormatOneWithRerunHint(t *testing.T) {
-	store := Store{Dir: filepath.Join(t.TempDir(), "snapshots")}
-	if err := ensureDir(store.Dir); err != nil {
-		t.Fatal(err)
-	}
-	id := "abcdefghijklmnopqrstuv"
-	data := []byte(`{"format":1}`)
-	data = []byte(strings.Replace(string(data), `}`, `,"id":"`+id+`"}`, 1))
-	if err := os.WriteFile(filepath.Join(store.Dir, id+".json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := store.Load(id)
-	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "rerun vuelta scan") {
-		t.Fatalf("format-1 error = %v", err)
+func TestStoreRejectsOlderFormatsWithRerunHint(t *testing.T) {
+	for _, format := range []int{1, 2} {
+		t.Run(fmt.Sprintf("format-%d", format), func(t *testing.T) {
+			store := Store{Dir: filepath.Join(t.TempDir(), "snapshots")}
+			if err := ensureDir(store.Dir); err != nil {
+				t.Fatal(err)
+			}
+			id := "abcdefghijklmnopqrstuv"
+			data := []byte(fmt.Sprintf(`{"format":%d,"id":%q}`, format, id))
+			if err := os.WriteFile(filepath.Join(store.Dir, id+".json"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := store.Load(id)
+			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "rerun vuelta scan") {
+				t.Fatalf("format-%d error = %v", format, err)
+			}
+		})
 	}
 }
 
@@ -91,7 +96,10 @@ func TestAdhocSnapshotBindsInputsPolicyAndGates(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(policyData)
-	inputs := map[string]string{"package.json": strings.Repeat("c", 64), "package-lock.json": strings.Repeat("d", 64)}
+	inputs := InputIdentity{
+		Stages: []string{"package-candidates"}, ManifestHash: strings.Repeat("b", 64),
+		Hashes: map[string]string{"package.json": strings.Repeat("c", 64), "package-lock.json": strings.Repeat("d", 64)},
+	}
 	now := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
 	policy := PolicyIdentity{Path: policyPath, Hash: fmt.Sprintf("%x", sum)}
 	gates := ScanGates{AllowProjectConfig: true, MinReleaseAge: "168h0m0s"}
@@ -106,8 +114,8 @@ func TestAdhocSnapshotBindsInputsPolicyAndGates(t *testing.T) {
 	if err := ValidateForAdhoc(snapshot, root, inputs, now); err != nil {
 		t.Fatalf("validate adhoc snapshot: %v", err)
 	}
-	changedInputs := cloneHashes(inputs)
-	changedInputs["package.json"] = strings.Repeat("e", 64)
+	changedInputs := cloneInputIdentity(inputs)
+	changedInputs.Hashes["package.json"] = strings.Repeat("e", 64)
 	if err := ValidateForAdhoc(snapshot, root, changedInputs, now); !errors.Is(err, ErrStale) {
 		t.Fatalf("changed-input error = %v", err)
 	}

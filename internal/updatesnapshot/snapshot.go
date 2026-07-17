@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 )
 
@@ -32,10 +33,9 @@ var (
 )
 
 const (
-	// FormatVersion is intentionally incompatible with the short-lived format
-	// 1 plans. Format 2 records the scan origin and every security-relevant
-	// scan-time input needed by the explicit scan -> update workflow.
-	FormatVersion = 2
+	// FormatVersion 3 adds a typed, hashed input manifest. Earlier snapshots did
+	// not prove which stage received each file and are intentionally invalid.
+	FormatVersion = 3
 
 	OriginWorkspace = "workspace"
 	OriginAdhoc     = "adhoc"
@@ -57,13 +57,20 @@ type Candidate struct {
 	ReleaseAgeVerified bool   `json:"release_age_verified"`
 }
 
+// InputIdentity binds a plan to its typed stage set and exact file contents.
+type InputIdentity struct {
+	Stages       []string          `json:"stages"`
+	ManifestHash string            `json:"manifest_hash"`
+	Hashes       map[string]string `json:"hashes"`
+}
+
 // WorkspaceIdentity binds a plan to exactly one clean workspace revision and
-// its explicitly allowed update inputs.
+// its explicitly allowed scan inputs.
 type WorkspaceIdentity struct {
-	CanonicalPath string            `json:"canonical_path"`
-	Remote        string            `json:"remote"`
-	BaseRevision  string            `json:"base_revision"`
-	InputHashes   map[string]string `json:"input_hashes"`
+	CanonicalPath string        `json:"canonical_path"`
+	Remote        string        `json:"remote"`
+	BaseRevision  string        `json:"base_revision"`
+	Input         InputIdentity `json:"input"`
 }
 
 // PolicyIdentity records an optional, canonical standalone policy. The
@@ -82,20 +89,20 @@ type ScanGates struct {
 
 // Snapshot is the on-disk plan. It is intentionally a small, strict schema.
 type Snapshot struct {
-	Format      int               `json:"format"`
-	ID          string            `json:"id"`
-	CreatedAt   time.Time         `json:"created_at"`
-	ExpiresAt   time.Time         `json:"expires_at"`
-	Origin      string            `json:"origin"`
-	Project     string            `json:"project,omitempty"`
-	AdhocPath   string            `json:"adhoc_path,omitempty"`
-	Workspace   WorkspaceIdentity `json:"workspace,omitempty"`
-	InputHashes map[string]string `json:"input_hashes,omitempty"`
-	Policy      PolicyIdentity    `json:"policy"`
-	Gates       ScanGates         `json:"scan_gates"`
-	ConfigHash  string            `json:"config_hash,omitempty"`
-	PolicyHash  string            `json:"policy_hash"`
-	Candidates  []Candidate       `json:"candidates"`
+	Format     int               `json:"format"`
+	ID         string            `json:"id"`
+	CreatedAt  time.Time         `json:"created_at"`
+	ExpiresAt  time.Time         `json:"expires_at"`
+	Origin     string            `json:"origin"`
+	Project    string            `json:"project,omitempty"`
+	AdhocPath  string            `json:"adhoc_path,omitempty"`
+	Workspace  WorkspaceIdentity `json:"workspace,omitempty"`
+	Input      InputIdentity     `json:"input,omitempty"`
+	Policy     PolicyIdentity    `json:"policy"`
+	Gates      ScanGates         `json:"scan_gates"`
+	ConfigHash string            `json:"config_hash,omitempty"`
+	PolicyHash string            `json:"policy_hash"`
+	Candidates []Candidate       `json:"candidates"`
 }
 
 // New creates an opaque-ID snapshot. ttl must be positive and is validated by
@@ -110,7 +117,7 @@ func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHas
 	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, effectiveHash, candidates)
 }
 
-// NewWorkspace creates a format-2 plan bound to a registered workspace.
+// NewWorkspace creates a format-3 plan bound to a registered workspace.
 func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
@@ -131,15 +138,15 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	return snapshot, nil
 }
 
-// NewAdhoc creates a format-2 plan bound to an explicit unregistered path.
-func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, inputHashes map[string]string, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
+// NewAdhoc creates a format-3 plan bound to an explicit unregistered path.
+func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input InputIdentity, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
 		return Snapshot{}, err
 	}
 	snapshot := Snapshot{
 		Format: FormatVersion, ID: id, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl),
-		Origin: OriginAdhoc, AdhocPath: canonicalPath, InputHashes: cloneHashes(inputHashes),
+		Origin: OriginAdhoc, AdhocPath: canonicalPath, Input: cloneInputIdentity(input),
 		Policy: policy, Gates: gates, PolicyHash: effectivePolicyHash,
 		Candidates: append([]Candidate(nil), candidates...),
 	}
@@ -158,6 +165,10 @@ func cloneHashes(hashes map[string]string) map[string]string {
 		copyHashes[path] = hash
 	}
 	return copyHashes
+}
+
+func cloneInputIdentity(input InputIdentity) InputIdentity {
+	return InputIdentity{Stages: append([]string(nil), input.Stages...), ManifestHash: input.ManifestHash, Hashes: cloneHashes(input.Hashes)}
 }
 
 func newID() (string, error) {
@@ -250,8 +261,8 @@ func (s Store) Load(id string) (Snapshot, error) {
 	if err := dec.Decode(&snapshot); err != nil {
 		return Snapshot{}, fmt.Errorf("%w: parse snapshot: %v", ErrInvalid, err)
 	}
-	if snapshot.Format == 1 {
-		return Snapshot{}, fmt.Errorf("%w: snapshot format 1 is no longer supported; rerun vuelta scan", ErrInvalid)
+	if snapshot.Format < FormatVersion {
+		return Snapshot{}, fmt.Errorf("%w: snapshot format %d is no longer supported; rerun vuelta scan", ErrInvalid, snapshot.Format)
 	}
 	if err := validateSnapshot(snapshot); err != nil {
 		return Snapshot{}, err
@@ -287,11 +298,20 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 	if err != nil || effectiveHash != snapshot.PolicyHash {
 		return fmt.Errorf("%w: effective scan policy changed", ErrStale)
 	}
-	identity, err := scanner.IdentityForSnapshot(ctx, ws)
+	stages, err := scaninput.ParseStages(snapshot.Workspace.Input.Stages)
+	if err != nil {
+		return fmt.Errorf("%w: malformed scan input stages", ErrStale)
+	}
+	identity, err := scanner.IdentityForSnapshotWithOptions(ctx, ws, scanner.IdentityOptions{
+		Stages: stages, AllowProjectConfig: snapshot.Gates.AllowProjectConfig, PolicyFile: cfg.VulnScan.PolicyFile,
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrStale, err)
 	}
-	actual := WorkspaceIdentity{CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes}
+	actual := WorkspaceIdentity{
+		CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
+		Input: InputIdentity{Stages: identity.InputStages, ManifestHash: identity.InputManifestHash, Hashes: identity.InputHashes},
+	}
 	if !reflect.DeepEqual(snapshot.Workspace, actual) {
 		return fmt.Errorf("%w: workspace revision, remote, or update inputs changed", ErrStale)
 	}
@@ -300,14 +320,14 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 
 // ValidateForAdhoc rejects an expired snapshot when the explicit directory,
 // its manifest/lock inputs, or its standalone policy changed.
-func ValidateForAdhoc(snapshot Snapshot, canonicalPath string, inputHashes map[string]string, now time.Time) error {
+func ValidateForAdhoc(snapshot Snapshot, canonicalPath string, input InputIdentity, now time.Time) error {
 	if err := validateSnapshot(snapshot); err != nil {
 		return err
 	}
 	if !now.Before(snapshot.ExpiresAt) {
 		return ErrExpired
 	}
-	if snapshot.Origin != OriginAdhoc || snapshot.AdhocPath != canonicalPath || !reflect.DeepEqual(snapshot.InputHashes, inputHashes) {
+	if snapshot.Origin != OriginAdhoc || snapshot.AdhocPath != canonicalPath || !reflect.DeepEqual(snapshot.Input, input) {
 		return fmt.Errorf("%w: adhoc target or update inputs changed", ErrStale)
 	}
 	if err := validatePolicyIdentity(snapshot.Policy); err != nil {
@@ -428,8 +448,8 @@ func validateExistingDir(dir string) error {
 }
 
 func validateSnapshot(snapshot Snapshot) error {
-	if snapshot.Format == 1 {
-		return fmt.Errorf("%w: snapshot format 1 is no longer supported; rerun vuelta scan", ErrInvalid)
+	if snapshot.Format < FormatVersion {
+		return fmt.Errorf("%w: snapshot format %d is no longer supported; rerun vuelta scan", ErrInvalid, snapshot.Format)
 	}
 	if snapshot.Format != FormatVersion || !idPattern.MatchString(snapshot.ID) || snapshot.CreatedAt.IsZero() || snapshot.ExpiresAt.IsZero() || !snapshot.ExpiresAt.After(snapshot.CreatedAt) {
 		return fmt.Errorf("%w: malformed snapshot metadata", ErrInvalid)
@@ -447,25 +467,24 @@ func validateSnapshot(snapshot Snapshot) error {
 	if snapshot.Policy.Path != PolicyNone && !hashPattern.MatchString(snapshot.Policy.Hash) {
 		return fmt.Errorf("%w: malformed policy hash", ErrInvalid)
 	}
-	var hashes map[string]string
 	switch snapshot.Origin {
 	case OriginWorkspace:
-		if snapshot.Project == "" || snapshot.AdhocPath != "" || !filepath.IsAbs(snapshot.Workspace.CanonicalPath) || snapshot.Workspace.BaseRevision == "" || !hashPattern.MatchString(snapshot.ConfigHash) || len(snapshot.Workspace.InputHashes) == 0 {
+		if snapshot.Project == "" || snapshot.AdhocPath != "" || !filepath.IsAbs(snapshot.Workspace.CanonicalPath) || snapshot.Workspace.BaseRevision == "" ||
+			!hashPattern.MatchString(snapshot.ConfigHash) || !reflect.DeepEqual(snapshot.Input, InputIdentity{}) {
 			return fmt.Errorf("%w: incomplete workspace identity", ErrInvalid)
 		}
-		hashes = snapshot.Workspace.InputHashes
+		if err := validateInputIdentity(snapshot.Workspace.Input); err != nil {
+			return err
+		}
 	case OriginAdhoc:
-		if snapshot.Project != "" || !filepath.IsAbs(snapshot.AdhocPath) || len(snapshot.InputHashes) == 0 {
+		if snapshot.Project != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
 			return fmt.Errorf("%w: incomplete adhoc identity", ErrInvalid)
 		}
-		hashes = snapshot.InputHashes
+		if err := validateInputIdentity(snapshot.Input); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%w: invalid snapshot origin", ErrInvalid)
-	}
-	for path, sum := range hashes {
-		if path == "" || path == "." || filepath.IsAbs(path) || !hashPattern.MatchString(sum) {
-			return fmt.Errorf("%w: malformed input hash", ErrInvalid)
-		}
 	}
 	for _, candidate := range snapshot.Candidates {
 		if candidate.Kind == "" || candidate.Name == "" || candidate.Target == "" {
@@ -473,6 +492,29 @@ func validateSnapshot(snapshot Snapshot) error {
 		}
 		if filepath.IsAbs(candidate.File) || candidate.File == ".." || strings.HasPrefix(filepath.Clean(candidate.File), ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: candidate file escapes the workspace", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+func validateInputIdentity(input InputIdentity) error {
+	if len(input.Stages) == 0 || !hashPattern.MatchString(input.ManifestHash) || len(input.Hashes) == 0 {
+		return fmt.Errorf("%w: incomplete scan input identity", ErrInvalid)
+	}
+	stages, err := scaninput.ParseStages(input.Stages)
+	if err != nil {
+		return fmt.Errorf("%w: malformed scan input stages", ErrInvalid)
+	}
+	canonical := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		canonical = append(canonical, string(stage))
+	}
+	if !reflect.DeepEqual(input.Stages, canonical) {
+		return fmt.Errorf("%w: scan input stages are not canonical", ErrInvalid)
+	}
+	for path, sum := range input.Hashes {
+		if path == "" || path == "." || filepath.IsAbs(path) || !hashPattern.MatchString(sum) {
+			return fmt.Errorf("%w: malformed input hash", ErrInvalid)
 		}
 	}
 	return nil

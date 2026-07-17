@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -214,13 +215,6 @@ func TestDockerRunArgsIncludeSecurityBaseline(t *testing.T) {
 	}
 }
 
-func TestDockerReadOnlyArgsProtectProject(t *testing.T) {
-	got := dockerReadOnlyArgs("node@sha256:x", []string{"npx", "ncu"}, "/sandbox/project", "egress", "http://proxy:3128")
-	if !slicesContain(got, "--read-only") || !slicesContain(got, "/sandbox/project:/project:ro") {
-		t.Fatalf("read-only scan args missing protections: %q", got)
-	}
-}
-
 func TestParsePackageCandidates(t *testing.T) {
 	candidates, err := parsePackageCandidates("npm", []byte(`{"left-pad":"1.3.0","@scope/pkg":"2.0.0"}`))
 	if err != nil {
@@ -228,6 +222,36 @@ func TestParsePackageCandidates(t *testing.T) {
 	}
 	if len(candidates) != 2 || candidates[0].Target == "" || candidates[1].Name == "" {
 		t.Fatalf("candidates = %#v", candidates)
+	}
+}
+
+func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{}`)
+	writeFile(t, root, "package-lock.json", `{}`)
+	writeFile(t, root, "unrelated-source.js", "sentinel")
+	contract, err := scaninput.PackageContract(config.Workspace{Stack: config.StackNode, PackageManager: "npm"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := packageScanner{
+		Kind: "npm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
+		Run: func(_ context.Context, _ string, _ []string, bundle scaninput.Bundle) (string, error) {
+			if _, ok := bundle.Content("package.json"); !ok {
+				t.Fatal("package manifest missing from minimal bundle")
+			}
+			if _, ok := bundle.Content("package-lock.json"); !ok {
+				t.Fatal("package lock missing from minimal bundle")
+			}
+			if _, ok := bundle.Content("unrelated-source.js"); ok {
+				t.Fatal("unrelated source visible to package scanner")
+			}
+			return `{"example":"2.0.0"}`, nil
+		},
+	}
+	candidates, err := scanner.Scan(context.Background(), root)
+	if err != nil || len(candidates) != 1 || candidates[0].Name != "example" {
+		t.Fatalf("Scan() = %#v, %v", candidates, err)
 	}
 }
 

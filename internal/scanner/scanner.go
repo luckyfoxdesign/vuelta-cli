@@ -6,8 +6,6 @@ package scanner
 
 import (
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +15,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 )
 
 // SkipReason explains why Preflight decided a workspace should be skipped
@@ -45,10 +44,20 @@ type PreflightResult struct {
 // SnapshotIdentity is the immutable workspace metadata used to bind a package
 // update plan to the exact project inputs that were scanned.
 type SnapshotIdentity struct {
-	CanonicalPath string
-	Remote        string
-	BaseRevision  string
-	InputHashes   map[string]string
+	CanonicalPath     string
+	Remote            string
+	BaseRevision      string
+	InputStages       []string
+	InputManifestHash string
+	InputHashes       map[string]string
+	InputCategories   []string
+}
+
+// IdentityOptions records the exact stage contracts used by a scan.
+type IdentityOptions struct {
+	Stages             []scaninput.Stage
+	AllowProjectConfig bool
+	PolicyFile         string
 }
 
 // RequiredTools lists host binaries the pipeline needs before it can run
@@ -140,6 +149,19 @@ func Preflight(ctx context.Context, ws config.Workspace) (PreflightResult, error
 // the Git revision, configured remote URL, and hashes of the only files that
 // package scanning is allowed to read. It never walks parent directories.
 func IdentityForSnapshot(ctx context.Context, ws config.Workspace) (SnapshotIdentity, error) {
+	stages := make([]scaninput.Stage, 0, 2)
+	if ws.PackageManager != "" {
+		stages = append(stages, scaninput.StagePackageCandidates)
+	}
+	if ws.DockerImages != nil {
+		stages = append(stages, scaninput.StageDockerManifest)
+	}
+	return IdentityForSnapshotWithOptions(ctx, ws, IdentityOptions{Stages: stages})
+}
+
+// IdentityForSnapshotWithOptions repeats preflight and binds the exact typed
+// input manifest used by package/vulnerability scan stages.
+func IdentityForSnapshotWithOptions(ctx context.Context, ws config.Workspace, options IdentityOptions) (SnapshotIdentity, error) {
 	pre, err := Preflight(ctx, ws)
 	if err != nil {
 		return SnapshotIdentity{}, err
@@ -158,11 +180,70 @@ func IdentityForSnapshot(ctx context.Context, ws config.Workspace) (SnapshotIden
 			return SnapshotIdentity{}, fmt.Errorf("resolve remote URL: %w", err)
 		}
 	}
-	hashes, err := inputHashes(pre.CanonicalPath, ws)
+	contracts, stages, err := InputContracts(ws, options)
 	if err != nil {
 		return SnapshotIdentity{}, err
 	}
-	return SnapshotIdentity{CanonicalPath: pre.CanonicalPath, Remote: strings.TrimSpace(remoteURL), BaseRevision: strings.TrimSpace(revision), InputHashes: hashes}, nil
+	manifests := make([]scaninput.Manifest, 0, len(contracts))
+	for _, contract := range contracts {
+		bundle, buildErr := scaninput.Build(ctx, pre.CanonicalPath, pre.CanonicalPath, scaninput.Options{RequireTracked: true}, contract)
+		if buildErr != nil {
+			return SnapshotIdentity{}, buildErr
+		}
+		manifests = append(manifests, bundle.Manifest)
+		bundle.Destroy()
+	}
+	manifest, err := scaninput.Combine(manifests...)
+	if err != nil {
+		return SnapshotIdentity{}, err
+	}
+	stageNames := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		stageNames = append(stageNames, string(stage))
+	}
+	return SnapshotIdentity{
+		CanonicalPath: pre.CanonicalPath, Remote: strings.TrimSpace(remoteURL), BaseRevision: strings.TrimSpace(revision),
+		InputStages: stageNames, InputManifestHash: manifest.Hash, InputHashes: manifest.InputHashes,
+		InputCategories: scaninput.ManifestCategories(manifest),
+	}, nil
+}
+
+// InputContracts returns deterministic contracts for snapshot creation,
+// revalidation, and path-free diagnostics.
+func InputContracts(ws config.Workspace, options IdentityOptions) ([]scaninput.Contract, []scaninput.Stage, error) {
+	values := make([]string, 0, len(options.Stages))
+	for _, stage := range options.Stages {
+		values = append(values, string(stage))
+	}
+	stages, err := scaninput.ParseStages(values)
+	if err != nil {
+		return nil, nil, err
+	}
+	contracts := make([]scaninput.Contract, 0, len(stages))
+	for _, stage := range stages {
+		switch stage {
+		case scaninput.StagePackageCandidates:
+			contract, contractErr := scaninput.PackageContract(ws, options.AllowProjectConfig)
+			if contractErr != nil {
+				return nil, nil, contractErr
+			}
+			contracts = append(contracts, contract)
+		case scaninput.StageDependencyCVE:
+			contract, contractErr := scaninput.DependencyContract(ws)
+			if contractErr != nil {
+				return nil, nil, contractErr
+			}
+			contracts = append(contracts, contract)
+		case scaninput.StageDockerManifest:
+			contracts = append(contracts, scaninput.DockerContract(ws))
+		case scaninput.StagePolicy:
+			if options.PolicyFile == "" {
+				return nil, nil, fmt.Errorf("vulnerability policy stage has no configured policy")
+			}
+			contracts = append(contracts, scaninput.PolicyContract(options.PolicyFile))
+		}
+	}
+	return contracts, stages, nil
 }
 
 func isClean(ctx context.Context, path string) (bool, error) {
@@ -226,34 +307,4 @@ func stackFilesPresent(path string, ws config.Workspace) bool {
 		}
 	}
 	return true
-}
-
-func inputHashes(root string, ws config.Workspace) (map[string]string, error) {
-	files := append([]string(nil), stackManifests[ws.Stack+"/"+ws.PackageManager]...)
-	if ws.DockerImages != nil {
-		files = append(files, ws.DockerImages.Files...)
-	}
-	if len(files) == 0 {
-		return nil, errors.New("workspace has no configured update input files")
-	}
-	hashes := make(map[string]string, len(files))
-	for _, rel := range files {
-		if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(filepath.Clean(rel), ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("invalid update input path %q", rel)
-		}
-		info, err := os.Lstat(filepath.Join(root, rel))
-		if err != nil {
-			return nil, fmt.Errorf("stat update input %s: %w", rel, err)
-		}
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("update input %s is not a regular file", rel)
-		}
-		data, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			return nil, fmt.Errorf("read update input %s: %w", rel, err)
-		}
-		sum := sha256.Sum256(data)
-		hashes[rel] = fmt.Sprintf("%x", sum)
-	}
-	return hashes, nil
 }

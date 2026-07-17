@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,7 +17,8 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
-	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
+	"github.com/luckyfoxdesign/vuelta/internal/scancontainer"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 )
 
 // Output bounds for untrusted scanner output (F5-MED-008). Scanner stdout is
@@ -68,30 +67,42 @@ type Command func(ctx context.Context, dir, name string, args ...string) ([]byte
 
 // Scanner invokes Trivy/OSV and validates their structured output.
 type Scanner struct {
-	Command Command
-	Docker  dockerexec.Runner
-	Now     func() time.Time
+	Command              Command
+	Docker               dockerexec.Runner
+	Now                  func() time.Time
+	allowUntrackedInputs bool
 }
 
-func (s Scanner) command(ctx context.Context, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+// NewAdhocScanner returns the narrow scanner used only for an explicit
+// unregistered directory. Registered pipeline callers use the zero-value
+// Scanner, which always requires tracked inputs.
+func NewAdhocScanner(command Command) Scanner {
+	return Scanner{Command: command, allowUntrackedInputs: true}
+}
+
+func (s Scanner) command(ctx context.Context, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
 	if s.Command != nil {
-		return s.Command(ctx, dir, name, args...)
+		private, err := scaninput.MaterializePrivate(ctx, bundle)
+		if err != nil {
+			return nil, err
+		}
+		output, commandErr := s.Command(ctx, private.Dir, name, args...)
+		return output, errors.Join(commandErr, private.Close())
 	}
 	docker := s.Docker
 	if docker == nil {
 		docker = dockerexec.Default()
 	}
-	return dockerCommandWith(ctx, docker, dir, image, egressConfig, name, args...)
+	return dockerCommandWith(ctx, docker, bundle, image, egressConfig, name, args...)
 }
 
-// dockerCommand runs a scanner in its pinned image. The scanned directory is
-// the sole host mount and is read-only; vulnerability data lives in tmpfs and
-// is fetched only through the configured registry allowlist proxy.
-func dockerCommand(ctx context.Context, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
-	return dockerCommandWith(ctx, dockerexec.Default(), dir, image, egressConfig, name, args...)
+// dockerCommand runs a scanner with no host mount. The minimal input archive
+// is copied through stdin before the read-only container starts.
+func dockerCommand(ctx context.Context, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+	return dockerCommandWith(ctx, dockerexec.Default(), bundle, image, egressConfig, name, args...)
 }
 
-func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, dir, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
 	if !exactDigest.MatchString(image) {
 		return nil, fmt.Errorf("scanner image %q is not pinned to an exact digest", image)
 	}
@@ -99,8 +110,13 @@ func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, dir, image
 	if err != nil {
 		return nil, err
 	}
-	result, err := docker.Run(ctx, dockerexec.Request{
-		Args:   dockerRunArgs(image, dir, network, proxyURL, name, args),
+	toolEnvironment := ""
+	if name == "trivy" {
+		toolEnvironment = name
+	}
+	result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
+		Image: image, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL, Tool: toolEnvironment,
+		Memory: "2g", Tmpfs: "2g",
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: scannerStdoutMaxBytes},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: scannerStderrTailBytes},
 	})
@@ -115,37 +131,6 @@ func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, dir, image
 		return nil, fmt.Errorf("docker run %s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return result.Stdout, nil
-}
-
-func dockerRunArgs(image, dir, network, proxyURL, name string, args []string) []string {
-	dockerArgs := []string{
-		"run", "--rm",
-		"--user", "65532:65532",
-		"--read-only",
-		"--security-opt", "no-new-privileges",
-		"--cap-drop", "ALL",
-		"--cpus", "1",
-		"--memory", "2g",
-		"--pids-limit", "256",
-		"--network", network,
-		"--env", "HTTP_PROXY=" + proxyURL,
-		"--env", "HTTPS_PROXY=" + proxyURL,
-		"--env", "http_proxy=" + proxyURL,
-		"--env", "https_proxy=" + proxyURL,
-		"--env", "NO_PROXY=localhost,127.0.0.1",
-		"--env", "HOME=/tmp",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,size=2g",
-		"--mount", "type=bind,src=" + dir + ",dst=/project,readonly",
-		"--workdir", "/project",
-	}
-	if name == "trivy" {
-		dockerArgs = append(dockerArgs,
-			"--env", "TRIVY_CACHE_DIR=/tmp/trivy",
-			"--env", "TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
-		)
-	}
-	dockerArgs = append(dockerArgs, image)
-	return append(dockerArgs, args...)
 }
 
 func (s Scanner) now() time.Time {
@@ -163,12 +148,12 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
 	}
-	policy, err := loadPolicy(ctx, ws.Path, scanConfig.PolicyFile, s.now())
+	policy, err := loadPolicy(ctx, ws.Path, scanConfig.PolicyFile, s.now(), !s.allowUntrackedInputs)
 	if err != nil {
 		return Report{}, err
 	}
 
-	findings, err := s.scanDependencies(ctx, root, cfg)
+	findings, err := s.scanDependencies(ctx, root, ws, cfg)
 	if err != nil {
 		return Report{}, err
 	}
@@ -186,7 +171,7 @@ func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspac
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
 	}
-	policy, err := loadPolicy(ctx, ws.Path, cfg.VulnScan.PolicyFile, s.now())
+	policy, err := loadPolicy(ctx, ws.Path, cfg.VulnScan.PolicyFile, s.now(), !s.allowUntrackedInputs)
 	if err != nil {
 		return Report{}, err
 	}
@@ -197,11 +182,24 @@ func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspac
 	return applyPolicy(findings, policy), nil
 }
 
-func (s Scanner) scanDependencies(ctx context.Context, root string, cfg config.Config) ([]Finding, error) {
+func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]Finding, error) {
 	scanConfig := cfg.VulnScan
+	contract, err := scaninput.DependencyContract(ws)
+	if err != nil {
+		return nil, err
+	}
+	repositoryRoot := ws.Path
+	if repositoryRoot == "" {
+		repositoryRoot = root
+	}
+	bundle, err := scaninput.Build(ctx, root, repositoryRoot, scaninput.Options{RequireTracked: !s.allowUntrackedInputs}, contract)
+	if err != nil {
+		return nil, err
+	}
+	defer bundle.Destroy()
 	switch scanConfig.DependencySource {
 	case "trivy":
-		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
+		out, err := s.command(ctx, bundle, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
 		if err != nil {
 			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
@@ -214,7 +212,7 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, cfg config.C
 		}
 		return parsed, nil
 	case "osv-scanner":
-		out, err := s.command(ctx, root, scanConfig.Image, cfg.Update.Egress, "osv-scanner", "--format", "json", "--lockfile", "/project")
+		out, err := s.command(ctx, bundle, scanConfig.Image, cfg.Update.Egress, "osv-scanner", "--format", "json", "--lockfile", "/project")
 		if err != nil {
 			return nil, fmt.Errorf("osv-scanner filesystem scan: %w", err)
 		}
@@ -239,7 +237,16 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	if scanConfig.ImageScan.Tool != "trivy" {
 		return nil, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
 	}
-	images, err := imageDigests(root, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
+	repositoryRoot := ws.Path
+	if repositoryRoot == "" {
+		repositoryRoot = root
+	}
+	bundle, err := scaninput.Build(ctx, root, repositoryRoot, scaninput.Options{RequireTracked: !s.allowUntrackedInputs}, scaninput.DockerContract(ws))
+	if err != nil {
+		return nil, err
+	}
+	defer bundle.Destroy()
+	images, err := imageDigests(bundle, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +258,7 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 		}
 		for _, platform := range imagePlatforms(ws, scanConfig) {
 			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, image)
-			out, err := s.command(ctx, root, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
+			out, err := s.command(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
 			if err != nil {
 				return nil, fmt.Errorf("trivy image scan %s (%s): %w", image, platform, err)
 			}
@@ -284,23 +291,12 @@ var (
 	exactDigest    = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 )
 
-func imageDigests(root string, files, runtimeImages []string) ([]string, error) {
+func imageDigests(bundle scaninput.Bundle, files, runtimeImages []string) ([]string, error) {
 	seen := make(map[string]bool)
 	for _, rel := range files {
-		if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(filepath.Clean(rel), ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("image scan file %q escapes project root", rel)
-		}
-		path := filepath.Join(root, rel)
-		info, err := os.Lstat(path)
-		if err != nil {
-			return nil, fmt.Errorf("read image scan file %s: %w", rel, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("image scan file %s is not a regular file", rel)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read image scan file %s: %w", rel, err)
+		data, ok := bundle.Content(rel)
+		if !ok {
+			return nil, fmt.Errorf("validated image scan input %s is unavailable", rel)
 		}
 		for _, pattern := range []*regexp.Regexp{fromReference, imageReference} {
 			for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
@@ -473,27 +469,18 @@ type policyException struct {
 	Expires string `yaml:"expires"`
 }
 
-func loadPolicy(ctx context.Context, projectRoot, rel string, now time.Time) (policyFile, error) {
+func loadPolicy(ctx context.Context, projectRoot, rel string, now time.Time, requireTracked bool) (policyFile, error) {
 	if rel == "" {
 		return policyFile{}, nil
 	}
-	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(filepath.Clean(rel), ".."+string(filepath.Separator)) {
-		return policyFile{}, fmt.Errorf("vulnerability policy %q must be project-relative", rel)
-	}
-	path := filepath.Join(projectRoot, rel)
-	info, err := os.Lstat(path)
+	bundle, err := scaninput.Build(ctx, projectRoot, projectRoot, scaninput.Options{RequireTracked: requireTracked}, scaninput.PolicyContract(rel))
 	if err != nil {
-		return policyFile{}, fmt.Errorf("read vulnerability policy: %w", err)
+		return policyFile{}, fmt.Errorf("validate vulnerability policy input: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return policyFile{}, errors.New("vulnerability policy must be a regular file")
-	}
-	if _, err := gitexec.Output(ctx, projectRoot, "ls-files", "--error-unmatch", "--", rel); err != nil {
-		return policyFile{}, errors.New("vulnerability policy must be tracked")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return policyFile{}, fmt.Errorf("read vulnerability policy: %w", err)
+	defer bundle.Destroy()
+	data, ok := bundle.Content(rel)
+	if !ok {
+		return policyFile{}, errors.New("validated vulnerability policy input is unavailable")
 	}
 	var policy policyFile
 	if err := yaml.Unmarshal(data, &policy); err != nil {

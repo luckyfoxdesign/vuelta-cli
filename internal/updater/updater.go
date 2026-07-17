@@ -12,6 +12,8 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
+	"github.com/luckyfoxdesign/vuelta/internal/scancontainer"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 )
 
 // Output bounds for untrusted container output (F5-MED-008). Discovery output
@@ -33,6 +35,10 @@ type Updater interface {
 // its combined output. Tests inject a fake to avoid needing a real Docker
 // daemon.
 type DockerRunner func(ctx context.Context, image string, args []string, workDir string) (output string, err error)
+
+// ReadOnlyDockerRunner executes discovery against an in-memory minimal input
+// archive rather than a host directory mount.
+type ReadOnlyDockerRunner func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (output string, err error)
 
 // ErrEgressPolicyUnavailable is returned when the registry allowlist policy
 // required for an update container has not been configured. The runner must
@@ -57,15 +63,16 @@ func NewDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressCon
 }
 
 // NewReadOnlyDockerRunner executes package discovery in the same fail-closed
-// egress environment as updates, but makes both the container root filesystem
-// and project mount read-only. Tools can use /tmp only for ephemeral caches.
-func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) DockerRunner {
+// egress environment as updates, but transfers only an in-memory allowlisted
+// context and makes the final container root filesystem read-only. Tools can
+// use /tmp only for ephemeral caches.
+func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) ReadOnlyDockerRunner {
 	return NewReadOnlyDockerRunnerWith(dockerexec.Default(), egressConfig)
 }
 
 // NewReadOnlyDockerRunnerWith returns a discovery runner using the supplied boundary.
-func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) DockerRunner {
-	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
+func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) ReadOnlyDockerRunner {
+	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (string, error) {
 		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
 			return "", err
@@ -73,9 +80,9 @@ func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.E
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		result, err := docker.Run(ctx, dockerexec.Request{
-			Args:     dockerReadOnlyArgs(image, args, workDir, network, proxyURL),
-			Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
+		result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
+			Image: image, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL,
+			Memory: "1g", Tmpfs: "64m", Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
 		})
 		var limitErr *dockerexec.OutputLimitError
 		if errors.As(err, &limitErr) {
@@ -148,17 +155,6 @@ func dockerRunArgs(image string, args []string, workDir, network, proxyURL strin
 		image,
 	}, args...)
 	return dockerArgs
-}
-
-func dockerReadOnlyArgs(image string, args []string, workDir, network, proxyURL string) []string {
-	dockerArgs := dockerRunArgs(image, args, workDir, network, proxyURL)
-	for i, arg := range dockerArgs {
-		if arg == "-v" && i+1 < len(dockerArgs) {
-			dockerArgs[i+1] += ":ro"
-			break
-		}
-	}
-	return append(dockerArgs[:1], append([]string{"--read-only"}, dockerArgs[1:]...)...)
 }
 
 // NoopUpdater reports no change; used for workspaces with nothing to update

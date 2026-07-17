@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
@@ -55,6 +57,7 @@ type scanResult struct {
 	Candidates      []updatesnapshot.Candidate `json:"candidates"`
 	Vulnerabilities []string                   `json:"vulnerabilities"`
 	Tools           []scanToolResult           `json:"tools"`
+	InputCategories []string                   `json:"input_categories"`
 	Warnings        []string                   `json:"warnings"`
 	Error           *jsonCommandError          `json:"error,omitempty"`
 }
@@ -419,7 +422,43 @@ func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, optio
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, InputCategories: []string{}, Warnings: []string{},
+	}
+	identityConfig := cfg
+	var identityWorkspace config.Workspace
+	if target.workspace != nil {
+		identityWorkspace = *target.workspace
+	} else {
+		project, detectErr := localupdate.Detect(target.path)
+		if detectErr != nil {
+			return failedScanResult(result, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
+		}
+		identityWorkspace = workspaceForAdhoc(project)
+		if options.execution == "local" {
+			identityConfig.VulnScan.PolicyFile = ""
+		}
+	}
+	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
+	var initialWorkspaceIdentity *scanner.SnapshotIdentity
+	var initialAdhocIdentity *updatesnapshot.InputIdentity
+	if target.workspace != nil {
+		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, identityWorkspace, identityOptions)
+		if identityErr != nil {
+			return failedScanResult(result, "scan_input_invalid", identityErr, "Commit tracked scan inputs and review their limits")
+		}
+		result.InputCategories = identity.InputCategories
+		if options.only != "vulnerabilities" {
+			initialWorkspaceIdentity = &identity
+		}
+	} else {
+		identity, categories, identityErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
+		if identityErr != nil {
+			return failedScanResult(result, "scan_input_invalid", identityErr, "Review the explicit scan inputs and their limits")
+		}
+		result.InputCategories = categories
+		if options.only != "vulnerabilities" {
+			initialAdhocIdentity = &identity
+		}
 	}
 	if options.only == "packages" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "vulnerabilities", Status: "skipped", Reason: "not requested"})
@@ -440,7 +479,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		return result
 	}
 
-	candidates, inputHashes, manager, verified, err := scanPackages(ctx, cfg, target, options, policy, minAge)
+	candidates, manager, verified, err := scanPackages(ctx, cfg, target, options, policy, minAge)
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
 		return failedScanResult(result, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
@@ -476,15 +515,26 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	}
 	var snapshot updatesnapshot.Snapshot
 	if target.workspace != nil {
-		identity, identityErr := scanner.IdentityForSnapshot(ctx, *target.workspace)
+		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, *target.workspace, identityOptions)
 		if identityErr != nil {
 			return failedScanResult(result, "snapshot_failed", identityErr, "Commit or stash changes, then run scan again")
 		}
+		if initialWorkspaceIdentity == nil || !reflect.DeepEqual(*initialWorkspaceIdentity, identity) {
+			return failedScanResult(result, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+		}
 		snapshot, err = updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), target.name, updatesnapshot.WorkspaceIdentity{
-			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision, InputHashes: identity.InputHashes,
+			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
+			Input: updatesnapshot.InputIdentity{Stages: identity.InputStages, ManifestHash: identity.InputManifestHash, Hashes: identity.InputHashes},
 		}, policyIdentity, gates, configHash, effectiveHash, result.Candidates)
 	} else {
-		snapshot, err = updatesnapshot.NewAdhoc(time.Now(), cfg.SnapshotTTL(), target.path, inputHashes, policyIdentity, gates, effectiveHash, result.Candidates)
+		identity, identityErr := adhocInputIdentity(ctx, identityWorkspace, identityOptions)
+		if identityErr != nil {
+			return failedScanResult(result, "snapshot_failed", identityErr, "Restore the explicit scan inputs and run scan again")
+		}
+		if initialAdhocIdentity == nil || !reflect.DeepEqual(*initialAdhocIdentity, identity) {
+			return failedScanResult(result, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+		}
+		snapshot, err = updatesnapshot.NewAdhoc(time.Now(), cfg.SnapshotTTL(), target.path, identity, policyIdentity, gates, effectiveHash, result.Candidates)
 	}
 	if err != nil {
 		return failedScanResult(result, "snapshot_failed", err, "Run scan again")
@@ -502,15 +552,21 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 func scanVulnerabilities(ctx context.Context, cfg config.Config, target scanTarget, execution string) ([]string, error) {
-	workspace := config.Workspace{Path: target.path}
+	var workspace config.Workspace
 	if target.workspace != nil {
 		workspace = *target.workspace
+	} else {
+		project, err := localupdate.Detect(target.path)
+		if err != nil {
+			return nil, err
+		}
+		workspace = workspaceForAdhoc(project)
 	}
 	security := pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}}
 	if execution == "local" {
 		localConfig := cfg
 		localConfig.VulnScan.PolicyFile = ""
-		security.Scanner = vulnscan.Scanner{Command: localScannerCommand}
+		security.Scanner = vulnscan.NewAdhocScanner(localScannerCommand)
 		cfg = localConfig
 	}
 	report, err := security.Baseline(ctx, workspace, cfg)
@@ -557,57 +613,57 @@ func localScannerCommandWith(resolve localexec.Resolver, run localScannerRunner)
 	}
 }
 
-func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, minAge time.Duration) ([]updatesnapshot.Candidate, map[string]string, string, bool, error) {
+func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, minAge time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 	minDays := int((minAge + 24*time.Hour - 1) / (24 * time.Hour))
 	if minAge == 0 {
 		minDays = 0
 	}
 	if target.workspace != nil {
 		if err := ensureProjectConfigAllowed(target.path, target.workspace.PackageManager, options.allowProjectConfig); err != nil {
-			return nil, nil, packageToolName(*target.workspace), false, err
+			return nil, packageToolName(*target.workspace), false, err
 		}
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
-		candidateScanner, err := updater.ResolveCandidateScanner(*target.workspace, scanConfig)
+		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(*target.workspace, scanConfig, updater.CandidateScannerOptions{
+			AllowProjectConfig: options.allowProjectConfig, RequireTracked: true,
+		})
 		if err != nil {
-			return nil, nil, target.workspace.PackageManager, false, err
+			return nil, target.workspace.PackageManager, false, err
 		}
 		candidates, err := candidateScanner.Scan(ctx, target.path)
-		return candidates, nil, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, minAge), err
+		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, minAge), err
 	}
 	project, err := localupdate.Detect(target.path)
 	if err != nil {
-		return nil, nil, "package-manager", false, err
-	}
-	hashes, err := hashAdhocInputs(project)
-	if err != nil {
-		return nil, nil, project.Manager, false, err
+		return nil, "package-manager", false, err
 	}
 	if options.execution == "local" {
 		localPolicy := policy
 		localPolicy.MinReleaseAgeDays = minDays
 		result, scanErr := localupdate.NewService().Scan(ctx, target.path, localPolicy, options.allowProjectConfig)
 		if scanErr != nil {
-			return nil, hashes, project.Manager, false, scanErr
+			return nil, project.Manager, false, scanErr
 		}
 		candidates := make([]updatesnapshot.Candidate, 0, len(result.Candidates))
 		for _, candidate := range result.Candidates {
 			candidates = append(candidates, updatesnapshot.Candidate{Kind: project.Manager, Name: candidate.Name, Current: candidate.Current, Target: candidate.Target})
 		}
-		return candidates, hashes, project.Manager, result.ReleaseAgeUsed, nil
+		return candidates, project.Manager, result.ReleaseAgeUsed, nil
 	}
 	if err := ensureProjectConfigAllowed(target.path, project.Manager, options.allowProjectConfig); err != nil {
-		return nil, hashes, project.Manager, false, err
+		return nil, project.Manager, false, err
 	}
 	workspace := workspaceForAdhoc(project)
 	scanConfig := cfg
 	scanConfig.Update.MinReleaseAgeDays = minDays
-	candidateScanner, err := updater.ResolveCandidateScanner(workspace, scanConfig)
+	candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
+		AllowProjectConfig: options.allowProjectConfig, RequireTracked: false,
+	})
 	if err != nil {
-		return nil, hashes, project.Manager, false, err
+		return nil, project.Manager, false, err
 	}
 	candidates, err := candidateScanner.Scan(ctx, target.path)
-	return candidates, hashes, project.Manager, workspaceReleaseAgeVerified(workspace, minAge), err
+	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, minAge), err
 }
 
 func ensureProjectConfigAllowed(path, manager string, allowed bool) error {
@@ -620,9 +676,9 @@ func ensureProjectConfigAllowed(path, manager string, allowed bool) error {
 	}
 	for _, name := range configs[manager] {
 		if _, err := os.Lstat(filepath.Join(path, name)); err == nil {
-			return fmt.Errorf("%s project config %s is present; pass --allow-project-config only after reviewing registry, proxy, script-shell, and plugin settings", manager, name)
+			return fmt.Errorf("%s project package-manager config is present; pass --allow-project-config only after reviewing registry, proxy, script-shell, and plugin settings", manager)
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat project config %s: %w", name, err)
+			return fmt.Errorf("stat %s project package-manager config: %w", manager, err)
 		}
 	}
 	return nil
@@ -650,25 +706,65 @@ func workspaceReleaseAgeVerified(workspace config.Workspace, minAge time.Duratio
 	return workspace.Stack == config.StackNode
 }
 
-func hashAdhocInputs(project localupdate.Project) (map[string]string, error) {
-	files := []string{project.Manifest}
-	if project.Lock != "" && project.Lock != project.Manifest {
-		files = append(files, project.Lock)
+func adhocInputIdentity(ctx context.Context, workspace config.Workspace, options scanner.IdentityOptions) (updatesnapshot.InputIdentity, error) {
+	identity, _, err := adhocInputIdentityAndCategories(ctx, workspace, options)
+	return identity, err
+}
+
+func adhocInputIdentityAndCategories(ctx context.Context, workspace config.Workspace, options scanner.IdentityOptions) (updatesnapshot.InputIdentity, []string, error) {
+	contracts, stages, err := scanner.InputContracts(workspace, options)
+	if err != nil {
+		return updatesnapshot.InputIdentity{}, nil, err
 	}
-	hashes := make(map[string]string, len(files))
-	for _, relative := range files {
-		info, err := os.Lstat(filepath.Join(project.Root, relative))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("update input %s is not a regular file", relative)
+	manifests := make([]scaninput.Manifest, 0, len(contracts))
+	for _, contract := range contracts {
+		bundle, buildErr := scaninput.Build(ctx, workspace.Path, workspace.Path, scaninput.Options{}, contract)
+		if buildErr != nil {
+			return updatesnapshot.InputIdentity{}, nil, buildErr
 		}
-		data, err := os.ReadFile(filepath.Join(project.Root, relative))
-		if err != nil {
-			return nil, fmt.Errorf("read update input %s: %w", relative, err)
-		}
-		sum := sha256.Sum256(data)
-		hashes[relative] = fmt.Sprintf("%x", sum)
+		manifests = append(manifests, bundle.Manifest)
+		bundle.Destroy()
 	}
-	return hashes, nil
+	manifest, err := scaninput.Combine(manifests...)
+	if err != nil {
+		return updatesnapshot.InputIdentity{}, nil, err
+	}
+	stageNames := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		stageNames = append(stageNames, string(stage))
+	}
+	return updatesnapshot.InputIdentity{Stages: stageNames, ManifestHash: manifest.Hash, Hashes: manifest.InputHashes}, scaninput.ManifestCategories(manifest), nil
+}
+
+func workspaceIdentityOptions(ws config.Workspace, cfg config.Config, options scanOptions) scanner.IdentityOptions {
+	stages := make([]scaninput.Stage, 0, 4)
+	seen := make(map[scaninput.Stage]bool)
+	add := func(stage scaninput.Stage) {
+		if !seen[stage] {
+			seen[stage] = true
+			stages = append(stages, stage)
+		}
+	}
+	if options.only != "vulnerabilities" {
+		if ws.PackageManager != "" {
+			add(scaninput.StagePackageCandidates)
+		}
+		if ws.DockerImages != nil {
+			add(scaninput.StageDockerManifest)
+		}
+	}
+	if options.only != "packages" {
+		if cfg.VulnScan.DependencySource == "trivy" || cfg.VulnScan.DependencySource == "osv-scanner" {
+			add(scaninput.StageDependencyCVE)
+		}
+		if cfg.VulnScan.ImageScan.Enabled && ws.DockerImages != nil {
+			add(scaninput.StageDockerManifest)
+		}
+		if cfg.VulnScan.PolicyFile != "" {
+			add(scaninput.StagePolicy)
+		}
+	}
+	return scanner.IdentityOptions{Stages: stages, AllowProjectConfig: options.allowProjectConfig, PolicyFile: cfg.VulnScan.PolicyFile}
 }
 
 func filterPolicyCandidates(candidates []updatesnapshot.Candidate, allowed []string) []updatesnapshot.Candidate {
@@ -724,6 +820,9 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 			label = result.Directory
 		}
 		fmt.Printf("%s: %s (%d vulnerabilities, %d package candidates)\n", label, result.Status, len(result.Vulnerabilities), len(result.Candidates))
+		if len(result.InputCategories) > 0 {
+			fmt.Printf("  scan inputs: %s\n", strings.Join(result.InputCategories, ", "))
+		}
 		for _, finding := range result.Vulnerabilities {
 			fmt.Printf("  vulnerability: %s\n", finding)
 		}

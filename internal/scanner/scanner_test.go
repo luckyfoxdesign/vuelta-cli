@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 )
 
 func initRepo(t *testing.T) string {
@@ -139,5 +140,42 @@ func TestRunGitHonorsCanceledContext(t *testing.T) {
 	_, err := runGit(ctx, t.TempDir(), "status", "--porcelain")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestSnapshotIdentityBindsExactStageManifestAndReviewedConfig(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, dir, "package.json", `{}`)
+	writeFile(t, dir, "package-lock.json", `{"lockfileVersion":3}`)
+	writeFile(t, dir, ".npmrc", "registry=https://registry.npmjs.org/\n")
+	if err := os.Mkdir(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "src/main.js", "unrelated")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "init")
+	workspace := config.Workspace{Path: dir, Stack: config.StackNode, PackageManager: "npm"}
+
+	withoutConfig, err := IdentityForSnapshotWithOptions(context.Background(), workspace, IdentityOptions{
+		Stages: []scaninput.Stage{scaninput.StagePackageCandidates},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := withoutConfig.InputHashes[".npmrc"]; ok {
+		t.Fatal("manager config entered snapshot identity without explicit opt-in")
+	}
+	if _, ok := withoutConfig.InputHashes["src/main.js"]; ok {
+		t.Fatal("unrelated source entered snapshot identity")
+	}
+
+	withConfig, err := IdentityForSnapshotWithOptions(context.Background(), workspace, IdentityOptions{
+		Stages: []scaninput.Stage{scaninput.StagePackageCandidates}, AllowProjectConfig: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := withConfig.InputHashes[".npmrc"]; !ok || withConfig.InputManifestHash == withoutConfig.InputManifestHash {
+		t.Fatal("reviewed manager config is not separately bound to input identity")
 	}
 }

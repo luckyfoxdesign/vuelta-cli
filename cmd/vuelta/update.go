@@ -22,6 +22,8 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
+	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -123,11 +125,11 @@ func executeUpdate(args []string) error {
 		if err != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Restore the scanned directory inputs and run vuelta scan again")
 		}
-		hashes, hashErr := hashAdhocInputs(adhocProject)
-		if hashErr != nil {
-			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", hashErr), "Restore the scanned directory inputs and run vuelta scan again")
+		identity, identityErr := currentAdhocInputIdentity(context.Background(), adhocProject, *cfg, snapshot)
+		if identityErr != nil {
+			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", identityErr), "Restore the scanned directory inputs and run vuelta scan again")
 		}
-		if validateErr := updatesnapshot.ValidateForAdhoc(snapshot, adhocProject.Root, hashes, time.Now()); validateErr != nil {
+		if validateErr := updatesnapshot.ValidateForAdhoc(snapshot, adhocProject.Root, identity, time.Now()); validateErr != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", validateErr), "Run vuelta scan again")
 		}
 	default:
@@ -340,7 +342,9 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
-	recheck, err := updater.ResolveCandidateScanner(workspace, cfg)
+	recheck, err := updater.ResolveCandidateScannerWithOptions(workspace, cfg, updater.CandidateScannerOptions{
+		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: true,
+	})
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
@@ -407,6 +411,13 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 }
 
 func executeLocalAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, project localupdate.Project, plan updatePlan, options updateOptions) (updateResult, error) {
+	identity, err := currentAdhocInputIdentity(ctx, project, config.Config{}, snapshot)
+	if err != nil {
+		return updateResult{}, fail(exitSnapshot, "%v", err)
+	}
+	if err := updatesnapshot.ValidateForAdhoc(snapshot, project.Root, identity, time.Now()); err != nil {
+		return updateResult{}, fail(exitSnapshot, "%v", err)
+	}
 	policy := config.LocalPackagePolicy{}
 	if snapshot.Policy.Path != updatesnapshot.PolicyNone {
 		loaded, err := config.LoadLocalPackagePolicy(snapshot.Policy.Path)
@@ -454,19 +465,21 @@ func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Sn
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
 	workspace := workspaceForAdhoc(project)
-	recheck, err := updater.ResolveCandidateScanner(workspace, cfg)
+	recheck, err := updater.ResolveCandidateScannerWithOptions(workspace, cfg, updater.CandidateScannerOptions{
+		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: false,
+	})
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
 	changed, err := localupdate.InPrivateCopy(project.Root, snapshot.Gates.AllowProjectConfig, !options.dryRun, func(privateProject localupdate.Project) error {
 		planned := updater.PlannedUpdater{
 			Candidates: snapshot.Candidates, Workspace: workspace, Config: cfg, AllowScripts: options.allowScripts, Recheck: recheck,
-			Validate: func(context.Context) error {
-				hashes, hashErr := hashAdhocInputs(project)
-				if hashErr != nil {
-					return hashErr
+			Validate: func(validationContext context.Context) error {
+				identity, identityErr := currentAdhocInputIdentity(validationContext, project, cfg, snapshot)
+				if identityErr != nil {
+					return identityErr
 				}
-				return updatesnapshot.ValidateForAdhoc(snapshot, project.Root, hashes, time.Now())
+				return updatesnapshot.ValidateForAdhoc(snapshot, project.Root, identity, time.Now())
 			},
 		}
 		_, updateErr := planned.Update(ctx, privateProject.Root)
@@ -525,4 +538,14 @@ func writeUpdateOutcome(jsonOutput bool, warnings []string, result updateResult,
 		}
 	}
 	return commandErr
+}
+
+func currentAdhocInputIdentity(ctx context.Context, project localupdate.Project, cfg config.Config, snapshot updatesnapshot.Snapshot) (updatesnapshot.InputIdentity, error) {
+	stages, err := scaninput.ParseStages(snapshot.Input.Stages)
+	if err != nil {
+		return updatesnapshot.InputIdentity{}, err
+	}
+	return adhocInputIdentity(ctx, workspaceForAdhoc(project), scanner.IdentityOptions{
+		Stages: stages, AllowProjectConfig: snapshot.Gates.AllowProjectConfig, PolicyFile: cfg.VulnScan.PolicyFile,
+	})
 }

@@ -77,7 +77,10 @@ make build                     # both cross-build targets
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
 - `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, optional autofix, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
+- `internal/repopolicy/` — TODO: describe this package.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
+- `internal/scancontainer/` — runs a scanner against an in-memory input archive. Repository contents are copied into a stopped container through Docker's stdin API; no host path is mounted and no host staging copy is created.
+- `internal/scaninput/` — defines, validates, hashes, and archives the exact regular files each scan stage may receive; registered contexts require tracked non-ignored inputs and never discover directories.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
 - `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update still receives exactly one reviewed snapshot ID.
 - `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
@@ -92,7 +95,8 @@ make build                     # both cross-build targets
 ## Architecture Notes
 
 - One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
-- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-2 snapshot before environment checks. Registered updates remain container-only; explicit adhoc `--execution local` is the sole narrow host-manager exception and never runs project tests.
+- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-3 snapshot before environment checks. Registered updates remain container-only; explicit adhoc `--execution local` is the sole narrow host-manager exception and never runs project tests.
+- Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.
 - Deploy candidates are immutable handoffs. `internal/deployworker` verifies signed queue/manifest delivery, records state atomically, and rolls back a failed digest-pinned Compose rollout.

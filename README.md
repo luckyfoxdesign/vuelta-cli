@@ -82,9 +82,23 @@ lock files locally and makes its GitHub API access fail closed. Image scanning
 is independent: it remains Trivy-only and checks OS packages only, so language
 dependencies are not reported again from an immutable image.
 
-Vulnerability scanning uses the same fail-closed egress proxy. Its scanner
-containers have a read-only mount of the configured scan directory, run as a
-non-root UID with all capabilities dropped, and never receive a Docker socket.
+Vulnerability and package-candidate scanners use exact per-stage input
+contracts. Registered projects contribute only tracked, non-ignored regular
+manifest, lock, Docker-manifest, and policy files; source trees, `.git`,
+`.env*`, credentials, symlinks, sockets, and unrelated files are never exposed.
+Package-manager configuration is excluded unless `--allow-project-config` was
+explicitly reviewed, and credential-bearing configuration still fails closed.
+
+Container scans do not bind-mount the repository or create a host-readable
+staging tree. Vuelta sends a bounded in-memory archive to a stopped loader,
+commits an ephemeral local input image, removes the loader, and starts a
+separate final container from the returned immutable image ID. The final
+container is read-only, runs as fixed non-root UID 65532 with all capabilities
+dropped, and never receives a Docker socket. Containers, loader, and ephemeral
+image are removed with an independent bounded cleanup context. Explicit local
+adhoc scanners receive the same minimal files in a same-user `0700` context
+with `0600` files.
+
 Trivy receives `--image-src registry`, so an image scan pulls only through the
 allowlisted registry rather than inspecting the host Docker daemon. Each scan
 uses a new tmpfs cache and refreshes its vulnerability database through the
@@ -196,10 +210,12 @@ Use `--dry-run` to run checks in a disposable copy without durable changes.
 
 Snapshots are stored in `~/.config/vuelta/update-snapshots` by default (or the
 absolute `update.snapshot_state_dir`). They contain only identity metadata,
-allowed-input hashes, gates, and candidate versions—never file contents,
-credentials, or command logs. A missing, malformed, expired, reconfigured,
-dirty, rebased, or changed-input snapshot exits with code 3 before any package
-manager runs; create a fresh scan instead.
+the canonical stage set, exact input-manifest/content hashes, gates, and
+candidate versions—never file contents, credentials, or command logs. Format-3
+snapshots are invalidated when any scanned input changes; unrelated source
+changes do not alter the input manifest. A missing, older-format, malformed,
+expired, reconfigured, dirty, rebased, or changed-input snapshot exits with
+code 3 before any package manager runs; create a fresh scan instead.
 
 ### Explicit adhoc local execution
 
