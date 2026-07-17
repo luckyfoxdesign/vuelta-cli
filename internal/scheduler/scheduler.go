@@ -120,6 +120,7 @@ type Summary struct {
 	Updated      int `json:"updated"`
 	Failed       int `json:"failed"`
 	Clean        int `json:"clean"`
+	Findings     int `json:"findings"`
 	ScanFailed   int `json:"scan_failed"`
 	NotAttempted int `json:"not_attempted"`
 }
@@ -198,7 +199,9 @@ func Run(ctx context.Context, runner Runner, options Options) (Report, int) {
 			report.Summary.Ready++
 		case "clean":
 			report.Summary.Clean++
-		case "failed":
+		case "findings":
+			report.Summary.Findings++
+		case "failed", "partial":
 			report.Summary.ScanFailed++
 		default:
 			addError(&report, "invalid_scan_result", fmt.Errorf("unsupported scan status %q", item.Status))

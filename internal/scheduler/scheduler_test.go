@@ -53,6 +53,24 @@ func TestRunContinuesAfterPartialScanAndUpdateFailure(t *testing.T) {
 	}
 }
 
+func TestRunRecognizesFindingsAndPartialScanStatuses(t *testing.T) {
+	runner := &fakeRunner{responses: []Invocation{
+		{Stdout: fixture(t, "scan-findings-and-partial.json"), ExitCode: ExitFailure},
+		{Stdout: updateFixture(t, "update-success.json", "snapshot-api"), ExitCode: ExitOK},
+	}}
+	report, exitCode := Run(context.Background(), runner, Options{FailurePolicy: FailureContinue, FindingsPolicy: FindingsReport})
+
+	if exitCode != ExitFailure {
+		t.Fatalf("exit code = %d, want %d", exitCode, ExitFailure)
+	}
+	if len(report.Errors) != 0 {
+		t.Fatalf("errors = %#v, want none (findings/partial are recognized statuses)", report.Errors)
+	}
+	if report.Summary != (Summary{Ready: 1, Updated: 1, Findings: 1, ScanFailed: 1}) {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+}
+
 func TestRunStopPolicyDoesNotApplyPartialScanSnapshots(t *testing.T) {
 	runner := &fakeRunner{responses: []Invocation{{Stdout: fixture(t, "scan-partial.json"), ExitCode: ExitFailure}}}
 	report, exitCode := Run(context.Background(), runner, Options{FailurePolicy: FailureStop, FindingsPolicy: FindingsReport})
