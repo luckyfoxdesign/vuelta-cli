@@ -48,17 +48,41 @@ var ErrEgressPolicyUnavailable = egress.ErrPolicyUnavailable
 // NewDockerRunner returns a runner bound to the strict local egress policy.
 // It never falls back to Docker's default bridge network.
 func NewDockerRunner(egressConfig config.EgressConfig) DockerRunner {
-	return NewDockerRunnerWith(dockerexec.Default(), egressConfig)
+	return NewDockerRunnerWithUser(dockerexec.Default(), egressConfig, "")
 }
 
 // NewDockerRunnerWith returns an update runner using the supplied boundary.
 func NewDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) DockerRunner {
+	return NewDockerRunnerWithUser(docker, egressConfig, "")
+}
+
+// NewDockerRunnerForUser binds mutable sandbox updates to the non-root user
+// declared by the selected toolchain profile.
+func NewDockerRunnerForUser(egressConfig config.EgressConfig, user string) DockerRunner {
+	return NewDockerRunnerWithProfile(dockerexec.Default(), egressConfig, user, "")
+}
+
+// NewDockerRunnerWithUser returns an update runner with an explicit profile
+// user. An empty user retains the legacy compatibility user.
+func NewDockerRunnerWithUser(docker dockerexec.Runner, egressConfig config.EgressConfig, user string) DockerRunner {
+	return NewDockerRunnerWithProfile(docker, egressConfig, user, "")
+}
+
+// NewDockerRunnerForProfile binds mutable sandbox updates to both the non-root
+// identity and target platform declared by the selected toolchain profile.
+func NewDockerRunnerForProfile(egressConfig config.EgressConfig, user, platform string) DockerRunner {
+	return NewDockerRunnerWithProfile(dockerexec.Default(), egressConfig, user, platform)
+}
+
+// NewDockerRunnerWithProfile returns an update runner with explicit profile
+// execution constraints. Config validation owns the platform allowlist.
+func NewDockerRunnerWithProfile(docker dockerexec.Runner, egressConfig config.EgressConfig, user, platform string) DockerRunner {
 	return func(ctx context.Context, image string, args []string, workDir string) (string, error) {
 		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
 			return "", err
 		}
-		return runDocker(ctx, docker, image, args, workDir, network, proxyURL)
+		return runDockerWithProfile(ctx, docker, image, args, workDir, network, proxyURL, user, platform)
 	}
 }
 
@@ -67,11 +91,35 @@ func NewDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressCon
 // context and makes the final container root filesystem read-only. Tools can
 // use /tmp only for ephemeral caches.
 func NewReadOnlyDockerRunner(egressConfig config.EgressConfig) ReadOnlyDockerRunner {
-	return NewReadOnlyDockerRunnerWith(dockerexec.Default(), egressConfig)
+	return NewReadOnlyDockerRunnerWithUser(dockerexec.Default(), egressConfig, "")
 }
 
 // NewReadOnlyDockerRunnerWith returns a discovery runner using the supplied boundary.
 func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.EgressConfig) ReadOnlyDockerRunner {
+	return NewReadOnlyDockerRunnerWithUser(docker, egressConfig, "")
+}
+
+// NewReadOnlyDockerRunnerForUser binds discovery to the non-root user declared
+// by the selected, acceptance-tested toolchain profile.
+func NewReadOnlyDockerRunnerForUser(egressConfig config.EgressConfig, user string) ReadOnlyDockerRunner {
+	return NewReadOnlyDockerRunnerWithProfile(dockerexec.Default(), egressConfig, user, "")
+}
+
+// NewReadOnlyDockerRunnerWithUser returns a discovery runner with an explicit
+// profile user. An empty user retains the legacy 65532 compatibility path.
+func NewReadOnlyDockerRunnerWithUser(docker dockerexec.Runner, egressConfig config.EgressConfig, user string) ReadOnlyDockerRunner {
+	return NewReadOnlyDockerRunnerWithProfile(docker, egressConfig, user, "")
+}
+
+// NewReadOnlyDockerRunnerForProfile binds discovery to the selected profile's
+// non-root identity and target platform.
+func NewReadOnlyDockerRunnerForProfile(egressConfig config.EgressConfig, user, platform string) ReadOnlyDockerRunner {
+	return NewReadOnlyDockerRunnerWithProfile(dockerexec.Default(), egressConfig, user, platform)
+}
+
+// NewReadOnlyDockerRunnerWithProfile returns a discovery runner with explicit
+// profile execution constraints.
+func NewReadOnlyDockerRunnerWithProfile(docker dockerexec.Runner, egressConfig config.EgressConfig, user, platform string) ReadOnlyDockerRunner {
 	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (string, error) {
 		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
@@ -81,11 +129,11 @@ func NewReadOnlyDockerRunnerWith(docker dockerexec.Runner, egressConfig config.E
 			return "", err
 		}
 		result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
-			Image: image, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL,
+			Image: image, Platform: platform, User: user, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL,
 			Memory: "1g", Tmpfs: "64m", Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
 		})
 		var limitErr *dockerexec.OutputLimitError
-		if errors.As(err, &limitErr) {
+		if errors.As(err, &limitErr) && limitErr.Stream == "output" && len(result.Combined) > 0 {
 			return "", fmt.Errorf("docker read-only scan %s %s: output exceeded %d bytes", image, strings.Join(args, " "), discoveryOutputMaxBytes)
 		}
 		if err != nil {
@@ -111,13 +159,13 @@ func RunDocker(ctx context.Context, image string, args []string, workDir string)
 // runDocker starts a hardened update container using the network supplied by
 // policy. It is kept separate from the policy adapter so every updater shares
 // the same container baseline.
-func runDocker(ctx context.Context, docker dockerexec.Runner, image string, args []string, workDir, network, proxyURL string) (string, error) {
+func runDockerWithProfile(ctx context.Context, docker dockerexec.Runner, image string, args []string, workDir, network, proxyURL, user, platform string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
 	result, err := docker.Run(ctx, dockerexec.Request{
-		Args:     dockerRunArgs(image, args, workDir, network, proxyURL),
+		Args:     dockerRunArgsForProfile(image, args, workDir, network, proxyURL, user, platform),
 		Combined: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: applyOutputTailBytes},
 	})
 	if err != nil {
@@ -134,27 +182,41 @@ func runDocker(ctx context.Context, docker dockerexec.Runner, image string, args
 // Git worktree. No Docker socket, host namespace, or host environment is
 // passed to the container.
 func dockerRunArgs(image string, args []string, workDir, network, proxyURL string) []string {
-	dockerArgs := append([]string{
-		"run", "--rm",
-		"--user", "65532:65532",
+	return dockerRunArgsForUser(image, args, workDir, network, proxyURL, "")
+}
+
+func dockerRunArgsForUser(image string, args []string, workDir, network, proxyURL, user string) []string {
+	return dockerRunArgsForProfile(image, args, workDir, network, proxyURL, user, "")
+}
+
+func dockerRunArgsForProfile(image string, args []string, workDir, network, proxyURL, user, platform string) []string {
+	if user == "" {
+		user = "65532:65532"
+	}
+	dockerArgs := []string{"run", "--rm"}
+	if platform != "" {
+		dockerArgs = append(dockerArgs, "--platform", platform)
+	}
+	dockerArgs = append(dockerArgs,
+		"--user", user,
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL",
 		"--cpus", "1",
 		"--memory", "1g",
 		"--pids-limit", "256",
 		"--network", network,
-		"--env", "HTTP_PROXY=" + proxyURL,
-		"--env", "HTTPS_PROXY=" + proxyURL,
-		"--env", "http_proxy=" + proxyURL,
-		"--env", "https_proxy=" + proxyURL,
+		"--env", "HTTP_PROXY="+proxyURL,
+		"--env", "HTTPS_PROXY="+proxyURL,
+		"--env", "http_proxy="+proxyURL,
+		"--env", "https_proxy="+proxyURL,
 		"--env", "NO_PROXY=localhost,127.0.0.1",
 		"--env", "HOME=/tmp",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
 		"-v", fmt.Sprintf("%s:/project", workDir),
 		"-w", "/project",
 		image,
-	}, args...)
-	return dockerArgs
+	)
+	return append(dockerArgs, args...)
 }
 
 // NoopUpdater reports no change; used for workspaces with nothing to update
@@ -192,49 +254,71 @@ func Resolve(ws config.Workspace, cfg config.Config) (Updater, error) {
 // ResolveWithDocker binds every updater command to the supplied Docker boundary.
 func ResolveWithDocker(ws config.Workspace, cfg config.Config, docker dockerexec.Runner) (Updater, error) {
 	var updaters []Updater
-	runner := NewDockerRunnerWith(docker, cfg.Update.Egress)
+	profile, _, err := ResolveToolchainProfile(ws, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("resolve toolchain profile: %w", err)
+	}
+	user := ""
+	platform := ""
+	if profile != nil {
+		user = profile.User
+		platform = profile.Platform
+	}
+	runner := NewDockerRunnerWithProfile(docker, cfg.Update.Egress, user, platform)
+	image := func(key string) (string, error) {
+		if profile != nil {
+			return profile.Image, nil
+		}
+		return requireImage(cfg, key)
+	}
 
 	switch {
 	case ws.Stack == config.StackPython && ws.PackageManager == "poetry":
-		img, err := requireImage(cfg, "python-poetry")
+		img, err := image("python-poetry")
 		if err != nil {
 			return nil, err
 		}
 		updaters = append(updaters, PoetryUpdater{Image: img, Run: runner})
 	case ws.Stack == config.StackPython && ws.PackageManager == "uv":
-		img, err := requireImage(cfg, "python-uv")
+		img, err := image("python-uv")
 		if err != nil {
 			return nil, err
 		}
 		updaters = append(updaters, UVUpdater{Image: img, Run: runner})
 	case ws.Stack == config.StackPython && ws.PackageManager == "pip-tools":
-		img, err := requireImage(cfg, "python-pip-tools")
+		img, err := image("python-pip-tools")
 		if err != nil {
 			return nil, err
 		}
 		updaters = append(updaters, PipToolsUpdater{Image: img, Run: runner})
 	case ws.Stack == config.StackNode && ws.PackageManager == "npm":
-		img, err := requireImage(cfg, "node")
+		img, err := image("node")
 		if err != nil {
 			return nil, err
 		}
-		ncuVersion, err := requireTool(cfg, "npm_check_updates")
-		if err != nil {
-			return nil, err
+		ncuVersion := ""
+		if profile == nil {
+			ncuVersion, err = requireTool(cfg, "npm_check_updates")
+			if err != nil {
+				return nil, err
+			}
 		}
-		updaters = append(updaters, NPMUpdater{Image: img, NCUVersion: ncuVersion, Run: runner})
+		updaters = append(updaters, NPMUpdater{Image: img, NCUVersion: ncuVersion, DirectNCU: profile != nil, Run: runner})
 	case ws.Stack == config.StackNode && ws.PackageManager == "bun":
-		img, err := requireImage(cfg, "bun")
+		img, err := image("bun")
 		if err != nil {
 			return nil, err
 		}
-		ncuVersion, err := requireTool(cfg, "npm_check_updates")
-		if err != nil {
-			return nil, err
+		ncuVersion := ""
+		if profile == nil {
+			ncuVersion, err = requireTool(cfg, "npm_check_updates")
+			if err != nil {
+				return nil, err
+			}
 		}
-		updaters = append(updaters, BunUpdater{Image: img, NCUVersion: ncuVersion, Run: runner})
+		updaters = append(updaters, BunUpdater{Image: img, NCUVersion: ncuVersion, DirectNCU: profile != nil, Run: runner})
 	case ws.Stack == config.StackNode && ws.PackageManager == "pnpm":
-		img, err := requireImage(cfg, "node")
+		img, err := image("node")
 		if err != nil {
 			return nil, err
 		}

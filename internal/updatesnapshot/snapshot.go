@@ -23,6 +23,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 )
 
 var (
@@ -33,10 +34,10 @@ var (
 )
 
 const (
-	// FormatVersion 4 binds registered updates to an explicit verification
-	// profile identity. Earlier snapshots could inherit a changed service
-	// command and are intentionally invalid.
-	FormatVersion = 4
+	// FormatVersion 5 additionally binds scans and updates to one exact
+	// toolchain capability profile. Earlier snapshots could switch runtime or
+	// scanner behavior after review and are intentionally invalid.
+	FormatVersion = 5
 
 	OriginWorkspace = "workspace"
 	OriginAdhoc     = "adhoc"
@@ -44,6 +45,7 @@ const (
 )
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
+var toolchainIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+:/-]+$`)
 var hashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -90,21 +92,22 @@ type ScanGates struct {
 
 // Snapshot is the on-disk plan. It is intentionally a small, strict schema.
 type Snapshot struct {
-	Format           int               `json:"format"`
-	ID               string            `json:"id"`
-	CreatedAt        time.Time         `json:"created_at"`
-	ExpiresAt        time.Time         `json:"expires_at"`
-	Origin           string            `json:"origin"`
-	Project          string            `json:"project,omitempty"`
-	AdhocPath        string            `json:"adhoc_path,omitempty"`
-	Workspace        WorkspaceIdentity `json:"workspace,omitempty"`
-	Input            InputIdentity     `json:"input,omitempty"`
-	Policy           PolicyIdentity    `json:"policy"`
-	Gates            ScanGates         `json:"scan_gates"`
-	ConfigHash       string            `json:"config_hash,omitempty"`
-	VerificationHash string            `json:"verification_hash,omitempty"`
-	PolicyHash       string            `json:"policy_hash"`
-	Candidates       []Candidate       `json:"candidates"`
+	Format           int                `json:"format"`
+	ID               string             `json:"id"`
+	CreatedAt        time.Time          `json:"created_at"`
+	ExpiresAt        time.Time          `json:"expires_at"`
+	Origin           string             `json:"origin"`
+	Project          string             `json:"project,omitempty"`
+	AdhocPath        string             `json:"adhoc_path,omitempty"`
+	Workspace        WorkspaceIdentity  `json:"workspace,omitempty"`
+	Input            InputIdentity      `json:"input,omitempty"`
+	Policy           PolicyIdentity     `json:"policy"`
+	Gates            ScanGates          `json:"scan_gates"`
+	ConfigHash       string             `json:"config_hash,omitempty"`
+	VerificationHash string             `json:"verification_hash,omitempty"`
+	Toolchain        toolchain.Identity `json:"toolchain,omitempty"`
+	PolicyHash       string             `json:"policy_hash"`
+	Candidates       []Candidate        `json:"candidates"`
 }
 
 // New creates an opaque-ID snapshot. ttl must be positive and is validated by
@@ -116,12 +119,12 @@ func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHas
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, verificationHash, effectiveHash, candidates)
+	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, verificationHash, toolchain.Identity{}, effectiveHash, candidates)
 }
 
-// NewWorkspace creates a format-4 plan bound to a registered workspace and
-// the exact verification profile reviewed during scan.
-func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, verificationHash, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
+// NewWorkspace creates a format-5 plan bound to a registered workspace, the
+// exact verification profile, and the selected toolchain contract.
+func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, verificationHash string, toolchainIdentity toolchain.Identity, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
 		return Snapshot{}, err
@@ -129,7 +132,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	snapshot := Snapshot{
 		Format: FormatVersion, ID: id, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl),
 		Origin: OriginWorkspace, Project: project, Workspace: identity, Policy: policy,
-		Gates: gates, ConfigHash: configHash, VerificationHash: verificationHash, PolicyHash: effectivePolicyHash,
+		Gates: gates, ConfigHash: configHash, VerificationHash: verificationHash, Toolchain: toolchainIdentity, PolicyHash: effectivePolicyHash,
 		Candidates: append([]Candidate(nil), candidates...),
 	}
 	if ttl <= 0 {
@@ -141,7 +144,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	return snapshot, nil
 }
 
-// NewAdhoc creates a format-4 plan bound to an explicit unregistered path.
+// NewAdhoc creates a format-5 plan bound to an explicit unregistered path.
 func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input InputIdentity, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
@@ -300,6 +303,17 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 	}
 	if verificationHash != snapshot.VerificationHash {
 		return fmt.Errorf("%w: verification profile changed", ErrStale)
+	}
+	if snapshot.Toolchain.ProfileID != "" {
+		_, actual, _, resolveErr := toolchain.Resolve(ws, cfg)
+		if resolveErr != nil {
+			return fmt.Errorf("%w: toolchain profile is no longer compatible: %v", ErrStale, resolveErr)
+		}
+		if !reflect.DeepEqual(snapshot.Toolchain, actual) {
+			return fmt.Errorf("%w: toolchain profile changed", ErrStale)
+		}
+	} else if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+		return fmt.Errorf("%w: snapshot has no toolchain profile identity", ErrStale)
 	}
 	if err := validatePolicyIdentity(snapshot.Policy); err != nil {
 		return err
@@ -486,8 +500,11 @@ func validateSnapshot(snapshot Snapshot) error {
 		if err := validateInputIdentity(snapshot.Workspace.Input); err != nil {
 			return err
 		}
+		if err := validateToolchainIdentity(snapshot.Toolchain); err != nil {
+			return err
+		}
 	case OriginAdhoc:
-		if snapshot.Project != "" || snapshot.VerificationHash != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
+		if snapshot.Project != "" || snapshot.VerificationHash != "" || snapshot.Toolchain.ProfileID != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
 			return fmt.Errorf("%w: incomplete adhoc identity", ErrInvalid)
 		}
 		if err := validateInputIdentity(snapshot.Input); err != nil {
@@ -503,6 +520,21 @@ func validateSnapshot(snapshot Snapshot) error {
 		if filepath.IsAbs(candidate.File) || candidate.File == ".." || strings.HasPrefix(filepath.Clean(candidate.File), ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: candidate file escapes the workspace", ErrInvalid)
 		}
+	}
+	return nil
+}
+
+func validateToolchainIdentity(identity toolchain.Identity) error {
+	if identity.ProfileID == "" {
+		if !reflect.DeepEqual(identity, toolchain.Identity{}) {
+			return fmt.Errorf("%w: partial toolchain identity", ErrInvalid)
+		}
+		return nil
+	}
+	if !toolchainIDPattern.MatchString(identity.ProfileID) || !hashPattern.MatchString(identity.Hash) || identity.Runtime == "" ||
+		identity.PackageManager == "" || identity.PackageManagerVersion == "" || identity.Scanner == "" || identity.ScannerVersion == "" ||
+		identity.Image == "" || identity.Platform == "" || identity.User == "" || len(identity.LockFormats) == 0 || !identity.Capabilities.ReadOnlyDiscovery {
+		return fmt.Errorf("%w: incomplete toolchain identity", ErrInvalid)
 	}
 	return nil
 }

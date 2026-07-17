@@ -291,6 +291,9 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 			"project_config":      fmt.Sprintf("scan decision: %t", snapshot.Gates.AllowProjectConfig),
 			"minimum_release_age": snapshot.Gates.MinReleaseAge,
 			"verification_hash":   snapshot.VerificationHash,
+			"toolchain_profile":   snapshot.Toolchain.ProfileID,
+			"toolchain_hash":      snapshot.Toolchain.Hash,
+			"toolchain_platform":  snapshot.Toolchain.Platform,
 			"release_age":         releaseAge,
 			"execution":           options.execution,
 			"durable_writes":      writeGate,
@@ -346,7 +349,11 @@ func writeHumanUpdatePlan(destination *os.File, plan updatePlan) error {
 }
 
 func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, cfg config.Config, workspace config.Workspace, plan updatePlan, options updateOptions) (updateResult, error) {
-	logger, err := logging.New(false)
+	logOutput := os.Stdout
+	if options.jsonOutput {
+		logOutput = os.Stderr
+	}
+	logger, err := logging.NewWithOutput(false, logOutput)
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}

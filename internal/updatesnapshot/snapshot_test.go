@@ -53,7 +53,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 
 func TestFormatFourRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
-	if snapshot.Format != 4 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
+	if snapshot.Format != 5 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
 		t.Fatalf("snapshot identity = %#v", snapshot)
 	}
 	if snapshot.Policy.Path != PolicyNone || snapshot.Policy.Hash != PolicyNone || snapshot.Gates.MinReleaseAge == "" {

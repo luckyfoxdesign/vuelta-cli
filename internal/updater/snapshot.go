@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -42,56 +44,68 @@ type CandidateScannerOptions struct {
 // contracts. Registered callers must leave RequireTracked enabled.
 func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, options CandidateScannerOptions) (CandidateScanner, error) {
 	var scanners []CandidateScanner
-	run := NewReadOnlyDockerRunner(cfg.Update.Egress)
 	packageContract, err := scaninput.PackageContract(ws, options.AllowProjectConfig)
 	if err != nil {
 		return nil, err
 	}
-	switch ws.Stack + "/" + ws.PackageManager {
-	case "python/poetry":
-		image, err := requireImage(cfg, "python-poetry")
+	if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+		profile, _, _, err := toolchain.Resolve(ws, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("resolve toolchain profile: %w", err)
+		}
+		scanner, err := profilePackageScanner(profile, cfg, ws, packageContract, options)
 		if err != nil {
 			return nil, err
 		}
-		scanners = append(scanners, packageScanner{Kind: "poetry", Image: image, Args: []string{"poetry", "show", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-	case "python/uv":
-		image, err := requireImage(cfg, "python-uv")
-		if err != nil {
-			return nil, err
+		scanners = append(scanners, scanner)
+	} else {
+		run := NewReadOnlyDockerRunner(cfg.Update.Egress)
+		switch ws.Stack + "/" + ws.PackageManager {
+		case "python/poetry":
+			image, err := requireImage(cfg, "python-poetry")
+			if err != nil {
+				return nil, err
+			}
+			scanners = append(scanners, packageScanner{Kind: "poetry", Image: image, Args: []string{"poetry", "show", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "python/uv":
+			image, err := requireImage(cfg, "python-uv")
+			if err != nil {
+				return nil, err
+			}
+			scanners = append(scanners, packageScanner{Kind: "uv", Image: image, Args: []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "python/pip-tools":
+			image, err := requireImage(cfg, "python-pip-tools")
+			if err != nil {
+				return nil, err
+			}
+			scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "node/npm", "node/bun":
+			key := "node"
+			launcher := "npx"
+			if ws.PackageManager == "bun" {
+				key, launcher = "bun", "bunx"
+			}
+			image, err := requireImage(cfg, key)
+			if err != nil {
+				return nil, err
+			}
+			version, err := requireTool(cfg, "npm_check_updates")
+			if err != nil {
+				return nil, err
+			}
+			args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
+			scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "node/pnpm":
+			image, err := requireImage(cfg, "node")
+			if err != nil {
+				return nil, err
+			}
+			args := []string{"pnpm", "outdated", "--format", "json", "--config.minimumReleaseAge=" + strconv.Itoa(cfg.Update.MinReleaseAgeDays)}
+			scanners = append(scanners, packageScanner{Kind: "pnpm", Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "docker/":
+		default:
+			return nil, fmt.Errorf("no snapshot scanner for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
 		}
-		scanners = append(scanners, packageScanner{Kind: "uv", Image: image, Args: []string{"uv", "tree", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-	case "python/pip-tools":
-		image, err := requireImage(cfg, "python-pip-tools")
-		if err != nil {
-			return nil, err
-		}
-		scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"pip", "list", "--outdated", "--format=json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-	case "node/npm", "node/bun":
-		key := "node"
-		launcher := "npx"
-		if ws.PackageManager == "bun" {
-			key, launcher = "bun", "bunx"
-		}
-		image, err := requireImage(cfg, key)
-		if err != nil {
-			return nil, err
-		}
-		version, err := requireTool(cfg, "npm_check_updates")
-		if err != nil {
-			return nil, err
-		}
-		args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
-		scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-	case "node/pnpm":
-		image, err := requireImage(cfg, "node")
-		if err != nil {
-			return nil, err
-		}
-		args := []string{"pnpm", "outdated", "--format", "json", "--config.minimumReleaseAge=" + strconv.Itoa(cfg.Update.MinReleaseAgeDays)}
-		scanners = append(scanners, packageScanner{Kind: "pnpm", Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-	case "docker/":
-	default:
-		return nil, fmt.Errorf("no snapshot scanner for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
 	}
 	if ws.DockerImages != nil {
 		scanners = append(scanners, dockerCandidateScanner{
@@ -100,6 +114,57 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 		})
 	}
 	return combinedScanner(scanners), nil
+}
+
+// ResolveToolchainProfile returns the exact profile used by production scan
+// and update paths. A nil profile indicates a legacy config without a catalog.
+func ResolveToolchainProfile(ws config.Workspace, cfg config.Config) (*config.ToolchainProfile, *toolchain.Identity, error) {
+	if ws.PackageManager == "" || len(cfg.Update.ToolchainProfiles) == 0 {
+		return nil, nil, nil
+	}
+	profile, identity, _, err := toolchain.Resolve(ws, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &profile, &identity, nil
+}
+
+func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, ws config.Workspace, contract scaninput.Contract, options CandidateScannerOptions) (packageScanner, error) {
+	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "pip"}[ws.PackageManager]; profile.Scanner != expected {
+		return packageScanner{}, fmt.Errorf("toolchain profile %q scanner %q is incompatible with %s", profile.ID, profile.Scanner, ws.PackageManager)
+	}
+	var args []string
+	switch ws.PackageManager {
+	case "npm", "bun":
+		args = []string{"ncu", "--jsonUpgraded"}
+		if cfg.Update.MinReleaseAgeDays > 0 {
+			if !profile.Capabilities.ReleaseAge {
+				return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
+			}
+			args = append(args, "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays*24))
+		}
+	case "pnpm":
+		args = []string{"pnpm", "outdated", "--format", "json"}
+		if cfg.Update.MinReleaseAgeDays > 0 {
+			if !profile.Capabilities.ReleaseAge {
+				return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
+			}
+			args = append(args, "--config.minimumReleaseAge="+strconv.Itoa(cfg.Update.MinReleaseAgeDays*24*60))
+		}
+	case "poetry":
+		args = []string{"poetry", "show", "--outdated", "--format", "json"}
+	case "uv":
+		args = []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}
+	case "pip-tools":
+		args = []string{"pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"}
+	default:
+		return packageScanner{}, fmt.Errorf("no profile scanner for package manager %q", ws.PackageManager)
+	}
+	return packageScanner{
+		Kind: ws.PackageManager, Image: profile.Image, Args: args,
+		Run: NewReadOnlyDockerRunnerForProfile(cfg.Update.Egress, profile.User, profile.Platform), Contract: contract,
+		RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
+	}, nil
 }
 
 type combinedScanner []CandidateScanner
@@ -135,7 +200,7 @@ func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updates
 	}
 	defer bundle.Destroy()
 	out, err := s.Run(ctx, s.Image, s.Args, bundle)
-	if err != nil {
+	if err != nil && !acceptedDiscoveryExit(s.Kind, err) {
 		return nil, err
 	}
 	candidates, err := parsePackageCandidates(s.Kind, []byte(out))
@@ -145,12 +210,35 @@ func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updates
 	return candidates, nil
 }
 
+type exitCoder interface {
+	ExitCode() int
+}
+
+// pnpm outdated deliberately exits 1 when it successfully finds outdated
+// dependencies. The output is still treated as untrusted and must pass the
+// same strict JSON/candidate validation before it can become a plan.
+func acceptedDiscoveryExit(kind string, err error) bool {
+	if kind != "pnpm" {
+		return false
+	}
+	var exit exitCoder
+	return errors.As(err, &exit) && exit.ExitCode() == 1
+}
+
 // parsePackageCandidates accepts the JSON shapes emitted by Poetry, pip,
 // pnpm, uv, and npm-check-updates. Unknown/malformed records are rejected so
 // untrusted registry metadata can never become an executable update plan.
 func parsePackageCandidates(kind string, data []byte) ([]updatesnapshot.Candidate, error) {
+	// Some scanner tools write an informational notice (venv creation, a
+	// version-check nag) on the same stream as their JSON output despite a
+	// machine-readable flag being requested. Tolerate surrounding text but
+	// still require one well-formed JSON value, not an arbitrary blob.
+	start := bytes.IndexAny(data, "{[")
+	if start < 0 {
+		return nil, errors.New("scanner output contains no JSON value")
+	}
 	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(data[start:])).Decode(&value); err != nil {
 		return nil, err
 	}
 	var candidates []updatesnapshot.Candidate
@@ -167,6 +255,13 @@ func parsePackageCandidates(kind string, data []byte) ([]updatesnapshot.Candidat
 }
 
 func collectCandidates(kind string, value any, candidates *[]updatesnapshot.Candidate) {
+	// uv tree --format json returns a dependency graph keyed by opaque
+	// "name==version@source" identifiers, not a flat name->record map, so it
+	// needs its own extraction instead of the generic heuristic below.
+	if kind == "uv" {
+		collectUVCandidates(value, candidates)
+		return
+	}
 	switch v := value.(type) {
 	case []any:
 		for _, item := range v {
@@ -192,6 +287,30 @@ func collectCandidates(kind string, value any, candidates *[]updatesnapshot.Cand
 				}
 			}
 		}
+	}
+}
+
+func collectUVCandidates(value any, candidates *[]updatesnapshot.Candidate) {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	resolution, ok := root["resolution"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, item := range resolution {
+		record, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := record["name"].(string)
+		latest, hasLatest := firstString(record, "latest_version")
+		if name == "" || !hasLatest {
+			continue
+		}
+		current, _ := firstString(record, "version")
+		*candidates = append(*candidates, updatesnapshot.Candidate{Kind: "uv", Name: name, Current: current, Target: latest})
 	}
 }
 
@@ -313,8 +432,18 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		}
 		changed = dockerChanged
 	}
-	runner := NewDockerRunner(u.Config.Update.Egress)
-	image, err := plannedImage(u.Workspace, u.Config)
+	profile, _, err := ResolveToolchainProfile(u.Workspace, u.Config)
+	if err != nil {
+		return false, fmt.Errorf("resolve toolchain profile: %w", err)
+	}
+	user := ""
+	platform := ""
+	if profile != nil {
+		user = profile.User
+		platform = profile.Platform
+	}
+	runner := NewDockerRunnerForProfile(u.Config.Update.Egress, user, platform)
+	image, err := plannedImage(u.Workspace, u.Config, profile)
 	if err != nil {
 		return false, err
 	}
@@ -326,7 +455,7 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		if candidate.Kind == "docker" {
 			continue
 		}
-		args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, u.AllowScripts)
+		args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, profile, u.AllowScripts)
 		if err != nil {
 			return false, err
 		}
@@ -358,18 +487,28 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 	return changed || before != after, nil
 }
 
-func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.Config, allowScripts bool) ([]string, error) {
+func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.Config, profile *config.ToolchainProfile, allowScripts bool) ([]string, error) {
 	if !validCandidate(candidate) {
 		return nil, errors.New("invalid snapshot candidate")
 	}
 	switch manager {
 	case "poetry":
-		return []string{"poetry", "update", candidate.Name}, nil
+		// poetry update respects an existing exact pin in pyproject.toml and
+		// silently no-ops instead of moving past it; poetry add rewrites the
+		// pin itself, matching how the other managers' updaters behave.
+		return []string{"poetry", "add", candidate.Name + "==" + candidate.Target}, nil
 	case "uv":
-		return []string{"uv", "lock", "--upgrade-package", candidate.Name + "==" + candidate.Target}, nil
+		// uv lock --upgrade-package only nudges resolution and fails closed
+		// ("unsatisfiable") against an existing exact pin; uv add rewrites the
+		// pin itself. --no-sync keeps this to a manifest/lock change instead
+		// of installing into a project-local .venv inside the sandbox.
+		return []string{"uv", "add", candidate.Name + "==" + candidate.Target, "--no-sync"}, nil
 	case "pip-tools":
 		return []string{"pip-compile", "--upgrade-package", candidate.Name + "==" + candidate.Target, "requirements.in"}, nil
 	case "npm":
+		if profile != nil {
+			return []string{"ncu", "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
+		}
 		version, err := requireTool(cfg, "npm_check_updates")
 		if err != nil {
 			return nil, err
@@ -382,6 +521,9 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 		}
 		return append(args, candidate.Name+"@"+candidate.Target), nil
 	case "bun":
+		if profile != nil {
+			return []string{"ncu", "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
+		}
 		version, err := requireTool(cfg, "npm_check_updates")
 		if err != nil {
 			return nil, err
@@ -392,7 +534,10 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 	}
 }
 
-func plannedImage(ws config.Workspace, cfg config.Config) (string, error) {
+func plannedImage(ws config.Workspace, cfg config.Config, profile *config.ToolchainProfile) (string, error) {
+	if profile != nil {
+		return profile.Image, nil
+	}
 	switch ws.PackageManager {
 	case "poetry":
 		return requireImage(cfg, "python-poetry")

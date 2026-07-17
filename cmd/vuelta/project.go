@@ -11,6 +11,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 )
 
 type jsonCommandError struct {
@@ -32,6 +33,7 @@ type projectListResult struct {
 	Name         string   `json:"name"`
 	Path         string   `json:"path"`
 	Verification []string `json:"verification"`
+	Toolchain    string   `json:"toolchain,omitempty"`
 }
 
 func runConfigValidate(args []string) error {
@@ -56,10 +58,13 @@ func runConfigValidate(args []string) error {
 	if validateErr := validateVerificationPolicies(*cfg); validateErr != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
 	}
+	if validateErr := validateToolchainPolicies(*cfg); validateErr != nil {
+		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
+	}
 	if *jsonOutput {
 		plans := make([]map[string]any, 0, len(cfg.Workspaces))
 		for _, workspace := range cfg.Workspaces {
-			plans = append(plans, map[string]any{"project": config.WorkspaceName(workspace), "verification": config.VerificationPlan(workspace)})
+			plans = append(plans, map[string]any{"project": config.WorkspaceName(workspace), "verification": config.VerificationPlan(workspace), "toolchain": resolvedToolchainID(workspace, *cfg)})
 		}
 		return writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "config validate",
@@ -75,6 +80,9 @@ func runConfigValidate(args []string) error {
 	for _, workspace := range cfg.Workspaces {
 		for _, step := range config.VerificationPlan(workspace) {
 			fmt.Printf("verification %s: %s\n", config.WorkspaceName(workspace), step)
+		}
+		if profileID := resolvedToolchainID(workspace, *cfg); profileID != "" {
+			fmt.Printf("toolchain %s: %s\n", config.WorkspaceName(workspace), profileID)
 		}
 	}
 	return nil
@@ -109,7 +117,15 @@ func runProjectList(args []string) error {
 		if canonicalErr != nil {
 			return jsonCommandFailure(*jsonOutput, "project list", "config_invalid", fail(exitConfig, "canonicalize workspace %s: %v", workspace.Path, canonicalErr), warnings)
 		}
-		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical, Verification: config.VerificationPlan(workspace)})
+		toolchainID := workspace.ToolchainProfile
+		if workspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+			profile, _, _, resolveErr := toolchain.Resolve(workspace, *cfg)
+			if resolveErr != nil {
+				return jsonCommandFailure(*jsonOutput, "project list", "config_invalid", fail(exitConfig, "%v", resolveErr), warnings)
+			}
+			toolchainID = profile.ID
+		}
+		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical, Verification: config.VerificationPlan(workspace), Toolchain: toolchainID})
 	}
 	if *jsonOutput {
 		return writeJSONEnvelope(jsonCommandEnvelope{
@@ -129,6 +145,9 @@ func runProjectList(args []string) error {
 		for _, step := range result.Verification {
 			fmt.Printf("  verification: %s\n", step)
 		}
+		if result.Toolchain != "" {
+			fmt.Printf("  toolchain: %s\n", result.Toolchain)
+		}
 	}
 	return nil
 }
@@ -139,6 +158,8 @@ func runProjectAdd(args []string) error {
 	name := fs.String("name", "", "persistent project name")
 	stack := fs.String("stack", "", "selected stack: python, node, or docker")
 	manager := fs.String("package-manager", "", "selected package manager for python or node")
+	toolchainProfile := fs.String("toolchain-profile", "", "curated toolchain profile ID (auto-resolved when omitted)")
+	platform := fs.String("platform", "", "scanner platform: linux/amd64 or linux/arm64")
 	branch := fs.String("branch", "", "protected branch")
 	remote := fs.String("remote", "", "Git remote")
 	scanOnly := fs.Bool("scan-only", false, "register the project for read-only scans without update authority")
@@ -186,6 +207,25 @@ func runProjectAdd(args []string) error {
 		}
 		setProjectInput(&input, missing.Flag, value)
 	}
+	workspace.ToolchainProfile = *toolchainProfile
+	workspace.Platform = *platform
+	configured, loadErr := config.Load(configFile)
+	if loadErr != nil {
+		return fail(exitConfig, "%v", loadErr)
+	}
+	if validateErr := configured.Validate(); validateErr != nil {
+		return fail(exitConfig, "%v", validateErr)
+	}
+	var selectedToolchain string
+	if workspace.PackageManager != "" && len(configured.Update.ToolchainProfiles) > 0 {
+		profile, _, constraints, resolveErr := toolchain.Resolve(workspace, *configured)
+		if resolveErr != nil {
+			return fail(exitConfig, "%v", resolveErr)
+		}
+		workspace.ToolchainProfile = profile.ID
+		workspace.Platform = profile.Platform
+		selectedToolchain = fmt.Sprintf("%s runtime=%s manager=%s@%s lock=%s platform=%s", profile.ID, profile.Runtime, profile.PackageManager, profile.PackageManagerVersion, constraints.LockFormat, profile.Platform)
+	}
 	plan, err := configinit.PlanWorkspaceAdd(configFile, workspace)
 	if err != nil {
 		return fail(exitConfig, "%v", err)
@@ -196,6 +236,9 @@ func runProjectAdd(args []string) error {
 	}
 	for _, step := range config.VerificationPlan(workspace) {
 		fmt.Fprintf(os.Stderr, "verification plan: %s\n", step)
+	}
+	if selectedToolchain != "" {
+		fmt.Fprintf(os.Stderr, "toolchain profile: %s\n", selectedToolchain)
 	}
 	fmt.Fprint(os.Stderr, plan.Diff(configFile))
 	if !*yes {
@@ -251,6 +294,33 @@ func validateVerificationPolicies(cfg config.Config) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func validateToolchainPolicies(cfg config.Config) error {
+	if len(cfg.Update.ToolchainProfiles) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, workspace := range cfg.Workspaces {
+		if workspace.PackageManager == "" {
+			continue
+		}
+		if _, _, _, err := toolchain.Resolve(workspace, cfg); err != nil {
+			errs = append(errs, fmt.Errorf("project %q toolchain: %w", config.WorkspaceName(workspace), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func resolvedToolchainID(workspace config.Workspace, cfg config.Config) string {
+	if workspace.PackageManager == "" || len(cfg.Update.ToolchainProfiles) == 0 {
+		return workspace.ToolchainProfile
+	}
+	profile, _, _, err := toolchain.Resolve(workspace, cfg)
+	if err != nil {
+		return ""
+	}
+	return profile.ID
 }
 
 func jsonCommandFailure(enabled bool, command, code string, commandErr error, warnings []string) error {

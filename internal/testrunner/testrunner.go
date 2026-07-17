@@ -314,6 +314,7 @@ type composeFile struct {
 
 type composeService struct {
 	Image       string                 `yaml:"image"`
+	Platform    string                 `yaml:"platform,omitempty"`
 	User        string                 `yaml:"user"`
 	ReadOnly    bool                   `yaml:"read_only"`
 	WorkingDir  string                 `yaml:"working_dir"`
@@ -371,6 +372,7 @@ type normalizedFile struct {
 
 type normalizedService struct {
 	Image       string                 `yaml:"image"`
+	Platform    string                 `yaml:"platform,omitempty"`
 	User        string                 `yaml:"user"`
 	ReadOnly    bool                   `yaml:"read_only,omitempty"`
 	WorkingDir  string                 `yaml:"working_dir,omitempty"`
@@ -491,6 +493,9 @@ func checkService(root string, cf composeFile, name string, svc composeService) 
 	if !digestPinned.MatchString(svc.Image) {
 		return zero, fmt.Errorf("service %q: image %q must be pinned by digest", name, svc.Image)
 	}
+	if svc.Platform != "" && svc.Platform != "linux/amd64" && svc.Platform != "linux/arm64" {
+		return zero, fmt.Errorf("service %q: platform must be linux/amd64 or linux/arm64", name)
+	}
 	if !isExplicitNonRootUser(svc.User) {
 		return zero, fmt.Errorf("service %q: user must be an explicit non-root UID", name)
 	}
@@ -519,6 +524,7 @@ func checkService(root string, cf composeFile, name string, svc composeService) 
 
 	return normalizedService{
 		Image:       svc.Image,
+		Platform:    svc.Platform,
 		User:        svc.User,
 		ReadOnly:    svc.ReadOnly,
 		WorkingDir:  svc.WorkingDir,

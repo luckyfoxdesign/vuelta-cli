@@ -143,6 +143,33 @@ func TestValidateComposeAcceptsDigestPinnedMinimalService(t *testing.T) {
 	}
 }
 
+func TestValidateComposePreservesAllowlistedPlatform(t *testing.T) {
+	dir := t.TempDir()
+	compose := strings.Replace(validCompose, "    user:", "    platform: linux/arm64\n    user:", 1)
+	composePath := filepath.Join(dir, "docker-compose.test.yml")
+	writeCompose(t, dir, "docker-compose.test.yml", compose)
+
+	normalized, err := validateCompose(dir, composePath, "test")
+	if err != nil {
+		t.Fatalf("validateCompose: %v", err)
+	}
+	if !strings.Contains(string(normalized), "platform: linux/arm64") {
+		t.Fatalf("normalized model omitted platform:\n%s", normalized)
+	}
+}
+
+func TestValidateComposeRejectsNonAllowlistedPlatform(t *testing.T) {
+	dir := t.TempDir()
+	compose := strings.Replace(validCompose, "    user:", "    platform: linux/s390x\n    user:", 1)
+	composePath := filepath.Join(dir, "docker-compose.test.yml")
+	writeCompose(t, dir, "docker-compose.test.yml", compose)
+
+	_, err := validateCompose(dir, composePath, "test")
+	if err == nil || !strings.Contains(err.Error(), "platform must be linux/amd64 or linux/arm64") {
+		t.Fatalf("validateCompose error = %v", err)
+	}
+}
+
 func TestRunExecutesSerializedValidatedModelWithSanitizedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(t.TempDir(), "args")

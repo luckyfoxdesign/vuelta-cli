@@ -1,0 +1,27 @@
+# Copy this file outside secret-bearing directories, replace every placeholder
+# with a released exact digest, and add one case per supported profile.
+engine: docker-desktop # docker-desktop | docker-engine
+cases:
+  - name: node22-pnpm9-amd64
+    fixture_root: testdata/fixtures/projects
+    fixture: node-pnpm-ok
+    # Set a positive value only when this exact profile has a tested release-age
+    # implementation. Zero still tests the real scanner command and snapshot.
+    min_release_age_days: 0
+    profile:
+      version: 1
+      id: node22-pnpm9-amd64
+      stack: node
+      package_manager: pnpm
+      runtime: "22"
+      package_manager_version: 9.15.0
+      scanner: pnpm
+      scanner_version: 9.15.0
+      image: registry.example/vuelta/node22-pnpm9@sha256:<released-digest>
+      platform: linux/amd64
+      user: "10001:10001"
+      lock_formats: [pnpm-v9]
+      capabilities:
+        read_only_discovery: true
+        release_age: false
+        project_config: false

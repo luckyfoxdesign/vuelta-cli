@@ -111,6 +111,50 @@ func TestRunUsesCreateCopyStartRemoveWithoutHostMount(t *testing.T) {
 	}
 }
 
+func TestRunUsesProfileDeclaredNonRootUser(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.User = "10001:10002"
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-profile-user", nil }}
+	if _, err := runner.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	create := strings.Join(docker.requests[4].Args, " ")
+	if !strings.Contains(create, "--user 10001:10002") {
+		t.Fatalf("profile user missing from final scanner create: %s", create)
+	}
+}
+
+func TestRunUsesAllowlistedProfilePlatformForLoaderAndScanner(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Platform = "linux/arm64"
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-profile-platform", nil }}
+	if _, err := runner.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{0, 4} {
+		args := strings.Join(docker.requests[index].Args, " ")
+		if !strings.Contains(args, "--platform linux/arm64") {
+			t.Fatalf("profile platform missing from create request %d: %s", index, args)
+		}
+	}
+}
+
+func TestRunRejectsNonAllowlistedProfilePlatformBeforeDocker(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Platform = "linux/s390x"
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-invalid-platform", nil }}
+	_, err := runner.Run(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), "scanner platform") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(docker.requests) != 0 {
+		t.Fatalf("Docker was called for invalid platform: %#v", docker.requests)
+	}
+}
+
 func TestRunCleansUpAfterCopyFailure(t *testing.T) {
 	docker := &fakeDocker{failAt: "cp"}
 	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-test", nil }}

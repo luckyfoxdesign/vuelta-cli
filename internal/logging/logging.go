@@ -30,11 +30,18 @@ type Logger struct {
 // New opens the default state log. It creates the directory as 0700 and the
 // log file as 0600, repairing overly broad permissions for existing paths.
 func New(jsonLogs bool) (*Logger, error) {
+	return NewWithOutput(jsonLogs, os.Stdout)
+}
+
+// NewWithOutput opens the default state log and writes the console copy to
+// stdout. Commands with a machine-readable stdout contract pass stderr so
+// operational records cannot corrupt the response envelope.
+func NewWithOutput(jsonLogs bool, output io.Writer) (*Logger, error) {
 	dir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve home directory: %w", err)
 	}
-	return NewAt(filepath.Join(dir, ".local", "state", "vuelta", "vuelta.log"), defaultMaxBytes, jsonLogs, os.Stdout)
+	return NewAt(filepath.Join(dir, ".local", "state", "vuelta", "vuelta.log"), defaultMaxBytes, jsonLogs, output)
 }
 
 // NewAt is provided for tests and callers with an explicit state location.

@@ -19,7 +19,9 @@ app/
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
 ├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
-│                        # sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler
+│                        # toolchain, sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler
+├── acceptance/          # opt-in real Docker engine scan/update matrix
+├── scanner-images/      # self-contained exact-version scanner image sources
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
 ├── config.example.yaml, Makefile
@@ -36,6 +38,7 @@ docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
 docker compose up -d egress-proxy # strict local package-registry proxy
+scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
 make build-mac                 # Docker cross-build both binaries for darwin/arm64
 make build-linux               # Docker cross-build both binaries for linux/amd64
 make build                     # both cross-build targets
@@ -51,7 +54,9 @@ make build                     # both cross-build targets
 - `go.mod` — Go module definition.
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
 - `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
-- `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy.
+- `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy, opt-in real-engine.
+- `scanner-images/` — exact-version scanner image release inputs.
+- `acceptance/` — environment-gated real-engine matrix and example catalog.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
 - `Makefile` — Docker-only cross-build targets for the CLI and scheduler.
@@ -80,12 +85,13 @@ make build                     # both cross-build targets
 - `internal/repopolicy/` — TODO: describe this package.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
 - `internal/scancontainer/` — runs a scanner against an in-memory input archive. Repository contents are copied into a stopped container through Docker's stdin API; no host path is mounted and no host staging copy is created.
-- `internal/scaninput/` — defines, validates, hashes, and archives the exact regular files each scan stage may receive; registered contexts require tracked non-ignored inputs and never discover directories.
+- `internal/scaninput/` — TODO: describe this package.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
 - `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update still receives exactly one reviewed snapshot ID.
 - `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
-- `internal/testrunner/` — validates and runs versioned, bounded, explicit-argv Compose verification steps against the sandboxed working copy; inherited service commands are cleared and every run is cleaned up.
+- `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
+- `internal/toolchain/` — resolves declarative project constraints to one immutable scanner/update profile without executing project code.
 - `internal/updater/` — discovers package candidates in read-only hardened containers and applies validated dependency and Docker image plans inside a sandboxed working copy.
 - `internal/updatesnapshot/` — stores short-lived, read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
 - `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.

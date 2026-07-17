@@ -215,6 +215,13 @@ func TestDockerRunArgsIncludeSecurityBaseline(t *testing.T) {
 	}
 }
 
+func TestDockerRunArgsIncludeProfilePlatform(t *testing.T) {
+	got := dockerRunArgsForProfile("node@sha256:x", []string{"npm", "install"}, "/sandbox/project", "vuelta-update-egress", "http://vuelta-egress-proxy:3128", "10001:10001", "linux/arm64")
+	if !slicesContain(got, "--platform") || !slicesContain(got, "linux/arm64") {
+		t.Fatalf("docker args missing profile platform: %q", got)
+	}
+}
+
 func TestParsePackageCandidates(t *testing.T) {
 	candidates, err := parsePackageCandidates("npm", []byte(`{"left-pad":"1.3.0","@scope/pkg":"2.0.0"}`))
 	if err != nil {
@@ -252,6 +259,67 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	candidates, err := scanner.Scan(context.Background(), root)
 	if err != nil || len(candidates) != 1 || candidates[0].Name != "example" {
 		t.Fatalf("Scan() = %#v, %v", candidates, err)
+	}
+}
+
+type fakeExitCode int
+
+func (e fakeExitCode) Error() string { return "command failed" }
+func (e fakeExitCode) ExitCode() int { return int(e) }
+
+func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{}`)
+	writeFile(t, root, "pnpm-lock.yaml", `lockfileVersion: '9.0'`)
+	contract, err := scaninput.PackageContract(config.Workspace{Stack: config.StackNode, PackageManager: "pnpm"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := packageScanner{
+		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
+		Run: func(context.Context, string, []string, scaninput.Bundle) (string, error) {
+			return `{"lodash":{"latest":"4.18.1","wanted":"4.17.20","dependencyType":"dependencies"}}`, fakeExitCode(1)
+		},
+	}
+	candidates, err := scanner.Scan(context.Background(), root)
+	if err != nil || len(candidates) != 1 || candidates[0].Name != "lodash" || candidates[0].Target != "4.18.1" {
+		t.Fatalf("Scan() = %#v, %v", candidates, err)
+	}
+	scanner.Run = func(context.Context, string, []string, scaninput.Bundle) (string, error) {
+		return `not-json`, fakeExitCode(1)
+	}
+	if _, err := scanner.Scan(context.Background(), root); err == nil || !strings.Contains(err.Error(), "parse pnpm") {
+		t.Fatalf("malformed exit-one output error = %v", err)
+	}
+}
+
+func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"engines":{"node":"24.x"},"packageManager":"npm@11.4.2"}`)
+	writeFile(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	image := "registry.example/vuelta/node24-npm@sha256:" + strings.Repeat("a", 64)
+	profile := config.ToolchainProfile{
+		Version: config.ToolchainProfileVersion, ID: "node24-npm", Stack: config.StackNode, PackageManager: "npm",
+		Runtime: "24", PackageManagerVersion: "11.4.2", Scanner: "ncu", ScannerVersion: "18.1.1",
+		Image: image, Platform: "linux/amd64", User: "10001:10001", LockFormats: []string{"npm-v3"},
+		Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true, ReleaseAge: true},
+	}
+	ws := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64", ToolchainProfile: profile.ID}
+	cfg := config.Config{Update: config.UpdateConfig{MinReleaseAgeDays: 7, ToolchainProfiles: []config.ToolchainProfile{profile}}}
+	resolved, err := ResolveCandidateScannerWithOptions(ws, cfg, CandidateScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, ok := resolved.(combinedScanner)
+	if !ok || len(combined) != 1 {
+		t.Fatalf("scanner = %T %#v", resolved, resolved)
+	}
+	packageScan, ok := combined[0].(packageScanner)
+	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"ncu", "--jsonUpgraded", "--cooldown", "168"}) {
+		t.Fatalf("profile scanner = %#v", combined[0])
+	}
+	if args, err := plannedArgs("npm", updatesnapshot.Candidate{Kind: "npm", Name: "example", Target: "2.0.0"}, cfg, &profile, false); err != nil || args[0] != "ncu" {
+		t.Fatalf("plannedArgs() = %#v, %v", args, err)
 	}
 }
 

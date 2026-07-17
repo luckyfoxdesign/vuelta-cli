@@ -22,6 +22,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -60,6 +61,7 @@ type scanResult struct {
 	InputCategories []string                   `json:"input_categories"`
 	Warnings        []string                   `json:"warnings"`
 	Verification    []string                   `json:"verification"`
+	Toolchain       *toolchain.Identity        `json:"toolchain,omitempty"`
 	Error           *jsonCommandError          `json:"error,omitempty"`
 }
 
@@ -450,6 +452,15 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 			identityConfig.VulnScan.PolicyFile = ""
 		}
 	}
+	var selectedToolchain toolchain.Identity
+	if options.only != "vulnerabilities" && options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
+		if resolveErr != nil {
+			return failedScanResult(result, "toolchain_incompatible", resolveErr, "Select a compatible curated toolchain profile or update the reviewed catalog")
+		}
+		selectedToolchain = *identity
+		result.Toolchain = identity
+	}
 	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
 	var initialWorkspaceIdentity *scanner.SnapshotIdentity
 	var initialAdhocIdentity *updatesnapshot.InputIdentity
@@ -545,7 +556,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		snapshot, err = updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), target.name, updatesnapshot.WorkspaceIdentity{
 			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
 			Input: updatesnapshot.InputIdentity{Stages: identity.InputStages, ManifestHash: identity.InputManifestHash, Hashes: identity.InputHashes},
-		}, policyIdentity, gates, configHash, verificationHash, effectiveHash, result.Candidates)
+		}, policyIdentity, gates, configHash, verificationHash, selectedToolchain, effectiveHash, result.Candidates)
 	} else {
 		identity, identityErr := adhocInputIdentity(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
@@ -651,7 +662,7 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 			return nil, target.workspace.PackageManager, false, err
 		}
 		candidates, err := candidateScanner.Scan(ctx, target.path)
-		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, minAge), err
+		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, cfg, minAge), err
 	}
 	project, err := localupdate.Detect(target.path)
 	if err != nil {
@@ -683,7 +694,7 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		return nil, project.Manager, false, err
 	}
 	candidates, err := candidateScanner.Scan(ctx, target.path)
-	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, minAge), err
+	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, cfg, minAge), err
 }
 
 func ensureProjectConfigAllowed(path, manager string, allowed bool) error {
@@ -719,9 +730,12 @@ func packageToolName(workspace config.Workspace) string {
 	return "docker-registry"
 }
 
-func workspaceReleaseAgeVerified(workspace config.Workspace, minAge time.Duration) bool {
+func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, minAge time.Duration) bool {
 	if minAge == 0 {
 		return true
+	}
+	if _, identity, err := updater.ResolveToolchainProfile(workspace, cfg); err == nil && identity != nil {
+		return identity.Capabilities.ReleaseAge
 	}
 	return workspace.Stack == config.StackNode
 }
@@ -876,9 +890,9 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 	for _, result := range ready {
 		defaultPath, _ := defaultConfigPath()
 		if configFile != "" && configFile != defaultPath {
-			fmt.Printf("Next: vuelta update --config %s %s\n", configFile, result.SnapshotID)
+			fmt.Printf("Next: vuelta update --config %s -- %s\n", configFile, result.SnapshotID)
 		} else {
-			fmt.Printf("Next: vuelta update %s\n", result.SnapshotID)
+			fmt.Printf("Next: vuelta update -- %s\n", result.SnapshotID)
 		}
 	}
 }

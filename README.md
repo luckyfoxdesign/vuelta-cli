@@ -6,6 +6,13 @@ and can queue an immutable deploy task. It has no resident daemon. Optional
 launchd/systemd automation invokes the separate `vuelta-scheduler` helper,
 which uses the same JSON `scan` → `update` workflow as a human operator.
 
+Node and Python scans may resolve a versioned curated toolchain profile from
+declarative runtime, manager, lock, and platform metadata. Profile-based scans
+use exact self-contained images and installed scanner binaries; snapshot
+format 5 binds update to the selected runtime, tool versions, image digest,
+platform, non-root user, lock support, and security capabilities. See
+`scanner-images/` and the real-engine section of `../docs/runbook-local.md`.
+
 ## Stack
 
 - Language: Go. Static `vuelta` and optional `vuelta-scheduler` binaries; no

@@ -26,6 +26,8 @@ import (
 // placeholders like "@sha256:<digest>".
 var digestRefPattern = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 var projectNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var toolVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?$`)
+var containerUserPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$`)
 
 // Config mirrors the config.yaml schema.
 type Config struct {
@@ -109,12 +111,42 @@ func AllowedGithubTokenEnv(name string) bool {
 }
 
 type UpdateConfig struct {
-	MinReleaseAgeDays int               `yaml:"min_release_age_days"`
-	SnapshotTTLHours  int               `yaml:"snapshot_ttl_hours"`
-	SnapshotStateDir  string            `yaml:"snapshot_state_dir"`
-	Egress            EgressConfig      `yaml:"egress"`
-	Images            map[string]string `yaml:"images"`
-	Tools             map[string]string `yaml:"tools"`
+	MinReleaseAgeDays int                `yaml:"min_release_age_days"`
+	SnapshotTTLHours  int                `yaml:"snapshot_ttl_hours"`
+	SnapshotStateDir  string             `yaml:"snapshot_state_dir"`
+	Egress            EgressConfig       `yaml:"egress"`
+	Images            map[string]string  `yaml:"images"`
+	Tools             map[string]string  `yaml:"tools"`
+	ToolchainProfiles []ToolchainProfile `yaml:"toolchain_profiles,omitempty"`
+}
+
+const ToolchainProfileVersion = 1
+
+// ToolchainProfile is one immutable, curated package-manager environment.
+// Commands are compiled into Vuelta; profiles can select versions and
+// capabilities but cannot introduce arbitrary argv or shell fragments.
+type ToolchainProfile struct {
+	Version               int                   `yaml:"version" json:"version"`
+	ID                    string                `yaml:"id" json:"id"`
+	Stack                 string                `yaml:"stack" json:"stack"`
+	PackageManager        string                `yaml:"package_manager" json:"package_manager"`
+	Runtime               string                `yaml:"runtime" json:"runtime"`
+	PackageManagerVersion string                `yaml:"package_manager_version" json:"package_manager_version"`
+	Scanner               string                `yaml:"scanner" json:"scanner"`
+	ScannerVersion        string                `yaml:"scanner_version" json:"scanner_version"`
+	Image                 string                `yaml:"image" json:"image"`
+	Platform              string                `yaml:"platform" json:"platform"`
+	User                  string                `yaml:"user" json:"user"`
+	LockFormats           []string              `yaml:"lock_formats" json:"lock_formats"`
+	Capabilities          ToolchainCapabilities `yaml:"capabilities" json:"capabilities"`
+}
+
+// ToolchainCapabilities records security gates the exact image/tool contract
+// has been acceptance-tested to implement.
+type ToolchainCapabilities struct {
+	ReadOnlyDiscovery bool `yaml:"read_only_discovery" json:"read_only_discovery"`
+	ReleaseAge        bool `yaml:"release_age" json:"release_age"`
+	ProjectConfig     bool `yaml:"project_config" json:"project_config"`
 }
 
 // EgressConfig names the checked-in local egress proxy. Update containers join
@@ -208,13 +240,15 @@ type DockerImagesSpec struct {
 }
 
 type Workspace struct {
-	Name           string              `yaml:"name,omitempty"`
-	Path           string              `yaml:"path"`
-	Stack          string              `yaml:"stack"`
-	PackageManager string              `yaml:"package_manager"`
-	Verification   VerificationProfile `yaml:"verification"`
-	Branch         string              `yaml:"branch"`
-	Remote         string              `yaml:"remote"`
+	Name             string              `yaml:"name,omitempty"`
+	Path             string              `yaml:"path"`
+	Stack            string              `yaml:"stack"`
+	PackageManager   string              `yaml:"package_manager"`
+	ToolchainProfile string              `yaml:"toolchain_profile,omitempty"`
+	Platform         string              `yaml:"platform,omitempty"`
+	Verification     VerificationProfile `yaml:"verification"`
+	Branch           string              `yaml:"branch"`
+	Remote           string              `yaml:"remote"`
 	// AllowedChangedPaths overrides the legacy config-wide Git allowlist for
 	// this workspace. Patterns are normalized repository-relative Git paths:
 	// slash is the only separator and *, ?, and [] never match across a slash.
@@ -393,11 +427,28 @@ func (c Config) AllowedChangedPaths(ws Workspace) []string {
 // docker_images.files must stay inside the project directory as plain files.
 func (c *Config) Validate() error {
 	var errs []error
+	profiles := make(map[string]ToolchainProfile, len(c.Update.ToolchainProfiles))
+	for i, profile := range c.Update.ToolchainProfiles {
+		errs = append(errs, validateToolchainProfile(i, profile)...)
+		if previous, ok := profiles[profile.ID]; ok {
+			errs = append(errs, fmt.Errorf("update.toolchain_profiles[%d].id: %q duplicates profile for %s/%s", i, profile.ID, previous.Stack, previous.PackageManager))
+		} else if profile.ID != "" {
+			profiles[profile.ID] = profile
+		}
+	}
 
 	seenNames := make(map[string]int, len(c.Workspaces))
 	seenPaths := make(map[string]int, len(c.Workspaces))
 	for i, ws := range c.Workspaces {
 		errs = append(errs, validateWorkspace(i, ws)...)
+		if ws.ToolchainProfile != "" {
+			profile, ok := profiles[ws.ToolchainProfile]
+			if !ok {
+				errs = append(errs, fmt.Errorf("workspaces[%d].toolchain_profile: %q is not in update.toolchain_profiles", i, ws.ToolchainProfile))
+			} else if profile.Stack != ws.Stack || profile.PackageManager != ws.PackageManager {
+				errs = append(errs, fmt.Errorf("workspaces[%d].toolchain_profile: %q is for %s/%s, not %s/%s", i, profile.ID, profile.Stack, profile.PackageManager, ws.Stack, ws.PackageManager))
+			}
+		}
 		for j, pattern := range ws.AllowedChangedPaths {
 			if err := gitpath.ValidatePattern(pattern); err != nil {
 				errs = append(errs, fmt.Errorf("workspaces[%d].allowed_changed_paths[%d]: %w", i, j, err))
@@ -465,6 +516,60 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+func validateToolchainProfile(index int, profile ToolchainProfile) []error {
+	label := fmt.Sprintf("update.toolchain_profiles[%d]", index)
+	var errs []error
+	if profile.Version != ToolchainProfileVersion {
+		errs = append(errs, fmt.Errorf("%s.version: must be %d", label, ToolchainProfileVersion))
+	}
+	if !projectNamePattern.MatchString(profile.ID) {
+		errs = append(errs, fmt.Errorf("%s.id: must be a stable alphanumeric profile ID", label))
+	}
+	managers, ok := packageManagersByStack[profile.Stack]
+	if !ok || profile.Stack == StackDocker || !managers[profile.PackageManager] {
+		errs = append(errs, fmt.Errorf("%s: unsupported stack/package_manager %q/%q", label, profile.Stack, profile.PackageManager))
+	}
+	if !toolVersionPattern.MatchString(profile.Runtime) {
+		errs = append(errs, fmt.Errorf("%s.runtime: must be an exact numeric version", label))
+	}
+	if !toolVersionPattern.MatchString(profile.PackageManagerVersion) {
+		errs = append(errs, fmt.Errorf("%s.package_manager_version: must be exact", label))
+	}
+	if profile.Scanner == "" || !projectNamePattern.MatchString(profile.Scanner) || !toolVersionPattern.MatchString(profile.ScannerVersion) {
+		errs = append(errs, fmt.Errorf("%s.scanner: name and exact scanner_version are required", label))
+	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "pip"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
+		errs = append(errs, fmt.Errorf("%s.scanner: must be %q for package manager %q", label, expected, profile.PackageManager))
+	}
+	if !digestRefPattern.MatchString(profile.Image) {
+		errs = append(errs, fmt.Errorf("%s.image: %q is not pinned to an exact digest", label, profile.Image))
+	}
+	if profile.Platform != "linux/amd64" && profile.Platform != "linux/arm64" {
+		errs = append(errs, fmt.Errorf("%s.platform: must be linux/amd64 or linux/arm64", label))
+	}
+	if !containerUserPattern.MatchString(profile.User) {
+		errs = append(errs, fmt.Errorf("%s.user: must be an explicit non-root numeric uid:gid", label))
+	}
+	allowedLocks := map[string]map[string]bool{
+		"npm": {"npm-v2": true, "npm-v3": true}, "pnpm": {"pnpm-v6": true, "pnpm-v9": true},
+		"bun": {"bun-text": true}, "poetry": {"poetry-v2": true}, "uv": {"uv-v1": true},
+		"pip-tools": {"requirements": true},
+	}[profile.PackageManager]
+	if len(profile.LockFormats) == 0 {
+		errs = append(errs, fmt.Errorf("%s.lock_formats: at least one format is required", label))
+	}
+	seenLocks := make(map[string]bool, len(profile.LockFormats))
+	for _, format := range profile.LockFormats {
+		if !allowedLocks[format] || seenLocks[format] {
+			errs = append(errs, fmt.Errorf("%s.lock_formats: unsupported or duplicate format %q", label, format))
+		}
+		seenLocks[format] = true
+	}
+	if !profile.Capabilities.ReadOnlyDiscovery {
+		errs = append(errs, fmt.Errorf("%s.capabilities.read_only_discovery: must be true", label))
+	}
+	return errs
+}
+
 func validateNotifyConfig(c NotifyConfig) []error {
 	var errs []error
 	if c.WebhookURLEnv != "" && c.WebhookURLEnv != NotifyWebhookURLEnv {
@@ -511,8 +616,9 @@ func (c Config) SnapshotPolicyHash(ws Workspace) (string, error) {
 		Egress              EgressConfig
 		Images              map[string]string
 		Tools               map[string]string
+		ToolchainProfiles   []ToolchainProfile
 		AllowedChangedPaths []string
-	}{ws, c.Update.MinReleaseAgeDays, c.Update.Egress, c.Update.Images, c.Update.Tools, c.AllowedChangedPaths(ws)}
+	}{ws, c.Update.MinReleaseAgeDays, c.Update.Egress, c.Update.Images, c.Update.Tools, c.Update.ToolchainProfiles, c.AllowedChangedPaths(ws)}
 	data, err := json.Marshal(policy)
 	if err != nil {
 		return "", fmt.Errorf("encode snapshot policy: %w", err)
@@ -722,6 +828,12 @@ func validateWorkspace(i int, ws Workspace) []error {
 	if ws.Name != "" && !projectNamePattern.MatchString(ws.Name) {
 		errs = append(errs, fmt.Errorf("%s.name: must start with an alphanumeric character and contain only letters, digits, dot, underscore, or hyphen", label))
 	}
+	if ws.ToolchainProfile != "" && !projectNamePattern.MatchString(ws.ToolchainProfile) {
+		errs = append(errs, fmt.Errorf("%s.toolchain_profile: must be a stable profile ID", label))
+	}
+	if ws.Platform != "" && ws.Platform != "linux/amd64" && ws.Platform != "linux/arm64" {
+		errs = append(errs, fmt.Errorf("%s.platform: must be linux/amd64 or linux/arm64", label))
+	}
 
 	if ws.Path == "" {
 		errs = append(errs, fmt.Errorf("%s.path: required", label))
@@ -826,7 +938,7 @@ func validateVerificationProfile(label string, ws Workspace) []error {
 		if err := validateSuccessExitCodes(step.SuccessExitCodes); err != nil {
 			errs = append(errs, fmt.Errorf("%s.success_exit_codes: %w", stepLabel, err))
 		}
-		if err := validateVerificationComposeFile(ws.Path, step.ComposeFile, step.Service); err != nil {
+		if err := validateVerificationComposeFile(ws.Path, step.ComposeFile, step.Service, ws.Platform); err != nil {
 			errs = append(errs, fmt.Errorf("%s.compose_file: %w", stepLabel, err))
 		}
 	}
@@ -932,7 +1044,7 @@ func validateSuccessExitCodes(codes []int) error {
 	return nil
 }
 
-func validateVerificationComposeFile(root, name, service string) error {
+func validateVerificationComposeFile(root, name, service, workspacePlatform string) error {
 	if name == "" || filepath.IsAbs(name) {
 		return errors.New("must be a project-relative regular file")
 	}
@@ -953,13 +1065,22 @@ func validateVerificationComposeFile(root, name, service string) error {
 		return fmt.Errorf("cannot read selected Compose file: %w", err)
 	}
 	var document struct {
-		Services map[string]yaml.Node `yaml:"services"`
+		Services map[string]struct {
+			Platform string `yaml:"platform"`
+		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		return fmt.Errorf("cannot parse selected Compose file: %w", err)
 	}
-	if _, ok := document.Services[service]; !ok {
+	selected, ok := document.Services[service]
+	if !ok {
 		return fmt.Errorf("service %q does not exist", service)
+	}
+	if selected.Platform != "" && selected.Platform != "linux/amd64" && selected.Platform != "linux/arm64" {
+		return errors.New("service platform must be linux/amd64 or linux/arm64")
+	}
+	if selected.Platform != "" && workspacePlatform != "" && selected.Platform != workspacePlatform {
+		return fmt.Errorf("service platform %q does not match workspace platform %q", selected.Platform, workspacePlatform)
 	}
 	return nil
 }

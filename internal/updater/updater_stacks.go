@@ -103,18 +103,25 @@ func (u PipToolsUpdater) Update(ctx context.Context, projectPath string) (bool, 
 type NPMUpdater struct {
 	Image      string
 	NCUVersion string
+	DirectNCU  bool
 	Run        DockerRunner
 }
 
 func (u NPMUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	if err := validateNCUVersion(u.NCUVersion); err != nil {
-		return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+	if !u.DirectNCU {
+		if err := validateNCUVersion(u.NCUVersion); err != nil {
+			return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+		}
 	}
 	before, err := lockDigest(projectPath, "package-lock.json")
 	if err != nil {
 		return false, err
 	}
-	if _, err := u.Run(ctx, u.Image, []string{"npx", "npm-check-updates@" + u.NCUVersion, "-u"}, projectPath); err != nil {
+	command := []string{"npx", "npm-check-updates@" + u.NCUVersion, "-u"}
+	if u.DirectNCU {
+		command = []string{"ncu", "-u"}
+	}
+	if _, err := u.Run(ctx, u.Image, command, projectPath); err != nil {
 		return false, err
 	}
 	if _, err := u.Run(ctx, u.Image, []string{"npm", "install"}, projectPath); err != nil {
@@ -133,18 +140,25 @@ func (u NPMUpdater) Update(ctx context.Context, projectPath string) (bool, error
 type BunUpdater struct {
 	Image      string
 	NCUVersion string
+	DirectNCU  bool
 	Run        DockerRunner
 }
 
 func (u BunUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	if err := validateNCUVersion(u.NCUVersion); err != nil {
-		return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+	if !u.DirectNCU {
+		if err := validateNCUVersion(u.NCUVersion); err != nil {
+			return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+		}
 	}
 	before, err := lockDigest(projectPath, "bun.lock")
 	if err != nil {
 		return false, err
 	}
-	if _, err := u.Run(ctx, u.Image, []string{"bunx", "npm-check-updates@" + u.NCUVersion, "-u"}, projectPath); err != nil {
+	command := []string{"bunx", "npm-check-updates@" + u.NCUVersion, "-u"}
+	if u.DirectNCU {
+		command = []string{"ncu", "-u"}
+	}
+	if _, err := u.Run(ctx, u.Image, command, projectPath); err != nil {
 		return false, err
 	}
 	if _, err := u.Run(ctx, u.Image, []string{"bun", "install"}, projectPath); err != nil {

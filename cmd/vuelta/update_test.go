@@ -26,6 +26,7 @@ func TestUpdateAcceptsFlagsBeforeOrAfterExactlyOneSnapshotID(t *testing.T) {
 	for _, args := range [][]string{
 		{"--dry-run", "--json", "abcdefghijklmnopqrstuv"},
 		{"abcdefghijklmnopqrstuv", "--dry-run", "--json"},
+		{"--dry-run", "--json", "--", "-snapshot-leading-hyphen"},
 	} {
 		normalized, err := normalizeCommandArgs(definition, args)
 		if err != nil {
@@ -35,7 +36,7 @@ func TestUpdateAcceptsFlagsBeforeOrAfterExactlyOneSnapshotID(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %v: %v", args, err)
 		}
-		if id != "abcdefghijklmnopqrstuv" || !options.dryRun || !options.jsonOutput {
+		if id != "abcdefghijklmnopqrstuv" && id != "-snapshot-leading-hyphen" || !options.dryRun || !options.jsonOutput {
 			t.Fatalf("parsed update = id %q options %#v", id, options)
 		}
 	}

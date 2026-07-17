@@ -24,15 +24,18 @@ import (
 const cleanupTimeout = 15 * time.Second
 
 var (
-	exactDigest  = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
-	localImageID = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	dockerName   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
-	safeSizeFlag = regexp.MustCompile(`^[1-9][0-9]*(k|m|g)$`)
+	exactDigest   = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+	localImageID  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	dockerName    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+	safeSizeFlag  = regexp.MustCompile(`^[1-9][0-9]*(k|m|g)$`)
+	containerUser = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$`)
 )
 
 // Request describes one hardened scanner container lifecycle.
 type Request struct {
 	Image    string
+	Platform string
+	User     string
 	Args     []string
 	Archive  []byte
 	Network  string
@@ -102,11 +105,16 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 		}
 	}()
 
+	loaderArgs := []string{"create", "--name", loaderName, "--network", "none"}
+	if request.Platform != "" {
+		loaderArgs = append(loaderArgs, "--platform", request.Platform)
+	}
+	loaderArgs = append(loaderArgs, request.Image)
 	if _, err := docker.Run(ctx, dockerexec.Request{
 		// Docker may fetch the exact digest before this stopped loader exists;
 		// repository input is copied only after create succeeds. The loader is
 		// never started and therefore cannot execute image code.
-		Args:   []string{"create", "--name", loaderName, "--network", "none", request.Image},
+		Args:   loaderArgs,
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	}); err != nil {
 		return dockerexec.Result{}, fmt.Errorf("create stopped scanner input loader: %w", err)
@@ -119,7 +127,10 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 		return dockerexec.Result{}, fmt.Errorf("copy scanner input archive: %w", err)
 	}
 	commitResult, err := docker.Run(ctx, dockerexec.Request{
-		Args:   []string{"commit", "--pause=true", loaderName, imageName},
+		// Pausing is Docker's default. Passing the deprecated --pause flag makes
+		// recent CLIs write a warning before the image ID and breaks the strict,
+		// bounded machine-output contract below.
+		Args:   []string{"commit", loaderName, imageName},
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 128},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	})
@@ -189,6 +200,12 @@ func validateRequest(request Request) error {
 	if request.Tool != "" && request.Tool != "trivy" {
 		return errors.New("scanner tool environment is not allowlisted")
 	}
+	if request.User != "" && !containerUser.MatchString(request.User) {
+		return errors.New("scanner user must be an explicit non-root numeric uid:gid")
+	}
+	if request.Platform != "" && request.Platform != "linux/amd64" && request.Platform != "linux/arm64" {
+		return errors.New("scanner platform must be linux/amd64 or linux/arm64")
+	}
 	if !safeSizeFlag.MatchString(request.Memory) || !safeSizeFlag.MatchString(request.Tmpfs) {
 		return errors.New("scanner resource limit is invalid")
 	}
@@ -242,9 +259,12 @@ func validateArchive(data []byte) error {
 
 func createArgs(name, image string, request Request) []string {
 	proxy := request.Proxy
+	user := request.User
+	if user == "" {
+		user = "65532:65532"
+	}
 	args := []string{
 		"create", "--name", name, "--pull", "never",
-		"--user", "65532:65532",
 		"--read-only",
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL",
@@ -261,6 +281,10 @@ func createArgs(name, image string, request Request) []string {
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=" + request.Tmpfs,
 		"--workdir", "/project",
 	}
+	if request.Platform != "" {
+		args = append(args, "--platform", request.Platform)
+	}
+	args = append(args, "--user", user)
 	if request.Tool == "trivy" {
 		args = append(args,
 			"--env", "TRIVY_CACHE_DIR=/tmp/trivy",
