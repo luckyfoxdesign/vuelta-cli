@@ -152,3 +152,26 @@ func TestLocalExecHelperProcess(t *testing.T) {
 	_, _ = os.Stdout.WriteString(strings.Repeat("x", 128))
 	_, _ = os.Stderr.WriteString(strings.Repeat("e", 64))
 }
+
+func TestClassifyRedactsAndBoundsNonZeroExitDetail(t *testing.T) {
+	result := Result{ExitCode: 1, Stderr: []byte("permission denied: token=abc123secret")}
+	category, detail := Classify(nil, result)
+	if category != "permission" {
+		t.Fatalf("category = %q, want permission", category)
+	}
+	if strings.Contains(detail, "abc123secret") {
+		t.Fatalf("detail leaked secret: %q", detail)
+	}
+}
+
+func TestClassifyOutputLimitAndContextErrors(t *testing.T) {
+	if category, _ := Classify(&OutputLimitError{Bytes: 10}, Result{}); category != "output_limit" {
+		t.Fatalf("output limit category = %q", category)
+	}
+	if category, _ := Classify(context.DeadlineExceeded, Result{}); category != "timeout" {
+		t.Fatalf("deadline category = %q", category)
+	}
+	if category, _ := Classify(context.Canceled, Result{}); category != "cancelled" {
+		t.Fatalf("cancel category = %q", category)
+	}
+}

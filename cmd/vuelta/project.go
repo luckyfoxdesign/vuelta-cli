@@ -15,9 +15,13 @@ import (
 )
 
 type jsonCommandError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Hint    string `json:"hint,omitempty"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Hint       string `json:"hint,omitempty"`
+	Stage      string `json:"stage,omitempty"`
+	Category   string `json:"category,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
 }
 
 type jsonCommandEnvelope struct {

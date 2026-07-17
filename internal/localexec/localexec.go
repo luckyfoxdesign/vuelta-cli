@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/capio"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 )
 
 const (
@@ -200,6 +201,25 @@ type OutputLimitError struct{ Bytes int }
 
 func (e *OutputLimitError) Error() string {
 	return fmt.Sprintf("local tool output exceeded %d bytes", e.Bytes)
+}
+
+// Classify derives a stable, safe category and bounded redacted detail from
+// an error and/or a completed Result returned by the Run* functions. err may
+// be nil when the caller is classifying an unexpected non-zero exit code
+// instead of a boundary failure.
+func Classify(err error, result Result) (safeerr.Category, string) {
+	var limitErr *OutputLimitError
+	if errors.As(err, &limitErr) {
+		return safeerr.CategoryOutputLimit, limitErr.Error()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return safeerr.CategoryTimeout, ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return safeerr.CategoryCancelled, ""
+	}
+	detail := safeerr.Tail(result.Stderr, 512)
+	return safeerr.ClassifyDetail(detail), detail
 }
 
 // RunTail retains only the most recent output while allowing the child to

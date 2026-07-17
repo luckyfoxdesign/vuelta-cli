@@ -20,6 +20,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
@@ -48,6 +49,32 @@ type scanToolResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// stageStatus is the outcome of one independent, observable scan stage.
+type stageStatus string
+
+const (
+	stageSucceeded    stageStatus = "succeeded"
+	stageFailed       stageStatus = "failed"
+	stageSkipped      stageStatus = "skipped"
+	stageNotRequested stageStatus = "not_requested"
+)
+
+const (
+	stagePreflight     = "preflight"
+	stageVulnerability = "vulnerability"
+	stageCandidate     = "candidate"
+	stageReleaseAge    = "release_age"
+	stageSnapshot      = "snapshot"
+)
+
+// scanStageResult reports one independent scan stage so a failure in one
+// stage never hides the outcome of another.
+type scanStageResult struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
 type scanResult struct {
 	Project         string                     `json:"project,omitempty"`
 	Directory       string                     `json:"directory"`
@@ -58,6 +85,7 @@ type scanResult struct {
 	Candidates      []updatesnapshot.Candidate `json:"candidates"`
 	Vulnerabilities []string                   `json:"vulnerabilities"`
 	Tools           []scanToolResult           `json:"tools"`
+	Stages          []scanStageResult          `json:"stages"`
 	InputCategories []string                   `json:"input_categories"`
 	Warnings        []string                   `json:"warnings"`
 	Verification    []string                   `json:"verification"`
@@ -68,8 +96,10 @@ type scanResult struct {
 type scanSummary struct {
 	Succeeded       int `json:"succeeded"`
 	Failed          int `json:"failed"`
+	Partial         int `json:"partial"`
 	Ready           int `json:"ready"`
 	Clean           int `json:"clean"`
+	Findings        int `json:"findings"`
 	ScanOnly        int `json:"scan_only"`
 	Candidates      int `json:"candidates"`
 	Vulnerabilities int `json:"vulnerabilities"`
@@ -429,7 +459,7 @@ func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, optio
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{},
 	}
 	if target.workspace != nil {
 		result.Verification = config.VerificationPlan(*target.workspace)
@@ -445,7 +475,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	} else {
 		project, detectErr := localupdate.Detect(target.path)
 		if detectErr != nil {
-			return failedScanResult(result, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
+			return failedScanResult(result, stagePreflight, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
 		}
 		identityWorkspace = workspaceForAdhoc(project)
 		if options.execution == "local" {
@@ -456,7 +486,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	if options.only != "vulnerabilities" && options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
 		if resolveErr != nil {
-			return failedScanResult(result, "toolchain_incompatible", resolveErr, "Select a compatible curated toolchain profile or update the reviewed catalog")
+			return failedScanResult(result, stagePreflight, "toolchain_incompatible", resolveErr, "Select a compatible curated toolchain profile or update the reviewed catalog")
 		}
 		selectedToolchain = *identity
 		result.Toolchain = identity
@@ -467,7 +497,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	if target.workspace != nil {
 		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, "scan_input_invalid", identityErr, "Commit tracked scan inputs and review their limits")
+			return failedScanResult(result, stagePreflight, "scan_input_invalid", identityErr, "Commit tracked scan inputs and review their limits")
 		}
 		result.InputCategories = identity.InputCategories
 		if options.only != "vulnerabilities" {
@@ -476,36 +506,48 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	} else {
 		identity, categories, identityErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, "scan_input_invalid", identityErr, "Review the explicit scan inputs and their limits")
+			return failedScanResult(result, stagePreflight, "scan_input_invalid", identityErr, "Review the explicit scan inputs and their limits")
 		}
 		result.InputCategories = categories
 		if options.only != "vulnerabilities" {
 			initialAdhocIdentity = &identity
 		}
 	}
+	result = addStage(result, stagePreflight, stageSucceeded, "")
+
 	if options.only == "packages" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "vulnerabilities", Status: "skipped", Reason: "not requested"})
+		result = addStage(result, stageVulnerability, stageNotRequested, "")
 	} else {
 		findings, err := scanVulnerabilities(ctx, cfg, target, options.execution)
 		if err != nil {
 			result.Tools = append(result.Tools, scanToolResult{Name: cfg.VulnScan.DependencySource, Status: "failed", Reason: err.Error()})
 			if options.only == "" {
 				result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "vulnerability scan failed"})
+				result = addStage(result, stageCandidate, stageSkipped, "vulnerability scan failed")
+			} else {
+				result = addStage(result, stageCandidate, stageNotRequested, "")
 			}
-			return failedScanResult(result, "vulnerability_scan_failed", err, "Make the configured scanner available and run scan again")
+			result = addStage(result, stageReleaseAge, stageNotRequested, "")
+			result = addStage(result, stageSnapshot, stageNotRequested, "")
+			return failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", err, "Make the configured scanner available and run scan again")
 		}
 		result.Vulnerabilities = findings
 		result.Tools = append(result.Tools, scanToolResult{Name: cfg.VulnScan.DependencySource, Status: "used"})
+		result = addStage(result, stageVulnerability, stageSucceeded, "")
 	}
 	if options.only == "vulnerabilities" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "not requested"})
-		return result
+		result = addStage(result, stageCandidate, stageNotRequested, "")
+		result = addStage(result, stageReleaseAge, stageNotRequested, "")
+		result = addStage(result, stageSnapshot, stageNotRequested, "")
+		return finalizeCleanOrFindings(result)
 	}
 
 	candidates, manager, verified, err := scanPackages(ctx, cfg, target, options, policy, minAge)
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
-		return failedScanResult(result, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
+		return failedScanResult(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
 	}
 	unverified := false
 	for index := range candidates {
@@ -514,16 +556,25 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	}
 	result.Candidates = filterPolicyCandidates(candidates, policy.AllowedPackages)
 	result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "used"})
-	if minAge > 0 && unverified && len(result.Candidates) > 0 {
+	result = addStage(result, stageCandidate, stageSucceeded, "")
+	switch {
+	case minAge == 0:
+		result = addStage(result, stageReleaseAge, stageNotRequested, "")
+	case unverified && len(result.Candidates) > 0:
 		result.Warnings = append(result.Warnings, "release age could not be verified for one or more candidates; update must fail closed unless explicitly authorized")
+		result = addStage(result, stageReleaseAge, stageSkipped, "release age could not be verified for one or more candidates")
+	default:
+		result = addStage(result, stageReleaseAge, stageSucceeded, "")
 	}
 	if options.allowProjectConfig {
 		result.Warnings = append(result.Warnings, "reviewed project package-manager configuration was allowed during scan")
 	}
 	if len(result.Candidates) == 0 {
-		return result
+		result = addStage(result, stageSnapshot, stageSkipped, "no package candidates")
+		return finalizeCleanOrFindings(result)
 	}
 	if target.workspace != nil && target.workspace.Verification.State == config.VerificationScanOnly {
+		result = addStage(result, stageSnapshot, stageSkipped, "verification profile is scan-only")
 		return result
 	}
 
@@ -532,26 +583,26 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	if target.workspace != nil {
 		configHash, err = cfg.SnapshotPolicyHash(*target.workspace)
 		if err != nil {
-			return failedScanResult(result, "snapshot_failed", err, "Validate the project configuration")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Validate the project configuration")
 		}
 		verificationHash, err = config.VerificationProfileHash(*target.workspace)
 		if err != nil {
-			return failedScanResult(result, "snapshot_failed", err, "Validate the verification profile")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Validate the verification profile")
 		}
 	}
 	gates := updatesnapshot.ScanGates{AllowProjectConfig: options.allowProjectConfig, MinReleaseAge: minAge.String()}
 	effectiveHash, err := effectiveScanPolicyHash(configHash, policyIdentity, gates)
 	if err != nil {
-		return failedScanResult(result, "snapshot_failed", err, "Run scan again")
+		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
 	}
 	var snapshot updatesnapshot.Snapshot
 	if target.workspace != nil {
 		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, *target.workspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, "snapshot_failed", identityErr, "Commit or stash changes, then run scan again")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", identityErr, "Commit or stash changes, then run scan again")
 		}
 		if initialWorkspaceIdentity == nil || !reflect.DeepEqual(*initialWorkspaceIdentity, identity) {
-			return failedScanResult(result, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
 		}
 		snapshot, err = updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), target.name, updatesnapshot.WorkspaceIdentity{
 			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
@@ -560,25 +611,59 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	} else {
 		identity, identityErr := adhocInputIdentity(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, "snapshot_failed", identityErr, "Restore the explicit scan inputs and run scan again")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", identityErr, "Restore the explicit scan inputs and run scan again")
 		}
 		if initialAdhocIdentity == nil || !reflect.DeepEqual(*initialAdhocIdentity, identity) {
-			return failedScanResult(result, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+			return failedScanResult(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
 		}
 		snapshot, err = updatesnapshot.NewAdhoc(time.Now(), cfg.SnapshotTTL(), target.path, identity, policyIdentity, gates, effectiveHash, result.Candidates)
 	}
 	if err != nil {
-		return failedScanResult(result, "snapshot_failed", err, "Run scan again")
+		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
 	}
 	stateDir, err := cfg.SnapshotStateDir()
 	if err != nil {
-		return failedScanResult(result, "snapshot_failed", err, "Set a valid snapshot state directory")
+		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Set a valid snapshot state directory")
 	}
 	if err := (updatesnapshot.Store{Dir: stateDir}).Save(snapshot); err != nil {
-		return failedScanResult(result, "snapshot_failed", err, "Check snapshot state-directory permissions")
+		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Check snapshot state-directory permissions")
 	}
 	result.SnapshotID = snapshot.ID
 	result.Status = "ready"
+	result = addStage(result, stageSnapshot, stageSucceeded, "")
+	return result
+}
+
+// addStage records one independent stage outcome. Stages are additive and
+// never overwritten, so a later failure never hides an earlier success.
+func addStage(result scanResult, name string, status stageStatus, reason string) scanResult {
+	result.Stages = append(result.Stages, scanStageResult{Name: name, Status: string(status), Reason: reason})
+	return result
+}
+
+// hasSucceededDataStage reports whether an independent stage that produces
+// user-visible findings (vulnerabilities or package candidates) already
+// completed successfully before a later stage failed.
+func hasSucceededDataStage(result scanResult) bool {
+	for _, stage := range result.Stages {
+		if stage.Status == string(stageSucceeded) && (stage.Name == stageVulnerability || stage.Name == stageCandidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizeCleanOrFindings promotes the default "clean" status to "findings"
+// once vulnerabilities or candidates are present, so a target with real
+// findings can never report as clean. It leaves an already-explicit status
+// (for example scan-only verification) untouched.
+func finalizeCleanOrFindings(result scanResult) scanResult {
+	if result.Status != "clean" {
+		return result
+	}
+	if len(result.Vulnerabilities) > 0 || len(result.Candidates) > 0 {
+		result.Status = "findings"
+	}
 	return result
 }
 
@@ -635,14 +720,37 @@ func localScannerCommandWith(resolve localexec.Resolver, run localScannerRunner)
 			err = errors.Join(err, fmt.Errorf("remove private local-scanner state: %w", cleanupErr))
 		}
 		if err != nil {
-			return nil, fmt.Errorf("run local %s scanner: %w: %s", name, err, strings.TrimSpace(string(result.Stderr)))
+			category, detail := localexec.Classify(err, result)
+			return nil, &localScanError{tool: name, category: category, exitCode: -1, detail: detail, err: err}
 		}
 		if result.ExitCode != 0 {
-			return nil, fmt.Errorf("run local %s scanner: exit %d: %s", name, result.ExitCode, strings.TrimSpace(string(result.Stderr)))
+			category, detail := localexec.Classify(nil, result)
+			return nil, &localScanError{tool: name, category: category, exitCode: result.ExitCode, detail: detail}
 		}
 		return result.Output, nil
 	}
 }
+
+// localScanError reports a local-tool scanner failure without embedding raw,
+// unbounded, or unredacted subprocess output in its top-level message. The
+// safe category/exit code/bounded detail are recovered via
+// classifySubprocessError.
+type localScanError struct {
+	tool     string
+	category safeerr.Category
+	exitCode int
+	detail   string
+	err      error
+}
+
+func (e *localScanError) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("run local %s scanner failed", e.tool)
+	}
+	return fmt.Sprintf("local %s scanner exited %d", e.tool, e.exitCode)
+}
+
+func (e *localScanError) Unwrap() error { return e.err }
 
 func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, minAge time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 	minDays := int((minAge + 24*time.Hour - 1) / (24 * time.Hour))
@@ -822,11 +930,52 @@ func effectiveScanPolicyHash(configHash string, policy updatesnapshot.PolicyIden
 	return updatesnapshot.EffectivePolicyHash(configHash, policy, gates)
 }
 
-func failedScanResult(result scanResult, code string, err error, hint string) scanResult {
-	result.Status = "failed"
-	result.Error = &jsonCommandError{Code: code, Message: err.Error(), Hint: hint}
+// failedScanResult records a stage failure. Data an earlier, independent
+// stage already produced (vulnerabilities or package candidates) is never
+// discarded: the target becomes "partial" rather than "failed" when that
+// happened, so successful findings stay visible instead of being hidden
+// behind a single opaque failure.
+func failedScanResult(result scanResult, stage, code string, err error, hint string) scanResult {
+	result = addStage(result, stage, stageFailed, safeStageReason(err))
+	if hasSucceededDataStage(result) {
+		result.Status = "partial"
+	} else {
+		result.Status = "failed"
+	}
+	category, exitCode, detail := classifySubprocessError(err)
+	result.Error = &jsonCommandError{
+		Code: code, Message: err.Error(), Hint: hint,
+		Stage: stage, Category: category, ExitCode: exitCode, StderrTail: detail,
+	}
 	return result
 }
+
+// classifySubprocessError extracts a safe category, exit code, and bounded
+// redacted diagnostic tail from an error that may originate from a hardened
+// dockerexec or localexec command boundary. It never inspects argv,
+// environment, or unbounded output, and returns zero values when err does
+// not originate from a recognized command boundary.
+func classifySubprocessError(err error) (category string, exitCode *int, detail string) {
+	if dockerCategory, code, dockerDetail := dockerexec.Classify(err); dockerCategory != safeerr.CategoryUnknown || dockerDetail != "" {
+		return string(dockerCategory), exitCodePtr(code), dockerDetail
+	}
+	var localErr *localScanError
+	if errors.As(err, &localErr) {
+		return string(localErr.category), exitCodePtr(localErr.exitCode), localErr.detail
+	}
+	return "", nil, ""
+}
+
+func exitCodePtr(code int) *int {
+	if code < 0 {
+		return nil
+	}
+	return &code
+}
+
+// safeStageReason is the per-stage diagnostic string. It reuses the already
+// safe top-level error message rather than any raw subprocess output.
+func safeStageReason(err error) string { return err.Error() }
 
 func summarizeScan(results []scanResult) scanSummary {
 	var summary scanSummary
@@ -836,12 +985,18 @@ func summarizeScan(results []scanResult) scanSummary {
 		switch result.Status {
 		case "failed":
 			summary.Failed++
+		case "partial":
+			summary.Failed++
+			summary.Partial++
 		case "ready":
 			summary.Succeeded++
 			summary.Ready++
 		case config.VerificationScanOnly:
 			summary.Succeeded++
 			summary.ScanOnly++
+		case "findings":
+			summary.Succeeded++
+			summary.Findings++
 		default:
 			summary.Succeeded++
 			summary.Clean++
@@ -857,6 +1012,13 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 			label = result.Directory
 		}
 		fmt.Printf("%s: %s (%d vulnerabilities, %d package candidates)\n", label, result.Status, len(result.Vulnerabilities), len(result.Candidates))
+		if len(result.Stages) > 0 {
+			stages := make([]string, 0, len(result.Stages))
+			for _, stage := range result.Stages {
+				stages = append(stages, fmt.Sprintf("%s=%s", stage.Name, stage.Status))
+			}
+			fmt.Printf("  stages: %s\n", strings.Join(stages, ", "))
+		}
 		if len(result.InputCategories) > 0 {
 			fmt.Printf("  scan inputs: %s\n", strings.Join(result.InputCategories, ", "))
 		}
@@ -878,6 +1040,18 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 		}
 		if result.Error != nil {
 			fmt.Fprintf(os.Stderr, "%s: %s\nHint: %s\n", label, result.Error.Message, result.Error.Hint)
+			if result.Error.Stage != "" {
+				fmt.Fprintf(os.Stderr, "  stage: %s\n", result.Error.Stage)
+			}
+			if result.Error.Category != "" {
+				fmt.Fprintf(os.Stderr, "  category: %s\n", result.Error.Category)
+			}
+			if result.Error.ExitCode != nil {
+				fmt.Fprintf(os.Stderr, "  exit code: %d\n", *result.Error.ExitCode)
+			}
+			if result.Error.StderrTail != "" {
+				fmt.Fprintf(os.Stderr, "  detail: %s\n", result.Error.StderrTail)
+			}
 		}
 	}
 	ready := make([]scanResult, 0)

@@ -109,3 +109,73 @@ func TestExecutorRejectsGroupWritableBinary(t *testing.T) {
 		t.Fatalf("expected writable binary rejection, got %v", err)
 	}
 }
+
+func TestRunCommandCapturesExitCodeAndRedactedStderrTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "docker")
+	script := "#!/bin/sh\necho 'permission denied: token=supersecret123' 1>&2\nexit 3\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	executor := New(Options{
+		Resolver:  func(string) (string, error) { return path, nil },
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+	})
+	_, err := executor.Run(context.Background(), Request{
+		Args:   []string{"ps"},
+		Stderr: Capture{Mode: Tail, Bytes: 4 << 10},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if err.Error() != "docker command failed" {
+		t.Fatalf("top-level error leaked detail: %q", err.Error())
+	}
+	category, exitCode, detail := Classify(err)
+	if exitCode != 3 {
+		t.Fatalf("exit code = %d, want 3", exitCode)
+	}
+	if category != "permission" {
+		t.Fatalf("category = %q, want permission", category)
+	}
+	if strings.Contains(detail, "supersecret123") {
+		t.Fatalf("detail leaked secret: %q", detail)
+	}
+	if !strings.Contains(detail, "<redacted>") {
+		t.Fatalf("detail did not redact credential-like text: %q", detail)
+	}
+}
+
+func TestRunCommandNeverCapturesUndiscardedStderr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "docker")
+	script := "#!/bin/sh\necho 'permission denied' 1>&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	executor := New(Options{
+		Resolver:  func(string) (string, error) { return path, nil },
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+	})
+	_, err := executor.Run(context.Background(), Request{Args: []string{"ps"}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	_, exitCode, detail := Classify(err)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1", exitCode)
+	}
+	if detail != "" {
+		t.Fatalf("detail = %q, want empty when the caller never captured stderr", detail)
+	}
+}
+
+func TestClassifyOutputLimitAndContextErrors(t *testing.T) {
+	if category, exitCode, _ := Classify(&OutputLimitError{Stream: "stdout", Limit: 10}); category != "output_limit" || exitCode != -1 {
+		t.Fatalf("output limit classify = %q/%d", category, exitCode)
+	}
+	if category, exitCode, _ := Classify(context.DeadlineExceeded); category != "timeout" || exitCode != -1 {
+		t.Fatalf("deadline classify = %q/%d", category, exitCode)
+	}
+	if category, exitCode, _ := Classify(context.Canceled); category != "cancelled" || exitCode != -1 {
+		t.Fatalf("cancel classify = %q/%d", category, exitCode)
+	}
+}

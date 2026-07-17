@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
@@ -247,11 +249,13 @@ func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 	}
 }
 
-func TestScanJSONEnvelopeRepresentsCleanReadyAndPartialFailure(t *testing.T) {
+func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t *testing.T) {
 	results := []scanResult{
-		{Project: "clean", Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{"CVE-1"}, Tools: []scanToolResult{}, Warnings: []string{}},
+		{Project: "clean", Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
+		{Project: "findings", Status: "findings", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{"CVE-1"}, Tools: []scanToolResult{}, Warnings: []string{}},
 		{Project: "docs", Status: config.VerificationScanOnly, Candidates: []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
 		{Project: "ready", Status: "ready", SnapshotID: "snapshot", Candidates: []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
+		{Project: "partial", Status: "partial", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{"CVE-2"}, Tools: []scanToolResult{}, Warnings: []string{}, Error: &jsonCommandError{Code: "package_scan_failed", Message: "package scan failed", Stage: "candidate"}},
 		{Project: "failed", Status: "failed", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}, Error: &jsonCommandError{Code: "scan_failed", Message: "failed"}},
 	}
 	summary := summarizeScan(results)
@@ -263,8 +267,118 @@ func TestScanJSONEnvelopeRepresentsCleanReadyAndPartialFailure(t *testing.T) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if summary.Clean != 1 || summary.ScanOnly != 1 || summary.Ready != 1 || summary.Failed != 1 || summary.Vulnerabilities != 1 {
+	if summary.Clean != 1 || summary.Findings != 1 || summary.ScanOnly != 1 || summary.Ready != 1 || summary.Partial != 1 || summary.Failed != 2 || summary.Vulnerabilities != 2 {
 		t.Fatalf("summary = %#v", summary)
+	}
+	// A "clean" result must never coexist with vulnerabilities or candidates.
+	for _, result := range results {
+		if result.Status == "clean" && (len(result.Vulnerabilities) > 0 || len(result.Candidates) > 0) {
+			t.Fatalf("project %q is clean but has findings", result.Project)
+		}
+	}
+	// scanResultError must treat partial the same as failed for exit-code precedence.
+	if resultErr := scanResultError(summary, "vulnerabilities"); resultErr == nil {
+		t.Fatal("expected a failure exit code when a partial result is present")
+	} else {
+		var coded commandError
+		if !errors.As(resultErr, &coded) || coded.code != exitFailure {
+			t.Fatalf("error = %#v, want exit %d", resultErr, exitFailure)
+		}
+	}
+}
+
+func TestFinalizeCleanOrFindingsPromotesOnlyDefaultClean(t *testing.T) {
+	clean := finalizeCleanOrFindings(scanResult{Status: "clean"})
+	if clean.Status != "clean" {
+		t.Fatalf("status = %q, want clean", clean.Status)
+	}
+	findings := finalizeCleanOrFindings(scanResult{Status: "clean", Vulnerabilities: []string{"CVE-1"}})
+	if findings.Status != "findings" {
+		t.Fatalf("status = %q, want findings", findings.Status)
+	}
+	findingsFromCandidates := finalizeCleanOrFindings(scanResult{Status: "clean", Candidates: []updatesnapshot.Candidate{{Name: "example"}}})
+	if findingsFromCandidates.Status != "findings" {
+		t.Fatalf("status = %q, want findings", findingsFromCandidates.Status)
+	}
+	scanOnly := finalizeCleanOrFindings(scanResult{Status: config.VerificationScanOnly, Vulnerabilities: []string{"CVE-1"}})
+	if scanOnly.Status != config.VerificationScanOnly {
+		t.Fatalf("status = %q, want unchanged scan-only status", scanOnly.Status)
+	}
+}
+
+func TestFailedScanResultPreservesEarlierSucceededStageAsPartial(t *testing.T) {
+	result := scanResult{Status: "clean", Vulnerabilities: []string{}, Candidates: []updatesnapshot.Candidate{}, Stages: []scanStageResult{}}
+	result = addStage(result, stagePreflight, stageSucceeded, "")
+	result = addStage(result, stageVulnerability, stageSucceeded, "")
+	result.Vulnerabilities = []string{"CVE-1", "CVE-2"}
+
+	failed := failedScanResult(result, stageCandidate, "package_scan_failed", errors.New("package scan failed"), "hint")
+	if failed.Status != "partial" {
+		t.Fatalf("status = %q, want partial", failed.Status)
+	}
+	if len(failed.Vulnerabilities) != 2 {
+		t.Fatalf("vulnerabilities were lost: %#v", failed.Vulnerabilities)
+	}
+	if failed.Error == nil || failed.Error.Stage != stageCandidate {
+		t.Fatalf("error stage = %#v, want %q", failed.Error, stageCandidate)
+	}
+}
+
+func TestFailedScanResultWithNoPriorDataStageIsFullyFailed(t *testing.T) {
+	result := scanResult{Status: "clean", Vulnerabilities: []string{}, Candidates: []updatesnapshot.Candidate{}, Stages: []scanStageResult{}}
+	result = addStage(result, stagePreflight, stageSucceeded, "")
+
+	failed := failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", errors.New("scanner unavailable"), "hint")
+	if failed.Status != "failed" {
+		t.Fatalf("status = %q, want failed", failed.Status)
+	}
+}
+
+func TestFailedScanResultSurfacesSafeCategoryExitCodeAndBoundedDetailForDockerFailures(t *testing.T) {
+	executor := dockerexec.New(dockerexec.Options{
+		Resolver: func(string) (string, error) {
+			path := filepath.Join(t.TempDir(), "docker")
+			script := "#!/bin/sh\necho 'permission denied: token=supersecret' 1>&2\nexit 5\n"
+			if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return path, nil
+		},
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+	})
+	_, runErr := executor.Run(context.Background(), dockerexec.Request{
+		Args:   []string{"run"},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	wrapped := fmt.Errorf("docker run trivy: %w", runErr)
+
+	result := scanResult{Status: "clean", Vulnerabilities: []string{}, Candidates: []updatesnapshot.Candidate{}, Stages: []scanStageResult{}}
+	failed := failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", wrapped, "hint")
+	if failed.Error.Category != "permission" {
+		t.Fatalf("category = %q, want permission", failed.Error.Category)
+	}
+	if failed.Error.ExitCode == nil || *failed.Error.ExitCode != 5 {
+		t.Fatalf("exit code = %v, want 5", failed.Error.ExitCode)
+	}
+	if strings.Contains(failed.Error.StderrTail, "supersecret") {
+		t.Fatalf("stderr tail leaked secret: %q", failed.Error.StderrTail)
+	}
+	if strings.Contains(failed.Error.Message, "supersecret") {
+		t.Fatalf("message leaked secret: %q", failed.Error.Message)
+	}
+}
+
+func TestFailedScanResultSurfacesLocalScanErrorCategory(t *testing.T) {
+	localErr := &localScanError{tool: "trivy", category: "permission", exitCode: 5, detail: "permission denied"}
+	wrapped := fmt.Errorf("run local trivy scanner: %w", localErr)
+
+	result := scanResult{Status: "clean", Vulnerabilities: []string{}, Candidates: []updatesnapshot.Candidate{}, Stages: []scanStageResult{}}
+	failed := failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", wrapped, "hint")
+	if failed.Error.Category != "permission" {
+		t.Fatalf("category = %q, want permission", failed.Error.Category)
+	}
+	if failed.Error.ExitCode == nil || *failed.Error.ExitCode != 5 {
+		t.Fatalf("exit code = %v, want 5", failed.Error.ExitCode)
 	}
 }
 

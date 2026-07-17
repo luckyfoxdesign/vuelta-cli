@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/capio"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 )
 
 const defaultWaitDelay = 10 * time.Second
@@ -234,11 +235,28 @@ func validateRequest(request Request) error {
 }
 
 // CommandError reports a Docker CLI failure without exposing untrusted
-// arguments, environment values, or child output.
-type CommandError struct{ err error }
+// arguments, environment values, or full child output. It still carries the
+// exit code and a bounded, redacted diagnostic tail derived only from output
+// the caller already chose to capture under its own limits.
+type CommandError struct {
+	err      error
+	exitCode int
+	detail   []byte
+}
 
 func (e *CommandError) Error() string { return "docker command failed" }
 func (e *CommandError) Unwrap() error { return e.err }
+
+// ExitCode returns the child's exit code, or -1 when it never ran to
+// completion (for example, the executable could not be started).
+func (e *CommandError) ExitCode() int { return e.exitCode }
+
+// SafeDetail returns a bounded, redacted diagnostic tail safe for display.
+func (e *CommandError) SafeDetail() string { return safeerr.Tail(e.detail, 512) }
+
+// Category derives a stable, safe failure classification from the bounded
+// diagnostic tail already captured by the caller.
+func (e *CommandError) Category() safeerr.Category { return safeerr.ClassifyDetail(e.SafeDetail()) }
 
 // OutputLimitError reports which structured stream exceeded its hard cap.
 type OutputLimitError struct {
@@ -248,6 +266,27 @@ type OutputLimitError struct {
 
 func (e *OutputLimitError) Error() string {
 	return fmt.Sprintf("docker %s exceeded %d bytes", e.Stream, e.Limit)
+}
+
+// Classify derives a stable, safe category, exit code (-1 when unknown), and
+// bounded redacted detail from an error returned by Run. It never inspects
+// argv, environment, or unbounded output.
+func Classify(err error) (safeerr.Category, int, string) {
+	var limitErr *OutputLimitError
+	if errors.As(err, &limitErr) {
+		return safeerr.CategoryOutputLimit, -1, limitErr.Error()
+	}
+	var cmdErr *CommandError
+	if errors.As(err, &cmdErr) {
+		return cmdErr.Category(), cmdErr.ExitCode(), cmdErr.SafeDetail()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return safeerr.CategoryTimeout, -1, ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return safeerr.CategoryCancelled, -1, ""
+	}
+	return safeerr.CategoryUnknown, -1, ""
 }
 
 type collector struct {
@@ -323,7 +362,16 @@ func runCommand(ctx context.Context, path string, request Request, environment [
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, ctxErr
 		}
-		return result, &CommandError{err: err}
+		exitCode := -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+		detail := result.Stderr
+		if len(detail) == 0 {
+			detail = result.Combined
+		}
+		return result, &CommandError{err: err, exitCode: exitCode, detail: detail}
 	}
 	return result, nil
 }
