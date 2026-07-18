@@ -21,6 +21,29 @@ func executable(t *testing.T, mode os.FileMode) string {
 	return path
 }
 
+func testEndpoint() Endpoint {
+	return Endpoint{SocketPath: "/approved/docker.sock", Expected: DaemonIdentity{
+		ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+		MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+	}}
+}
+
+func testEndpointValidator(Endpoint) (string, error) { return "/approved/docker.sock", nil }
+
+func daemonProbeResult(request Request) (Result, bool) {
+	if len(request.Args) < 3 || request.Args[0] != "--host" || request.Args[1] != "unix:///approved/docker.sock" {
+		return Result{}, false
+	}
+	switch request.Args[2] {
+	case "version":
+		return Result{Stdout: []byte(`{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"arm64"}`)}, true
+	case "info":
+		return Result{Stdout: []byte(`{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}`)}, true
+	default:
+		return Result{}, false
+	}
+}
+
 func TestExecutorBindsAbsolutePathOnceAndUsesAllowlistedEnvironment(t *testing.T) {
 	approved := executable(t, 0o755)
 	configDir := filepath.Join(t.TempDir(), "docker-config")
@@ -36,9 +59,16 @@ func TestExecutorBindsAbsolutePathOnceAndUsesAllowlistedEnvironment(t *testing.T
 			return approved, nil
 		},
 		ConfigDir: configDir,
-		CommandRunner: func(_ context.Context, path string, _ Request, env []string) (Result, error) {
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
+		CommandRunner: func(_ context.Context, path string, request Request, env []string) (Result, error) {
 			paths = append(paths, path)
 			environments = append(environments, append([]string(nil), env...))
+			if result, ok := daemonProbeResult(request); ok {
+				return result, nil
+			}
+			if !reflect.DeepEqual(request.Args, []string{"--host", "unix:///approved/docker.sock", "ps"}) {
+				t.Fatalf("caller argv = %#v", request.Args)
+			}
 			return Result{}, nil
 		},
 	})
@@ -46,13 +76,14 @@ func TestExecutorBindsAbsolutePathOnceAndUsesAllowlistedEnvironment(t *testing.T
 	for name, value := range map[string]string{
 		"PATH": "/hostile/bin", "DOCKER_HOST": "tcp://attacker.invalid:2375",
 		"DOCKER_CONTEXT": "hostile", "DOCKER_CONFIG": "/hostile/config",
+		"DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "/hostile/certs",
 		"HTTP_PROXY": "http://attacker.invalid", "HTTPS_PROXY": "http://attacker.invalid",
-		"ALL_PROXY": "socks5://attacker.invalid", "HOME": "/hostile/home",
+		"ALL_PROXY": "socks5://attacker.invalid", "NO_PROXY": "*", "HOME": "/hostile/home",
 	} {
 		t.Setenv(name, value)
 	}
 
-	request := Request{Args: []string{"version"}, Env: map[string]string{"VUELTA_IMAGE": "registry.example/app@sha256:abc"}}
+	request := Request{Args: []string{"ps"}, Env: map[string]string{"VUELTA_IMAGE": "registry.example/app@sha256:abc"}}
 	if _, err := executor.Run(context.Background(), request); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
@@ -69,13 +100,18 @@ func TestExecutorBindsAbsolutePathOnceAndUsesAllowlistedEnvironment(t *testing.T
 	if resolveCalls != 1 {
 		t.Fatalf("resolver called %d times, want 1", resolveCalls)
 	}
-	if !reflect.DeepEqual(paths, []string{absolute, absolute}) {
+	if !reflect.DeepEqual(paths, []string{absolute, absolute, absolute, absolute}) {
 		t.Fatalf("command paths = %#v, want exact absolute path %q", paths, absolute)
 	}
-	wantEnv := []string{"DOCKER_CONFIG=" + configDir, "VUELTA_IMAGE=registry.example/app@sha256:abc"}
-	for _, got := range environments {
-		if !reflect.DeepEqual(got, wantEnv) {
-			t.Fatalf("child environment = %#v, want %#v", got, wantEnv)
+	wantProbeEnv := []string{"DOCKER_CONFIG=" + configDir}
+	wantCallerEnv := []string{"DOCKER_CONFIG=" + configDir, "VUELTA_IMAGE=registry.example/app@sha256:abc"}
+	for i, got := range environments {
+		want := wantCallerEnv
+		if i < 2 {
+			want = wantProbeEnv
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("child environment[%d] = %#v, want %#v", i, got, want)
 		}
 	}
 	data, err := os.ReadFile(filepath.Join(configDir, "config.json"))
@@ -91,6 +127,7 @@ func TestExecutorRejectsUnapprovedEnvironment(t *testing.T) {
 	executor := New(Options{
 		Resolver:  func(string) (string, error) { return executable(t, 0o755), nil },
 		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
 	})
 	_, err := executor.Run(context.Background(), Request{
 		Args: []string{"version"}, Env: map[string]string{"DOCKER_HOST": "tcp://attacker.invalid:2375"},
@@ -104,6 +141,7 @@ func TestExecutorRejectsGroupWritableBinary(t *testing.T) {
 	executor := New(Options{
 		Resolver:  func(string) (string, error) { return executable(t, 0o775), nil },
 		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
 	})
 	if _, err := executor.Path(); err == nil || !strings.Contains(err.Error(), "writable") {
 		t.Fatalf("expected writable binary rejection, got %v", err)
@@ -112,13 +150,14 @@ func TestExecutorRejectsGroupWritableBinary(t *testing.T) {
 
 func TestRunCommandCapturesExitCodeAndRedactedStderrTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "docker")
-	script := "#!/bin/sh\necho 'permission denied: token=supersecret123' 1>&2\nexit 3\n"
+	script := "#!/bin/sh\nif [ \"$3\" = version ]; then echo '{\"server_version\":\"28.3.2\",\"api_version\":\"1.49\",\"os\":\"linux\",\"architecture\":\"arm64\"}'; exit 0; fi\nif [ \"$3\" = info ]; then echo '{\"id\":\"daemon-approved\",\"security_options\":[\"name=seccomp,profile=builtin\"]}'; exit 0; fi\necho 'permission denied: token=supersecret123' 1>&2\nexit 3\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	executor := New(Options{
 		Resolver:  func(string) (string, error) { return path, nil },
 		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
 	})
 	_, err := executor.Run(context.Background(), Request{
 		Args:   []string{"ps"},
@@ -147,13 +186,14 @@ func TestRunCommandCapturesExitCodeAndRedactedStderrTail(t *testing.T) {
 
 func TestRunCommandNeverCapturesUndiscardedStderr(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "docker")
-	script := "#!/bin/sh\necho 'permission denied' 1>&2\nexit 1\n"
+	script := "#!/bin/sh\nif [ \"$3\" = version ]; then echo '{\"server_version\":\"28.3.2\",\"api_version\":\"1.49\",\"os\":\"linux\",\"architecture\":\"arm64\"}'; exit 0; fi\nif [ \"$3\" = info ]; then echo '{\"id\":\"daemon-approved\",\"security_options\":[\"name=seccomp,profile=builtin\"]}'; exit 0; fi\necho 'permission denied' 1>&2\nexit 1\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	executor := New(Options{
 		Resolver:  func(string) (string, error) { return path, nil },
 		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
 	})
 	_, err := executor.Run(context.Background(), Request{Args: []string{"ps"}})
 	if err == nil {
@@ -165,6 +205,55 @@ func TestRunCommandNeverCapturesUndiscardedStderr(t *testing.T) {
 	}
 	if detail != "" {
 		t.Fatalf("detail = %q, want empty when the caller never captured stderr", detail)
+	}
+}
+
+func TestExecutorRejectsUnexpectedDaemonIdentityBeforeCallerCommand(t *testing.T) {
+	called := false
+	executor := New(Options{
+		Resolver:  func(string) (string, error) { return executable(t, 0o755), nil },
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"), Endpoint: testEndpoint(), EndpointValidator: testEndpointValidator,
+		CommandRunner: func(_ context.Context, _ string, request Request, _ []string) (Result, error) {
+			if request.Args[2] == "version" {
+				return Result{Stdout: []byte(`{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"arm64"}`)}, nil
+			}
+			if request.Args[2] == "info" {
+				return Result{Stdout: []byte(`{"id":"attacker-daemon","security_options":["name=seccomp,profile=builtin"]}`)}, nil
+			}
+			called = true
+			return Result{}, nil
+		},
+	})
+	_, err := executor.Run(context.Background(), Request{Args: []string{"ps"}})
+	if err == nil || !strings.Contains(err.Error(), "identity does not match") {
+		t.Fatalf("unexpected identity error = %v", err)
+	}
+	if called {
+		t.Fatal("caller command ran against an unexpected daemon")
+	}
+}
+
+func TestAttestDaemonRejectsVersionPlatformAPIAndSecurityDrift(t *testing.T) {
+	expected := testEndpoint().Expected
+	validVersion := versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "arm64"}
+	validInfo := infoIdentity{ID: "daemon-approved", SecurityOptions: []string{"name=seccomp,profile=builtin"}}
+	tests := []struct {
+		name    string
+		version versionIdentity
+		info    infoIdentity
+		want    string
+	}{
+		{name: "server version", version: versionIdentity{ServerVersion: "28.3.3", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "arm64"}, info: validInfo, want: "server version"},
+		{name: "platform", version: versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "amd64"}, info: validInfo, want: "platform"},
+		{name: "api", version: versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.43", OperatingSystem: "linux", Architecture: "arm64"}, info: validInfo, want: "API version"},
+		{name: "security option", version: validVersion, info: infoIdentity{ID: "daemon-approved", SecurityOptions: []string{"name=cgroupns"}}, want: "security option"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := attestDaemon(expected, test.version, test.info); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("attest error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

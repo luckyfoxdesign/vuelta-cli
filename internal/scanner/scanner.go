@@ -91,6 +91,9 @@ func checkToolsWithDocker(tools []string, docker dockerexec.Runner) error {
 		default:
 			_, err = exec.LookPath(tool)
 		}
+		if tool == "docker" && err != nil {
+			return fmt.Errorf("approved Docker CLI or endpoint is unavailable: %w", err)
+		}
 		if err != nil {
 			missing = append(missing, tool)
 		}

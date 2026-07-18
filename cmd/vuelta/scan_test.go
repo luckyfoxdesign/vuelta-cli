@@ -338,13 +338,18 @@ func TestFailedScanResultSurfacesSafeCategoryExitCodeAndBoundedDetailForDockerFa
 	executor := dockerexec.New(dockerexec.Options{
 		Resolver: func(string) (string, error) {
 			path := filepath.Join(t.TempDir(), "docker")
-			script := "#!/bin/sh\necho 'permission denied: token=supersecret' 1>&2\nexit 5\n"
+			script := "#!/bin/sh\nif [ \"$3\" = version ]; then echo '{\"server_version\":\"28.3.2\",\"api_version\":\"1.49\",\"os\":\"linux\",\"architecture\":\"arm64\"}'; exit 0; fi\nif [ \"$3\" = info ]; then echo '{\"id\":\"daemon-approved\",\"security_options\":[\"name=seccomp,profile=builtin\"]}'; exit 0; fi\necho 'permission denied: token=supersecret' 1>&2\nexit 5\n"
 			if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			return path, nil
 		},
 		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint: dockerexec.Endpoint{SocketPath: "/approved/docker.sock", Expected: dockerexec.DaemonIdentity{
+			ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
+		EndpointValidator: func(dockerexec.Endpoint) (string, error) { return "/approved/docker.sock", nil },
 	})
 	_, runErr := executor.Run(context.Background(), dockerexec.Request{
 		Args:   []string{"run"},

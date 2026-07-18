@@ -92,17 +92,27 @@ func installFakeDocker(t *testing.T, passOnCall int) dockerexec.Runner {
 	}
 	dir := t.TempDir()
 	var script string
+	identity := `if [ "$3" = version ]; then
+  echo '{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"amd64"}'
+  exit 0
+fi
+if [ "$3" = info ]; then
+  echo '{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}'
+  exit 0
+fi
+`
 	switch {
 	case passOnCall == 0:
-		script = "#!/bin/sh\nexit 0\n"
+		script = "#!/bin/sh\n" + identity + "exit 0\n"
 	case passOnCall < 0:
-		script = "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\nexit 1\n"
+		script = "#!/bin/sh\n" + identity + "for arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\nexit 1\n"
 	default:
 		counter := filepath.Join(dir, "calls")
 		if err := os.WriteFile(counter, []byte("0"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		script = fmt.Sprintf(`#!/bin/sh
+%s
 for arg in "$@"; do
   [ "$arg" = down ] && exit 0
 done
@@ -113,13 +123,20 @@ if [ "$n" -lt %d ]; then
   exit 1
 fi
 exit 0
-`, counter, counter, passOnCall)
+`, identity, counter, counter, passOnCall)
 	}
 	path := filepath.Join(dir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return dockerexec.New(dockerexec.Options{Resolver: func(string) (string, error) { return path, nil }})
+	return dockerexec.New(dockerexec.Options{
+		Resolver: func(string) (string, error) { return path, nil },
+		Endpoint: dockerexec.Endpoint{SocketPath: "/approved/docker.sock", Expected: dockerexec.DaemonIdentity{
+			ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
+		EndpointValidator: func(dockerexec.Endpoint) (string, error) { return "/approved/docker.sock", nil },
+	})
 }
 
 type fakeSecurityGate struct {

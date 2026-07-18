@@ -68,6 +68,38 @@ paths listed under `workspaces[]` are ever touched.
 
 ## Runner isolation
 
+Every Docker child is bound to the reviewed local Unix socket with an explicit
+`--host unix:///absolute/path`; Docker context discovery and inherited
+`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, TLS, proxy, and credential
+helper settings are never authority. Before the first caller command, Vuelta
+checks the socket type, ownership, and permissions, then attests the daemon ID,
+exact server version, OS/architecture, minimum API version, and required
+security options. A mismatch fails closed before a scanner, updater, test, or
+deploy command runs.
+
+Configure development under `docker.developer`. Linux Docker Engine normally
+uses `/var/run/docker.sock`; Docker Desktop on macOS normally uses the
+per-user `/Users/YOU/.docker/run/docker.sock`. Do not create a system-wide
+socket symlink. To collect the non-secret values without reading ambient Docker
+configuration or credential helpers, create an empty protected directory and
+probe only the selected socket:
+
+```bash
+vuelta_probe_config=$(mktemp -d)
+chmod 700 "$vuelta_probe_config"
+printf '{}\n' > "$vuelta_probe_config/config.json"
+chmod 600 "$vuelta_probe_config/config.json"
+vuelta_socket=/absolute/path/to/docker.sock
+DOCKER_CONFIG="$vuelta_probe_config" docker --host "unix://$vuelta_socket" version --format '{"server_version":{{json .Server.Version}},"api_version":{{json .Server.APIVersion}},"os":{{json .Server.Os}},"architecture":{{json .Server.Arch}}}'
+DOCKER_CONFIG="$vuelta_probe_config" docker --host "unix://$vuelta_socket" info --format '{"id":{{json .ID}},"security_options":{{json .SecurityOptions}}}'
+```
+
+Copy the exact results into `expected_daemon` and remove the temporary
+`config.json` and directory. Re-review the identity after an intentional Engine
+or Docker Desktop upgrade. The server-only worker uses the separate
+`production_worker.docker` block; never reuse a developer socket path in a
+deploy configuration.
+
 Each update starts from `git archive <base SHA>` in a fresh `0700` directory.
 Only tracked regular files are extracted; `.git`, ignored/untracked files,
 `.env*`, host credentials, sockets, and symlinks do not enter the runner. The

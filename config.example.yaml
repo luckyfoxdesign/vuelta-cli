@@ -3,6 +3,23 @@
 # are read from the fixed environment variables below only when sending.
 # Adhoc local execution uses scan-time gates and an optional standalone policy
 # supplied explicitly with `vuelta scan --policy`.
+# Docker execution is disabled until this reviewed endpoint is configured.
+# Use /var/run/docker.sock for Linux Engine. Docker Desktop macOS normally uses
+# /Users/YOU/.docker/run/docker.sock; keep the absolute path in this private
+# 0600 config rather than expanding HOME or reading an ambient Docker context.
+# Obtain these exact non-secret identity fields with an isolated empty Docker
+# config and an explicit --host, as documented in README.md.
+# docker:
+#   developer:
+#     socket: "/Users/YOU/.docker/run/docker.sock"
+#     expected_daemon:
+#       id: "<exact-docker-info-id>"
+#       server_version: "<exact-server-version>"
+#       operating_system: "linux"
+#       architecture: "arm64"
+#       minimum_api_version: "1.44"
+#       required_security_options:
+#         - "name=seccomp,profile=builtin"
 notify:
   webhook_url_env: "" # to enable, set exactly "VUELTA_NOTIFY_WEBHOOK_URL"
   telegram:
@@ -99,6 +116,16 @@ deploy_task:
 # this file; these are base64-encoded Ed25519 *public* keys supplied by CI.
 # The configured Compose service must set image: "${VUELTA_IMAGE}".
 # production_worker:
+#   # This deploy endpoint is deliberately separate from docker.developer.
+#   docker:
+#     socket: "/var/run/docker.sock"
+#     expected_daemon:
+#       id: "<exact-production-daemon-id>"
+#       server_version: "<exact-server-version>"
+#       operating_system: "linux"
+#       architecture: "amd64"
+#       minimum_api_version: "1.44"
+#       required_security_options: ["name=seccomp,profile=builtin"]
 #   state_dir: "/var/lib/vuelta/deploy-state"
 #   source_mode: "signed_queue_file" # signed_queue_file | git_tag
 #   queue_file: "/var/lib/vuelta/delivery/candidates.jsonl"

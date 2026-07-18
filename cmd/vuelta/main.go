@@ -18,6 +18,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/deployworker"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/tasks"
@@ -292,6 +293,16 @@ func runDeployWorker(args []string) error {
 		return fail(exitConfig, "production_worker configuration is required for deploy worker")
 	}
 	workerConfig := cfg.ProductionWorker
+	deployEndpoint, err := configuredDockerEndpoint(workerConfig.Docker, "production_worker.docker")
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	deployDocker := dockerexec.New(dockerexec.Options{Endpoint: deployEndpoint})
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), time.Duration(workerConfig.OperationTimeoutSecond)*time.Second)
+	defer verifyCancel()
+	if err := deployDocker.Verify(verifyCtx); err != nil {
+		return fail(exitEnv, "deploy Docker endpoint verification failed: %v", err)
+	}
 	manifestKey, _ := base64.StdEncoding.DecodeString(workerConfig.ManifestPublicKey)
 	var source deployworker.Source
 	switch workerConfig.SourceMode {
@@ -319,7 +330,7 @@ func runDeployWorker(args []string) error {
 	worker := deployworker.Worker{
 		Source:   source,
 		Verifier: deployworker.Ed25519ManifestVerifier{PublicKey: manifestKey, Load: deployworker.DigestFileLoader(workerConfig.ManifestDir)},
-		Adapter:  deployworker.ComposeAdapter{Projects: composeProjects}, Notifier: notify.New(cfg.Notify), Projects: projects,
+		Adapter:  deployworker.ComposeAdapter{Projects: composeProjects, Docker: deployDocker}, Notifier: notify.New(cfg.Notify), Projects: projects,
 		StateDir: workerConfig.StateDir, MaxCandidateAge: time.Duration(workerConfig.MaxCandidateAgeMinutes) * time.Minute,
 		OperationTimeout: time.Duration(workerConfig.OperationTimeoutSecond) * time.Second,
 	}

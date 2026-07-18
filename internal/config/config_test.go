@@ -98,6 +98,10 @@ func TestNotificationReferencesDoNotAffectSnapshotPolicyHash(t *testing.T) {
 func TestValidateProductionWorkerRejectsUnsafeOrIncompleteAdapter(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	valid := &ProductionWorkerConfig{
+		Docker: &DockerEndpointConfig{Socket: "/var/run/docker.sock", ExpectedDaemon: DockerDaemonIdentity{
+			ID: "daemon-id", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
 		StateDir: "/var/lib/vuelta/state", SourceMode: "signed_queue_file", QueueFile: "/var/lib/vuelta/queue.jsonl", ManifestDir: "/var/lib/vuelta/manifests",
 		CandidatePublicKey: key, ManifestPublicKey: key, MaxCandidateAgeMinutes: 60, OperationTimeoutSecond: 120,
 		Projects: []ProductionProject{{Name: "api", ImageRepository: "registry.example/vuelta/api", ComposeFile: "/etc/vuelta/api.compose.yml", Service: "api", HealthURL: "https://api.example.com/healthz", SmokeURL: "https://api.example.com/smoke"}},
@@ -109,6 +113,20 @@ func TestValidateProductionWorkerRejectsUnsafeOrIncompleteAdapter(t *testing.T) 
 	valid.Projects[0].SmokeURL = "http://api.example.com/smoke"
 	if errs := validateProductionWorker(valid); len(errs) == 0 {
 		t.Fatal("expected unsafe production adapter to be rejected")
+	}
+}
+
+func TestValidateDockerEndpointRequiresPinnedIdentityAndLocalSocket(t *testing.T) {
+	endpoint := &DockerEndpointConfig{Socket: "tcp://attacker.invalid:2375"}
+	if errs := validateDockerEndpoint("docker.developer", endpoint, true); len(errs) < 6 {
+		t.Fatalf("incomplete endpoint errors = %v", errs)
+	}
+	endpoint = &DockerEndpointConfig{Socket: "/var/run/docker.sock", ExpectedDaemon: DockerDaemonIdentity{
+		ID: "daemon-id", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+		MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+	}}
+	if errs := validateDockerEndpoint("docker.developer", endpoint, true); len(errs) != 0 {
+		t.Fatalf("valid endpoint errors = %v", errs)
 	}
 }
 

@@ -141,6 +141,11 @@ func executeScan(args []string) error {
 	if executionErr := validateScanExecution(targets, options); executionErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_execution", fail(exitConfig, "%v", executionErr), "Use --execution container or select an unregistered --directory")
 	}
+	if options.execution == "container" {
+		if dockerErr := configureDeveloperDocker(*cfg); dockerErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", dockerErr), "Configure docker.developer for the approved local daemon")
+		}
+	}
 	policy, policyIdentity, policyErr := loadScanPolicy(options.policyPath)
 	if policyErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "policy_invalid", fail(exitConfig, "%v", policyErr), "Review --policy and run scan again")
@@ -430,7 +435,7 @@ func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options s
 func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, options scanOptions, resolve localexec.Resolver) error {
 	if options.execution == "container" {
 		if _, err := dockerexec.Default().Path(); err != nil {
-			return errors.New("docker is required for container execution; for an adhoc directory, explicitly choose --execution local")
+			return fmt.Errorf("approved Docker endpoint is unavailable: %w; for an adhoc directory, explicitly choose --execution local", err)
 		}
 	}
 	if options.only != "vulnerabilities" {

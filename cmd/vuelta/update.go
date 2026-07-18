@@ -142,6 +142,11 @@ func executeUpdate(args []string) error {
 	default:
 		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "invalid snapshot origin"), "Run vuelta scan again")
 	}
+	if options.execution == "container" {
+		if dockerErr := configureDeveloperDocker(*cfg); dockerErr != nil {
+			return updateTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", dockerErr), "Configure docker.developer for the approved local daemon")
+		}
+	}
 	plan := buildUpdatePlan(snapshot, workspace, adhocProject, *cfg, options)
 	planWriter := os.Stdout
 	if options.jsonOutput {

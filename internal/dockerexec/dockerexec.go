@@ -1,10 +1,12 @@
 // Package dockerexec is the single process boundary for Docker CLI commands.
-// It binds commands to one verified absolute executable and runs them with a
-// minimal environment and bounded output collectors.
+// It binds commands to one verified absolute executable and approved local
+// Unix socket, attests daemon identity/capabilities, and runs every command
+// with a minimal environment and bounded output collectors.
 package dockerexec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +24,8 @@ import (
 )
 
 const defaultWaitDelay = 10 * time.Second
+
+const daemonOutputLimit = 32 << 10
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -77,12 +81,40 @@ type Resolver func(string) (string, error)
 // tests can inspect the exact path and environment without starting a child.
 type CommandRunner func(context.Context, string, Request, []string) (Result, error)
 
-// Options supplies test seams. Zero values select hardened production
-// behavior. ConfigDir, when set, must name a new or protected empty directory.
+// EndpointValidator canonicalizes and validates a configured endpoint. Tests
+// may inject it when the platform test sandbox cannot create a protected Unix
+// socket parent hierarchy.
+type EndpointValidator func(Endpoint) (string, error)
+
+// Endpoint is the complete authority for one local Docker daemon. SocketPath
+// is canonicalized and validated before use; Expected is attested before the
+// first caller command runs.
+type Endpoint struct {
+	SocketPath string
+	Expected   DaemonIdentity
+}
+
+// DaemonIdentity pins stable daemon identity and the minimum capabilities
+// required by Vuelta. SecurityOptions are exact entries reported by
+// `docker info`; every configured entry must be present.
+type DaemonIdentity struct {
+	ID                      string
+	ServerVersion           string
+	OperatingSystem         string
+	Architecture            string
+	MinimumAPIVersion       string
+	RequiredSecurityOptions []string
+}
+
+// Options supplies the approved endpoint plus test seams. A zero Endpoint
+// fails closed. ConfigDir, when set, must name a new or protected empty
+// directory.
 type Options struct {
-	Resolver      Resolver
-	CommandRunner CommandRunner
-	ConfigDir     string
+	Resolver          Resolver
+	CommandRunner     CommandRunner
+	EndpointValidator EndpointValidator
+	ConfigDir         string
+	Endpoint          Endpoint
 }
 
 // Executor binds all of its invocations to one resolved Docker CLI and one
@@ -93,21 +125,60 @@ type Executor struct {
 	path    string
 	env     []string
 	err     error
+	host    string
+
+	verifyMu sync.Mutex
+	verified bool
 }
 
 // New returns a lazily initialized executor. The first Path or Run call fixes
 // the executable and environment for the lifetime of the executor.
 func New(options Options) *Executor { return &Executor{options: options} }
 
-var defaultExecutor Runner = New(Options{})
+var (
+	defaultMu       sync.RWMutex
+	defaultExecutor Runner = New(Options{})
+)
 
 // Default returns the process-wide production executor.
-func Default() Runner { return defaultExecutor }
+func Default() Runner {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	return defaultExecutor
+}
+
+// ConfigureDefault replaces the fail-closed process default with an executor
+// bound to endpoint. CLI entrypoints call it only after loading their reviewed
+// configuration; ambient Docker variables are never consulted.
+func ConfigureDefault(endpoint Endpoint) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	defaultExecutor = New(Options{Endpoint: endpoint})
+}
 
 // Path returns the verified absolute Docker CLI path.
 func (e *Executor) Path() (string, error) {
 	e.initialize()
 	return e.path, e.err
+}
+
+// Verify attests the configured daemon without running a caller command.
+// Deploy entrypoints use it to fail before consuming deployment work.
+func (e *Executor) Verify(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.initialize()
+	if e.err != nil {
+		return e.err
+	}
+	run := e.options.CommandRunner
+	if run == nil {
+		run = runCommand
+	}
+	environment := append([]string(nil), e.env...)
+	sort.Strings(environment)
+	return e.verifyDaemon(ctx, run, environment)
 }
 
 // Run executes one Docker command with the fixed executable and minimal
@@ -123,15 +194,21 @@ func (e *Executor) Run(ctx context.Context, request Request) (Result, error) {
 	if err := validateRequest(request); err != nil {
 		return Result{}, err
 	}
-	environment := append([]string(nil), e.env...)
+	baseEnvironment := append([]string(nil), e.env...)
+	sort.Strings(baseEnvironment)
+	environment := append([]string(nil), baseEnvironment...)
 	for name, value := range request.Env {
 		environment = append(environment, name+"="+value)
 	}
 	sort.Strings(environment)
+	if err := e.Verify(ctx); err != nil {
+		return Result{}, err
+	}
 	run := e.options.CommandRunner
 	if run == nil {
 		run = runCommand
 	}
+	request.Args = e.boundArgs(request.Args)
 	return run(ctx, e.path, request, environment)
 }
 
@@ -174,6 +251,16 @@ func (e *Executor) initialize() {
 			return
 		}
 
+		validate := e.options.EndpointValidator
+		if validate == nil {
+			validate = validateEndpoint
+		}
+		socketPath, err := validate(e.options.Endpoint)
+		if err != nil {
+			e.err = err
+			return
+		}
+
 		configDir, err := prepareConfigDir(e.options.ConfigDir)
 		if err != nil {
 			e.err = err
@@ -181,7 +268,129 @@ func (e *Executor) initialize() {
 		}
 		e.path = path
 		e.env = []string{"DOCKER_CONFIG=" + configDir}
+		e.host = "unix://" + filepath.ToSlash(socketPath)
 	})
+}
+
+func (e *Executor) boundArgs(args []string) []string {
+	bound := make([]string, 0, len(args)+2)
+	bound = append(bound, "--host", e.host)
+	return append(bound, args...)
+}
+
+type versionIdentity struct {
+	ServerVersion   string `json:"server_version"`
+	APIVersion      string `json:"api_version"`
+	OperatingSystem string `json:"os"`
+	Architecture    string `json:"architecture"`
+}
+
+type infoIdentity struct {
+	ID              string   `json:"id"`
+	SecurityOptions []string `json:"security_options"`
+}
+
+func (e *Executor) verifyDaemon(ctx context.Context, run CommandRunner, environment []string) error {
+	e.verifyMu.Lock()
+	defer e.verifyMu.Unlock()
+	if e.verified {
+		return nil
+	}
+	versionRequest := Request{
+		Args:   e.boundArgs([]string{"version", "--format", `{"server_version":{{json .Server.Version}},"api_version":{{json .Server.APIVersion}},"os":{{json .Server.Os}},"architecture":{{json .Server.Arch}}}`}),
+		Stdout: Capture{Mode: Limit, Bytes: daemonOutputLimit},
+		Stderr: Capture{Mode: Tail, Bytes: 4 << 10},
+	}
+	versionResult, err := run(ctx, e.path, versionRequest, environment)
+	if err != nil {
+		return daemonProbeError(ctx, err)
+	}
+	var version versionIdentity
+	if err := json.Unmarshal(versionResult.Stdout, &version); err != nil {
+		return errors.New("approved Docker daemon returned an invalid version identity")
+	}
+	infoRequest := Request{
+		Args:   e.boundArgs([]string{"info", "--format", `{"id":{{json .ID}},"security_options":{{json .SecurityOptions}}}`}),
+		Stdout: Capture{Mode: Limit, Bytes: daemonOutputLimit},
+		Stderr: Capture{Mode: Tail, Bytes: 4 << 10},
+	}
+	infoResult, err := run(ctx, e.path, infoRequest, environment)
+	if err != nil {
+		return daemonProbeError(ctx, err)
+	}
+	var info infoIdentity
+	if err := json.Unmarshal(infoResult.Stdout, &info); err != nil {
+		return errors.New("approved Docker daemon returned an invalid capability identity")
+	}
+	if err := attestDaemon(e.options.Endpoint.Expected, version, info); err != nil {
+		return err
+	}
+	e.verified = true
+	return nil
+}
+
+func daemonProbeError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	category, _, _ := Classify(err)
+	if category == safeerr.CategoryUnknown {
+		return errors.New("approved Docker endpoint is inaccessible or does not support the required identity probe")
+	}
+	return fmt.Errorf("approved Docker endpoint identity probe failed (%s)", category)
+}
+
+func attestDaemon(expected DaemonIdentity, version versionIdentity, info infoIdentity) error {
+	if info.ID != expected.ID {
+		return errors.New("approved Docker daemon identity does not match docker configuration")
+	}
+	if version.ServerVersion != expected.ServerVersion {
+		return fmt.Errorf("approved Docker daemon server version is %q; expected %q", version.ServerVersion, expected.ServerVersion)
+	}
+	if version.OperatingSystem != expected.OperatingSystem || version.Architecture != expected.Architecture {
+		return fmt.Errorf("approved Docker daemon platform is %s/%s; expected %s/%s", version.OperatingSystem, version.Architecture, expected.OperatingSystem, expected.Architecture)
+	}
+	if compareAPIVersions(version.APIVersion, expected.MinimumAPIVersion) < 0 {
+		return fmt.Errorf("approved Docker daemon API version is %q; version %q or newer is required", version.APIVersion, expected.MinimumAPIVersion)
+	}
+	available := make(map[string]bool, len(info.SecurityOptions))
+	for _, option := range info.SecurityOptions {
+		available[option] = true
+	}
+	for _, required := range expected.RequiredSecurityOptions {
+		if !available[required] {
+			return fmt.Errorf("approved Docker daemon is missing required security option %q", required)
+		}
+	}
+	return nil
+}
+
+func compareAPIVersions(actual, required string) int {
+	parse := func(value string) (int, int, bool) {
+		var major, minor int
+		if _, err := fmt.Sscanf(value, "%d.%d", &major, &minor); err != nil || fmt.Sprintf("%d.%d", major, minor) != value {
+			return 0, 0, false
+		}
+		return major, minor, true
+	}
+	actualMajor, actualMinor, actualOK := parse(actual)
+	requiredMajor, requiredMinor, requiredOK := parse(required)
+	if !actualOK || !requiredOK {
+		return -1
+	}
+	if actualMajor != requiredMajor {
+		if actualMajor > requiredMajor {
+			return 1
+		}
+		return -1
+	}
+	if actualMinor > requiredMinor {
+		return 1
+	}
+	if actualMinor < requiredMinor {
+		return -1
+	}
+	return 0
 }
 
 func prepareConfigDir(path string) (string, error) {

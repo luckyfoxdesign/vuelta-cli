@@ -31,6 +31,7 @@ var containerUserPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$
 
 // Config mirrors the config.yaml schema.
 type Config struct {
+	Docker           *DockerConfig           `yaml:"docker,omitempty"`
 	Notify           NotifyConfig            `yaml:"notify"`
 	VulnScan         VulnScanConfig          `yaml:"vuln_scan"`
 	GithubAdvisories GithubAdvisoriesConfig  `yaml:"github_advisories"`
@@ -40,6 +41,31 @@ type Config struct {
 	ProductionWorker *ProductionWorkerConfig `yaml:"production_worker,omitempty"`
 	Workspaces       []Workspace             `yaml:"workspaces"`
 	Git              GitConfig               `yaml:"git"`
+}
+
+// DockerConfig holds the developer-side daemon authority used by scan and
+// update. The production deploy worker has a separate endpoint below so the
+// two trust domains cannot be selected by the same inherited context.
+type DockerConfig struct {
+	Developer *DockerEndpointConfig `yaml:"developer,omitempty"`
+}
+
+// DockerEndpointConfig selects one approved local Unix socket and the daemon
+// identity/capabilities expected behind it. It intentionally has no context,
+// TCP, TLS, credential-helper, or environment-driven fields.
+type DockerEndpointConfig struct {
+	Socket         string               `yaml:"socket"`
+	ExpectedDaemon DockerDaemonIdentity `yaml:"expected_daemon"`
+}
+
+// DockerDaemonIdentity is the reviewed daemon attestation contract.
+type DockerDaemonIdentity struct {
+	ID                      string   `yaml:"id"`
+	ServerVersion           string   `yaml:"server_version"`
+	OperatingSystem         string   `yaml:"operating_system"`
+	Architecture            string   `yaml:"architecture"`
+	MinimumAPIVersion       string   `yaml:"minimum_api_version"`
+	RequiredSecurityOptions []string `yaml:"required_security_options"`
 }
 
 type NotifyConfig struct {
@@ -176,20 +202,21 @@ type DeployTaskConfig struct {
 // keys authenticate delivery and manifests; private signing keys are never
 // read by vuelta or stored in this file.
 type ProductionWorkerConfig struct {
-	StateDir               string              `yaml:"state_dir"`
-	SourceMode             string              `yaml:"source_mode"`
-	QueueFile              string              `yaml:"queue_file"`
-	ManifestDir            string              `yaml:"manifest_dir"`
-	CandidatePublicKey     string              `yaml:"candidate_public_key"`
-	GitMirror              string              `yaml:"git_mirror"`
-	GitRemote              string              `yaml:"git_remote"`
-	GitExpectedOrigin      string              `yaml:"git_expected_origin"`
-	GitTagPrefix           string              `yaml:"git_tag_prefix"`
-	GitTrustedFingerprint  string              `yaml:"git_trusted_fingerprint"`
-	ManifestPublicKey      string              `yaml:"manifest_public_key"`
-	MaxCandidateAgeMinutes int                 `yaml:"max_candidate_age_minutes"`
-	OperationTimeoutSecond int                 `yaml:"operation_timeout_seconds"`
-	Projects               []ProductionProject `yaml:"projects"`
+	Docker                 *DockerEndpointConfig `yaml:"docker,omitempty"`
+	StateDir               string                `yaml:"state_dir"`
+	SourceMode             string                `yaml:"source_mode"`
+	QueueFile              string                `yaml:"queue_file"`
+	ManifestDir            string                `yaml:"manifest_dir"`
+	CandidatePublicKey     string                `yaml:"candidate_public_key"`
+	GitMirror              string                `yaml:"git_mirror"`
+	GitRemote              string                `yaml:"git_remote"`
+	GitExpectedOrigin      string                `yaml:"git_expected_origin"`
+	GitTagPrefix           string                `yaml:"git_tag_prefix"`
+	GitTrustedFingerprint  string                `yaml:"git_trusted_fingerprint"`
+	ManifestPublicKey      string                `yaml:"manifest_public_key"`
+	MaxCandidateAgeMinutes int                   `yaml:"max_candidate_age_minutes"`
+	OperationTimeoutSecond int                   `yaml:"operation_timeout_seconds"`
+	Projects               []ProductionProject   `yaml:"projects"`
 }
 
 // ProductionProject is a fixed per-project Compose adapter. There are no
@@ -482,6 +509,9 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, validateEgress(c.Update.Egress)...)
+	if c.Docker != nil {
+		errs = append(errs, validateDockerEndpoint("docker.developer", c.Docker.Developer, false)...)
+	}
 	if c.Update.MinReleaseAgeDays < 0 {
 		errs = append(errs, errors.New("update.min_release_age_days: must not be negative"))
 	}
@@ -648,6 +678,7 @@ func validateProductionWorker(c *ProductionWorkerConfig) []error {
 		return nil
 	}
 	var errs []error
+	errs = append(errs, validateDockerEndpoint("production_worker.docker", c.Docker, true)...)
 	if !filepath.IsAbs(c.StateDir) || !filepath.IsAbs(c.ManifestDir) {
 		errs = append(errs, errors.New("production_worker state_dir and manifest_dir must be absolute paths"))
 	}
@@ -698,6 +729,42 @@ func validateProductionWorker(c *ProductionWorkerConfig) []error {
 				errs = append(errs, fmt.Errorf("%s.%s must be HTTPS or loopback HTTP", label, name))
 			}
 		}
+	}
+	return errs
+}
+
+func validateDockerEndpoint(label string, endpoint *DockerEndpointConfig, required bool) []error {
+	if endpoint == nil {
+		if required {
+			return []error{fmt.Errorf("%s: an explicit deploy Docker endpoint is required", label)}
+		}
+		return nil
+	}
+	var errs []error
+	if !filepath.IsAbs(endpoint.Socket) || strings.ContainsRune(endpoint.Socket, '\x00') {
+		errs = append(errs, fmt.Errorf("%s.socket: must be an absolute local Unix socket path", label))
+	}
+	identity := endpoint.ExpectedDaemon
+	for field, value := range map[string]string{
+		"id": identity.ID, "server_version": identity.ServerVersion,
+		"operating_system": identity.OperatingSystem, "architecture": identity.Architecture,
+	} {
+		if strings.TrimSpace(value) == "" || len(value) > 256 || strings.ContainsAny(value, "\r\n\x00") {
+			errs = append(errs, fmt.Errorf("%s.expected_daemon.%s: a bounded exact value is required", label, field))
+		}
+	}
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+$`).MatchString(identity.MinimumAPIVersion) {
+		errs = append(errs, fmt.Errorf("%s.expected_daemon.minimum_api_version: major.minor is required", label))
+	}
+	if len(identity.RequiredSecurityOptions) == 0 {
+		errs = append(errs, fmt.Errorf("%s.expected_daemon.required_security_options: at least one exact option is required", label))
+	}
+	seen := make(map[string]bool, len(identity.RequiredSecurityOptions))
+	for i, option := range identity.RequiredSecurityOptions {
+		if strings.TrimSpace(option) == "" || len(option) > 256 || strings.ContainsAny(option, "\r\n\x00") || seen[option] {
+			errs = append(errs, fmt.Errorf("%s.expected_daemon.required_security_options[%d]: must be a unique bounded exact option", label, i))
+		}
+		seen[option] = true
 	}
 	return errs
 }

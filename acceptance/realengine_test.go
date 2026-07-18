@@ -18,6 +18,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/testfixture"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
@@ -55,6 +56,18 @@ type commandEnvelope struct {
 	} `json:"errors"`
 }
 
+type dockerVersionIdentity struct {
+	ServerVersion   string `json:"server_version"`
+	APIVersion      string `json:"api_version"`
+	OperatingSystem string `json:"os"`
+	Architecture    string `json:"architecture"`
+}
+
+type dockerInfoIdentity struct {
+	ID              string   `json:"id"`
+	SecurityOptions []string `json:"security_options"`
+}
+
 func TestRealEngineScanMatrix(t *testing.T) {
 	matrixPath := os.Getenv("VUELTA_ACCEPTANCE_MATRIX")
 	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
@@ -65,14 +78,40 @@ func TestRealEngineScanMatrix(t *testing.T) {
 		t.Fatal("[infrastructure] VUELTA_ACCEPTANCE_ROOT must be absolute")
 	}
 	loaded := loadMatrix(t, matrixPath)
-	checkEngine(t, loaded.Engine)
+	dockerConfig := checkEngine(t, loaded.Engine)
 	binary := buildProductionBinary(t, root)
 	for _, testCase := range loaded.Cases {
 		testCase := testCase
 		t.Run(testCase.Name, func(t *testing.T) {
 			t.Parallel()
-			runCase(t, binary, root, testCase)
+			runCase(t, binary, root, dockerConfig, testCase)
 		})
+	}
+}
+
+func TestRealEngineDockerEndpointIdentity(t *testing.T) {
+	configured := checkEngine(t, "").Developer
+	executor := dockerexec.New(dockerexec.Options{Endpoint: dockerexec.Endpoint{
+		SocketPath: configured.Socket,
+		Expected: dockerexec.DaemonIdentity{
+			ID: configured.ExpectedDaemon.ID, ServerVersion: configured.ExpectedDaemon.ServerVersion,
+			OperatingSystem: configured.ExpectedDaemon.OperatingSystem, Architecture: configured.ExpectedDaemon.Architecture,
+			MinimumAPIVersion:       configured.ExpectedDaemon.MinimumAPIVersion,
+			RequiredSecurityOptions: append([]string(nil), configured.ExpectedDaemon.RequiredSecurityOptions...),
+		},
+	}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result, err := executor.Run(ctx, dockerexec.Request{
+		Args:   []string{"version", "--format", `{{.Server.Version}}`},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 1024},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		t.Fatalf("[compatibility] explicit endpoint executor smoke: %v", err)
+	}
+	if strings.TrimSpace(string(result.Stdout)) != configured.ExpectedDaemon.ServerVersion {
+		t.Fatalf("[compatibility] caller command returned an unexpected server version")
 	}
 }
 
@@ -97,19 +136,53 @@ func loadMatrix(t *testing.T, path string) matrix {
 	return result
 }
 
-func checkEngine(t *testing.T, expected string) {
+func checkEngine(t *testing.T, expected string) *config.DockerConfig {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "info", "--format", `{{json .}}`).Output()
-	if err != nil {
-		t.Fatalf("[infrastructure] Docker endpoint is unavailable: %v", err)
+	isolatedConfig := t.TempDir()
+	if err := os.WriteFile(filepath.Join(isolatedConfig, "config.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("[infrastructure] initialize isolated Docker config: %v", err)
 	}
-	text := strings.ToLower(string(out))
+	run := func(args ...string) []byte {
+		t.Helper()
+		command := exec.CommandContext(ctx, "docker", append([]string{"--host", "unix:///var/run/docker.sock"}, args...)...)
+		command.Env = []string{"DOCKER_CONFIG=" + isolatedConfig}
+		out, err := command.Output()
+		if err != nil {
+			t.Fatalf("[infrastructure] explicit Docker endpoint is unavailable: %v", err)
+		}
+		return out
+	}
+	versionOutput := run("version", "--format", `{"server_version":{{json .Server.Version}},"api_version":{{json .Server.APIVersion}},"os":{{json .Server.Os}},"architecture":{{json .Server.Arch}}}`)
+	infoOutput := run("info", "--format", `{"id":{{json .ID}},"security_options":{{json .SecurityOptions}},"name":{{json .Name}}}`)
+	var version dockerVersionIdentity
+	if err := json.Unmarshal(versionOutput, &version); err != nil {
+		t.Fatalf("[infrastructure] decode Docker version identity: %v", err)
+	}
+	var info struct {
+		dockerInfoIdentity
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(infoOutput, &info); err != nil {
+		t.Fatalf("[infrastructure] decode Docker capability identity: %v", err)
+	}
+	if info.ID == "" || version.ServerVersion == "" || version.APIVersion == "" || len(info.SecurityOptions) == 0 {
+		t.Fatal("[infrastructure] Docker daemon omitted required identity fields")
+	}
+	text := strings.ToLower(info.Name)
 	isDesktop := strings.Contains(text, "docker desktop")
-	if (expected == "docker-desktop") != isDesktop {
+	if expected != "" && (expected == "docker-desktop") != isDesktop {
 		t.Fatalf("[infrastructure] matrix expects %s but endpoint reports a different engine", expected)
 	}
+	return &config.DockerConfig{Developer: &config.DockerEndpointConfig{
+		Socket: "/var/run/docker.sock",
+		ExpectedDaemon: config.DockerDaemonIdentity{
+			ID: info.ID, ServerVersion: version.ServerVersion, OperatingSystem: version.OperatingSystem,
+			Architecture: version.Architecture, MinimumAPIVersion: version.APIVersion,
+			RequiredSecurityOptions: append([]string(nil), info.SecurityOptions...),
+		},
+	}}
 }
 
 func buildProductionBinary(t *testing.T, root string) string {
@@ -130,7 +203,7 @@ func buildProductionBinary(t *testing.T, root string) string {
 	return binary
 }
 
-func runCase(t *testing.T, binary, sharedRoot string, testCase matrixCase) {
+func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.DockerConfig, testCase matrixCase) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
 	defer cancel()
@@ -168,6 +241,7 @@ func runCase(t *testing.T, binary, sharedRoot string, testCase matrixCase) {
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+xdgConfigHome)
 
 	cfg := configinit.NewConfig()
+	cfg.Docker = dockerConfig
 	cfg.Update.MinReleaseAgeDays = testCase.MinReleaseAgeDays
 	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
 	cfg.Update.ToolchainProfiles = []config.ToolchainProfile{testCase.Profile}

@@ -16,8 +16,25 @@ import (
 
 func fakeDockerExecutor(t *testing.T, path string) dockerexec.Runner {
 	t.Helper()
-	return dockerexec.New(dockerexec.Options{Resolver: func(string) (string, error) { return path, nil }})
+	return dockerexec.New(dockerexec.Options{
+		Resolver: func(string) (string, error) { return path, nil },
+		Endpoint: dockerexec.Endpoint{SocketPath: "/approved/docker.sock", Expected: dockerexec.DaemonIdentity{
+			ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
+		EndpointValidator: func(dockerexec.Endpoint) (string, error) { return "/approved/docker.sock", nil },
+	})
 }
+
+const fakeDockerIdentity = `if [ "$3" = version ]; then
+  echo '{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"amd64"}'
+  exit 0
+fi
+if [ "$3" = info ]; then
+  echo '{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}'
+  exit 0
+fi
+`
 
 func installFakeDocker(t *testing.T, exitCode int) dockerexec.Runner {
 	t.Helper()
@@ -25,7 +42,7 @@ func installFakeDocker(t *testing.T, exitCode int) dockerexec.Runner {
 		t.Skip("fake docker shell script requires a POSIX shell")
 	}
 	dir := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\necho fake docker invoked: \"$@\"\nexit %d\n", exitCode)
+	script := fmt.Sprintf("#!/bin/sh\n%sfor arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\necho fake docker invoked: \"$@\"\nexit %d\n", fakeDockerIdentity, exitCode)
 	path := filepath.Join(dir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -40,7 +57,7 @@ func installDockerInvocationMarker(t *testing.T, marker string) dockerexec.Runne
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "docker")
-	script := fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)
+	script := fmt.Sprintf("#!/bin/sh\n%s: > %q\n", fakeDockerIdentity, marker)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +71,7 @@ func installCapturingFakeDocker(t *testing.T, argsPath, modelPath string) docker
 	}
 	dir := t.TempDir()
 	script := fmt.Sprintf(`#!/bin/sh
+%s
 case " $* " in
 *" run "*) printf '%%s\n' "$@" > %q ;;
 esac
@@ -64,7 +82,7 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
-`, argsPath, modelPath)
+`, fakeDockerIdentity, argsPath, modelPath)
 	path := filepath.Join(dir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -627,7 +645,7 @@ func TestRunTimesOut(t *testing.T) {
 	}
 	dir := t.TempDir()
 	cleanupMarker := filepath.Join(t.TempDir(), "cleanup")
-	script := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = down ] && { : > %q; exit 0; }; done\nsleep 5\n", cleanupMarker)
+	script := fmt.Sprintf("#!/bin/sh\n%sfor arg in \"$@\"; do [ \"$arg\" = down ] && { : > %q; exit 0; }; done\nsleep 5\n", fakeDockerIdentity, cleanupMarker)
 	scriptDir := t.TempDir()
 	path := filepath.Join(scriptDir, "docker")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
