@@ -127,6 +127,28 @@ func TestDetectDoesNotOfferSingleDevServerAsVerification(t *testing.T) {
 	}
 }
 
+func TestDetectOffersDedicatedVerificationCompose(t *testing.T) {
+	project := nodeProject(t)
+	writeProjectFile(t, project, "package.json", `{"scripts":{"build":"vite build","dev":"vite dev"}}`+"\n")
+	writeProjectFile(t, project, "compose.yml", "services:\n  s_svelteapp:\n    command: npm i && npm run dev\n")
+	writeProjectFile(t, project, "compose.verify.yml", validVerificationCompose("verify"))
+
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.VerificationCandidates) != 1 || discovery.VerificationCandidates[0].ComposeFile != "compose.verify.yml" {
+		t.Fatalf("verification candidates = %#v, want dedicated compose file", discovery.VerificationCandidates)
+	}
+	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Verification.State != "ready" || len(workspace.Verification.Steps) != 1 {
+		t.Fatalf("verification profile = %#v", workspace.Verification)
+	}
+}
+
 func TestBuildExplicitMultiStepVerificationFromDeclarativeMetadata(t *testing.T) {
 	project := nodeProject(t)
 	writeProjectFile(t, project, "package.json", `{"scripts":{"test":"vitest run","build":"vite build","dev":"vite dev"}}`+"\n")

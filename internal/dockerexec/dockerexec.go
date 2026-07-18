@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ import (
 const defaultWaitDelay = 10 * time.Second
 
 const daemonOutputLimit = 32 << 10
+
+var daemonProbeTimeout = 30 * time.Second
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -178,7 +181,9 @@ func (e *Executor) Verify(ctx context.Context) error {
 	}
 	environment := append([]string(nil), e.env...)
 	sort.Strings(environment)
-	return e.verifyDaemon(ctx, run, environment)
+	probeCtx, cancel := context.WithTimeout(ctx, daemonProbeTimeout)
+	defer cancel()
+	return e.verifyDaemon(probeCtx, run, environment)
 }
 
 // Run executes one Docker command with the fixed executable and minimal
@@ -267,7 +272,16 @@ func (e *Executor) initialize() {
 			return
 		}
 		e.path = path
-		e.env = []string{"DOCKER_CONFIG=" + configDir}
+		// Docker Desktop's macOS CLI needs a home directory even when an
+		// explicit Unix socket and DOCKER_CONFIG are supplied. Without HOME it
+		// can hang while probing `docker info`. Keep both HOME and TMPDIR inside
+		// the same protected, credential-free directory instead of inheriting
+		// either location from the caller.
+		e.env = []string{
+			"DOCKER_CONFIG=" + configDir,
+			"HOME=" + configDir,
+			"TMPDIR=" + configDir,
+		}
 		e.host = "unix://" + filepath.ToSlash(socketPath)
 	})
 }
@@ -396,7 +410,7 @@ func compareAPIVersions(actual, required string) int {
 func prepareConfigDir(path string) (string, error) {
 	var err error
 	if path == "" {
-		path, err = os.MkdirTemp("", "vuelta-docker-config-")
+		path, err = os.MkdirTemp(dockerConfigTempRoot(runtime.GOOS), "vuelta-docker-config-")
 	} else {
 		err = os.Mkdir(path, 0o700)
 		if os.IsExist(err) {
@@ -418,6 +432,17 @@ func prepareConfigDir(path string) (string, error) {
 		return "", fmt.Errorf("initialize isolated Docker config: %w", err)
 	}
 	return path, nil
+}
+
+func dockerConfigTempRoot(goos string) string {
+	if goos == "darwin" {
+		// Docker Desktop can hang when its isolated DOCKER_CONFIG lives under
+		// DARWIN_USER_TEMP_DIR (/var/folders/...). A random 0700 directory in
+		// macOS's private system temp root avoids that client bug without
+		// exposing the caller's home or Docker credentials.
+		return "/private/tmp"
+	}
+	return ""
 }
 
 func validateRequest(request Request) error {

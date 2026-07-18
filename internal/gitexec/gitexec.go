@@ -278,6 +278,9 @@ func (e *Executor) initialize() {
 			"LANG=C",
 			"LC_ALL=C",
 			"PATH=/usr/bin:/bin",
+			// Avoid macOS confstr(DARWIN_USER_TEMP_DIR) warnings entering the
+			// bounded combined output consumed by metadata-only callers.
+			"TMPDIR=" + stateDir,
 		}
 		if socket := approvedAgentSocket(); socket != "" {
 			e.env = append(e.env, "SSH_AUTH_SOCK="+socket)

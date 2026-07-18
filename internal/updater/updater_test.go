@@ -315,11 +315,60 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 		t.Fatalf("scanner = %T %#v", resolved, resolved)
 	}
 	packageScan, ok := combined[0].(packageScanner)
-	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"ncu", "--jsonUpgraded", "--cooldown", "168"}) {
+	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"ncu", "--jsonUpgraded", "--removeRange", "--cooldown", "168"}) {
 		t.Fatalf("profile scanner = %#v", combined[0])
 	}
-	if args, err := plannedArgs("npm", updatesnapshot.Candidate{Kind: "npm", Name: "example", Target: "2.0.0"}, cfg, &profile, false); err != nil || args[0] != "ncu" {
+	if args, err := plannedArgs("npm", updatesnapshot.Candidate{Kind: "npm", Name: "example", Target: "2.0.0"}, cfg, &profile, false); err != nil || !reflect.DeepEqual(args, []string{"ncu", "--filter", "example", "--cooldown", "168", "-u"}) {
 		t.Fatalf("plannedArgs() = %#v, %v", args, err)
+	}
+}
+
+func TestPlannedNPMUpdateAppliesOnlyReviewedTargetAndKeepsDependenciesForVerification(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"dependencies":{"example":"^1.0.0"}}`)
+	writeFile(t, root, "package-lock.json", `{"lockfileVersion":3,"version":"before"}`)
+	candidate := updatesnapshot.Candidate{Kind: "npm", Name: "example", Target: "2.0.0"}
+	calls := 0
+	u := PlannedUpdater{
+		Candidates: []updatesnapshot.Candidate{candidate},
+		Workspace:  config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm"},
+		Config: config.Config{Update: config.UpdateConfig{
+			MinReleaseAgeDays: 7,
+			Images:            map[string]string{"node": "node@sha256:x"},
+			Tools:             map[string]string{"npm_check_updates": "22.2.9"},
+		}},
+		Validate: func(context.Context) error { return nil },
+		Recheck:  staticCandidateScanner{candidates: []updatesnapshot.Candidate{candidate}},
+		Run: func(_ context.Context, _ string, args []string, workDir string) (string, error) {
+			calls++
+			switch calls {
+			case 1:
+				want := []string{"npx", "npm-check-updates@22.2.9", "--filter", "example", "--cooldown", "168", "-u"}
+				if !reflect.DeepEqual(args, want) {
+					t.Fatalf("ncu argv = %#v, want %#v", args, want)
+				}
+				return "", os.WriteFile(filepath.Join(workDir, "package.json"), []byte(`{"dependencies":{"example":"^2.0.0"}}`), 0o644)
+			case 2:
+				want := []string{"npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"}
+				if !reflect.DeepEqual(args, want) {
+					t.Fatalf("npm argv = %#v, want %#v", args, want)
+				}
+				if err := os.Mkdir(filepath.Join(workDir, "node_modules"), 0o755); err != nil {
+					return "", err
+				}
+				return "", os.WriteFile(filepath.Join(workDir, "package-lock.json"), []byte(`{"lockfileVersion":3,"version":"after"}`), 0o644)
+			default:
+				t.Fatalf("unexpected updater call %d", calls)
+				return "", nil
+			}
+		},
+	}
+	changed, err := u.Update(context.Background(), root)
+	if err != nil || !changed || calls != 2 {
+		t.Fatalf("Update() = %t, %v; calls=%d", changed, err, calls)
+	}
+	if _, err := os.Stat(filepath.Join(root, "node_modules")); err != nil {
+		t.Fatalf("verification dependencies were not retained in sandbox: %v", err)
 	}
 }
 

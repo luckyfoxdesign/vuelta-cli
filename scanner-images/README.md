@@ -33,10 +33,10 @@ Example for one profile:
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg BASE_IMAGE='node:24-slim@sha256:<verified-index-digest>' \
-  --build-arg NCU_VERSION='18.1.1' \
+  --build-arg NCU_VERSION='22.2.9' \
   --file scanner-images/node-ncu.Dockerfile \
-  --tag registry.example/vuelta/node24-npm-ncu:18.1.1 --push .
-docker buildx imagetools inspect registry.example/vuelta/node24-npm-ncu:18.1.1
+  --tag registry.example/vuelta/node24-npm-ncu:22.2.9 --push .
+docker buildx imagetools inspect registry.example/vuelta/node24-npm-ncu:22.2.9
 ```
 
 For pip-tools, add the scanner version to the existing pinned pip build args:

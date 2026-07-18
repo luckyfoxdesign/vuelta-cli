@@ -165,6 +165,24 @@ func TestParserSupportsInterspersedFlagsAndTerminator(t *testing.T) {
 	}
 }
 
+func TestProjectAddParserAcceptsToolchainSelection(t *testing.T) {
+	definition, args, err := resolveCommand([]string{
+		"project", "add", "--toolchain-profile", "node24-npm-arm64",
+		"--platform", "linux/arm64", ".",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeCommandArgs(definition, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--toolchain-profile", "node24-npm-arm64", "--platform", "linux/arm64", "."}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalize project add = %v, want %v", got, want)
+	}
+}
+
 func TestTerminalFormattingPolicy(t *testing.T) {
 	tests := []struct {
 		name      string

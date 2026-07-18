@@ -306,6 +306,35 @@ func TestSyncTreeRejectsSandboxDeletion(t *testing.T) {
 	}
 }
 
+func TestSyncTreeSkipsTransientNodeModules(t *testing.T) {
+	sandbox := t.TempDir()
+	dst := t.TempDir()
+	writeFile(t, sandbox, "package.json", "{}\n")
+	writeFile(t, sandbox, "node_modules/example/index.js", "module.exports = {}\n")
+
+	if err := SyncTree(sandbox, dst); err != nil {
+		t.Fatalf("SyncTree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "package.json")); err != nil {
+		t.Fatalf("ordinary file was not synced: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "node_modules")); !os.IsNotExist(err) {
+		t.Fatalf("transient node_modules was copied: %v", err)
+	}
+}
+
+func TestSyncTreeRejectsTrackedNodeModules(t *testing.T) {
+	sandbox := t.TempDir()
+	dst := t.TempDir()
+	writeFile(t, sandbox, "node_modules/example/index.js", "updated\n")
+	writeFile(t, dst, "node_modules/example/index.js", "base\n")
+
+	err := SyncTree(sandbox, dst)
+	if err == nil || !strings.Contains(err.Error(), "tracked node_modules") {
+		t.Fatalf("expected tracked node_modules to be rejected, got %v", err)
+	}
+}
+
 func TestCommitAndPushReviewBranch(t *testing.T) {
 	work := newRepoWithRemote(t)
 	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")

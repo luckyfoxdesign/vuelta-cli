@@ -92,6 +92,8 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--name"}, valueName: "NAME", description: "set the persistent project name (defaults to path basename)"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select python, node, or docker"},
 			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the Python or Node package manager"},
+			{names: []string{"--toolchain-profile"}, valueName: "ID", description: "select an exact curated toolchain profile"},
+			{names: []string{"--platform"}, valueName: "PLATFORM", description: "select linux/amd64 or linux/arm64"},
 			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},
 			{names: []string{"--scan-only"}, description: "disable updates until a ready verification profile is configured"},
 			{names: []string{"--branch"}, valueName: "NAME", description: "set the protected branch"},

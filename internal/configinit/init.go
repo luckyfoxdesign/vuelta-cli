@@ -21,9 +21,12 @@ import (
 )
 
 var (
-	composeNames = []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
-	dockerNames  = []string{"Dockerfile", "dockerfile"}
-	fromPattern  = regexp.MustCompile(`(?mi)^\s*FROM\s+(?:--[^\s]+\s+)*([^\s]+)`) // Dockerfile grammar subset; image token only.
+	composeNames = []string{
+		"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml",
+		"compose.verify.yaml", "compose.verify.yml",
+	}
+	dockerNames = []string{"Dockerfile", "dockerfile"}
+	fromPattern = regexp.MustCompile(`(?mi)^\s*FROM\s+(?:--[^\s]+\s+)*([^\s]+)`) // Dockerfile grammar subset; image token only.
 )
 
 // Discovery contains only values found in allowlisted, project-root files or

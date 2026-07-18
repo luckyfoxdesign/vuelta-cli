@@ -134,7 +134,10 @@ func NewLandingCopy(ctx context.Context, repoPath, baseSHA string) (dir string, 
 }
 
 // SyncTree copies every regular file from src into dst at the same
-// relative path, creating directories as needed. It refuses to copy
+// relative path, creating directories as needed. A top-level node_modules
+// directory produced by an npm update remains available for verification in
+// the ephemeral sandbox but is never copied into the Git-backed landing copy.
+// Repositories that already track node_modules are rejected. It refuses to copy
 // symlinks or any non-regular file: the sandbox that produces src is
 // expected to contain only tracked files and the updater's own edits, and
 // a symlink appearing there is treated as a policy violation rather than
@@ -158,6 +161,14 @@ func SyncTree(src, dst string) error {
 			return fmt.Errorf("sync: refusing to copy %s from sandbox", rel)
 		}
 		target := filepath.Join(dst, rel)
+		if rel == "node_modules" && d.IsDir() {
+			if _, err := os.Lstat(target); err == nil {
+				return errors.New("sync: tracked node_modules is not supported")
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("sync: inspect destination node_modules: %w", err)
+			}
+			return filepath.SkipDir
+		}
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}

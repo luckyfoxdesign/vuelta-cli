@@ -2,11 +2,13 @@ package dockerexec
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func executable(t *testing.T, mode os.FileMode) string {
@@ -103,8 +105,8 @@ func TestExecutorBindsAbsolutePathOnceAndUsesAllowlistedEnvironment(t *testing.T
 	if !reflect.DeepEqual(paths, []string{absolute, absolute, absolute, absolute}) {
 		t.Fatalf("command paths = %#v, want exact absolute path %q", paths, absolute)
 	}
-	wantProbeEnv := []string{"DOCKER_CONFIG=" + configDir}
-	wantCallerEnv := []string{"DOCKER_CONFIG=" + configDir, "VUELTA_IMAGE=registry.example/app@sha256:abc"}
+	wantProbeEnv := []string{"DOCKER_CONFIG=" + configDir, "HOME=" + configDir, "TMPDIR=" + configDir}
+	wantCallerEnv := []string{"DOCKER_CONFIG=" + configDir, "HOME=" + configDir, "TMPDIR=" + configDir, "VUELTA_IMAGE=registry.example/app@sha256:abc"}
 	for i, got := range environments {
 		want := wantCallerEnv
 		if i < 2 {
@@ -134,6 +136,15 @@ func TestExecutorRejectsUnapprovedEnvironment(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "not allowlisted") {
 		t.Fatalf("expected environment rejection, got %v", err)
+	}
+}
+
+func TestDockerConfigTempRootAvoidsDarwinUserTempDirectory(t *testing.T) {
+	if got := dockerConfigTempRoot("darwin"); got != "/private/tmp" {
+		t.Fatalf("darwin temp root = %q", got)
+	}
+	if got := dockerConfigTempRoot("linux"); got != "" {
+		t.Fatalf("linux temp root = %q, want platform default", got)
 	}
 }
 
@@ -230,6 +241,25 @@ func TestExecutorRejectsUnexpectedDaemonIdentityBeforeCallerCommand(t *testing.T
 	}
 	if called {
 		t.Fatal("caller command ran against an unexpected daemon")
+	}
+}
+
+func TestExecutorBoundsDaemonIdentityProbe(t *testing.T) {
+	previous := daemonProbeTimeout
+	daemonProbeTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { daemonProbeTimeout = previous })
+
+	executor := New(Options{
+		Resolver:  func(string) (string, error) { return executable(t, 0o755), nil },
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"), Endpoint: testEndpoint(), EndpointValidator: testEndpointValidator,
+		CommandRunner: func(ctx context.Context, _ string, _ Request, _ []string) (Result, error) {
+			<-ctx.Done()
+			return Result{}, ctx.Err()
+		},
+	})
+	err := executor.Verify(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Verify error = %v, want deadline exceeded", err)
 	}
 }
 

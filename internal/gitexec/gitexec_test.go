@@ -101,7 +101,7 @@ func TestExecutorBindsApprovedPathAndDropsHostileEnvironment(t *testing.T) {
 	if strings.Contains(joinedEnv, "/hostile/") || strings.Contains(joinedEnv, "GIT_SSH") {
 		t.Fatalf("hostile environment reached child: %q", gotEnv)
 	}
-	for _, required := range []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "PATH=/usr/bin:/bin"} {
+	for _, required := range []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "PATH=/usr/bin:/bin", "TMPDIR=" + stateDir} {
 		if !contains(gotEnv, required) {
 			t.Fatalf("child environment missing %q: %q", required, gotEnv)
 		}

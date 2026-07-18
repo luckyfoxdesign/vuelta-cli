@@ -96,7 +96,7 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 			if err != nil {
 				return nil, err
 			}
-			args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
+			args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--removeRange", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
 			scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 		case "node/pnpm":
 			image, err := requireImage(cfg, "node")
@@ -139,7 +139,9 @@ func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, w
 	var args []string
 	switch ws.PackageManager {
 	case "npm", "bun":
-		args = []string{"ncu", "--jsonUpgraded"}
+		// Snapshot candidates must contain exact versions. By default ncu
+		// preserves the manifest range (for example "^4.0.3") in JSON output.
+		args = []string{"ncu", "--jsonUpgraded", "--removeRange"}
 		if cfg.Update.MinReleaseAgeDays > 0 {
 			if !profile.Capabilities.ReleaseAge {
 				return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
@@ -481,11 +483,14 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		}
 	}
 	if u.Workspace.PackageManager == "npm" {
-		args := []string{"npm", "install", "--package-lock-only"}
+		args := []string{"npm", "install", "--no-audit", "--no-fund"}
 		if !u.AllowScripts {
 			args = append(args, "--ignore-scripts")
 		}
 		_, err = runner(ctx, image, args, projectPath)
+		if err == nil {
+			err = validateNPMCandidateTargets(projectPath, packageCandidates)
+		}
 	}
 	if u.Workspace.PackageManager == "bun" {
 		args := []string{"bun", "install", "--lockfile-only"}
@@ -524,13 +529,13 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 		return nil, errors.New("pip-tools updates require manifest pin rewriting before pip-compile")
 	case "npm":
 		if profile != nil {
-			return []string{"ncu", "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
+			return plannedNCUArgs("ncu", candidate.Name, cfg.Update.MinReleaseAgeDays), nil
 		}
 		version, err := requireTool(cfg, "npm_check_updates")
 		if err != nil {
 			return nil, err
 		}
-		return []string{"npx", "npm-check-updates@" + version, "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
+		return plannedNCUArgs("npx", candidate.Name, cfg.Update.MinReleaseAgeDays, "npm-check-updates@"+version), nil
 	case "pnpm":
 		args := []string{"pnpm", "update", "--lockfile-only"}
 		if !allowScripts {
@@ -549,6 +554,62 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 	default:
 		return nil, fmt.Errorf("no planned update command for %q", manager)
 	}
+}
+
+func plannedNCUArgs(launcher, name string, minReleaseAgeDays int, prefix ...string) []string {
+	args := []string{launcher}
+	args = append(args, prefix...)
+	args = append(args, "--filter", name)
+	if minReleaseAgeDays > 0 {
+		args = append(args, "--cooldown", strconv.Itoa(minReleaseAgeDays*24))
+	}
+	return append(args, "-u")
+}
+
+func validateNPMCandidateTargets(root string, candidates []updatesnapshot.Candidate) error {
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return fmt.Errorf("read updated package.json: %w", err)
+	}
+	var manifest struct {
+		Dependencies         map[string]string `json:"dependencies"`
+		DevDependencies      map[string]string `json:"devDependencies"`
+		OptionalDependencies map[string]string `json:"optionalDependencies"`
+		PeerDependencies     map[string]string `json:"peerDependencies"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("parse updated package.json: %w", err)
+	}
+	sections := []map[string]string{manifest.Dependencies, manifest.DevDependencies, manifest.OptionalDependencies, manifest.PeerDependencies}
+	for _, candidate := range candidates {
+		if candidate.Kind != "npm" {
+			continue
+		}
+		matches := 0
+		spec := ""
+		for _, section := range sections {
+			if value, ok := section[candidate.Name]; ok {
+				matches++
+				spec = value
+			}
+		}
+		if matches != 1 || !npmSpecTargets(spec, candidate.Target) {
+			return fmt.Errorf("npm candidate %q was not pinned to reviewed target %q", candidate.Name, candidate.Target)
+		}
+	}
+	return nil
+}
+
+func npmSpecTargets(spec, target string) bool {
+	value := strings.TrimSpace(spec)
+	for _, prefix := range []string{">=", "<=", "^", "~", ">", "<", "="} {
+		if strings.HasPrefix(value, prefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(value, prefix))
+			break
+		}
+	}
+	value = strings.TrimPrefix(value, "v")
+	return value == target
 }
 
 func plannedImage(ws config.Workspace, cfg config.Config, profile *config.ToolchainProfile) (string, error) {
