@@ -41,7 +41,8 @@ type CandidateScannerOptions struct {
 }
 
 // ResolveCandidateScannerWithOptions selects scanners with exact input
-// contracts. Registered callers must leave RequireTracked enabled.
+// contracts. Snapshot/update callers require tracked inputs; the read-only
+// scan command may defer that integrity check until snapshot creation.
 func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, options CandidateScannerOptions) (CandidateScanner, error) {
 	if err := toolchain.ValidateManagerSupport(ws.Stack, ws.PackageManager); err != nil {
 		return nil, err

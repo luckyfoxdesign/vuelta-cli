@@ -26,7 +26,7 @@ func (r *fakeRunner) Run(_ context.Context, args []string) Invocation {
 
 func TestRunContinuesAfterPartialScanAndUpdateFailure(t *testing.T) {
 	runner := &fakeRunner{responses: []Invocation{
-		{Stdout: fixture(t, "scan-partial.json"), ExitCode: ExitFailure},
+		{Stdout: fixture(t, "scan-partial.json"), ExitCode: ExitPartial},
 		{Stdout: updateFixture(t, "update-failure.json", "snapshot-api"), ExitCode: ExitFailure},
 		{Stdout: updateFixture(t, "update-success.json", "snapshot-worker"), ExitCode: ExitOK},
 	}}
@@ -55,7 +55,7 @@ func TestRunContinuesAfterPartialScanAndUpdateFailure(t *testing.T) {
 
 func TestRunRecognizesFindingsAndPartialScanStatuses(t *testing.T) {
 	runner := &fakeRunner{responses: []Invocation{
-		{Stdout: fixture(t, "scan-findings-and-partial.json"), ExitCode: ExitFailure},
+		{Stdout: fixture(t, "scan-findings-and-partial.json"), ExitCode: ExitPartial},
 		{Stdout: updateFixture(t, "update-success.json", "snapshot-api"), ExitCode: ExitOK},
 	}}
 	report, exitCode := Run(context.Background(), runner, Options{FailurePolicy: FailureContinue, FindingsPolicy: FindingsReport})
@@ -72,7 +72,7 @@ func TestRunRecognizesFindingsAndPartialScanStatuses(t *testing.T) {
 }
 
 func TestRunStopPolicyDoesNotApplyPartialScanSnapshots(t *testing.T) {
-	runner := &fakeRunner{responses: []Invocation{{Stdout: fixture(t, "scan-partial.json"), ExitCode: ExitFailure}}}
+	runner := &fakeRunner{responses: []Invocation{{Stdout: fixture(t, "scan-partial.json"), ExitCode: ExitPartial}}}
 	report, exitCode := Run(context.Background(), runner, Options{FailurePolicy: FailureStop, FindingsPolicy: FindingsReport})
 	if exitCode != ExitFailure || len(runner.calls) != 1 || report.Summary.NotAttempted != 2 {
 		t.Fatalf("exit=%d calls=%#v report=%#v", exitCode, runner.calls, report)

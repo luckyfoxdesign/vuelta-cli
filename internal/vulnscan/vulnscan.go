@@ -80,6 +80,14 @@ func NewAdhocScanner(command Command) Scanner {
 	return Scanner{Command: command, allowUntrackedInputs: true}
 }
 
+// NewReadOnlyScanner returns the container scanner used by the read-only scan
+// command. Scan inputs remain allowlisted and secret-like names are rejected,
+// but Git tracking is deferred to snapshot creation so a dirty honest project
+// can still receive vulnerability findings.
+func NewReadOnlyScanner() Scanner {
+	return Scanner{allowUntrackedInputs: true}
+}
+
 func (s Scanner) command(ctx context.Context, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
 	if s.Command != nil {
 		private, err := scaninput.MaterializePrivate(ctx, bundle)

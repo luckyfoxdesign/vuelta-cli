@@ -15,11 +15,9 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
-	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
-	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -32,6 +30,7 @@ import (
 const (
 	exitEnv                        = 4
 	exitFindings                   = 5
+	exitPartial                    = 6
 	localScannerStdoutMaxBytes     = 64 << 20
 	localScannerStderrTailMaxBytes = 64 << 10
 )
@@ -41,6 +40,8 @@ type scanTarget struct {
 	name      string
 	path      string
 	origin    string
+	err       error
+	dockerErr error
 }
 
 type scanToolResult struct {
@@ -62,6 +63,7 @@ const (
 const (
 	stagePreflight     = "preflight"
 	stageVulnerability = "vulnerability"
+	stageAlerts        = "alerts"
 	stageCandidate     = "candidate"
 	stageReleaseAge    = "release_age"
 	stageSnapshot      = "snapshot"
@@ -128,12 +130,6 @@ func executeScan(args []string) error {
 		return scanTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", loadErr), "Create or select a valid config with --config")
 	}
 	warnings := configWarnings(cfg)
-	if validateErr := cfg.Validate(); validateErr != nil {
-		return scanTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", validateErr), "Run vuelta config validate for details")
-	}
-	if validateErr := validateVerificationPolicies(*cfg); validateErr != nil {
-		return scanTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", validateErr), "Run vuelta config validate for details")
-	}
 	targets, targetErr := resolveScanTargets(*cfg, options, currentDirectory)
 	if targetErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", targetErr), "Choose one of --project, --directory, or --all")
@@ -142,8 +138,14 @@ func executeScan(args []string) error {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_execution", fail(exitConfig, "%v", executionErr), "Use --execution container or select an unregistered --directory")
 	}
 	if options.execution == "container" {
-		if dockerErr := configureDeveloperDocker(*cfg); dockerErr != nil {
-			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", dockerErr), "Configure docker.developer for the approved local daemon")
+		dockerErr := configureDeveloperDocker(*cfg)
+		if dockerErr == nil {
+			_, dockerErr = dockerexec.Default().Path()
+		}
+		if dockerErr != nil {
+			for index := range targets {
+				targets[index].dockerErr = fmt.Errorf("approved Docker endpoint is unavailable: %w", dockerErr)
+			}
 		}
 	}
 	policy, policyIdentity, policyErr := loadScanPolicy(options.policyPath)
@@ -154,10 +156,6 @@ func executeScan(args []string) error {
 	if minAgeErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_invocation", fail(exitConfig, "%v", minAgeErr), "Use 0, a Go duration such as 168h, or a day duration such as 7d")
 	}
-	if err := preflightScanEnvironment(*cfg, targets, options); err != nil {
-		return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", err), "Install the required tool or choose an allowed execution mode")
-	}
-
 	results := make([]scanResult, 0, len(targets))
 	for _, target := range targets {
 		results = append(results, scanOneTarget(context.Background(), *cfg, target, options, policy, policyIdentity, minAge))
@@ -189,8 +187,11 @@ func validateScanExecution(targets []scanTarget, options scanOptions) error {
 }
 
 func scanResultError(summary scanSummary, failOn string) error {
-	if summary.Failed > 0 {
+	if summary.Failed > 0 && summary.Succeeded == 0 && summary.Partial == 0 {
 		return fail(exitFailure, "%d scan target(s) failed", summary.Failed)
+	}
+	if summary.Failed > 0 || summary.Partial > 0 {
+		return fail(exitPartial, "%d scan target(s) returned partial results and %d failed", summary.Partial, summary.Failed)
 	}
 	if failOn == "vulnerabilities" && summary.Vulnerabilities > 0 {
 		return fail(exitFindings, "%d vulnerability finding(s)", summary.Vulnerabilities)
@@ -279,11 +280,14 @@ var currentDirectory = os.Getwd
 func resolveScanTargets(cfg config.Config, options scanOptions, getwd func() (string, error)) ([]scanTarget, error) {
 	registered := make([]scanTarget, 0, len(cfg.Workspaces))
 	for index := range cfg.Workspaces {
+		workspace := &cfg.Workspaces[index]
+		name := config.WorkspaceName(*workspace)
 		canonical, err := canonicalDirectory(cfg.Workspaces[index].Path)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalize project %q: %w", config.WorkspaceName(cfg.Workspaces[index]), err)
+			registered = append(registered, scanTarget{workspace: workspace, name: name, path: workspace.Path, origin: updatesnapshot.OriginWorkspace, err: fmt.Errorf("canonicalize project %q: %w", name, err)})
+			continue
 		}
-		registered = append(registered, scanTarget{workspace: &cfg.Workspaces[index], name: config.WorkspaceName(cfg.Workspaces[index]), path: canonical, origin: updatesnapshot.OriginWorkspace})
+		registered = append(registered, scanTarget{workspace: workspace, name: name, path: canonical, origin: updatesnapshot.OriginWorkspace})
 	}
 	if options.all {
 		if len(registered) == 0 {
@@ -292,12 +296,20 @@ func resolveScanTargets(cfg config.Config, options scanOptions, getwd func() (st
 		return registered, nil
 	}
 	if options.project != "" {
+		var matches []scanTarget
 		for _, target := range registered {
 			if target.name == options.project {
-				return []scanTarget{target}, nil
+				matches = append(matches, target)
 			}
 		}
-		return nil, fmt.Errorf("project %q is not configured", options.project)
+		switch len(matches) {
+		case 0:
+			return nil, fmt.Errorf("project %q is not configured", options.project)
+		case 1:
+			return matches, nil
+		default:
+			return nil, fmt.Errorf("project %q is configured more than once; give every workspace a unique name", options.project)
+		}
 	}
 	selectedPath := options.directory
 	if selectedPath == "" {
@@ -328,6 +340,9 @@ func containingRegisteredTarget(targets []scanTarget, path string) (*scanTarget,
 	var matches []scanTarget
 	longest := -1
 	for _, target := range targets {
+		if target.err != nil {
+			continue
+		}
 		if !pathContains(target.path, path) {
 			continue
 		}
@@ -428,43 +443,33 @@ func effectiveMinReleaseAge(value string, configuredDays, policyDays int) (time.
 	return duration, nil
 }
 
-func preflightScanEnvironment(cfg config.Config, targets []scanTarget, options scanOptions) error {
-	return preflightScanEnvironmentWith(cfg, targets, options, nil)
-}
-
-func preflightScanEnvironmentWith(cfg config.Config, targets []scanTarget, options scanOptions, resolve localexec.Resolver) error {
-	if options.execution == "container" {
-		if _, err := dockerexec.Default().Path(); err != nil {
-			return fmt.Errorf("approved Docker endpoint is unavailable: %w; for an adhoc directory, explicitly choose --execution local", err)
-		}
-	}
-	if options.only != "vulnerabilities" {
-		for _, target := range targets {
-			if target.workspace != nil {
-				if _, err := gitexec.Default().Path(); err != nil {
-					return errors.New("git is required to bind registered project snapshots to their current revision")
-				}
-				break
-			}
-		}
-	}
-	if options.execution == "local" && options.only != "packages" {
-		if cfg.VulnScan.DependencySource != "trivy" && cfg.VulnScan.DependencySource != "osv-scanner" {
-			return fmt.Errorf("local vulnerability scanning does not support %q", cfg.VulnScan.DependencySource)
-		}
-		for _, target := range targets {
-			if _, err := localexec.Resolve(target.path, cfg.VulnScan.DependencySource, resolve); err != nil {
-				return fmt.Errorf("requested vulnerability scanner %q is unavailable or untrusted: %w", cfg.VulnScan.DependencySource, err)
-			}
-		}
-	}
-	return nil
-}
-
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
+	return scanOneTargetWith(ctx, cfg, target, options, policy, policyIdentity, minAge, scanStageRunners{
+		vulnerabilities: scanVulnerabilityStage,
+		alerts:          scanAlertsStage,
+		packages:        scanPackages,
+	})
+}
+
+type scanStageRunners struct {
+	vulnerabilities func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error)
+	alerts          func(context.Context, config.Config, scanTarget) ([]string, bool, error)
+	packages        func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
+}
+
+func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
 		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{},
+	}
+	if target.err != nil {
+		result = recordScanStageFailure(result, stagePreflight, "target_unavailable", target.err, "Fix the configured workspace path, then run scan again")
+		result = addStage(result, stageVulnerability, stageNotRequested, "workspace path is unavailable")
+		result = addStage(result, stageAlerts, stageNotRequested, "workspace path is unavailable")
+		result = addStage(result, stageCandidate, stageNotRequested, "workspace path is unavailable")
+		result = addStage(result, stageReleaseAge, stageNotRequested, "workspace path is unavailable")
+		result = addStage(result, stageSnapshot, stageNotRequested, "workspace path is unavailable")
+		return finalizeStageOutcomes(result)
 	}
 	if target.workspace != nil {
 		result.Verification = config.VerificationPlan(*target.workspace)
@@ -480,79 +485,86 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	} else {
 		project, detectErr := localupdate.Detect(target.path)
 		if detectErr != nil {
-			return failedScanResult(result, stagePreflight, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
+			result = recordScanStageFailure(result, stagePreflight, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
+			result = addStage(result, stageVulnerability, stageNotRequested, "project stack was not detected")
+			result = addStage(result, stageAlerts, stageNotRequested, "project stack was not detected")
+			result = addStage(result, stageCandidate, stageNotRequested, "project stack was not detected")
+			result = addStage(result, stageReleaseAge, stageNotRequested, "project stack was not detected")
+			result = addStage(result, stageSnapshot, stageNotRequested, "project stack was not detected")
+			return finalizeStageOutcomes(result)
 		}
 		identityWorkspace = workspaceForAdhoc(project)
 		if options.execution == "local" {
 			identityConfig.VulnScan.PolicyFile = ""
 		}
 	}
-	var selectedToolchain toolchain.Identity
-	if options.only != "vulnerabilities" && options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
-		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
-		if resolveErr != nil {
-			return failedScanResult(result, stagePreflight, "toolchain_incompatible", resolveErr, "Select a compatible curated toolchain profile or update the reviewed catalog")
-		}
-		selectedToolchain = *identity
-		result.Toolchain = identity
-	}
 	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
-	var initialWorkspaceIdentity *scanner.SnapshotIdentity
-	var initialAdhocIdentity *updatesnapshot.InputIdentity
-	if target.workspace != nil {
-		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, identityWorkspace, identityOptions)
-		if identityErr != nil {
-			return failedScanResult(result, stagePreflight, "scan_input_invalid", identityErr, "Commit tracked scan inputs and review their limits")
-		}
-		result.InputCategories = identity.InputCategories
-		if options.only != "vulnerabilities" {
-			initialWorkspaceIdentity = &identity
-		}
-	} else {
-		identity, categories, identityErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
-		if identityErr != nil {
-			return failedScanResult(result, stagePreflight, "scan_input_invalid", identityErr, "Review the explicit scan inputs and their limits")
-		}
-		result.InputCategories = categories
-		if options.only != "vulnerabilities" {
-			initialAdhocIdentity = &identity
-		}
+	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
+	if initialInputErr == nil {
+		result.InputCategories = inputCategories
 	}
 	result = addStage(result, stagePreflight, stageSucceeded, "")
 
 	if options.only == "packages" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "vulnerabilities", Status: "skipped", Reason: "not requested"})
 		result = addStage(result, stageVulnerability, stageNotRequested, "")
+		result = addStage(result, stageAlerts, stageNotRequested, "")
 	} else {
-		findings, err := scanVulnerabilities(ctx, cfg, target, options.execution)
-		if err != nil {
-			result.Tools = append(result.Tools, scanToolResult{Name: cfg.VulnScan.DependencySource, Status: "failed", Reason: err.Error()})
-			if options.only == "" {
-				result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "vulnerability scan failed"})
-				result = addStage(result, stageCandidate, stageSkipped, "vulnerability scan failed")
-			} else {
-				result = addStage(result, stageCandidate, stageNotRequested, "")
-			}
-			result = addStage(result, stageReleaseAge, stageNotRequested, "")
-			result = addStage(result, stageSnapshot, stageNotRequested, "")
-			return failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", err, "Make the configured scanner available and run scan again")
+		var findings []string
+		tool := cfg.VulnScan.DependencySource
+		requested := true
+		var scanErr error
+		if target.dockerErr != nil && vulnerabilityStageUsesDocker(cfg, identityWorkspace, options.execution) {
+			scanErr = target.dockerErr
+		} else {
+			findings, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options.execution)
 		}
-		result.Vulnerabilities = findings
-		result.Tools = append(result.Tools, scanToolResult{Name: cfg.VulnScan.DependencySource, Status: "used"})
-		result = addStage(result, stageVulnerability, stageSucceeded, "")
+		if !requested {
+			result = addStage(result, stageVulnerability, stageNotRequested, "")
+		} else if scanErr != nil {
+			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "failed", Reason: scanErr.Error()})
+			result = recordScanStageFailure(result, stageVulnerability, "vulnerability_scan_failed", scanErr, "Make the configured scanner available and run scan again")
+		} else {
+			result.Vulnerabilities = appendUniqueStrings(result.Vulnerabilities, findings...)
+			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "used"})
+			result = addStage(result, stageVulnerability, stageSucceeded, "")
+		}
+
+		alertFindings, requested, alertErr := runners.alerts(ctx, cfg, target)
+		if !requested {
+			result = addStage(result, stageAlerts, stageNotRequested, "")
+		} else if alertErr != nil {
+			result.Tools = append(result.Tools, scanToolResult{Name: "github-dependabot", Status: "failed", Reason: alertErr.Error()})
+			result = recordScanStageFailure(result, stageAlerts, "alerts_scan_failed", alertErr, "Check the GitHub remote, token configuration, and API availability")
+		} else {
+			result.Vulnerabilities = appendUniqueStrings(result.Vulnerabilities, alertFindings...)
+			result.Tools = append(result.Tools, scanToolResult{Name: "github-dependabot", Status: "used"})
+			result = addStage(result, stageAlerts, stageSucceeded, "")
+		}
 	}
 	if options.only == "vulnerabilities" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "not requested"})
 		result = addStage(result, stageCandidate, stageNotRequested, "")
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
 		result = addStage(result, stageSnapshot, stageNotRequested, "")
-		return finalizeCleanOrFindings(result)
+		return finalizeStageOutcomes(result)
 	}
 
-	candidates, manager, verified, err := scanPackages(ctx, cfg, target, options, policy, minAge)
+	var candidates []updatesnapshot.Candidate
+	manager := packageToolName(identityWorkspace)
+	var verified bool
+	var err error
+	if target.dockerErr != nil && options.execution == "container" {
+		err = target.dockerErr
+	} else {
+		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
+	}
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
-		return failedScanResult(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
+		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
+		result = addStage(result, stageReleaseAge, stageNotRequested, "package candidates are unavailable")
+		result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
+		return finalizeStageOutcomes(result)
 	}
 	unverified := false
 	for index := range candidates {
@@ -576,38 +588,66 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	}
 	if len(result.Candidates) == 0 {
 		result = addStage(result, stageSnapshot, stageSkipped, "no package candidates")
-		return finalizeCleanOrFindings(result)
+		return finalizeStageOutcomes(result)
 	}
 	if target.workspace != nil && target.workspace.Verification.State == config.VerificationScanOnly {
 		result = addStage(result, stageSnapshot, stageSkipped, "verification profile is scan-only")
-		return result
+		return finalizeStageOutcomes(result)
+	}
+	if hasFailedStage(result, stageVulnerability) || hasFailedStage(result, stageAlerts) {
+		result = addStage(result, stageSnapshot, stageSkipped, "a requested security stage did not complete")
+		return finalizeStageOutcomes(result)
+	}
+	if err := validateSnapshotReadiness(cfg, target); err != nil {
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Run vuelta config validate and fix update-only configuration before creating a snapshot")
+		return finalizeStageOutcomes(result)
+	}
+	if initialInputErr != nil {
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", initialInputErr, "Review the explicit scan inputs and their limits")
+		return finalizeStageOutcomes(result)
 	}
 
+	var selectedToolchain toolchain.Identity
+	if options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
+		if resolveErr != nil {
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", resolveErr, "Fix the selected toolchain profile before creating an update snapshot")
+			return finalizeStageOutcomes(result)
+		}
+		selectedToolchain = *identity
+		result.Toolchain = identity
+	}
 	configHash := "adhoc"
 	verificationHash := ""
 	if target.workspace != nil {
 		configHash, err = cfg.SnapshotPolicyHash(*target.workspace)
 		if err != nil {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Validate the project configuration")
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Validate the project configuration")
+			return finalizeStageOutcomes(result)
 		}
 		verificationHash, err = config.VerificationProfileHash(*target.workspace)
 		if err != nil {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Validate the verification profile")
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Validate the verification profile")
+			return finalizeStageOutcomes(result)
 		}
 	}
 	gates := updatesnapshot.ScanGates{AllowProjectConfig: options.allowProjectConfig, MinReleaseAge: minAge.String()}
 	effectiveHash, err := effectiveScanPolicyHash(configHash, policyIdentity, gates)
 	if err != nil {
-		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
+		return finalizeStageOutcomes(result)
 	}
 	var snapshot updatesnapshot.Snapshot
 	if target.workspace != nil {
 		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, *target.workspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", identityErr, "Commit or stash changes, then run scan again")
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", identityErr, "Commit or stash changes to create an update snapshot; scan findings above remain valid")
+			return finalizeStageOutcomes(result)
 		}
-		if initialWorkspaceIdentity == nil || !reflect.DeepEqual(*initialWorkspaceIdentity, identity) {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+		strictInput := updatesnapshot.InputIdentity{Stages: identity.InputStages, ManifestHash: identity.InputManifestHash, Hashes: identity.InputHashes}
+		if !reflect.DeepEqual(initialInput, strictInput) {
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+			return finalizeStageOutcomes(result)
 		}
 		snapshot, err = updatesnapshot.NewWorkspace(time.Now(), cfg.SnapshotTTL(), target.name, updatesnapshot.WorkspaceIdentity{
 			CanonicalPath: identity.CanonicalPath, Remote: identity.Remote, BaseRevision: identity.BaseRevision,
@@ -616,22 +656,27 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 	} else {
 		identity, identityErr := adhocInputIdentity(ctx, identityWorkspace, identityOptions)
 		if identityErr != nil {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", identityErr, "Restore the explicit scan inputs and run scan again")
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", identityErr, "Restore the explicit scan inputs and run scan again")
+			return finalizeStageOutcomes(result)
 		}
-		if initialAdhocIdentity == nil || !reflect.DeepEqual(*initialAdhocIdentity, identity) {
-			return failedScanResult(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+		if !reflect.DeepEqual(initialInput, identity) {
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", updatesnapshot.ErrStale, "Scan inputs changed during the scan; run scan again")
+			return finalizeStageOutcomes(result)
 		}
 		snapshot, err = updatesnapshot.NewAdhoc(time.Now(), cfg.SnapshotTTL(), target.path, identity, policyIdentity, gates, effectiveHash, result.Candidates)
 	}
 	if err != nil {
-		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
+		return finalizeStageOutcomes(result)
 	}
 	stateDir, err := cfg.SnapshotStateDir()
 	if err != nil {
-		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Set a valid snapshot state directory")
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Set a valid snapshot state directory")
+		return finalizeStageOutcomes(result)
 	}
 	if err := (updatesnapshot.Store{Dir: stateDir}).Save(snapshot); err != nil {
-		return failedScanResult(result, stageSnapshot, "snapshot_failed", err, "Check snapshot state-directory permissions")
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Check snapshot state-directory permissions")
+		return finalizeStageOutcomes(result)
 	}
 	result.SnapshotID = snapshot.ID
 	result.Status = "ready"
@@ -651,11 +696,39 @@ func addStage(result scanResult, name string, status stageStatus, reason string)
 // completed successfully before a later stage failed.
 func hasSucceededDataStage(result scanResult) bool {
 	for _, stage := range result.Stages {
-		if stage.Status == string(stageSucceeded) && (stage.Name == stageVulnerability || stage.Name == stageCandidate) {
+		if stage.Status == string(stageSucceeded) && (stage.Name == stageVulnerability || stage.Name == stageAlerts || stage.Name == stageCandidate) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasFailedStage(result scanResult, name string) bool {
+	for _, stage := range result.Stages {
+		if stage.Name == name && stage.Status == string(stageFailed) {
+			return true
+		}
+	}
+	return false
+}
+
+func finalizeStageOutcomes(result scanResult) scanResult {
+	hasFailure := false
+	for _, stage := range result.Stages {
+		if stage.Status == string(stageFailed) {
+			hasFailure = true
+			break
+		}
+	}
+	if !hasFailure {
+		return finalizeCleanOrFindings(result)
+	}
+	if hasSucceededDataStage(result) {
+		result.Status = "partial"
+	} else {
+		result.Status = "failed"
+	}
+	return result
 }
 
 // finalizeCleanOrFindings promotes the default "clean" status to "findings"
@@ -672,29 +745,83 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilities(ctx context.Context, cfg config.Config, target scanTarget, execution string) ([]string, error) {
-	var workspace config.Workspace
-	if target.workspace != nil {
-		workspace = *target.workspace
-	} else {
-		project, err := localupdate.Detect(target.path)
-		if err != nil {
-			return nil, err
-		}
-		workspace = workspaceForAdhoc(project)
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget, execution string) ([]string, string, bool, error) {
+	workspace, err := scanWorkspace(target)
+	if err != nil {
+		return nil, cfg.VulnScan.DependencySource, true, err
 	}
-	security := pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}}
+	scanner := vulnscan.NewReadOnlyScanner()
 	if execution == "local" {
 		localConfig := cfg
 		localConfig.VulnScan.PolicyFile = ""
-		security.Scanner = vulnscan.NewAdhocScanner(localScannerCommand)
 		cfg = localConfig
+		scanner = vulnscan.NewAdhocScanner(localScannerCommand)
 	}
-	report, err := security.Baseline(ctx, workspace, cfg)
+	if cfg.VulnScan.DependencySource == "github-dependabot" {
+		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
+			return nil, "trivy-images", false, nil
+		}
+		report, scanErr := scanner.ScanImages(ctx, target.path, workspace, cfg)
+		return findingRefs(report.Findings), cfg.VulnScan.ImageScan.Tool, true, scanErr
+	}
+	report, scanErr := scanner.Scan(ctx, target.path, workspace, cfg)
+	return findingRefs(report.Findings), cfg.VulnScan.DependencySource, true, scanErr
+}
+
+func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace, execution string) bool {
+	if execution != "container" {
+		return false
+	}
+	if cfg.VulnScan.DependencySource == "github-dependabot" {
+		return cfg.VulnScan.ImageScan.Enabled && workspace.DockerImages != nil
+	}
+	return true
+}
+
+func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) ([]string, bool, error) {
+	if cfg.VulnScan.DependencySource != "github-dependabot" {
+		return nil, false, nil
+	}
+	workspace, err := scanWorkspace(target)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
-	return append([]string(nil), report.Findings...), nil
+	findings, err := (githubalerts.Client{}).Scan(ctx, workspace, cfg.GithubAdvisories)
+	return findingRefs(findings), true, err
+}
+
+func scanWorkspace(target scanTarget) (config.Workspace, error) {
+	if target.workspace != nil {
+		return *target.workspace, nil
+	}
+	project, err := localupdate.Detect(target.path)
+	if err != nil {
+		return config.Workspace{}, err
+	}
+	return workspaceForAdhoc(project), nil
+}
+
+func findingRefs(findings []vulnscan.Finding) []string {
+	refs := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		refs = appendUniqueStrings(refs, finding.Ref())
+	}
+	sort.Strings(refs)
+	return refs
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	seen := make(map[string]bool, len(values)+len(additions))
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range additions {
+		if !seen[value] {
+			values = append(values, value)
+			seen[value] = true
+		}
+	}
+	return values
 }
 
 func localScannerCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
@@ -763,13 +890,11 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		minDays = 0
 	}
 	if target.workspace != nil {
-		if err := ensureProjectConfigAllowed(target.path, target.workspace.PackageManager, options.allowProjectConfig); err != nil {
-			return nil, packageToolName(*target.workspace), false, err
-		}
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
+		failOpenUnsupportedReleaseAge(&scanConfig, *target.workspace)
 		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(*target.workspace, scanConfig, updater.CandidateScannerOptions{
-			AllowProjectConfig: options.allowProjectConfig, RequireTracked: true,
+			AllowProjectConfig: options.allowProjectConfig, RequireTracked: false,
 		})
 		if err != nil {
 			return nil, target.workspace.PackageManager, false, err
@@ -794,12 +919,10 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		}
 		return candidates, project.Manager, result.ReleaseAgeUsed, nil
 	}
-	if err := ensureProjectConfigAllowed(target.path, project.Manager, options.allowProjectConfig); err != nil {
-		return nil, project.Manager, false, err
-	}
 	workspace := workspaceForAdhoc(project)
 	scanConfig := cfg
 	scanConfig.Update.MinReleaseAgeDays = minDays
+	failOpenUnsupportedReleaseAge(&scanConfig, workspace)
 	candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
 		AllowProjectConfig: options.allowProjectConfig, RequireTracked: false,
 	})
@@ -808,24 +931,6 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 	}
 	candidates, err := candidateScanner.Scan(ctx, target.path)
 	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, cfg, minAge), err
-}
-
-func ensureProjectConfigAllowed(path, manager string, allowed bool) error {
-	if allowed || manager == "" {
-		return nil
-	}
-	configs := map[string][]string{
-		"npm": {".npmrc"}, "pnpm": {".npmrc", "pnpm-workspace.yaml"}, "bun": {".npmrc", "bunfig.toml"},
-		"poetry": {"poetry.toml"}, "uv": {}, "pip-tools": {"pip.conf"},
-	}
-	for _, name := range configs[manager] {
-		if _, err := os.Lstat(filepath.Join(path, name)); err == nil {
-			return fmt.Errorf("%s project package-manager config is present; pass --allow-project-config only after reviewing registry, proxy, script-shell, and plugin settings", manager)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat %s project package-manager config: %w", manager, err)
-		}
-	}
-	return nil
 }
 
 func workspaceForAdhoc(project localupdate.Project) config.Workspace {
@@ -851,6 +956,16 @@ func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, 
 		return identity.Capabilities.ReleaseAge
 	}
 	return workspace.Stack == config.StackNode
+}
+
+func failOpenUnsupportedReleaseAge(cfg *config.Config, workspace config.Workspace) {
+	if cfg.Update.MinReleaseAgeDays == 0 {
+		return
+	}
+	_, identity, err := updater.ResolveToolchainProfile(workspace, *cfg)
+	if err == nil && identity != nil && !identity.Capabilities.ReleaseAge {
+		cfg.Update.MinReleaseAgeDays = 0
+	}
 }
 
 func adhocInputIdentity(ctx context.Context, workspace config.Workspace, options scanner.IdentityOptions) (updatesnapshot.InputIdentity, error) {
@@ -935,23 +1050,52 @@ func effectiveScanPolicyHash(configHash string, policy updatesnapshot.PolicyIden
 	return updatesnapshot.EffectivePolicyHash(configHash, policy, gates)
 }
 
+func validateSnapshotReadiness(cfg config.Config, target scanTarget) error {
+	selected := cfg
+	if target.workspace == nil {
+		selected.Workspaces = nil
+	} else {
+		selected.Workspaces = []config.Workspace{*target.workspace}
+	}
+	if err := selected.Validate(); err != nil {
+		return err
+	}
+	return validateVerificationPolicies(selected)
+}
+
 // failedScanResult records a stage failure. Data an earlier, independent
 // stage already produced (vulnerabilities or package candidates) is never
 // discarded: the target becomes "partial" rather than "failed" when that
 // happened, so successful findings stay visible instead of being hidden
 // behind a single opaque failure.
 func failedScanResult(result scanResult, stage, code string, err error, hint string) scanResult {
+	return finalizeStageOutcomes(recordScanStageFailure(result, stage, code, err, hint))
+}
+
+func recordScanStageFailure(result scanResult, stage, code string, err error, hint string) scanResult {
 	result = addStage(result, stage, stageFailed, safeStageReason(err))
-	if hasSucceededDataStage(result) {
-		result.Status = "partial"
-	} else {
-		result.Status = "failed"
-	}
 	category, exitCode, detail := classifySubprocessError(err)
-	result.Error = &jsonCommandError{
+	failure := &jsonCommandError{
 		Code: code, Message: err.Error(), Hint: hint,
 		Stage: stage, Category: category, ExitCode: exitCode, StderrTail: detail,
 	}
+	if result.Error == nil {
+		result.Error = failure
+	}
+	warning := fmt.Sprintf("%s stage unavailable: %s", stage, safeStageReason(err))
+	if category != "" {
+		warning += "; category=" + category
+	}
+	if exitCode != nil {
+		warning += fmt.Sprintf("; exit_code=%d", *exitCode)
+	}
+	if detail != "" {
+		warning += "; detail=" + detail
+	}
+	if hint != "" {
+		warning += ". " + hint
+	}
+	result.Warnings = append(result.Warnings, warning)
 	return result
 }
 
@@ -991,7 +1135,6 @@ func summarizeScan(results []scanResult) scanSummary {
 		case "failed":
 			summary.Failed++
 		case "partial":
-			summary.Failed++
 			summary.Partial++
 		case "ready":
 			summary.Succeeded++

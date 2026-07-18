@@ -14,6 +14,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
+	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -195,26 +196,6 @@ func TestLocalScannerUsesCanonicalBinaryAndPrivateEnvironment(t *testing.T) {
 	}
 }
 
-func TestPreflightRejectsWritableLocalScanner(t *testing.T) {
-	project := t.TempDir()
-	binary := filepath.Join(t.TempDir(), "trivy")
-	if err := os.WriteFile(binary, []byte("test executable"), 0o722); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(binary, 0o722); err != nil {
-		t.Fatal(err)
-	}
-	err := preflightScanEnvironmentWith(
-		config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy"}},
-		[]scanTarget{{path: project, origin: updatesnapshot.OriginAdhoc}},
-		scanOptions{execution: "local", only: "vulnerabilities"},
-		func(string) (string, error) { return binary, nil },
-	)
-	if err == nil || !strings.Contains(err.Error(), "group- or world-writable") {
-		t.Fatalf("preflight error = %v", err)
-	}
-}
-
 func TestEffectiveMinReleaseAge(t *testing.T) {
 	for _, test := range []struct {
 		value      string
@@ -249,6 +230,148 @@ func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 	}
 }
 
+func TestScanExitCodeDistinguishesMixedResultsFromTotalFailure(t *testing.T) {
+	var coded commandError
+	if err := scanResultError(scanSummary{Failed: 1, Succeeded: 1}, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+		t.Fatalf("mixed result error = %#v, want exit %d", err, exitPartial)
+	}
+	if err := scanResultError(scanSummary{Partial: 1}, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+		t.Fatalf("partial result error = %#v, want exit %d", err, exitPartial)
+	}
+	if err := scanResultError(scanSummary{Failed: 2}, ""); !errors.As(err, &coded) || coded.code != exitFailure {
+		t.Fatalf("total failure error = %#v, want exit %d", err, exitFailure)
+	}
+	if err := scanResultError(scanSummary{Succeeded: 2}, ""); err != nil {
+		t.Fatalf("clean scan error = %v", err)
+	}
+}
+
+func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"package.json":      `{"name":"example"}`,
+		"package-lock.json": `{"lockfileVersion":3}`,
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace := config.Workspace{
+		Name: "example", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
+	policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
+
+	tests := []struct {
+		name             string
+		dependencySource string
+		vulnerabilityErr error
+		alertErr         error
+		packageErr       error
+		wantStage        string
+	}{
+		{name: "vulnerability failure preserves packages", dependencySource: "trivy", vulnerabilityErr: errors.New("trivy unavailable"), wantStage: stageVulnerability},
+		{name: "optional alerts failure preserves packages", dependencySource: "github-dependabot", alertErr: errors.New("GitHub API unavailable"), wantStage: stageAlerts},
+		{name: "package failure preserves vulnerabilities", dependencySource: "trivy", packageErr: errors.New("unsupported manager"), wantStage: stageCandidate},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runners := scanStageRunners{
+				vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+					if test.dependencySource == "github-dependabot" {
+						return nil, "trivy-images", false, nil
+					}
+					return []string{"CVE-1"}, "trivy", true, test.vulnerabilityErr
+				},
+				alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+					if test.dependencySource != "github-dependabot" {
+						return nil, false, nil
+					}
+					return []string{"GHSA-1"}, true, test.alertErr
+				},
+				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+					if test.packageErr != nil {
+						return nil, "npm", false, test.packageErr
+					}
+					return []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0"}}, "npm", true, nil
+				},
+			}
+			cfg := config.Config{VulnScan: config.VulnScanConfig{DependencySource: test.dependencySource}}
+			result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, policyIdentity, 0, runners)
+			if result.Status != "partial" {
+				t.Fatalf("status = %q, want partial; result=%#v", result.Status, result)
+			}
+			if !hasFailedStage(result, test.wantStage) || len(result.Warnings) == 0 {
+				t.Fatalf("missing failed stage/warning: %#v", result)
+			}
+			if test.packageErr == nil && len(result.Candidates) != 1 {
+				t.Fatalf("package result was lost: %#v", result.Candidates)
+			}
+			if test.packageErr != nil && len(result.Vulnerabilities) != 1 {
+				t.Fatalf("vulnerability result was lost: %#v", result.Vulnerabilities)
+			}
+		})
+	}
+}
+
+func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
+	root := t.TempDir()
+	workspace := config.Workspace{
+		Name: "example", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	target := scanTarget{
+		workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace,
+		dockerErr: errors.New("approved Docker endpoint is unavailable"),
+	}
+	alertsCalled := false
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			return nil, "trivy-images", false, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+			alertsCalled = true
+			return []string{"GHSA-1"}, true, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("Docker-backed package runner was called")
+			return nil, "npm", false, nil
+		},
+	}
+	cfg := config.Config{VulnScan: config.VulnScanConfig{DependencySource: "github-dependabot"}}
+	result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if !alertsCalled || result.Status != "partial" || len(result.Vulnerabilities) != 1 || !hasFailedStage(result, stageCandidate) {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	workspace := config.Workspace{Name: "supported", Path: root, Stack: config.StackNode, PackageManager: "npm"}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			return nil, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("package stage was not requested")
+			return nil, "", false, nil
+		},
+	}
+	options := scanOptions{execution: "container", only: "vulnerabilities"}
+	broken := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{name: "broken", path: "/missing", origin: updatesnapshot.OriginWorkspace, err: errors.New("configured path is unavailable")}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	supported := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	summary := summarizeScan([]scanResult{broken, supported})
+	if broken.Status != "failed" || supported.Status != "clean" || summary.Failed != 1 || summary.Succeeded != 1 {
+		t.Fatalf("broken=%#v supported=%#v summary=%#v", broken, supported, summary)
+	}
+	var coded commandError
+	if err := scanResultError(summary, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+		t.Fatalf("mixed workspace exit = %#v, want %d", err, exitPartial)
+	}
+}
+
 func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t *testing.T) {
 	results := []scanResult{
 		{Project: "clean", Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Warnings: []string{}},
@@ -267,7 +390,7 @@ func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t 
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if summary.Clean != 1 || summary.Findings != 1 || summary.ScanOnly != 1 || summary.Ready != 1 || summary.Partial != 1 || summary.Failed != 2 || summary.Vulnerabilities != 2 {
+	if summary.Clean != 1 || summary.Findings != 1 || summary.ScanOnly != 1 || summary.Ready != 1 || summary.Partial != 1 || summary.Failed != 1 || summary.Vulnerabilities != 2 {
 		t.Fatalf("summary = %#v", summary)
 	}
 	// A "clean" result must never coexist with vulnerabilities or candidates.
@@ -276,13 +399,13 @@ func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t 
 			t.Fatalf("project %q is clean but has findings", result.Project)
 		}
 	}
-	// scanResultError must treat partial the same as failed for exit-code precedence.
+	// Partial results have a stable exit code distinct from a total failure.
 	if resultErr := scanResultError(summary, "vulnerabilities"); resultErr == nil {
 		t.Fatal("expected a failure exit code when a partial result is present")
 	} else {
 		var coded commandError
-		if !errors.As(resultErr, &coded) || coded.code != exitFailure {
-			t.Fatalf("error = %#v, want exit %d", resultErr, exitFailure)
+		if !errors.As(resultErr, &coded) || coded.code != exitPartial {
+			t.Fatalf("error = %#v, want exit %d", resultErr, exitPartial)
 		}
 	}
 }
@@ -371,6 +494,9 @@ func TestFailedScanResultSurfacesSafeCategoryExitCodeAndBoundedDetailForDockerFa
 	if strings.Contains(failed.Error.Message, "supersecret") {
 		t.Fatalf("message leaked secret: %q", failed.Error.Message)
 	}
+	if len(failed.Warnings) != 1 || !strings.Contains(failed.Warnings[0], "category=permission") || strings.Contains(failed.Warnings[0], "supersecret") {
+		t.Fatalf("warning is not actionable and redacted: %#v", failed.Warnings)
+	}
 }
 
 func TestFailedScanResultSurfacesLocalScanErrorCategory(t *testing.T) {
@@ -387,16 +513,31 @@ func TestFailedScanResultSurfacesLocalScanErrorCategory(t *testing.T) {
 	}
 }
 
-func TestEnsureProjectConfigRequiresExplicitOptIn(t *testing.T) {
+func TestProjectConfigIsIgnoredUnlessExplicitlyAllowed(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.WriteFile(filepath.Join(directory, ".npmrc"), []byte("registry=https://example.invalid\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureProjectConfigAllowed(directory, "npm", false); err == nil || !strings.Contains(err.Error(), "--allow-project-config") {
-		t.Fatalf("error = %v", err)
+	workspace := config.Workspace{Path: directory, Stack: config.StackNode, PackageManager: "npm"}
+	contract, err := scaninput.PackageContract(workspace, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := ensureProjectConfigAllowed(directory, "npm", true); err != nil {
-		t.Fatalf("explicit opt-in: %v", err)
+	for _, file := range contract.Files {
+		if file.Path == ".npmrc" {
+			t.Fatal("project config entered the default scan contract")
+		}
+	}
+	contract, err = scaninput.PackageContract(workspace, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, file := range contract.Files {
+		found = found || file.Path == ".npmrc"
+	}
+	if !found {
+		t.Fatal("explicitly allowed project config is missing from scan contract")
 	}
 }
 

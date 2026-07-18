@@ -19,6 +19,7 @@ const (
 	ExitOK          = 0
 	ExitFailure     = 1
 	ExitFindings    = 5
+	ExitPartial     = 6
 	ExitInterrupted = 130
 
 	FailureContinue = "continue"
@@ -208,14 +209,14 @@ func Run(ctx context.Context, runner Runner, options Options) (Report, int) {
 		}
 	}
 
-	if scan.ExitCode != ExitOK && scan.ExitCode != ExitFailure && scan.ExitCode != ExitFindings {
+	if scan.ExitCode != ExitOK && scan.ExitCode != ExitFailure && scan.ExitCode != ExitFindings && scan.ExitCode != ExitPartial {
 		appendEnvelopeErrors(&report, envelope.Errors)
 		if len(report.Errors) == 0 {
 			addError(&report, "scan_failed", fmt.Errorf("scan exited with status %d", scan.ExitCode))
 		}
 		return report, scan.ExitCode
 	}
-	if (scan.ExitCode == ExitFailure || report.Summary.ScanFailed > 0 || len(report.Errors) > 0) && options.FailurePolicy == FailureStop {
+	if (scan.ExitCode == ExitFailure || scan.ExitCode == ExitPartial || report.Summary.ScanFailed > 0 || len(report.Errors) > 0) && options.FailurePolicy == FailureStop {
 		report.Summary.NotAttempted = report.Summary.Ready
 		appendEnvelopeErrors(&report, envelope.Errors)
 		return report, ExitFailure
@@ -255,7 +256,7 @@ func Run(ctx context.Context, runner Runner, options Options) (Report, int) {
 	}
 
 	appendEnvelopeErrors(&report, envelope.Errors)
-	if scan.ExitCode == ExitFailure || report.Summary.ScanFailed > 0 || report.Summary.Failed > 0 || len(report.Errors) > 0 {
+	if scan.ExitCode == ExitFailure || scan.ExitCode == ExitPartial || report.Summary.ScanFailed > 0 || report.Summary.Failed > 0 || len(report.Errors) > 0 {
 		return report, ExitFailure
 	}
 	if scan.ExitCode == ExitFindings {
