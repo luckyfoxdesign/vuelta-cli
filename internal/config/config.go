@@ -567,7 +567,7 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	}
 	if profile.Scanner == "" || !projectNamePattern.MatchString(profile.Scanner) || !toolVersionPattern.MatchString(profile.ScannerVersion) {
 		errs = append(errs, fmt.Errorf("%s.scanner: name and exact scanner_version are required", label))
-	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "pip"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
+	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
 		errs = append(errs, fmt.Errorf("%s.scanner: must be %q for package manager %q", label, expected, profile.PackageManager))
 	}
 	if !digestRefPattern.MatchString(profile.Image) {

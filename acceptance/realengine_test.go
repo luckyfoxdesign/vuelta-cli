@@ -171,7 +171,8 @@ func checkEngine(t *testing.T, expected string) *config.DockerConfig {
 		t.Fatal("[infrastructure] Docker daemon omitted required identity fields")
 	}
 	text := strings.ToLower(info.Name)
-	isDesktop := strings.Contains(text, "docker desktop")
+	operatingSystem := strings.ToLower(version.OperatingSystem)
+	isDesktop := strings.Contains(text, "docker desktop") || strings.Contains(text, "docker-desktop") || strings.Contains(operatingSystem, "docker desktop")
 	if expected != "" && (expected == "docker-desktop") != isDesktop {
 		t.Fatalf("[infrastructure] matrix expects %s but endpoint reports a different engine", expected)
 	}

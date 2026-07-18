@@ -50,12 +50,11 @@ func TestResolveNodeRuntimeAndNPMLockMatrix(t *testing.T) {
 	}
 }
 
-func TestResolvePNPMBunAndPythonProfiles(t *testing.T) {
+func TestResolvePNPMAndPythonProfiles(t *testing.T) {
 	tests := []struct {
 		name, stack, manager, runtime, managerVersion, lock, manifestName, manifest, lockName, lockContents string
 	}{
 		{"pnpm", "node", "pnpm", "22", "9.15.0", "pnpm-v9", "package.json", `{"engines":{"node":"22.x"},"packageManager":"pnpm@9.15.0"}`, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n"},
-		{"bun", "node", "bun", "22", "1.2.0", "bun-text", "package.json", `{"engines":{"node":"22.x"},"packageManager":"bun@1.2.0"}`, "bun.lock", "[lockfile]\n"},
 		{"poetry", "python", "poetry", "3.12", "2.1.1", "poetry-v2", "pyproject.toml", "[project]\nrequires-python = \">=3.12,<3.13\"\n", "poetry.lock", "package = []\n"},
 		{"uv", "python", "uv", "3.12", "0.6.14", "uv-v1", "pyproject.toml", "[project]\nrequires-python = \">=3.12,<3.13\"\n", "uv.lock", "version = 1\n"},
 		{"pip-tools", "python", "pip-tools", "3.12", "7.5.0", "requirements", "pyproject.toml", "[project]\nrequires-python = \">=3.12,<3.13\"\n", "requirements.txt", "example==1.0.0\n"},
@@ -67,7 +66,7 @@ func TestResolvePNPMBunAndPythonProfiles(t *testing.T) {
 			write(t, root, testCase.lockName, testCase.lockContents)
 			selected := profile(testCase.name, testCase.manager, testCase.runtime, testCase.managerVersion, testCase.lock)
 			selected.Stack = testCase.stack
-			selected.Scanner = map[string]string{"pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "pip"}[testCase.manager]
+			selected.Scanner = map[string]string{"pnpm": "pnpm", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan"}[testCase.manager]
 			selected.ScannerVersion = testCase.managerVersion
 			ws := config.Workspace{Path: root, Stack: testCase.stack, PackageManager: testCase.manager, Platform: "linux/amd64"}
 			got, _, _, err := Resolve(ws, config.Config{Update: config.UpdateConfig{ToolchainProfiles: []config.ToolchainProfile{selected}}})
@@ -75,6 +74,21 @@ func TestResolvePNPMBunAndPythonProfiles(t *testing.T) {
 				t.Fatalf("Resolve() = %q, %v", got.ID, err)
 			}
 		})
+	}
+}
+
+func TestResolveRejectsBunWithActionableDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "package.json", `{"engines":{"node":"22.x"},"packageManager":"bun@1.2.0"}`)
+	write(t, root, "bun.lock", "[lockfile]\n")
+	selected := profile("bun", "bun", "22", "1.2.0", "bun-text")
+	ws := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "bun", Platform: "linux/amd64"}
+	_, _, constraints, err := Resolve(ws, config.Config{Update: config.UpdateConfig{ToolchainProfiles: []config.ToolchainProfile{selected}}})
+	if err == nil || !strings.Contains(err.Error(), "npm-check-updates") || !strings.Contains(err.Error(), "use npm or pnpm") {
+		t.Fatalf("bun resolution error = %v", err)
+	}
+	if constraints.PackageManager != "bun" || constraints.LockFormat != "bun-text" {
+		t.Fatalf("bun constraints = %#v", constraints)
 	}
 }
 

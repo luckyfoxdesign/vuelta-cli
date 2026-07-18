@@ -183,7 +183,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	}
 
 	// Step 5: security post-check.
-	post, err := deps.Security.PostCheck(ctx, sandboxDir, ws, cfg, baseline)
+	post, err := deps.Security.PostCheck(ctx, landingDir, ws, cfg, baseline)
 	if err != nil {
 		return failResult(project, "security post-check", err)
 	}

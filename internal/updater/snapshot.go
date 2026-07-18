@@ -43,6 +43,9 @@ type CandidateScannerOptions struct {
 // ResolveCandidateScannerWithOptions selects scanners with exact input
 // contracts. Registered callers must leave RequireTracked enabled.
 func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, options CandidateScannerOptions) (CandidateScanner, error) {
+	if err := toolchain.ValidateManagerSupport(ws.Stack, ws.PackageManager); err != nil {
+		return nil, err
+	}
 	var scanners []CandidateScanner
 	packageContract, err := scaninput.PackageContract(ws, options.AllowProjectConfig)
 	if err != nil {
@@ -78,7 +81,7 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 			if err != nil {
 				return nil, err
 			}
-			scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+			scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"vuelta-pip-tools-scan"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 		case "node/npm", "node/bun":
 			key := "node"
 			launcher := "npx"
@@ -130,7 +133,7 @@ func ResolveToolchainProfile(ws config.Workspace, cfg config.Config) (*config.To
 }
 
 func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, ws config.Workspace, contract scaninput.Contract, options CandidateScannerOptions) (packageScanner, error) {
-	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "pip"}[ws.PackageManager]; profile.Scanner != expected {
+	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan"}[ws.PackageManager]; profile.Scanner != expected {
 		return packageScanner{}, fmt.Errorf("toolchain profile %q scanner %q is incompatible with %s", profile.ID, profile.Scanner, ws.PackageManager)
 	}
 	var args []string
@@ -156,7 +159,7 @@ func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, w
 	case "uv":
 		args = []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}
 	case "pip-tools":
-		args = []string{"pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"}
+		args = []string{"vuelta-pip-tools-scan"}
 	default:
 		return packageScanner{}, fmt.Errorf("no profile scanner for package manager %q", ws.PackageManager)
 	}
@@ -225,8 +228,9 @@ func acceptedDiscoveryExit(kind string, err error) bool {
 	return errors.As(err, &exit) && exit.ExitCode() == 1
 }
 
-// parsePackageCandidates accepts the JSON shapes emitted by Poetry, pip,
-// pnpm, uv, and npm-check-updates. Unknown/malformed records are rejected so
+// parsePackageCandidates accepts the JSON shapes emitted by Poetry, the
+// pip-tools metadata scanner, pnpm, uv, and npm-check-updates. Unknown or
+// malformed records are rejected so
 // untrusted registry metadata can never become an executable update plan.
 func parsePackageCandidates(kind string, data []byte) ([]updatesnapshot.Candidate, error) {
 	// Some scanner tools write an informational notice (venv creation, a
@@ -323,7 +327,7 @@ func firstString(record map[string]any, keys ...string) (string, bool) {
 	return "", false
 }
 
-var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+/-]+$`)
+var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+!/-]+$`)
 
 func validCandidate(candidate updatesnapshot.Candidate) bool {
 	return candidatePartPattern.MatchString(candidate.Name) && candidatePartPattern.MatchString(candidate.Target) && (candidate.Current == "" || candidatePartPattern.MatchString(candidate.Current))
@@ -388,6 +392,7 @@ type PlannedUpdater struct {
 	AllowScripts bool
 	Validate     func(context.Context) error
 	Recheck      CandidateScanner
+	Run          DockerRunner
 }
 
 func (u PlannedUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
@@ -442,7 +447,10 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 		user = profile.User
 		platform = profile.Platform
 	}
-	runner := NewDockerRunnerForProfile(u.Config.Update.Egress, user, platform)
+	runner := u.Run
+	if runner == nil {
+		runner = NewDockerRunnerForProfile(u.Config.Update.Egress, user, platform)
+	}
 	image, err := plannedImage(u.Workspace, u.Config, profile)
 	if err != nil {
 		return false, err
@@ -451,16 +459,25 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	for _, candidate := range u.Candidates {
-		if candidate.Kind == "docker" {
-			continue
+	packageCandidates := nonDockerCandidates(u.Candidates)
+	if u.Workspace.PackageManager == "pip-tools" && len(packageCandidates) > 0 {
+		for _, candidate := range packageCandidates {
+			if err := rewritePipToolsPin(projectPath, candidate); err != nil {
+				return false, err
+			}
 		}
-		args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, profile, u.AllowScripts)
-		if err != nil {
+		if _, err := runner(ctx, image, []string{"pip-compile", "requirements.in"}, projectPath); err != nil {
 			return false, err
 		}
-		if _, err := runner(ctx, image, args, projectPath); err != nil {
-			return false, err
+	} else {
+		for _, candidate := range packageCandidates {
+			args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, profile, u.AllowScripts)
+			if err != nil {
+				return false, err
+			}
+			if _, err := runner(ctx, image, args, projectPath); err != nil {
+				return false, err
+			}
 		}
 	}
 	if u.Workspace.PackageManager == "npm" {
@@ -504,7 +521,7 @@ func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.
 		// of installing into a project-local .venv inside the sandbox.
 		return []string{"uv", "add", candidate.Name + "==" + candidate.Target, "--no-sync"}, nil
 	case "pip-tools":
-		return []string{"pip-compile", "--upgrade-package", candidate.Name + "==" + candidate.Target, "requirements.in"}, nil
+		return nil, errors.New("pip-tools updates require manifest pin rewriting before pip-compile")
 	case "npm":
 		if profile != nil {
 			return []string{"ncu", "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
@@ -556,6 +573,68 @@ func plannedImage(ws config.Workspace, cfg config.Config, profile *config.Toolch
 func plannedLockDigest(ws config.Workspace, projectPath string) (string, error) {
 	file := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock", "pip-tools": "requirements.txt", "npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "bun": "bun.lock"}[ws.PackageManager]
 	return lockDigest(projectPath, file)
+}
+
+func nonDockerCandidates(candidates []updatesnapshot.Candidate) []updatesnapshot.Candidate {
+	result := make([]updatesnapshot.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Kind != "docker" {
+			result = append(result, candidate)
+		}
+	}
+	return result
+}
+
+var pipToolsPinPattern = regexp.MustCompile(`^(\s*)([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^]\r\n]+\])?(\s*==\s*)([A-Za-z0-9][A-Za-z0-9.!+_-]*)(\s*(?:#.*)?)$`)
+var pythonNameSeparatorPattern = regexp.MustCompile(`[-_.]+`)
+
+func rewritePipToolsPin(projectPath string, candidate updatesnapshot.Candidate) error {
+	if candidate.Current == "" {
+		return fmt.Errorf("pip-tools candidate %q has no current exact pin", candidate.Name)
+	}
+	path := filepath.Join(projectPath, "requirements.in")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect requirements.in: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("requirements.in must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read requirements.in: %w", err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	wanted := normalizePythonPackage(candidate.Name)
+	matches := 0
+	for index, lineWithEnding := range lines {
+		line := strings.TrimSuffix(lineWithEnding, "\n")
+		ending := strings.TrimPrefix(lineWithEnding, line)
+		parts := pipToolsPinPattern.FindStringSubmatch(strings.TrimSuffix(line, "\r"))
+		if parts == nil || normalizePythonPackage(parts[2]) != wanted {
+			continue
+		}
+		matches++
+		if parts[5] != candidate.Current {
+			return fmt.Errorf("pip-tools pin for %q changed from snapshot version %q", candidate.Name, candidate.Current)
+		}
+		carriageReturn := ""
+		if strings.HasSuffix(line, "\r") {
+			carriageReturn = "\r"
+		}
+		lines[index] = parts[1] + parts[2] + parts[3] + parts[4] + candidate.Target + parts[6] + carriageReturn + ending
+	}
+	if matches != 1 {
+		return fmt.Errorf("requirements.in must contain exactly one direct exact pin for %q", candidate.Name)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "")), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write requirements.in: %w", err)
+	}
+	return nil
+}
+
+func normalizePythonPackage(name string) string {
+	return strings.ToLower(pythonNameSeparatorPattern.ReplaceAllString(name, "-"))
 }
 
 func hasDockerCandidates(candidates []updatesnapshot.Candidate) bool {

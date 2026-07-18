@@ -142,13 +142,17 @@ exit 0
 type fakeSecurityGate struct {
 	baselineErr error
 	postErr     error
+	postPath    *string
 }
 
 func (f fakeSecurityGate) Baseline(context.Context, config.Workspace, config.Config) (Report, error) {
 	return Report{Ran: true}, f.baselineErr
 }
 
-func (f fakeSecurityGate) PostCheck(context.Context, string, config.Workspace, config.Config, Report) (Report, error) {
+func (f fakeSecurityGate) PostCheck(_ context.Context, path string, _ config.Workspace, _ config.Config, _ Report) (Report, error) {
+	if f.postPath != nil {
+		*f.postPath = path
+	}
 	return Report{Ran: true, Findings: []string{"CVE-TEST-0001"}}, f.postErr
 }
 
@@ -188,6 +192,8 @@ func TestRunWorkspaceUpdatesAndPushesReviewBranch(t *testing.T) {
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	deps := baseDeps(true, docker)
+	var postPath string
+	deps.Security = fakeSecurityGate{postPath: &postPath}
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "updated" {
@@ -200,6 +206,9 @@ func TestRunWorkspaceUpdatesAndPushesReviewBranch(t *testing.T) {
 	out := run(t, work, "ls-remote", "origin", "refs/heads/"+wantBranch)
 	if strings.TrimSpace(out) == "" {
 		t.Fatal("expected review branch to exist on remote")
+	}
+	if !strings.HasPrefix(filepath.Base(postPath), "vuelta-landing-") {
+		t.Fatalf("security post-check path = %q, want validated landing copy", postPath)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"gopkg.in/yaml.v3"
 )
 
@@ -375,6 +376,9 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 		}
 		if !contains(d.PackageManagers[stack], manager) {
 			return config.Workspace{}, fmt.Errorf("--package-manager %q was not detected for stack %q", manager, stack)
+		}
+		if err := toolchain.ValidateManagerSupport(stack, manager); err != nil {
+			return config.Workspace{}, err
 		}
 	}
 	verification, err := d.buildVerification(input, manager)

@@ -55,6 +55,9 @@ func Resolve(ws config.Workspace, cfg config.Config) (config.ToolchainProfile, I
 	if err != nil {
 		return config.ToolchainProfile{}, Identity{}, Constraints{}, err
 	}
+	if err := ValidateManagerSupport(constraints.Stack, constraints.PackageManager); err != nil {
+		return config.ToolchainProfile{}, Identity{}, constraints, err
+	}
 	profiles := cfg.Update.ToolchainProfiles
 	if len(profiles) == 0 {
 		return config.ToolchainProfile{}, Identity{}, constraints, errors.New("no toolchain profiles are configured")
@@ -98,6 +101,15 @@ func Resolve(ws config.Workspace, cfg config.Config) (config.ToolchainProfile, I
 	}
 	identity, err := IdentityForProfile(matches[0])
 	return matches[0], identity, constraints, err
+}
+
+// ValidateManagerSupport rejects manager families without a safe structured
+// scanner before a project is onboarded or Docker is called.
+func ValidateManagerSupport(stack, manager string) error {
+	if stack == config.StackNode && manager == "bun" {
+		return errors.New("node/bun package scanning is unsupported: npm-check-updates cannot use the mandatory egress proxy under Bun; use npm or pnpm until a Bun scanner with stable structured output is available")
+	}
+	return nil
 }
 
 // IdentityForProfile returns the stable full-contract identity of a profile.

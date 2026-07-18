@@ -323,6 +323,84 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 	}
 }
 
+func TestProfilePipToolsScannerUsesProjectPinMetadataCommand(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pyproject.toml", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	writeFile(t, root, "requirements.in", "requests==2.31.0\n")
+	writeFile(t, root, "requirements.txt", "requests==2.31.0\n")
+	image := "registry.example/vuelta/python312-pip-tools@sha256:" + strings.Repeat("a", 64)
+	profile := config.ToolchainProfile{
+		Version: config.ToolchainProfileVersion, ID: "python312-pip-tools", Stack: config.StackPython, PackageManager: "pip-tools",
+		Runtime: "3.12", PackageManagerVersion: "7.5.0", Scanner: "vuelta-pip-tools-scan", ScannerVersion: "1.0.0",
+		Image: image, Platform: "linux/amd64", User: "10001:10001", LockFormats: []string{"requirements"},
+		Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true},
+	}
+	ws := config.Workspace{Path: root, Stack: config.StackPython, PackageManager: "pip-tools", Platform: "linux/amd64", ToolchainProfile: profile.ID}
+	cfg := config.Config{Update: config.UpdateConfig{ToolchainProfiles: []config.ToolchainProfile{profile}}}
+	resolved, err := ResolveCandidateScannerWithOptions(ws, cfg, CandidateScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, ok := resolved.(combinedScanner)
+	if !ok || len(combined) != 1 {
+		t.Fatalf("scanner = %T %#v", resolved, resolved)
+	}
+	packageScan, ok := combined[0].(packageScanner)
+	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"vuelta-pip-tools-scan"}) {
+		t.Fatalf("profile scanner = %#v", combined[0])
+	}
+}
+
+func TestLegacyBunScannerFailsBeforeDockerResolution(t *testing.T) {
+	ws := config.Workspace{Stack: config.StackNode, PackageManager: "bun"}
+	_, err := ResolveCandidateScannerWithOptions(ws, config.Config{}, CandidateScannerOptions{})
+	if err == nil || !strings.Contains(err.Error(), "mandatory egress proxy") {
+		t.Fatalf("bun scanner error = %v", err)
+	}
+}
+
+func TestPlannedPipToolsUpdateRewritesPinThenCompilesOnce(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "requirements.in", "requests[socks] == 2.31.0 # direct\n")
+	writeFile(t, root, "requirements.txt", "requests==2.31.0\n")
+	candidate := updatesnapshot.Candidate{Kind: "pip-tools", Name: "requests", Current: "2.31.0", Target: "2.32.4"}
+	calls := 0
+	u := PlannedUpdater{
+		Candidates: []updatesnapshot.Candidate{candidate},
+		Workspace:  config.Workspace{Path: root, Stack: config.StackPython, PackageManager: "pip-tools"},
+		Config:     config.Config{Update: config.UpdateConfig{Images: map[string]string{"python-pip-tools": "python@sha256:x"}}},
+		Validate:   func(context.Context) error { return nil },
+		Recheck:    staticCandidateScanner{candidates: []updatesnapshot.Candidate{candidate}},
+		Run: func(_ context.Context, _ string, args []string, workDir string) (string, error) {
+			calls++
+			if !reflect.DeepEqual(args, []string{"pip-compile", "requirements.in"}) {
+				t.Fatalf("pip-tools argv = %#v", args)
+			}
+			manifest, err := os.ReadFile(filepath.Join(workDir, "requirements.in"))
+			if err != nil {
+				return "", err
+			}
+			if string(manifest) != "requests[socks] == 2.32.4 # direct\n" {
+				t.Fatalf("rewritten requirements.in = %q", manifest)
+			}
+			return "", os.WriteFile(filepath.Join(workDir, "requirements.txt"), []byte("requests==2.32.4\n"), 0o644)
+		},
+	}
+	changed, err := u.Update(context.Background(), root)
+	if err != nil || !changed || calls != 1 {
+		t.Fatalf("Update() = %t, %v; calls = %d", changed, err, calls)
+	}
+}
+
+func TestRewritePipToolsPinRejectsUnpinnedInput(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "requirements.in", "requests>=2.31.0\n")
+	err := rewritePipToolsPin(root, updatesnapshot.Candidate{Kind: "pip-tools", Name: "requests", Current: "2.31.0", Target: "2.32.4"})
+	if err == nil || !strings.Contains(err.Error(), "exactly one direct exact pin") {
+		t.Fatalf("rewrite error = %v", err)
+	}
+}
+
 func TestPlannedUpdaterDoesNotWriteWhenSnapshotValidationFails(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "package-lock.json", "unchanged\n")
@@ -352,6 +430,12 @@ type fakeCandidateScanner struct{ called *bool }
 func (f fakeCandidateScanner) Scan(context.Context, string) ([]updatesnapshot.Candidate, error) {
 	*f.called = true
 	return nil, nil
+}
+
+type staticCandidateScanner struct{ candidates []updatesnapshot.Candidate }
+
+func (s staticCandidateScanner) Scan(context.Context, string) ([]updatesnapshot.Candidate, error) {
+	return append([]updatesnapshot.Candidate(nil), s.candidates...), nil
 }
 
 func slicesContain(values []string, want string) bool {

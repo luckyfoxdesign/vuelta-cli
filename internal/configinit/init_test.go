@@ -94,6 +94,19 @@ func TestBuildRequiresFlagsForAmbiguousDetection(t *testing.T) {
 	}
 }
 
+func TestBuildWorkspaceRejectsBunBeforeOnboarding(t *testing.T) {
+	project := nodeProject(t)
+	writeProjectFile(t, project, "bun.lock", "[lockfile]\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = discovery.BuildWorkspace(Input{PackageManager: "bun", Branch: "main", Remote: "origin"})
+	if err == nil || !strings.Contains(err.Error(), "use npm or pnpm") {
+		t.Fatalf("bun onboarding error = %v", err)
+	}
+}
+
 func TestDetectDoesNotOfferSingleDevServerAsVerification(t *testing.T) {
 	project := nodeProject(t)
 	writeProjectFile(t, project, "package.json", `{"scripts":{"build":"vite build"}}`+"\n")

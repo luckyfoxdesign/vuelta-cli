@@ -25,3 +25,24 @@ cases:
         read_only_discovery: true
         release_age: false
         project_config: false
+  - name: python312-pip-tools-amd64
+    fixture_root: testdata/fixtures/projects
+    fixture: py-pip-tools-ok
+    min_release_age_days: 0
+    profile:
+      version: 1
+      id: python312-pip-tools-amd64
+      stack: python
+      package_manager: pip-tools
+      runtime: "3.12"
+      package_manager_version: 7.5.0
+      scanner: vuelta-pip-tools-scan
+      scanner_version: 1.0.0
+      image: registry.example/vuelta/python312-pip-tools@sha256:<released-digest>
+      platform: linux/amd64
+      user: "10001:10001"
+      lock_formats: [requirements]
+      capabilities:
+        read_only_discovery: true
+        release_age: false
+        project_config: false
