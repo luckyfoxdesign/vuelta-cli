@@ -42,10 +42,16 @@ type matrixCase struct {
 
 type commandEnvelope struct {
 	Results []struct {
-		Status     string              `json:"status"`
-		SnapshotID string              `json:"snapshot_id"`
-		Toolchain  *toolchain.Identity `json:"toolchain"`
-		Error      *struct {
+		Status          string   `json:"status"`
+		SnapshotID      string   `json:"snapshot_id"`
+		Vulnerabilities []string `json:"vulnerabilities"`
+		InputCategories []string `json:"input_categories"`
+		Stages          []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"stages"`
+		Toolchain *toolchain.Identity `json:"toolchain"`
+		Error     *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
@@ -113,6 +119,70 @@ func TestRealEngineDockerEndpointIdentity(t *testing.T) {
 	if strings.TrimSpace(string(result.Stdout)) != configured.ExpectedDaemon.ServerVersion {
 		t.Fatalf("[compatibility] caller command returned an unexpected server version")
 	}
+}
+
+func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
+	matrixPath := os.Getenv("VUELTA_ACCEPTANCE_MATRIX")
+	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
+	if matrixPath == "" || root == "" {
+		t.Skip("manual/networked suite: use scripts/real-engine-acceptance.sh MATRIX")
+	}
+	if !filepath.IsAbs(root) {
+		t.Fatal("[infrastructure] VUELTA_ACCEPTANCE_ROOT must be absolute")
+	}
+	loaded := loadMatrix(t, matrixPath)
+	dockerConfig := checkEngine(t, loaded.Engine)
+	binary := buildProductionBinary(t, root)
+	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
+	defer cancel()
+	caseRoot, err := os.MkdirTemp(root, "vuelta-requirements-cve-")
+	if err != nil {
+		t.Fatalf("[infrastructure] create case directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(caseRoot) })
+	project := filepath.Join(caseRoot, "project")
+	if err := testfixture.SetupProject(ctx, "/src/testdata/fixtures/projects", "py-requirements-only-cve", project); err != nil {
+		t.Fatalf("[infrastructure] prepare fixture: %v", err)
+	}
+
+	cfg := configinit.NewConfig()
+	cfg.Docker = dockerConfig
+	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
+	configPath := filepath.Join(caseRoot, "config.yaml")
+	writeConfig(t, configPath, cfg)
+	env := append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(caseRoot, "xdg-config"))
+	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--directory", project, "--execution", "container", "--only", "vulnerabilities", "--json", "--config", configPath)
+	if len(scan.Results) != 1 {
+		t.Fatalf("[parsing] scan results = %#v", scan.Results)
+	}
+	result := scan.Results[0]
+	if result.Error != nil || (result.Status != "clean" && result.Status != "findings") {
+		t.Fatalf("[scanner] requirements-only scan result = %#v", result)
+	}
+	if result.SnapshotID != "" || !containsAcceptance(result.InputCategories, "dependency-input") || !hasAcceptanceStage(result.Stages, "vulnerability", "succeeded") {
+		t.Fatalf("[security] requirements-only scan boundaries = %#v", result)
+	}
+}
+
+func containsAcceptance(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAcceptanceStage(stages []struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}, name, status string) bool {
+	for _, stage := range stages {
+		if stage.Name == name && stage.Status == status {
+			return true
+		}
+	}
+	return false
 }
 
 func loadMatrix(t *testing.T, path string) matrix {

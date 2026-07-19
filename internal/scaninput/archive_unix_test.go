@@ -5,8 +5,10 @@ package scaninput
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -26,5 +28,20 @@ func TestBuildRejectsUnixSocket(t *testing.T) {
 	_, err = Build(context.Background(), root, root, Options{}, contract)
 	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("socket input error = %v", err)
+	}
+}
+
+func TestPythonRequirementsContractRejectsFIFO(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "requirements.txt")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Build(context.Background(), root, root, Options{}, PythonRequirementsContract())
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("FIFO input error = %v", err)
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("FIFO fixture disappeared: %v", statErr)
 	}
 }

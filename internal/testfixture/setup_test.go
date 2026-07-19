@@ -22,7 +22,7 @@ func fixturesRoot(t *testing.T) string {
 }
 
 func TestSetupProjectCreatesIndependentGitRepositories(t *testing.T) {
-	for _, name := range []string{"py-poetry-ok", "py-poetry-real-ok", "py-uv-ok", "py-pip-tools-ok", "node-pnpm-ok", "node-npm-ok", "node-bun-ok", "docker-app-ok", "py-poetry-failtest", "node-pnpm-cve", "docker-app-cve", "malicious-postinstall", "escape-symlink"} {
+	for _, name := range []string{"py-poetry-ok", "py-poetry-real-ok", "py-uv-ok", "py-pip-tools-ok", "py-requirements-only-cve", "node-pnpm-ok", "node-npm-ok", "node-bun-ok", "docker-app-ok", "py-poetry-failtest", "node-pnpm-cve", "docker-app-cve", "malicious-postinstall", "escape-symlink"} {
 		t.Run(name, func(t *testing.T) {
 			destination := filepath.Join(t.TempDir(), name)
 			if err := SetupProject(context.Background(), fixturesRoot(t), name, destination); err != nil {

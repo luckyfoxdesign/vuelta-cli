@@ -368,6 +368,147 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	}
 }
 
+func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
+	vulnerabilityCalled := false
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			vulnerabilityCalled = true
+			return []string{"CVE-2026-0001"}, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("package scanner was called for --only vulnerabilities")
+			return nil, "", false, nil
+		},
+	}
+	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "trivy",
+	}}, target, scanOptions{execution: "container", only: "vulnerabilities"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if !vulnerabilityCalled || result.Status != "findings" || len(result.Vulnerabilities) != 1 || result.Error != nil {
+		t.Fatalf("result = %#v; vulnerabilityCalled=%t", result, vulnerabilityCalled)
+	}
+	if !containsString(result.InputCategories, string(scaninput.CategoryDependency)) || result.SnapshotID != "" {
+		t.Fatalf("input/snapshot result = %#v", result)
+	}
+}
+
+func TestStandaloneRequirementsCombinedScanIsPartialWithoutSnapshot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			return []string{"CVE-2026-0001"}, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("unsupported standalone requirements contract reached package scanner")
+			return nil, "", false, nil
+		},
+	}
+	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "trivy",
+	}}, scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if result.Status != "partial" || result.Error == nil || result.Error.Code != "package_updates_unsupported" {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(result.Vulnerabilities) != 1 || result.SnapshotID != "" || !hasFailedStage(result, stageCandidate) {
+		t.Fatalf("vulnerability/snapshot result = %#v", result)
+	}
+	if !containsSubstring(result.Warnings, "vulnerabilities scanned; package updates unsupported") {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+	var coded commandError
+	if err := scanResultError(summarizeScan([]scanResult{result}), ""); !errors.As(err, &coded) || coded.code != exitPartial {
+		t.Fatalf("exit = %#v, want %d", err, exitPartial)
+	}
+}
+
+func TestStandaloneRequirementsPackagesOnlyIsActionableAndRunsNoScanner(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			t.Fatal("vulnerability scanner was called for --only packages")
+			return nil, "", false, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+			t.Fatal("alerts scanner was called for --only packages")
+			return nil, false, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("package scanner was called without a mutable package contract")
+			return nil, "", false, nil
+		},
+	}
+	result := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{
+		path: root, origin: updatesnapshot.OriginAdhoc,
+	}, scanOptions{execution: "container", only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if result.Status != "failed" || result.Error == nil || result.Error.Code != "package_updates_unsupported" || result.SnapshotID != "" {
+		t.Fatalf("result = %#v", result)
+	}
+	if !strings.Contains(result.Error.Hint, "manifest/lock pair") || !hasFailedStage(result, stageCandidate) {
+		t.Fatalf("diagnostics = %#v", result)
+	}
+}
+
+func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := config.Workspace{
+		Name: "legacy-python", Path: root, Stack: config.StackPython,
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	called := false
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			called = true
+			return nil, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("package scanner was called")
+			return nil, "", false, nil
+		},
+	}
+	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "trivy",
+	}}, scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}, scanOptions{
+		execution: "container", only: "vulnerabilities",
+	}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if !called || result.Status != config.VerificationScanOnly || result.Error != nil || !containsString(result.InputCategories, string(scaninput.CategoryDependency)) {
+		t.Fatalf("result = %#v; called=%t", result, called)
+	}
+}
+
+func containsSubstring(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	root := t.TempDir()
 	workspace := config.Workspace{

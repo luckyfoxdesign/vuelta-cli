@@ -929,6 +929,9 @@ func validateWorkspace(i int, ws Workspace) []error {
 		if ws.PackageManager != "" {
 			errs = append(errs, fmt.Errorf("%s.package_manager: docker stack has no package manager", label))
 		}
+	} else if ws.Stack == StackPython && ws.PackageManager == "" && ws.Verification.State == VerificationScanOnly {
+		// A scan-only Python workspace may expose a root requirements.txt to
+		// vulnerability scanners without claiming that pip-tools owns it.
 	} else if !managers[ws.PackageManager] {
 		errs = append(errs, fmt.Errorf("%s.package_manager: %q is not valid for stack %q", label, ws.PackageManager, ws.Stack))
 	}

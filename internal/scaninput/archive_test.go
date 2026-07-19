@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 )
@@ -110,6 +111,101 @@ func TestBuildArchivesOnlyAllowlistedTrackedInputs(t *testing.T) {
 	}
 	if len(bundle.Manifest.InputHashes) != 2 || len(bundle.Manifest.Entries) != 2 {
 		t.Fatalf("manifest = %#v", bundle.Manifest)
+	}
+}
+
+func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "requirements.txt", "flask==0.5\n")
+	write(t, root, "requirements.in", "flask\n")
+	write(t, root, "pyproject.toml", "[project]\nname = \"unrelated\"\n")
+
+	contract, err := DependencyContract(config.Workspace{Path: root, Stack: config.StackPython})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := Build(context.Background(), root, root, Options{}, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := archiveFiles(t, bundle.Archive)
+	want := map[string]string{"project/requirements.txt": "flask==0.5\n"}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("archive files = %v, want only standalone requirements input", sortedKeys(files))
+	}
+	if len(bundle.Manifest.Entries) != 1 || bundle.Manifest.Entries[0].Category != CategoryDependency {
+		t.Fatalf("manifest = %#v", bundle.Manifest)
+	}
+	if _, err := PackageContract(config.Workspace{Path: root, Stack: config.StackPython}, false); err == nil {
+		t.Fatal("standalone requirements.txt unexpectedly enabled a package contract")
+	}
+}
+
+func TestPythonRequirementsContractRejectsUnsafeInputs(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func(*testing.T, string)
+		limits Limits
+		want   string
+	}{
+		{name: "symlink", setup: func(t *testing.T, root string) {
+			outside := filepath.Join(t.TempDir(), "outside.txt")
+			if err := os.WriteFile(outside, []byte("flask==0.5\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(root, "requirements.txt")); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "regular file"},
+		{name: "hardlink", setup: func(t *testing.T, root string) {
+			write(t, root, "outside.txt", "flask==0.5\n")
+			if err := os.Link(filepath.Join(root, "outside.txt"), filepath.Join(root, "requirements.txt")); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "hard links"},
+		{name: "oversized", setup: func(t *testing.T, root string) {
+			write(t, root, "requirements.txt", "flask==0.5\n")
+		}, limits: Limits{MaxFileBytes: 4}, want: "size limit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			test.setup(t, root)
+			_, err := Build(context.Background(), root, root, Options{Limits: test.limits}, PythonRequirementsContract())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestPythonRequirementsContractRejectsChangedDuringRead(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "requirements.txt")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), 16<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		for tick := int64(1); ; tick++ {
+			select {
+			case <-stop:
+				return
+			default:
+				stamp := time.Unix(1_700_000_000, tick)
+				_ = os.Chtimes(path, stamp, stamp)
+			}
+		}
+	}()
+	<-started
+	_, err := Build(context.Background(), root, root, Options{Limits: Limits{
+		MaxFileBytes: 32 << 20, MaxTotalBytes: 32 << 20,
+	}}, PythonRequirementsContract())
+	close(stop)
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("Build error = %v, want changed-during-read rejection", err)
 	}
 }
 

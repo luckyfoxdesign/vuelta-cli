@@ -53,6 +53,57 @@ func TestScanParsesFreshStructuredTrivyResultWithoutIgnoreFlags(t *testing.T) {
 	}
 }
 
+func TestStandaloneRequirementsReachesSelectedDependencyScanner(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name, source, output string
+		wantArg              string
+	}{
+		{
+			name: "trivy", source: "trivy", wantArg: "fs",
+			output: trivyJSON(now.Add(-time.Hour).Format(time.RFC3339)),
+		},
+		{
+			name: "osv", source: "osv-scanner", wantArg: "--lockfile",
+			output: `{"database_updated_at":"` + now.Add(-time.Hour).Format(time.RFC3339) + `","results":[{"source":{"path":"requirements.txt"},"packages":[{"package":{"name":"flask"},"groups":[{"ids":["CVE-2026-0002"],"packages":[{"version":"0.5"}]}]}]}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "unrelated.py"), []byte("sentinel\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			scanner := NewAdhocScanner(func(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+				called = true
+				if name != test.source || !contains(args, test.wantArg) {
+					t.Fatalf("scanner command = %s %v", name, args)
+				}
+				if data, err := os.ReadFile(filepath.Join(dir, "requirements.txt")); err != nil || string(data) != "flask==0.5\n" {
+					t.Fatalf("requirements input = %q, %v", data, err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "unrelated.py")); !os.IsNotExist(err) {
+					t.Fatalf("unrelated input entered scanner context: %v", err)
+				}
+				return []byte(test.output), nil
+			})
+			scanner.Now = func() time.Time { return now }
+			report, err := scanner.Scan(context.Background(), root, config.Workspace{
+				Path: root, Stack: config.StackPython,
+			}, config.Config{VulnScan: config.VulnScanConfig{
+				DependencySource: test.source, DatabaseMaxAgeHours: 24,
+			}})
+			if err != nil || !called || len(report.Findings) != 1 {
+				t.Fatalf("Scan() = %+v, %v; called=%t", report, err, called)
+			}
+		})
+	}
+}
+
 func TestScanRejectsStaleDatabase(t *testing.T) {
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	scanner := NewAdhocScanner(func(_ context.Context, _ string, _ string, _ ...string) ([]byte, error) {

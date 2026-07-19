@@ -148,6 +148,33 @@ func TestValidateRejectsUnsafeVerificationCommand(t *testing.T) {
 	}
 }
 
+func TestValidateWorkspaceAllowsManagerlessPythonOnlyForScanOnly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workspace := Workspace{
+		Path: dir, Stack: StackPython,
+		Verification: VerificationProfile{Version: VerificationVersion, State: VerificationScanOnly},
+	}
+	if errs := validateWorkspace(0, workspace); len(errs) != 0 {
+		t.Fatalf("scan-only requirements workspace errors = %v", errs)
+	}
+	workspace.Verification = VerificationProfile{Version: VerificationVersion, State: VerificationReady}
+	errs := validateWorkspace(0, workspace)
+	if len(errs) == 0 || !strings.Contains(errorsText(errs), "package_manager") {
+		t.Fatalf("update-capable managerless workspace errors = %v", errs)
+	}
+}
+
+func errorsText(errs []error) string {
+	parts := make([]string, 0, len(errs))
+	for _, err := range errs {
+		parts = append(parts, err.Error())
+	}
+	return strings.Join(parts, "\n")
+}
+
 func TestPackageVerificationCommandRejectsScriptDriftToWatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "package.json")

@@ -35,6 +35,8 @@ const (
 	localScannerStderrTailMaxBytes = 64 << 10
 )
 
+var errRequirementsPackageUnsupported = errors.New("package updates are unsupported for a standalone root requirements.txt without a mutable manifest/lock pair")
+
 type scanTarget struct {
 	workspace *config.Workspace
 	name      string
@@ -493,9 +495,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	if target.workspace != nil {
 		identityWorkspace = *target.workspace
 	} else {
-		project, detectErr := localupdate.Detect(target.path)
+		detectedWorkspace, detectErr := scanWorkspace(target)
 		if detectErr != nil {
-			result = recordScanStageFailure(result, stagePreflight, "scan_input_invalid", detectErr, "Select a directory with one supported manifest/lock pair")
+			result = recordScanStageFailure(result, stagePreflight, "scan_input_invalid", detectErr, "Select a directory with a supported dependency input")
 			result = addStage(result, stageVulnerability, stageNotRequested, "project stack was not detected")
 			result = addStage(result, stageAlerts, stageNotRequested, "project stack was not detected")
 			result = addStage(result, stageCandidate, stageNotRequested, "project stack was not detected")
@@ -503,7 +505,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result = addStage(result, stageSnapshot, stageNotRequested, "project stack was not detected")
 			return finalizeStageOutcomes(result)
 		}
-		identityWorkspace = workspaceForAdhoc(project)
+		identityWorkspace = detectedWorkspace
 		if options.execution == "local" {
 			identityConfig.VulnScan.PolicyFile = ""
 		}
@@ -581,14 +583,30 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	manager := packageToolName(identityWorkspace)
 	var verified bool
 	var err error
-	if target.dockerErr != nil && options.execution == "container" {
+	if isStandaloneRequirementsWorkspace(identityWorkspace) {
+		manager = "package-manager"
+		err = errRequirementsPackageUnsupported
+	} else if target.dockerErr != nil && options.execution == "container" {
 		err = target.dockerErr
 	} else {
 		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
 	}
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
-		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
+		code := "package_scan_failed"
+		hint := "Review the package-manager and execution-mode diagnostics"
+		if errors.Is(err, errRequirementsPackageUnsupported) {
+			code = "package_updates_unsupported"
+			hint = "Add a supported Python manifest/lock pair to enable package updates; vulnerability scanning remains available"
+		}
+		result = recordScanStageFailure(result, stageCandidate, code, err, hint)
+		if errors.Is(err, errRequirementsPackageUnsupported) {
+			warning := "package updates unsupported for standalone root requirements.txt; no update snapshot was created"
+			if hasSucceededStage(result, stageVulnerability) {
+				warning = "vulnerabilities scanned; package updates unsupported for standalone root requirements.txt; no update snapshot was created"
+			}
+			result.Warnings = appendUniqueStrings(result.Warnings, warning)
+		}
 		result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 		result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
 		return finalizeStageOutcomes(result)
@@ -832,10 +850,26 @@ func scanWorkspace(target scanTarget) (config.Workspace, error) {
 		return *target.workspace, nil
 	}
 	project, err := localupdate.Detect(target.path)
-	if err != nil {
-		return config.Workspace{}, err
+	if err == nil {
+		return workspaceForAdhoc(project), nil
 	}
-	return workspaceForAdhoc(project), nil
+	if _, requirementsErr := os.Lstat(filepath.Join(target.path, "requirements.txt")); requirementsErr == nil {
+		return config.Workspace{Path: target.path, Stack: config.StackPython}, nil
+	}
+	return config.Workspace{}, err
+}
+
+func isStandaloneRequirementsWorkspace(workspace config.Workspace) bool {
+	return workspace.Stack == config.StackPython && workspace.PackageManager == ""
+}
+
+func hasSucceededStage(result scanResult, name string) bool {
+	for _, stage := range result.Stages {
+		if stage.Name == name && stage.Status == string(stageSucceeded) {
+			return true
+		}
+	}
+	return false
 }
 
 func findingRefs(findings []vulnscan.Finding) []string {
@@ -982,7 +1016,10 @@ func packageToolName(workspace config.Workspace) string {
 	if workspace.PackageManager != "" {
 		return workspace.PackageManager
 	}
-	return "docker-registry"
+	if workspace.Stack == config.StackDocker {
+		return "docker-registry"
+	}
+	return "package-manager"
 }
 
 func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, minAge time.Duration, identity *toolchain.Identity) bool {

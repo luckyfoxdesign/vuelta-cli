@@ -25,6 +25,7 @@ type Category string
 const (
 	CategoryManifest       Category = "package-manifest"
 	CategoryLock           Category = "package-lock"
+	CategoryDependency     Category = "dependency-input"
 	CategoryManagerConfig  Category = "package-manager-config"
 	CategoryDockerManifest Category = "docker-manifest"
 	CategoryPolicy         Category = "vulnerability-policy"
@@ -104,12 +105,24 @@ func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, er
 // DependencyContract excludes manager configuration because CVE scanners need
 // only recognized manifests and lockfiles.
 func DependencyContract(ws config.Workspace) (Contract, error) {
+	if ws.Stack == config.StackPython && ws.PackageManager == "" {
+		return PythonRequirementsContract(), nil
+	}
 	contract, err := PackageContract(ws, false)
 	if err != nil {
 		return Contract{}, err
 	}
 	contract.Stage = StageDependencyCVE
 	return contract, nil
+}
+
+// PythonRequirementsContract returns the manager-independent dependency
+// input accepted by CVE scanners. A requirements.txt file alone does not
+// imply that pip-tools owns it and never enables package updates.
+func PythonRequirementsContract() Contract {
+	return Contract{Stage: StageDependencyCVE, Files: []File{{
+		Path: "requirements.txt", Category: CategoryDependency,
+	}}}
 }
 
 // DockerContract returns only explicitly configured Docker manifest files.
