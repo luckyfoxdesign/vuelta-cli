@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 )
 
 func testSnapshot(t *testing.T) Snapshot {
@@ -51,9 +52,9 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFormatFourRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) {
+func TestFormatSixRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
-	if snapshot.Format != 5 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
+	if snapshot.Format != 6 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
 		t.Fatalf("snapshot identity = %#v", snapshot)
 	}
 	if snapshot.Policy.Path != PolicyNone || snapshot.Policy.Hash != PolicyNone || snapshot.Gates.MinReleaseAge == "" {
@@ -68,8 +69,30 @@ func TestFormatFourRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) 
 	}
 }
 
+func TestSnapshotRecordsAdaptiveToolchainSourceImageIDAndVersions(t *testing.T) {
+	snapshot := testSnapshot(t)
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	profile := config.ToolchainProfile{
+		Version: config.ToolchainProfileVersion, ID: "default-node24-npm", Stack: config.StackNode,
+		PackageManager: "npm", Runtime: "24", PackageManagerVersion: "11.4.2",
+		Scanner: "ncu", ScannerVersion: "22.2.9", Image: imageID, Platform: "linux/arm64", User: "10001:10001",
+		LockFormats: []string{"npm-v2", "npm-v3"}, Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true, ReleaseAge: true},
+	}
+	identity, err := toolchain.IdentityForResolvedProfile(profile, toolchain.SourceDefault, imageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Toolchain = identity
+	if err := validateSnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Toolchain.Source != "default" || snapshot.Toolchain.ImageID != imageID || snapshot.Toolchain.Runtime != "24" || snapshot.Toolchain.PackageManagerVersion != "11.4.2" || snapshot.Toolchain.ScannerVersion != "22.2.9" {
+		t.Fatalf("toolchain snapshot identity = %#v", snapshot.Toolchain)
+	}
+}
+
 func TestStoreRejectsOlderFormatsWithRerunHint(t *testing.T) {
-	for _, format := range []int{1, 2, 3} {
+	for _, format := range []int{1, 2, 3, 4, 5} {
 		t.Run(fmt.Sprintf("format-%d", format), func(t *testing.T) {
 			store := Store{Dir: filepath.Join(t.TempDir(), "snapshots")}
 			if err := ensureDir(store.Dir); err != nil {

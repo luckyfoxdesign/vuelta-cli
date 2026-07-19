@@ -141,16 +141,17 @@ type UpdateConfig struct {
 	SnapshotTTLHours  int                `yaml:"snapshot_ttl_hours"`
 	SnapshotStateDir  string             `yaml:"snapshot_state_dir"`
 	Egress            EgressConfig       `yaml:"egress"`
-	Images            map[string]string  `yaml:"images"`
-	Tools             map[string]string  `yaml:"tools"`
+	Images            map[string]string  `yaml:"images,omitempty"`
+	Tools             map[string]string  `yaml:"tools,omitempty"`
 	ToolchainProfiles []ToolchainProfile `yaml:"toolchain_profiles,omitempty"`
 }
 
 const ToolchainProfileVersion = 1
 
-// ToolchainProfile is one immutable, curated package-manager environment.
-// Commands are compiled into Vuelta; profiles can select versions and
-// capabilities but cannot introduce arbitrary argv or shell fragments.
+// ToolchainProfile is an explicit operator override for one immutable
+// package-manager environment. Embedded defaults are selected automatically;
+// overrides can select versions and capabilities but cannot introduce argv or
+// shell fragments.
 type ToolchainProfile struct {
 	Version               int                   `yaml:"version" json:"version"`
 	ID                    string                `yaml:"id" json:"id"`

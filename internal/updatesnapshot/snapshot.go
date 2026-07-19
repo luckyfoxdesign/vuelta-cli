@@ -34,10 +34,9 @@ var (
 )
 
 const (
-	// FormatVersion 5 additionally binds scans and updates to one exact
-	// toolchain capability profile. Earlier snapshots could switch runtime or
-	// scanner behavior after review and are intentionally invalid.
-	FormatVersion = 5
+	// FormatVersion 6 additionally records whether a toolchain came from an
+	// embedded default or operator override plus its exact image identity.
+	FormatVersion = 6
 
 	OriginWorkspace = "workspace"
 	OriginAdhoc     = "adhoc"
@@ -122,7 +121,7 @@ func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHas
 	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, verificationHash, toolchain.Identity{}, effectiveHash, candidates)
 }
 
-// NewWorkspace creates a format-5 plan bound to a registered workspace, the
+// NewWorkspace creates a format-6 plan bound to a registered workspace, the
 // exact verification profile, and the selected toolchain contract.
 func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, verificationHash string, toolchainIdentity toolchain.Identity, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
@@ -144,7 +143,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	return snapshot, nil
 }
 
-// NewAdhoc creates a format-5 plan bound to an explicit unregistered path.
+// NewAdhoc creates a format-6 plan bound to an explicit unregistered path.
 func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input InputIdentity, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
@@ -531,9 +530,10 @@ func validateToolchainIdentity(identity toolchain.Identity) error {
 		}
 		return nil
 	}
-	if !toolchainIDPattern.MatchString(identity.ProfileID) || !hashPattern.MatchString(identity.Hash) || identity.Runtime == "" ||
+	if (identity.Source != toolchain.SourceDefault && identity.Source != toolchain.SourceOverride) ||
+		!toolchainIDPattern.MatchString(identity.ProfileID) || !hashPattern.MatchString(identity.Hash) || identity.Runtime == "" ||
 		identity.PackageManager == "" || identity.PackageManagerVersion == "" || identity.Scanner == "" || identity.ScannerVersion == "" ||
-		identity.Image == "" || identity.Platform == "" || identity.User == "" || len(identity.LockFormats) == 0 || !identity.Capabilities.ReadOnlyDiscovery {
+		identity.Image == "" || identity.ImageID == "" || identity.Platform == "" || identity.User == "" || len(identity.LockFormats) == 0 || !identity.Capabilities.ReadOnlyDiscovery {
 		return fmt.Errorf("%w: incomplete toolchain identity", ErrInvalid)
 	}
 	return nil

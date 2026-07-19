@@ -19,6 +19,8 @@ notable=""
 for dir in "$ROOT"/internal/*/; do
   [ -d "$dir" ] || continue
   name="$(basename "$dir")"
+	doc_files=("$dir"*.go)
+	[ -f "${dir}doc.go" ] && doc_files=("${dir}doc.go")
   doc="$(awk '
     /^\/\// {
       if ($0 ~ /^\/\/ Package/) started = 1
@@ -26,7 +28,7 @@ for dir in "$ROOT"/internal/*/; do
       next
     }
     { exit }
-  ' "$dir"*.go 2>/dev/null | sed -E "s#^Package [a-zA-Z0-9_]+ ##; s/ +\$//")"
+  ' "${doc_files[@]}" 2>/dev/null | sed -E "s#^Package [a-zA-Z0-9_]+ ##; s/ +\$//")"
   notable="${notable}- \`internal/${name}/\` — ${doc:-TODO: describe this package.}\n"
 done
 [ -n "$notable" ] || notable="- TODO: add important directories.\n"
@@ -45,7 +47,7 @@ trap 'rm -f "$tmp"' EXIT
 	printf '├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,\n'
 	printf '│                        # toolchain, sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler\n'
 	printf '├── acceptance/          # opt-in real Docker engine scan/update matrix\n'
-	printf '├── scanner-images/      # self-contained exact-version scanner image sources\n'
+	printf '├── scanner-images/      # embedded exact-version scanner build inputs\n'
 	printf '├── egress/              # local registry-allowlisting forward proxy\n'
 	printf '├── deploy/              # launchd and systemd scheduler examples\n'
   printf '├── config.example.yaml, Makefile\n'
@@ -72,7 +74,7 @@ trap 'rm -f "$tmp"' EXIT
   printf -- '- `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.\n'
 	printf -- '- `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.\n'
 	printf -- '- `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy, opt-in real-engine.\n'
-	printf -- '- `scanner-images/` — exact-version scanner image release inputs.\n'
+	printf -- '- `scanner-images/` — embedded exact-version scanner build inputs.\n'
 	printf -- '- `acceptance/` — environment-gated real-engine matrix and example catalog.\n'
 	printf -- '- `egress/` — local fail-closed proxy and its scratch-image Dockerfile.\n'
 	printf -- '- `Dockerfile` — shared dev image for the test/race/tidy/build services.\n'

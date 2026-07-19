@@ -42,7 +42,7 @@ var globalOptionDefinitions = []optionDefinition{
 var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
-		description: "find vulnerabilities and create read-only update snapshots", group: "Everyday commands",
+		description: "find vulnerabilities with adaptive local scanner toolchains and create read-only update snapshots", group: "Everyday commands",
 		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory . --execution local", "vuelta scan --all --json"},
 		options: []optionDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
@@ -92,7 +92,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--name"}, valueName: "NAME", description: "set the persistent project name (defaults to path basename)"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select python, node, or docker"},
 			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the Python or Node package manager"},
-			{names: []string{"--toolchain-profile"}, valueName: "ID", description: "select an exact curated toolchain profile"},
+			{names: []string{"--toolchain-profile"}, valueName: "ID", description: "select an explicit operator override instead of the detected default"},
 			{names: []string{"--platform"}, valueName: "PLATFORM", description: "select linux/amd64 or linux/arm64"},
 			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},
 			{names: []string{"--scan-only"}, description: "disable updates until a ready verification profile is configured"},
@@ -119,7 +119,7 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		path: []string{"config", "init"}, usage: "vuelta config init [options] [config-path]",
-		description: "create an empty validated configuration", examples: []string{"vuelta config init", "vuelta config init --replace --yes"},
+		description: "create an empty validated configuration without scanner image pins", examples: []string{"vuelta config init", "vuelta config init --replace --yes"},
 		options: []optionDefinition{
 			{names: []string{"--replace"}, description: "replace an existing config after review"},
 			{names: []string{"--yes"}, description: "confirm the displayed replacement diff"},

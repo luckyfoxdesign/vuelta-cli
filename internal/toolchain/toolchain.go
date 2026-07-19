@@ -1,5 +1,3 @@
-// Package toolchain resolves declarative project constraints to one immutable
-// scanner/update profile without executing project code.
 package toolchain
 
 import (
@@ -34,6 +32,7 @@ type Constraints struct {
 // Identity is persisted in snapshots so update cannot silently switch image,
 // runtime, scanner, platform, user, lock support, or capability semantics.
 type Identity struct {
+	Source                string                       `json:"source"`
 	ProfileID             string                       `json:"profile_id"`
 	Hash                  string                       `json:"hash"`
 	Runtime               string                       `json:"runtime"`
@@ -42,65 +41,26 @@ type Identity struct {
 	Scanner               string                       `json:"scanner"`
 	ScannerVersion        string                       `json:"scanner_version"`
 	Image                 string                       `json:"image"`
+	ImageID               string                       `json:"image_id"`
 	Platform              string                       `json:"platform"`
 	User                  string                       `json:"user"`
 	LockFormats           []string                     `json:"lock_formats"`
 	Capabilities          config.ToolchainCapabilities `json:"capabilities"`
 }
 
-// Resolve selects exactly one compatible profile. Ambiguous, conflicting, or
-// unsupported metadata fails before Docker is called.
+// Resolve selects profile metadata without calling Docker. Scan callers use
+// Prepare so embedded defaults are built and pinned to a local image ID.
 func Resolve(ws config.Workspace, cfg config.Config) (config.ToolchainProfile, Identity, Constraints, error) {
-	constraints, err := Detect(ws)
-	if err != nil {
-		return config.ToolchainProfile{}, Identity{}, Constraints{}, err
+	constraints, detectErr := Detect(ws)
+	if detectErr != nil {
+		return config.ToolchainProfile{}, Identity{}, Constraints{}, detectErr
 	}
-	if err := ValidateManagerSupport(constraints.Stack, constraints.PackageManager); err != nil {
+	selection, err := Select(ws, cfg)
+	if err != nil {
 		return config.ToolchainProfile{}, Identity{}, constraints, err
 	}
-	profiles := cfg.Update.ToolchainProfiles
-	if len(profiles) == 0 {
-		return config.ToolchainProfile{}, Identity{}, constraints, errors.New("no toolchain profiles are configured")
-	}
-	var matches []config.ToolchainProfile
-	var reasons []string
-	for _, profile := range profiles {
-		if ws.ToolchainProfile != "" && profile.ID != ws.ToolchainProfile {
-			continue
-		}
-		if reason := incompatibility(profile, constraints); reason != "" {
-			reasons = append(reasons, profile.ID+": "+reason)
-			continue
-		}
-		matches = append(matches, profile)
-	}
-	if len(matches) == 0 {
-		sort.Strings(reasons)
-		selected := "configured profiles"
-		if ws.ToolchainProfile != "" {
-			selected = "profile " + ws.ToolchainProfile
-		}
-		details := strings.Join(reasons, "; ")
-		if details == "" {
-			ids := make([]string, 0, len(profiles))
-			for _, profile := range profiles {
-				ids = append(ids, profile.ID)
-			}
-			sort.Strings(ids)
-			details = "available profiles: " + strings.Join(ids, ", ")
-		}
-		return config.ToolchainProfile{}, Identity{}, constraints, fmt.Errorf("no compatible toolchain %s for runtime=%q manager=%s@%q lock=%s platform=%s (%s)", selected, constraints.Runtime, constraints.PackageManager, constraints.PackageManagerVersion, constraints.LockFormat, constraints.Platform, details)
-	}
-	if len(matches) > 1 {
-		ids := make([]string, 0, len(matches))
-		for _, profile := range matches {
-			ids = append(ids, profile.ID)
-		}
-		sort.Strings(ids)
-		return config.ToolchainProfile{}, Identity{}, constraints, fmt.Errorf("toolchain constraints are ambiguous; compatible profiles are %s; set workspaces[].toolchain_profile", strings.Join(ids, ", "))
-	}
-	identity, err := IdentityForProfile(matches[0])
-	return matches[0], identity, constraints, err
+	identity, err := IdentityForResolvedProfile(selection.Profile, selection.Source, selection.Profile.Image)
+	return selection.Profile, identity, selection.Constraints, err
 }
 
 // ValidateManagerSupport rejects manager families without a safe structured
@@ -114,7 +74,19 @@ func ValidateManagerSupport(stack, manager string) error {
 
 // IdentityForProfile returns the stable full-contract identity of a profile.
 func IdentityForProfile(profile config.ToolchainProfile) (Identity, error) {
-	data, err := json.Marshal(profile)
+	return IdentityForResolvedProfile(profile, SourceOverride, profile.Image)
+}
+
+// IdentityForResolvedProfile returns the exact source/image contract persisted
+// in snapshots. imageID is a local sha256 ID for defaults and the immutable
+// configured image identity for overrides.
+func IdentityForResolvedProfile(profile config.ToolchainProfile, source, imageID string) (Identity, error) {
+	contract := struct {
+		Profile config.ToolchainProfile `json:"profile"`
+		Source  string                  `json:"source"`
+		ImageID string                  `json:"image_id"`
+	}{Profile: profile, Source: source, ImageID: imageID}
+	data, err := json.Marshal(contract)
 	if err != nil {
 		return Identity{}, fmt.Errorf("encode toolchain profile: %w", err)
 	}
@@ -122,9 +94,9 @@ func IdentityForProfile(profile config.ToolchainProfile) (Identity, error) {
 	locks := append([]string(nil), profile.LockFormats...)
 	sort.Strings(locks)
 	return Identity{
-		ProfileID: profile.ID, Hash: fmt.Sprintf("%x", sum), Runtime: profile.Runtime,
+		Source: source, ProfileID: profile.ID, Hash: fmt.Sprintf("%x", sum), Runtime: profile.Runtime,
 		PackageManager: profile.PackageManager, PackageManagerVersion: profile.PackageManagerVersion,
-		Scanner: profile.Scanner, ScannerVersion: profile.ScannerVersion, Image: profile.Image,
+		Scanner: profile.Scanner, ScannerVersion: profile.ScannerVersion, Image: profile.Image, ImageID: imageID,
 		Platform: profile.Platform, User: profile.User, LockFormats: locks, Capabilities: profile.Capabilities,
 	}, nil
 }

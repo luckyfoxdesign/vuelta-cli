@@ -21,7 +21,7 @@ app/
 ├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
 │                        # toolchain, sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
-├── scanner-images/      # self-contained exact-version scanner image sources
+├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
 ├── config.example.yaml, Makefile
@@ -55,7 +55,7 @@ make build                     # both cross-build targets
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
 - `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
 - `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy, opt-in real-engine.
-- `scanner-images/` — exact-version scanner image release inputs.
+- `scanner-images/` — embedded exact-version scanner build inputs.
 - `acceptance/` — environment-gated real-engine matrix and example catalog.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
@@ -92,7 +92,7 @@ make build                     # both cross-build targets
 - `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
-- `internal/toolchain/` — resolves declarative project constraints to one immutable scanner/update profile without executing project code.
+- `internal/toolchain/` — resolves declarative project constraints to an operator override or embedded scan default and builds defaults without executing project code.
 - `internal/updater/` — discovers package candidates in read-only hardened containers and applies validated dependency and Docker image plans inside a sandboxed working copy.
 - `internal/updatesnapshot/` — stores short-lived, read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
 - `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
@@ -116,7 +116,7 @@ make build                     # both cross-build targets
 
 ## Known Sharp Edges
 
-- `config.example.yaml` uses real arm64 image digests. Refresh them deliberately with `docker manifest inspect --verbose` when upgrading an image or toolchain.
+- Package scanner defaults are embedded and built locally on demand; `update.toolchain_profiles` is only an explicit digest-pinned operator override.
 - A real package-manager update needs `docker compose up -d egress-proxy`; Vuelta rejects an unavailable proxy/network before an updater starts.
 - `.golangci.yml` targets golangci-lint v2's config schema (`version: "2"`), matching the tag-and-digest-pinned `golangci/golangci-lint:v2.12.2-alpine` image in `compose.yml`; refresh its multi-platform index digest with the controlled process in `README.md`.
 <!-- manual:end -->

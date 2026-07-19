@@ -15,6 +15,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -369,6 +370,51 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	var coded commandError
 	if err := scanResultError(summary, ""); !errors.As(err, &coded) || coded.code != exitPartial {
 		t.Fatalf("mixed workspace exit = %#v, want %d", err, exitPartial)
+	}
+}
+
+func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
+	brokenRoot := t.TempDir()
+	supportedRoot := t.TempDir()
+	for _, root := range []string{brokenRoot, supportedRoot} {
+		if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"engines":{"node":"22.x"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte(`{"lockfileVersion":3}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	brokenWorkspace := config.Workspace{Name: "broken", Path: brokenRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
+	supportedWorkspace := config.Workspace{Name: "supported", Path: supportedRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+			return nil, "trivy", false, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return nil, "npm", true, nil
+		},
+		prepareToolchain: func(_ context.Context, _ config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
+			if workspace.Name == "broken" {
+				return toolchain.Prepared{}, errors.New("embedded scanner build failed")
+			}
+			selection, err := toolchain.Select(workspace, config.Config{})
+			if err != nil {
+				return toolchain.Prepared{}, err
+			}
+			selection.Profile.Image = "sha256:" + strings.Repeat("a", 64)
+			identity, err := toolchain.IdentityForResolvedProfile(selection.Profile, selection.Source, selection.Profile.Image)
+			return toolchain.Prepared{Selection: selection, Identity: identity}, err
+		},
+	}
+	options := scanOptions{execution: "container", only: "packages"}
+	broken := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &brokenWorkspace, name: "broken", path: brokenRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	supported := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &supportedWorkspace, name: "supported", path: supportedRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	if broken.Status != "partial" || broken.Error == nil || broken.Error.Code != "toolchain_incompatible" || !strings.Contains(broken.Error.Hint, "override") {
+		t.Fatalf("broken result = %#v", broken)
+	}
+	if supported.Status != "clean" || hasFailedStage(supported, stageCandidate) {
+		t.Fatalf("supported result = %#v", supported)
 	}
 }
 

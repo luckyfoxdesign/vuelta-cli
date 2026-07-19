@@ -82,7 +82,7 @@ func TestProjectAddNonInteractiveIsIdempotent(t *testing.T) {
 	project := t.TempDir()
 	for name, contents := range map[string]string{
 		"package.json":      "{}\n",
-		"package-lock.json": "{}\n",
+		"package-lock.json": "{\"lockfileVersion\":3}\n",
 		"compose.yml":       "services:\n  test: {}\n",
 	} {
 		if err := os.WriteFile(filepath.Join(project, name), []byte(contents), 0o600); err != nil {
@@ -139,6 +139,46 @@ func TestProjectListAndConfigValidateJSONEnvelopes(t *testing.T) {
 				t.Fatalf("errors = %#v", envelope.Errors)
 			}
 		})
+	}
+}
+
+func TestConfigValidateReportsDefaultAndOverrideToolchainSources(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"engines":{"node":"24.x"},"packageManager":"npm@11.4.2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte(`{"lockfileVersion":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := configinit.NewConfig()
+	cfg.Workspaces = []config.Workspace{{
+		Name: "api", Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64",
+		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(cfg, path, false); err != nil {
+		t.Fatal(err)
+	}
+	output, err := captureStdout(t, func() error { return run([]string{"config", "validate", "--config", path}) })
+	if err != nil || !strings.Contains(output, "default-node24-npm (source=default)") {
+		t.Fatalf("default validation output = %q, %v", output, err)
+	}
+	cfg.Update.ToolchainProfiles = []config.ToolchainProfile{{
+		Version: config.ToolchainProfileVersion, ID: "operator-node24-npm", Stack: config.StackNode, PackageManager: "npm",
+		Runtime: "24", PackageManagerVersion: "11.4.2", Scanner: "ncu", ScannerVersion: "22.2.9",
+		Image: "registry.example/scanner@sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64", User: "10001:10001",
+		LockFormats: []string{"npm-v3"}, Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true, ReleaseAge: true},
+	}}
+	if err := configinit.Write(cfg, path, true); err != nil {
+		t.Fatal(err)
+	}
+	output, err = captureStdout(t, func() error { return run([]string{"config", "validate", "--config", path}) })
+	if err != nil || !strings.Contains(output, "operator-node24-npm (source=override)") {
+		t.Fatalf("override validation output = %q, %v", output, err)
 	}
 }
 

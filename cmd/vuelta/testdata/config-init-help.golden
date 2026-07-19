@@ -1,4 +1,4 @@
-vuelta config init — create an empty validated configuration
+vuelta config init — create an empty validated configuration without scanner image pins
 
 Examples:
   vuelta config init

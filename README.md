@@ -6,10 +6,11 @@ and can queue an immutable deploy task. It has no resident daemon. Optional
 launchd/systemd automation invokes the separate `vuelta-scheduler` helper,
 which uses the same JSON `scan` → `update` workflow as a human operator.
 
-Node and Python scans may resolve a versioned curated toolchain profile from
-declarative runtime, manager, lock, and platform metadata. Profile-based scans
-use exact self-contained images and installed scanner binaries; snapshot
-format 5 binds update to the selected runtime, tool versions, image digest,
+Node and Python scans resolve adaptive defaults from declarative runtime,
+manager, lock, and platform metadata. Scanner Dockerfiles are embedded in the
+binary, built locally on first use, and cached by content hash; an explicit
+`update.toolchain_profiles` entry is only an operator override. Snapshot format
+6 records the profile source, local image identity, runtime and tool versions,
 platform, non-root user, lock support, and security capabilities. See
 `scanner-images/` and the real-engine section of `../docs/runbook-local.md`.
 
@@ -59,7 +60,7 @@ fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.
 See the file for the full schema:
 notification targets, vulnerability scan settings, GitHub advisories,
-per-stack update pinning, autofix, deploy task mode, the list of
+optional package-scanner overrides, autofix, deploy task mode, the list of
 `workspaces` to manage, and the git allowlist that gates which files an
 update is allowed to touch.
 

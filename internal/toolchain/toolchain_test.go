@@ -24,7 +24,7 @@ func TestResolveNodeRuntimeLockAndManagerVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "node24-npm" || identity.ProfileID != got.ID || identity.Hash == "" || constraints.LockFormat != "npm-v3" {
+	if got.ID != "node24-npm" || identity.ProfileID != got.ID || identity.Source != SourceOverride || identity.Hash == "" || constraints.LockFormat != "npm-v3" {
 		t.Fatalf("resolution = %#v, %#v, %#v", got, identity, constraints)
 	}
 }
@@ -105,8 +105,46 @@ func TestResolveRejectsUnsupportedAndAmbiguousConstraints(t *testing.T) {
 		t.Fatalf("ambiguous resolution error = %v", err)
 	}
 	write(t, root, "package.json", `{"engines":{"node":"24.x"}}`)
-	if _, _, _, err := Resolve(ws, config.Config{Update: config.UpdateConfig{ToolchainProfiles: profiles}}); err == nil || !strings.Contains(err.Error(), "no compatible") {
-		t.Fatalf("unsupported resolution error = %v", err)
+	selection, err := Select(ws, config.Config{Update: config.UpdateConfig{ToolchainProfiles: profiles}})
+	if err != nil || selection.Source != SourceDefault || selection.Profile.Runtime != "24" {
+		t.Fatalf("default fallback = %#v, %v", selection, err)
+	}
+}
+
+func TestSelectEmbeddedDefaultMatrixWithoutConfigProfiles(t *testing.T) {
+	for _, runtimeVersion := range []string{"20", "22", "24"} {
+		for _, manager := range []string{"npm", "pnpm"} {
+			t.Run("node"+runtimeVersion+"-"+manager, func(t *testing.T) {
+				root := t.TempDir()
+				managerVersion := "10.9.2"
+				if manager == "pnpm" {
+					managerVersion = "9.15.0"
+					write(t, root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+				} else {
+					write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+				}
+				write(t, root, "package.json", fmt.Sprintf(`{"engines":{"node":"%s.x"},"packageManager":"%s@%s"}`, runtimeVersion, manager, managerVersion))
+				selection, err := Select(config.Workspace{Path: root, Stack: config.StackNode, PackageManager: manager, Platform: "linux/amd64"}, config.Config{})
+				if err != nil || selection.Source != SourceDefault || selection.Profile.Runtime != runtimeVersion || selection.Profile.PackageManagerVersion != managerVersion || selection.build == nil {
+					t.Fatalf("Select() = %#v, %v", selection, err)
+				}
+			})
+		}
+	}
+
+	for _, runtimeVersion := range []string{"3.11", "3.12", "3.13"} {
+		for _, manager := range []string{"poetry", "uv"} {
+			t.Run("python"+runtimeVersion+"-"+manager, func(t *testing.T) {
+				root := t.TempDir()
+				write(t, root, "pyproject.toml", fmt.Sprintf("[project]\nrequires-python = \"%s\"\n", runtimeVersion))
+				lock := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock"}[manager]
+				write(t, root, lock, "version = 1\n")
+				selection, err := Select(config.Workspace{Path: root, Stack: config.StackPython, PackageManager: manager, Platform: "linux/arm64"}, config.Config{})
+				if err != nil || selection.Profile.Runtime != runtimeVersion || selection.Source != SourceDefault {
+					t.Fatalf("Select() = %#v, %v", selection, err)
+				}
+			})
+		}
 	}
 }
 

@@ -333,8 +333,6 @@ func NewConfig() *config.Config {
 				Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy",
 				ProxyURL: "http://vuelta-egress-proxy:3128",
 			},
-			Images: defaultImages(),
-			Tools:  map[string]string{"npm_check_updates": "17.1.16", "poetry": "2.1.1", "pip_tools": "7.5.0"},
 		},
 		Autofix: config.AutofixConfig{
 			Enabled: false, ClaudeBin: "claude", MaxTurns: 10, AllowedTools: "Read,Edit,Grep",

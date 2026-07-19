@@ -38,6 +38,9 @@ func ResolveCandidateScanner(ws config.Workspace, cfg config.Config) (CandidateS
 type CandidateScannerOptions struct {
 	AllowProjectConfig bool
 	RequireTracked     bool
+	// ToolchainProfile is a scan-prepared embedded default or override. Update
+	// callers leave it nil and retain the existing fail-closed resolution path.
+	ToolchainProfile *config.ToolchainProfile
 }
 
 // ResolveCandidateScannerWithOptions selects scanners with exact input
@@ -52,7 +55,13 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 	if err != nil {
 		return nil, err
 	}
-	if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+	if ws.PackageManager != "" && options.ToolchainProfile != nil {
+		scanner, err := profilePackageScanner(*options.ToolchainProfile, cfg, ws, packageContract, options)
+		if err != nil {
+			return nil, err
+		}
+		scanners = append(scanners, scanner)
+	} else if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		profile, _, _, err := toolchain.Resolve(ws, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("resolve toolchain profile: %w", err)

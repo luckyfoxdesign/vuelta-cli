@@ -31,9 +31,9 @@ vuln_scan:
   # This replaces vuln_scan.tool and github_advisories.enabled. Delete those
   # legacy keys when migrating: source selection is fail-closed.
   dependency_source: trivy
-  # linux/arm64 digests resolved with `docker manifest inspect --verbose` on 2026-07-14.
   # Required only for a trivy or osv-scanner dependency source; omit it for
-  # github-dependabot. Re-resolve deliberately when upgrading either scanner.
+  # github-dependabot. This security-scanner pin is maintained as a reviewed
+  # release input and is unrelated to adaptive package-scanner defaults.
   image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
   # For dependency_source: osv-scanner use ghcr.io/google/osv-scanner@sha256:c41702c554122e8491c996b661d085919e42d54d49cfb9f2473beb5a3dfdf628.
   fail_on_severity: HIGH  # CRITICAL | HIGH | MEDIUM
@@ -66,32 +66,22 @@ update:
     # Start it before every update run: docker compose up -d egress-proxy.
     # Its checked-in allowlist is in egress/main.go; add a registry there and
     # rebuild the proxy before adding a workspace that needs it.
-  images:                  # every image is an immutable digest from a trusted registry; no latest/lts tags
-    # arm64 digests resolved with `docker manifest inspect --verbose` on 2026-07-14.
-    # Re-resolve every digest deliberately before an image/toolchain upgrade.
-    python-poetry: "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153"
-    python-uv: "ghcr.io/astral-sh/uv:0.6.14@sha256:a06fb406bda92ac2c105cd45111a206b80294215d6480fa4ce4fd931ab66d7b2"
-    python-pip-tools: "python:3.12-slim@sha256:b3acc63118e4dde71287074936a02afe84748dc6a7ef9ed544fea2745cfa6153"
-    node: "node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"
-    bun: "oven/bun:1.2@sha256:24b8162f18519860276bddcd5cf74045815be0bd1023b35061fb926f1b7989d2"
-  tools:                   # exact tool versions baked into the prepared images
-    npm_check_updates: "17.1.16"
-    poetry: "2.1.1"
-    pip_tools: "7.5.0"
-  # New deployments should use released self-contained profiles below. The
-  # legacy images/tools maps remain readable during migration. Every profile
-  # image must be built from scanner-images/, published for its platform, and
-  # replaced with the resulting exact registry digest before uncommenting.
+  # Node 20/22/24 and supported Python scanner images are selected from project
+  # metadata, built locally from Dockerfiles embedded in the binary, and cached
+  # by content hash. No package-scanner image digest is required here.
+  # Add a full immutable profile only for an operator-reviewed exception. A
+  # compatible override wins over the embedded default and is reported by
+  # `vuelta config validate` as source=override.
   # toolchain_profiles:
   #   - version: 1
-  #     id: node24-npm11-arm64
+  #     id: private-node24-npm11-arm64
   #     stack: node
   #     package_manager: npm
   #     runtime: "24"
   #     package_manager_version: "11.4.2"
   #     scanner: ncu
-  #     scanner_version: "18.1.1"
-  #     image: "registry.example/vuelta/node24-npm@sha256:<released-digest>"
+  #     scanner_version: "22.2.9"
+  #     image: "registry.example/vuelta/node24-npm@sha256:<64-hex-digest>"
   #     platform: linux/arm64
   #     user: "10001:10001"
   #     lock_formats: [npm-v2, npm-v3]
@@ -154,9 +144,9 @@ workspaces:
   - name: vuelta-app             # stable project name used by CLI selectors and output
     path: .                      # canonicalized when added with `vuelta project add`
     stack: docker
-    # For node/python workspaces, optionally pin one compatible catalog ID;
-    # otherwise Vuelta requires declarative constraints to select exactly one.
-    # toolchain_profile: node24-npm11-arm64
+    # Node/Python workspaces use the detected embedded default. Set this only
+    # to select one configured operator override explicitly.
+    # toolchain_profile: private-node24-npm11-arm64
     # platform: linux/arm64
     # This repository's development Compose file builds local images, so the
     # example is deliberately scan-only. Updates and update --dry-run fail

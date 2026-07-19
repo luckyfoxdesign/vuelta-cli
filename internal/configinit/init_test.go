@@ -43,6 +43,9 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	if got := strings.Join(cfg.Workspaces[0].AllowedChangedPaths, ","); got != "package-lock.json,package.json" {
 		t.Fatalf("default root-only allowed paths = %q", got)
 	}
+	if len(cfg.Update.Images) != 0 || len(cfg.Update.Tools) != 0 || len(cfg.Update.ToolchainProfiles) != 0 {
+		t.Fatalf("config init seeded legacy scanner pins: %#v", cfg.Update)
+	}
 	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
 	if err := Write(cfg, path, false); err != nil {
 		t.Fatalf("Write: %v", err)

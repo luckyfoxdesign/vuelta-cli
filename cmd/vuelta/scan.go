@@ -118,6 +118,8 @@ type scanOptions struct {
 	execution          string
 	failOn             string
 	jsonOutput         bool
+	toolchainProfile   *config.ToolchainProfile
+	toolchainIdentity  *toolchain.Identity
 }
 
 func executeScan(args []string) error {
@@ -448,13 +450,19 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		vulnerabilities: scanVulnerabilityStage,
 		alerts:          scanAlertsStage,
 		packages:        scanPackages,
+		prepareToolchain: func(ctx context.Context, cfg config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
+			return toolchain.Prepare(ctx, workspace, cfg, dockerexec.Default(), func(message string) {
+				fmt.Fprintln(os.Stderr, "toolchain:", message)
+			})
+		},
 	})
 }
 
 type scanStageRunners struct {
-	vulnerabilities func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error)
-	alerts          func(context.Context, config.Config, scanTarget) ([]string, bool, error)
-	packages        func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
+	vulnerabilities  func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error)
+	alerts           func(context.Context, config.Config, scanTarget) ([]string, bool, error)
+	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
+	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
 }
 
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
@@ -550,6 +558,23 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		return finalizeStageOutcomes(result)
 	}
 
+	if options.execution == "container" && identityWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
+		prepared, prepareErr := runners.prepareToolchain(ctx, cfg, identityWorkspace)
+		if prepareErr != nil {
+			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(identityWorkspace), Status: "failed", Reason: prepareErr.Error()})
+			result = recordScanStageFailure(result, stageCandidate, "toolchain_incompatible", prepareErr, "Adjust the detected runtime/manager constraint or add a compatible update.toolchain_profiles override")
+			result = addStage(result, stageReleaseAge, stageNotRequested, "package candidates are unavailable")
+			result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
+			return finalizeStageOutcomes(result)
+		}
+		options.toolchainProfile = &prepared.Profile
+		options.toolchainIdentity = &prepared.Identity
+		result.Toolchain = &prepared.Identity
+		if prepared.Built {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("built default toolchain %s locally; cache key %s will be reused by later scans", prepared.Profile.ID, prepared.CacheKey[:12]))
+		}
+	}
+
 	var candidates []updatesnapshot.Candidate
 	manager := packageToolName(identityWorkspace)
 	var verified bool
@@ -608,7 +633,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 
 	var selectedToolchain toolchain.Identity
-	if options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+	if options.execution == "container" && options.toolchainIdentity != nil {
+		selectedToolchain = *options.toolchainIdentity
+		result.Toolchain = options.toolchainIdentity
+	} else if options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
 		if resolveErr != nil {
 			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", resolveErr, "Fix the selected toolchain profile before creating an update snapshot")
@@ -723,7 +751,7 @@ func finalizeStageOutcomes(result scanResult) scanResult {
 	if !hasFailure {
 		return finalizeCleanOrFindings(result)
 	}
-	if hasSucceededDataStage(result) {
+	if hasSucceededDataStage(result) || (result.Error != nil && result.Error.Code == "toolchain_incompatible") {
 		result.Status = "partial"
 	} else {
 		result.Status = "failed"
@@ -892,15 +920,15 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 	if target.workspace != nil {
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
-		failOpenUnsupportedReleaseAge(&scanConfig, *target.workspace)
+		failOpenUnsupportedReleaseAge(&scanConfig, *target.workspace, options.toolchainIdentity)
 		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(*target.workspace, scanConfig, updater.CandidateScannerOptions{
-			AllowProjectConfig: options.allowProjectConfig, RequireTracked: false,
+			AllowProjectConfig: options.allowProjectConfig, RequireTracked: false, ToolchainProfile: options.toolchainProfile,
 		})
 		if err != nil {
 			return nil, target.workspace.PackageManager, false, err
 		}
 		candidates, err := candidateScanner.Scan(ctx, target.path)
-		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, cfg, minAge), err
+		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, cfg, minAge, options.toolchainIdentity), err
 	}
 	project, err := localupdate.Detect(target.path)
 	if err != nil {
@@ -922,15 +950,15 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 	workspace := workspaceForAdhoc(project)
 	scanConfig := cfg
 	scanConfig.Update.MinReleaseAgeDays = minDays
-	failOpenUnsupportedReleaseAge(&scanConfig, workspace)
+	failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
 	candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
-		AllowProjectConfig: options.allowProjectConfig, RequireTracked: false,
+		AllowProjectConfig: options.allowProjectConfig, RequireTracked: false, ToolchainProfile: options.toolchainProfile,
 	})
 	if err != nil {
 		return nil, project.Manager, false, err
 	}
 	candidates, err := candidateScanner.Scan(ctx, target.path)
-	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, cfg, minAge), err
+	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 }
 
 func workspaceForAdhoc(project localupdate.Project) config.Workspace {
@@ -948,9 +976,12 @@ func packageToolName(workspace config.Workspace) string {
 	return "docker-registry"
 }
 
-func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, minAge time.Duration) bool {
+func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, minAge time.Duration, identity *toolchain.Identity) bool {
 	if minAge == 0 {
 		return true
+	}
+	if identity != nil {
+		return identity.Capabilities.ReleaseAge
 	}
 	if _, identity, err := updater.ResolveToolchainProfile(workspace, cfg); err == nil && identity != nil {
 		return identity.Capabilities.ReleaseAge
@@ -958,8 +989,14 @@ func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, 
 	return workspace.Stack == config.StackNode
 }
 
-func failOpenUnsupportedReleaseAge(cfg *config.Config, workspace config.Workspace) {
+func failOpenUnsupportedReleaseAge(cfg *config.Config, workspace config.Workspace, identity *toolchain.Identity) {
 	if cfg.Update.MinReleaseAgeDays == 0 {
+		return
+	}
+	if identity != nil {
+		if !identity.Capabilities.ReleaseAge {
+			cfg.Update.MinReleaseAgeDays = 0
+		}
 		return
 	}
 	_, identity, err := updater.ResolveToolchainProfile(workspace, *cfg)

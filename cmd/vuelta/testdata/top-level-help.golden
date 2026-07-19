@@ -6,7 +6,7 @@ Examples:
   vuelta project add . --name api
 
 Everyday commands:
-  scan         find vulnerabilities and create read-only update snapshots
+  scan         find vulnerabilities with adaptive local scanner toolchains and create read-only update snapshots
   update       apply exactly one validated update snapshot
 
 Configuration:
