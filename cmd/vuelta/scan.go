@@ -58,6 +58,8 @@ const (
 	stageFailed       stageStatus = "failed"
 	stageSkipped      stageStatus = "skipped"
 	stageNotRequested stageStatus = "not_requested"
+	stageVerified     stageStatus = "verified"
+	stageUnverified   stageStatus = "unverified"
 )
 
 const (
@@ -563,7 +565,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		if prepareErr != nil {
 			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(identityWorkspace), Status: "failed", Reason: prepareErr.Error()})
 			result = recordScanStageFailure(result, stageCandidate, "toolchain_incompatible", prepareErr, "Adjust the detected runtime/manager constraint or add a compatible update.toolchain_profiles override")
-			result = addStage(result, stageReleaseAge, stageNotRequested, "package candidates are unavailable")
+			result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 			result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
 			return finalizeStageOutcomes(result)
 		}
@@ -587,7 +589,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
 		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
-		result = addStage(result, stageReleaseAge, stageNotRequested, "package candidates are unavailable")
+		result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 		result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
 		return finalizeStageOutcomes(result)
 	}
@@ -604,9 +606,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
 	case unverified && len(result.Candidates) > 0:
 		result.Warnings = append(result.Warnings, "release age could not be verified for one or more candidates; update must fail closed unless explicitly authorized")
-		result = addStage(result, stageReleaseAge, stageSkipped, "release age could not be verified for one or more candidates")
+		result = addStage(result, stageReleaseAge, stageUnverified, "release age could not be verified for one or more candidates")
 	default:
-		result = addStage(result, stageReleaseAge, stageSucceeded, "")
+		result = addStage(result, stageReleaseAge, stageVerified, "")
 	}
 	if options.allowProjectConfig {
 		result.Warnings = append(result.Warnings, "reviewed project package-manager configuration was allowed during scan")
@@ -710,6 +712,13 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result.Status = "ready"
 	result = addStage(result, stageSnapshot, stageSucceeded, "")
 	return result
+}
+
+func addUnavailableReleaseAgeStage(result scanResult, minAge time.Duration, reason string) scanResult {
+	if minAge > 0 {
+		return addStage(result, stageReleaseAge, stageFailed, reason)
+	}
+	return addStage(result, stageReleaseAge, stageNotRequested, reason)
 }
 
 // addStage records one independent stage outcome. Stages are additive and

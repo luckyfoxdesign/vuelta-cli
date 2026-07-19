@@ -219,6 +219,58 @@ func TestEffectiveMinReleaseAge(t *testing.T) {
 	}
 }
 
+func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"example"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte(`{"lockfileVersion":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := config.Workspace{
+		Name: "example", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
+	for _, testCase := range []struct {
+		name, want string
+		verified   bool
+		err        error
+	}{
+		{name: "verified", verified: true, want: string(stageVerified)},
+		{name: "unverified", want: string(stageUnverified)},
+		{name: "failed", err: errors.New("scanner failed"), want: string(stageFailed)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			runners := scanStageRunners{
+				vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+					return nil, "trivy", false, nil
+				},
+				alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+					if testCase.err != nil {
+						return nil, "npm", false, testCase.err
+					}
+					return []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0"}}, "npm", testCase.verified, nil
+				},
+			}
+			result := scanOneTargetWith(context.Background(), config.Config{}, target, scanOptions{execution: "container", only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
+			got := ""
+			for _, stage := range result.Stages {
+				if stage.Name == stageReleaseAge {
+					got = stage.Status
+				}
+			}
+			if got != testCase.want {
+				t.Fatalf("release-age status = %q, want %q; result=%#v", got, testCase.want, result)
+			}
+			if testCase.want == string(stageUnverified) && len(result.Warnings) == 0 {
+				t.Fatal("unverified release age was not surfaced as a warning")
+			}
+		})
+	}
+}
+
 func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 	err := scanResultError(scanSummary{Failed: 1, Vulnerabilities: 3}, "vulnerabilities")
 	var coded commandError

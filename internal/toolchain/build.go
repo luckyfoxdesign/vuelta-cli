@@ -21,6 +21,11 @@ import (
 
 const scannerBuildTimeout = 20 * time.Minute
 
+const (
+	scannerBuildContractVersion = 2
+	scannerValidationTimeout    = 2 * time.Minute
+)
+
 var localImageIDPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type buildSpec struct {
@@ -106,10 +111,11 @@ func buildCacheKey(selection Selection) (string, error) {
 		return "", err
 	}
 	payload := struct {
-		Profile config.ToolchainProfile `json:"profile"`
-		Build   buildSpec               `json:"build"`
-		Files   []embeddedEntry         `json:"files"`
-	}{Profile: selection.Profile, Build: *selection.build, Files: entries}
+		Contract int                     `json:"contract"`
+		Profile  config.ToolchainProfile `json:"profile"`
+		Build    buildSpec               `json:"build"`
+		Files    []embeddedEntry         `json:"files"`
+	}{Contract: scannerBuildContractVersion, Profile: selection.Profile, Build: *selection.build, Files: entries}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("encode scanner build inputs: %w", err)
@@ -165,7 +171,8 @@ func buildDefault(ctx context.Context, docker dockerexec.Runner, selection Selec
 			return fmt.Errorf("materialize embedded scanner input %s: %w", entry.Name, err)
 		}
 	}
-	args := []string{"build", "--platform", selection.Profile.Platform, "--tag", tag, "--file", filepath.Join("scanner-images", selection.build.Dockerfile)}
+	iidPath := filepath.Join(root, "image.id")
+	args := []string{"build", "--pull", "--platform", selection.Profile.Platform, "--file", filepath.Join("scanner-images", selection.build.Dockerfile), "--iidfile", iidPath}
 	argNames := make([]string, 0, len(selection.build.Args))
 	for name := range selection.build.Args {
 		argNames = append(argNames, name)
@@ -189,5 +196,93 @@ func buildDefault(ctx context.Context, docker dockerexec.Runner, selection Selec
 		}
 		return fmt.Errorf("build embedded scanner image failed (%s, exit %d)", category, exitCode)
 	}
+	iid, err := os.ReadFile(iidPath)
+	if err != nil {
+		return fmt.Errorf("read locally built scanner image ID: %w", err)
+	}
+	imageID := strings.TrimSpace(string(iid))
+	if !localImageIDPattern.MatchString(imageID) {
+		return errors.New("local scanner build returned a malformed image ID")
+	}
+	if err := validateBuiltDefault(ctx, docker, selection.Profile, imageID); err != nil {
+		return err
+	}
+	if _, err := docker.Run(ctx, dockerexec.Request{
+		Args:   []string{"image", "tag", imageID, tag},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	}); err != nil {
+		return fmt.Errorf("publish validated scanner cache tag: %w", err)
+	}
 	return nil
+}
+
+type builtImageMetadata struct {
+	ID           string `json:"id"`
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	User         string `json:"user"`
+}
+
+// validateBuiltDefault runs only while refreshing an embedded image, before
+// the content-addressed cache tag is published. Live scans therefore reuse a
+// previously validated local image instead of repeating startup probes.
+func validateBuiltDefault(ctx context.Context, docker dockerexec.Runner, profile config.ToolchainProfile, imageID string) error {
+	validationCtx, cancel := context.WithTimeout(ctx, scannerValidationTimeout)
+	defer cancel()
+	format := `{"id":{{json .Id}},"os":{{json .Os}},"architecture":{{json .Architecture}},"user":{{json .Config.User}}}`
+	result, err := docker.Run(validationCtx, dockerexec.Request{
+		Args:   []string{"image", "inspect", "--format", format, imageID},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 1024},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		return fmt.Errorf("inspect built scanner contract: %w", err)
+	}
+	var metadata builtImageMetadata
+	if err := json.Unmarshal(result.Stdout, &metadata); err != nil {
+		return errors.New("approved Docker daemon returned malformed scanner metadata")
+	}
+	wantOS, wantArch, ok := strings.Cut(profile.Platform, "/")
+	if !ok || wantOS == "" || wantArch == "" {
+		return fmt.Errorf("toolchain profile %q has invalid platform %q", profile.ID, profile.Platform)
+	}
+	if metadata.ID != imageID || metadata.OS != wantOS || metadata.Architecture != wantArch {
+		return fmt.Errorf("built scanner identity/platform mismatch for profile %q", profile.ID)
+	}
+	if metadata.User != profile.User {
+		return fmt.Errorf("built scanner user %q does not match profile %q user %q", metadata.User, profile.ID, profile.User)
+	}
+
+	smokeArgs := []string{
+		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges", "--user", profile.User, "--platform", profile.Platform,
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", imageID, profile.Scanner, "--version",
+	}
+	smoke, err := docker.Run(validationCtx, dockerexec.Request{
+		Args: smokeArgs, Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 4 << 10},
+	})
+	if err != nil {
+		category, exitCode, detail := dockerexec.Classify(err)
+		if detail != "" {
+			return fmt.Errorf("validate hardened scanner startup failed (%s, exit %d): %s", category, exitCode, detail)
+		}
+		return fmt.Errorf("validate hardened scanner startup failed (%s, exit %d)", category, exitCode)
+	}
+	if !matchesScannerVersion(profile.Scanner, profile.ScannerVersion, strings.TrimSpace(string(smoke.Combined))) {
+		return fmt.Errorf("scanner %q did not report expected version %q", profile.Scanner, profile.ScannerVersion)
+	}
+	return nil
+}
+
+func matchesScannerVersion(scanner, version, output string) bool {
+	switch scanner {
+	case "ncu", "pnpm", "vuelta-pip-tools-scan":
+		return output == version
+	case "poetry":
+		return strings.Contains(output, "version "+version)
+	case "uv":
+		return strings.HasPrefix(output, "uv "+version) && (len(output) == len("uv "+version) || output[len("uv "+version)] == ' ')
+	default:
+		return false
+	}
 }

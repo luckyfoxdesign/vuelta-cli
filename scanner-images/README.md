@@ -8,6 +8,14 @@ build arguments. Every package/scanner version is installed and verified at
 build time; a live scan invokes the installed executable directly and never
 uses `npx`, `bunx`, Corepack downloads, or runtime `pip install`.
 
+Before a newly built image receives its content-hash cache tag, Vuelta also
+inspects its immutable local image ID, OS/architecture, and configured user,
+then runs the scanner's exact `--version` contract with no network, a
+read-only root filesystem, dropped capabilities, `no-new-privileges`, the
+profile's numeric user, and a `noexec` `/tmp`. A failed inspection or smoke
+test leaves the cache tag unpublished. Cached images are not reprobed during
+each live scan.
+
 `python-pip-tools.Dockerfile` also installs the versioned
 `vuelta-pip-tools-scan` helper. It reads only direct exact pins from
 `requirements.in`, queries bounded PyPI JSON metadata through the mandatory
@@ -30,3 +38,23 @@ The embedded default table and exact tool versions live in
 it is an optional full, digest-pinned operator override for exceptional
 environments. Vuelta never pushes locally built defaults and the isolated
 Docker boundary does not read registry credentials.
+
+## Controlled refresh
+
+Refreshing a scanner is a reviewed source change, not a background download:
+
+1. Inspect every base tag's registry manifest, record its current digest and
+   confirm the required `linux/amd64` and `linux/arm64` entries.
+2. Review upstream release notes and advisories for the base runtime, package
+   manager, scanner, and their installed dependency tree. Run the configured
+   pinned Trivy image against each locally built image ID when performing the
+   review; do not make this network/database-dependent audit part of live
+   `scan`.
+3. Update only exact versions in `internal/toolchain/defaults.go` and the
+   matching build arguments. The build contract and embedded inputs change
+   the cache key; `docker build --pull` refreshes the reviewed base tag.
+4. Run the Docker test, race, and lint services plus the real-engine matrix
+   for npm, pnpm, Poetry, and uv. That matrix is the registry/network command
+   smoke test; the pre-cache probe separately proves hardened startup.
+5. Review the diff for provenance, unexpected downloads, credentials, and
+   weakened container flags before committing the refresh.
