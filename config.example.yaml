@@ -139,6 +139,9 @@ deploy_task:
 #       smoke_url: "https://api.example.com/smoke"
 
 workspaces:
+  # A requirements.txt-only Python project uses package_manager: requirements
+  # and must remain verification.state: scan_only. Scan JSON returns candidates
+  # with reason manifest_has_no_safe_mutation_contract and no snapshot.
   # This checked-in smoke configuration validates from the app/ directory.
   # Replace it with explicit target repositories before a real update run.
   - name: vuelta-app             # stable project name used by CLI selectors and output

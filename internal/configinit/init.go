@@ -96,6 +96,8 @@ func Detect(selectedRoot string) (Discovery, error) {
 	}
 	if regular(root, "requirements.in") {
 		d.addManager(config.StackPython, "pip-tools")
+	} else if regular(root, "requirements.txt") && len(d.PackageManagers[config.StackPython]) == 0 {
+		d.addManager(config.StackPython, "requirements")
 	}
 	if regular(root, "package.json") {
 		if regular(root, "package-lock.json") {
@@ -443,6 +445,12 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 }
 
 func (d Discovery) buildVerification(input Input, manager string) (config.VerificationProfile, error) {
+	if manager == "requirements" {
+		if len(input.VerificationNames) != 0 {
+			return config.VerificationProfile{}, errors.New("python/requirements has no safe mutation contract and cannot use --verification; register it as scan-only")
+		}
+		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
+	}
 	if input.ScanOnly {
 		if len(input.VerificationNames) != 0 {
 			return config.VerificationProfile{}, errors.New("--scan-only cannot be combined with --verification")
@@ -518,6 +526,8 @@ func defaultAllowedPaths(stack, manager string, dockerFiles []string) []string {
 			return []string{"pyproject.toml", "uv.lock"}
 		case "pip-tools":
 			return []string{"requirements.in", "requirements.txt"}
+		case "requirements":
+			return []string{"requirements.txt"}
 		}
 	case config.StackNode:
 		return []string{"package.json", map[string]string{"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "bun": "bun.lock"}[manager]}

@@ -16,6 +16,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
+	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -389,15 +390,15 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
 		DependencySource: "trivy",
 	}}, target, scanOptions{execution: "container", only: "vulnerabilities"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
-	if !vulnerabilityCalled || result.Status != "findings" || len(result.Vulnerabilities) != 1 || result.Error != nil {
+	if !vulnerabilityCalled || result.Status != config.VerificationScanOnly || len(result.Vulnerabilities) != 1 || result.Error != nil {
 		t.Fatalf("result = %#v; vulnerabilityCalled=%t", result, vulnerabilityCalled)
 	}
-	if !containsString(result.InputCategories, string(scaninput.CategoryDependency)) || result.SnapshotID != "" {
+	if !containsString(result.InputCategories, string(scaninput.CategoryDependency)) || result.SnapshotID != "" || result.PackageUpdates == nil || result.PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" {
 		t.Fatalf("input/snapshot result = %#v", result)
 	}
 }
 
-func TestStandaloneRequirementsCombinedScanIsPartialWithoutSnapshot(t *testing.T) {
+func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -407,30 +408,34 @@ func TestStandaloneRequirementsCombinedScanIsPartialWithoutSnapshot(t *testing.T
 			return []string{"CVE-2026-0001"}, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
-		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
-			t.Fatal("unsupported standalone requirements contract reached package scanner")
-			return nil, "", false, nil
+		packages: func(_ context.Context, _ config.Config, _ scanTarget, options scanOptions, _ config.LocalPackagePolicy, _ time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			if options.packageDiagnostics != nil {
+				*options.packageDiagnostics = append(*options.packageDiagnostics, updater.ScanDiagnostic{File: "requirements.txt", Line: 2, Code: "exact_pin_required", Message: "expected one exact pin"})
+			}
+			return []updatesnapshot.Candidate{{Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2"}}, "requirements", false, nil
 		},
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
 		DependencySource: "trivy",
-	}}, scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
-	if result.Status != "partial" || result.Error == nil || result.Error.Code != "package_updates_unsupported" {
+	}}, scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
+	if result.Status != config.VerificationScanOnly || result.Error != nil || result.PackageUpdates == nil || result.PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" {
 		t.Fatalf("result = %#v", result)
 	}
-	if len(result.Vulnerabilities) != 1 || result.SnapshotID != "" || !hasFailedStage(result, stageCandidate) {
+	if len(result.Vulnerabilities) != 1 || len(result.Candidates) != 1 || len(result.Diagnostics) != 1 || result.SnapshotID != "" || hasFailedStage(result, stageCandidate) {
 		t.Fatalf("vulnerability/snapshot result = %#v", result)
 	}
-	if !containsSubstring(result.Warnings, "vulnerabilities scanned; package updates unsupported") {
+	if !containsSubstring(result.Warnings, "no update snapshot") {
 		t.Fatalf("warnings = %#v", result.Warnings)
 	}
-	var coded commandError
-	if err := scanResultError(summarizeScan([]scanResult{result}), ""); !errors.As(err, &coded) || coded.code != exitPartial {
-		t.Fatalf("exit = %#v, want %d", err, exitPartial)
+	if !containsSubstring(result.Warnings, "release age could not be verified") {
+		t.Fatalf("release-age warnings = %#v", result.Warnings)
+	}
+	if err := scanResultError(summarizeScan([]scanResult{result}), ""); err != nil {
+		t.Fatalf("scan-only findings returned failure exit: %v", err)
 	}
 }
 
-func TestStandaloneRequirementsPackagesOnlyIsActionableAndRunsNoScanner(t *testing.T) {
+func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -445,17 +450,16 @@ func TestStandaloneRequirementsPackagesOnlyIsActionableAndRunsNoScanner(t *testi
 			return nil, false, nil
 		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
-			t.Fatal("package scanner was called without a mutable package contract")
-			return nil, "", false, nil
+			return []updatesnapshot.Candidate{{Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2"}}, "requirements", false, nil
 		},
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{
 		path: root, origin: updatesnapshot.OriginAdhoc,
 	}, scanOptions{execution: "container", only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
-	if result.Status != "failed" || result.Error == nil || result.Error.Code != "package_updates_unsupported" || result.SnapshotID != "" {
+	if result.Status != config.VerificationScanOnly || result.Error != nil || len(result.Candidates) != 1 || result.SnapshotID != "" {
 		t.Fatalf("result = %#v", result)
 	}
-	if !strings.Contains(result.Error.Hint, "manifest/lock pair") || !hasFailedStage(result, stageCandidate) {
+	if result.PackageUpdates == nil || result.PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" || hasFailedStage(result, stageCandidate) {
 		t.Fatalf("diagnostics = %#v", result)
 	}
 }

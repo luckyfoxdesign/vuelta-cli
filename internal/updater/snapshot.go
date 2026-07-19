@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
@@ -24,6 +25,36 @@ import (
 // output that would be persisted in a snapshot.
 type CandidateScanner interface {
 	Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error)
+}
+
+// ScanDiagnostic is one bounded, path-safe problem with an individual
+// dependency record. Diagnostics never become update-plan input.
+type ScanDiagnostic struct {
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// CandidateReport keeps valid candidates independent from unsupported input
+// records so one bad line cannot hide findings from other reviewed pins.
+type CandidateReport struct {
+	Candidates  []updatesnapshot.Candidate `json:"candidates"`
+	Diagnostics []ScanDiagnostic           `json:"diagnostics"`
+}
+
+type candidateReportScanner interface {
+	ScanReport(ctx context.Context, projectPath string) (CandidateReport, error)
+}
+
+// ScanCandidateReport preserves the original CandidateScanner API for update
+// rechecks while exposing structured diagnostics to the scan command.
+func ScanCandidateReport(ctx context.Context, scanner CandidateScanner, projectPath string) (CandidateReport, error) {
+	if reporter, ok := scanner.(candidateReportScanner); ok {
+		return reporter.ScanReport(ctx, projectPath)
+	}
+	candidates, err := scanner.Scan(ctx, projectPath)
+	return CandidateReport{Candidates: candidates, Diagnostics: []ScanDiagnostic{}}, err
 }
 
 // ResolveCandidateScanner selects the read-only discovery command for a
@@ -92,6 +123,12 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 				return nil, err
 			}
 			scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"vuelta-pip-tools-scan"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
+		case "python/requirements":
+			image, err := requireImage(cfg, "python-pip-tools")
+			if err != nil {
+				return nil, err
+			}
+			scanners = append(scanners, packageScanner{Kind: "requirements", Image: image, Args: []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
 		case "node/npm", "node/bun":
 			key := "node"
 			launcher := "npx"
@@ -143,7 +180,7 @@ func ResolveToolchainProfile(ws config.Workspace, cfg config.Config) (*config.To
 }
 
 func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, ws config.Workspace, contract scaninput.Contract, options CandidateScannerOptions) (packageScanner, error) {
-	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan"}[ws.PackageManager]; profile.Scanner != expected {
+	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan", "requirements": "vuelta-pip-tools-scan"}[ws.PackageManager]; profile.Scanner != expected {
 		return packageScanner{}, fmt.Errorf("toolchain profile %q scanner %q is incompatible with %s", profile.ID, profile.Scanner, ws.PackageManager)
 	}
 	var args []string
@@ -172,6 +209,8 @@ func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, w
 		args = []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}
 	case "pip-tools":
 		args = []string{"vuelta-pip-tools-scan"}
+	case "requirements":
+		args = []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}
 	default:
 		return packageScanner{}, fmt.Errorf("no profile scanner for package manager %q", ws.PackageManager)
 	}
@@ -185,18 +224,34 @@ func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, w
 type combinedScanner []CandidateScanner
 
 func (s combinedScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
+	report, err := s.ScanReport(ctx, projectPath)
+	return report.Candidates, err
+}
+
+func (s combinedScanner) ScanReport(ctx context.Context, projectPath string) (CandidateReport, error) {
 	var candidates []updatesnapshot.Candidate
+	var diagnostics []ScanDiagnostic
 	for _, scanner := range s {
-		found, err := scanner.Scan(ctx, projectPath)
+		report, err := ScanCandidateReport(ctx, scanner, projectPath)
 		if err != nil {
-			return nil, err
+			return CandidateReport{}, err
 		}
-		candidates = append(candidates, found...)
+		candidates = append(candidates, report.Candidates...)
+		diagnostics = append(diagnostics, report.Diagnostics...)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].Kind+"/"+candidates[i].Name < candidates[j].Kind+"/"+candidates[j].Name
 	})
-	return candidates, nil
+	sort.Slice(diagnostics, func(i, j int) bool {
+		if diagnostics[i].File != diagnostics[j].File {
+			return diagnostics[i].File < diagnostics[j].File
+		}
+		if diagnostics[i].Line != diagnostics[j].Line {
+			return diagnostics[i].Line < diagnostics[j].Line
+		}
+		return diagnostics[i].Code < diagnostics[j].Code
+	})
+	return CandidateReport{Candidates: candidates, Diagnostics: diagnostics}, nil
 }
 
 type packageScanner struct {
@@ -209,20 +264,25 @@ type packageScanner struct {
 }
 
 func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
+	report, err := s.ScanReport(ctx, projectPath)
+	return report.Candidates, err
+}
+
+func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (CandidateReport, error) {
 	bundle, err := scaninput.Build(ctx, projectPath, s.RepositoryRoot, scaninput.Options{RequireTracked: s.RequireTracked}, s.Contract)
 	if err != nil {
-		return nil, err
+		return CandidateReport{}, err
 	}
 	defer bundle.Destroy()
 	out, err := s.Run(ctx, s.Image, s.Args, bundle)
 	if err != nil && !acceptedDiscoveryExit(s.Kind, err) {
-		return nil, err
+		return CandidateReport{}, err
 	}
-	candidates, err := parsePackageCandidates(s.Kind, []byte(out))
+	report, err := parsePackageReport(s.Kind, []byte(out))
 	if err != nil {
-		return nil, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
+		return CandidateReport{}, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
 	}
-	return candidates, nil
+	return report, nil
 }
 
 type exitCoder interface {
@@ -245,29 +305,81 @@ func acceptedDiscoveryExit(kind string, err error) bool {
 // malformed records are rejected so
 // untrusted registry metadata can never become an executable update plan.
 func parsePackageCandidates(kind string, data []byte) ([]updatesnapshot.Candidate, error) {
+	report, err := parsePackageReport(kind, data)
+	return report.Candidates, err
+}
+
+func parsePackageReport(kind string, data []byte) (CandidateReport, error) {
 	// Some scanner tools write an informational notice (venv creation, a
 	// version-check nag) on the same stream as their JSON output despite a
 	// machine-readable flag being requested. Tolerate surrounding text but
 	// still require one well-formed JSON value, not an arbitrary blob.
 	start := bytes.IndexAny(data, "{[")
 	if start < 0 {
-		return nil, errors.New("scanner output contains no JSON value")
+		return CandidateReport{}, errors.New("scanner output contains no JSON value")
 	}
 	var value any
 	if err := json.NewDecoder(bytes.NewReader(data[start:])).Decode(&value); err != nil {
-		return nil, err
+		return CandidateReport{}, err
+	}
+	diagnostics := []ScanDiagnostic{}
+	if kind == "requirements" {
+		root, ok := value.(map[string]any)
+		if !ok {
+			return CandidateReport{}, errors.New("requirements scanner report must be an object")
+		}
+		if err := decodeRequirementsDiagnostics(root["diagnostics"], &diagnostics); err != nil {
+			return CandidateReport{}, err
+		}
+		value = root["candidates"]
+		if value == nil {
+			return CandidateReport{}, errors.New("requirements scanner report has no candidates array")
+		}
 	}
 	var candidates []updatesnapshot.Candidate
 	collectCandidates(kind, value, &candidates)
 	if candidates == nil {
-		return []updatesnapshot.Candidate{}, nil
+		candidates = []updatesnapshot.Candidate{}
 	}
 	for _, candidate := range candidates {
 		if !validCandidate(candidate) {
-			return nil, fmt.Errorf("invalid candidate %q", candidate.Name)
+			return CandidateReport{}, fmt.Errorf("invalid candidate %q", candidate.Name)
+		}
+		if kind == "requirements" && !requirementsNamePattern.MatchString(candidate.Name) {
+			return CandidateReport{}, fmt.Errorf("requirements candidate name %q is not canonical", candidate.Name)
 		}
 	}
-	return candidates, nil
+	return CandidateReport{Candidates: candidates, Diagnostics: diagnostics}, nil
+}
+
+var (
+	diagnosticCodePattern   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	requirementsNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+)
+
+func decodeRequirementsDiagnostics(value any, diagnostics *[]ScanDiagnostic) error {
+	items, ok := value.([]any)
+	if !ok {
+		return errors.New("requirements scanner diagnostics must be an array")
+	}
+	if len(items) > 256 {
+		return errors.New("requirements scanner diagnostics exceed 256 records")
+	}
+	for _, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("requirements scanner diagnostic is malformed")
+		}
+		file, _ := record["file"].(string)
+		code, _ := record["code"].(string)
+		message, _ := record["message"].(string)
+		line, lineOK := record["line"].(float64)
+		if file != "requirements.txt" || !diagnosticCodePattern.MatchString(code) || message == "" || len(message) > 512 || strings.IndexFunc(message, unicode.IsControl) >= 0 || !lineOK || line < 1 || line > 1_000_000 || line != float64(int(line)) {
+			return errors.New("requirements scanner diagnostic is invalid")
+		}
+		*diagnostics = append(*diagnostics, ScanDiagnostic{File: file, Line: int(line), Code: code, Message: message})
+	}
+	return nil
 }
 
 func collectCandidates(kind string, value any, candidates *[]updatesnapshot.Candidate) {

@@ -291,12 +291,13 @@ func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 // stack has no manifest of its own here: it is validated via
 // docker_images.files by config.Validate.
 var stackManifests = map[string][]string{
-	"python/poetry":    {"pyproject.toml", "poetry.lock"},
-	"python/uv":        {"pyproject.toml", "uv.lock"},
-	"python/pip-tools": {"requirements.in"},
-	"node/npm":         {"package.json", "package-lock.json"},
-	"node/pnpm":        {"package.json", "pnpm-lock.yaml"},
-	"node/bun":         {"package.json", "bun.lock"},
+	"python/poetry":       {"pyproject.toml", "poetry.lock"},
+	"python/uv":           {"pyproject.toml", "uv.lock"},
+	"python/pip-tools":    {"requirements.in"},
+	"python/requirements": {"requirements.txt"},
+	"node/npm":            {"package.json", "package-lock.json"},
+	"node/pnpm":           {"package.json", "pnpm-lock.yaml"},
+	"node/bun":            {"package.json", "bun.lock"},
 }
 
 func stackFilesPresent(path string, ws config.Workspace) bool {

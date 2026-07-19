@@ -309,7 +309,7 @@ const (
 // packageManagersByStack lists the package managers valid for each stack.
 // The docker stack has no package manager of its own.
 var packageManagersByStack = map[string]map[string]bool{
-	StackPython: {"poetry": true, "uv": true, "pip-tools": true},
+	StackPython: {"poetry": true, "uv": true, "pip-tools": true, "requirements": true},
 	StackNode:   {"npm": true, "pnpm": true, "bun": true},
 	StackDocker: {},
 }
@@ -568,7 +568,7 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	}
 	if profile.Scanner == "" || !projectNamePattern.MatchString(profile.Scanner) || !toolVersionPattern.MatchString(profile.ScannerVersion) {
 		errs = append(errs, fmt.Errorf("%s.scanner: name and exact scanner_version are required", label))
-	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
+	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan", "requirements": "vuelta-pip-tools-scan"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
 		errs = append(errs, fmt.Errorf("%s.scanner: must be %q for package manager %q", label, expected, profile.PackageManager))
 	}
 	if !digestRefPattern.MatchString(profile.Image) {
@@ -583,7 +583,7 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	allowedLocks := map[string]map[string]bool{
 		"npm": {"npm-v2": true, "npm-v3": true}, "pnpm": {"pnpm-v6": true, "pnpm-v9": true},
 		"bun": {"bun-text": true}, "poetry": {"poetry-v2": true}, "uv": {"uv-v1": true},
-		"pip-tools": {"requirements": true},
+		"pip-tools": {"requirements": true}, "requirements": {"requirements-direct": true},
 	}[profile.PackageManager]
 	if len(profile.LockFormats) == 0 {
 		errs = append(errs, fmt.Errorf("%s.lock_formats: at least one format is required", label))
@@ -931,9 +931,13 @@ func validateWorkspace(i int, ws Workspace) []error {
 		}
 	} else if ws.Stack == StackPython && ws.PackageManager == "" && ws.Verification.State == VerificationScanOnly {
 		// A scan-only Python workspace may expose a root requirements.txt to
-		// vulnerability scanners without claiming that pip-tools owns it.
+		// scanners without claiming that pip-tools owns it. This legacy form is
+		// retained until the explicit config-schema migration.
 	} else if !managers[ws.PackageManager] {
 		errs = append(errs, fmt.Errorf("%s.package_manager: %q is not valid for stack %q", label, ws.PackageManager, ws.Stack))
+	}
+	if ws.Stack == StackPython && ws.PackageManager == "requirements" && ws.Verification.State != VerificationScanOnly {
+		errs = append(errs, fmt.Errorf("%s.verification.state: python/requirements has no safe mutation contract and must be scan_only", label))
 	}
 
 	errs = append(errs, validateVerificationProfile(label, ws)...)

@@ -23,7 +23,7 @@ const (
 	defaultUVVersion       = "0.6.14"
 	defaultPipVersion      = "25.0.1"
 	defaultPipToolsVersion = "7.5.0"
-	defaultPipScanner      = "1.0.0"
+	defaultPipScanner      = "1.1.0"
 )
 
 var exactVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?$`)
@@ -153,6 +153,13 @@ func defaultProfile(constraints Constraints) (config.ToolchainProfile, buildSpec
 		profile.LockFormats = []string{"requirements"}
 		build.Dockerfile = "python-pip-tools.Dockerfile"
 		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "PIP_VERSION": defaultPipVersion, "PIP_TOOLS_VERSION": managerVersion, "SCANNER_VERSION": defaultPipScanner}
+	case "python/requirements":
+		managerVersion = defaultPipVersion
+		profile.ID = "default-python" + strings.ReplaceAll(runtimeVersion, ".", "") + "-requirements"
+		profile.Scanner, profile.ScannerVersion = "vuelta-pip-tools-scan", defaultPipScanner
+		profile.LockFormats = []string{"requirements-direct"}
+		build.Dockerfile = "python-pip-tools.Dockerfile"
+		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "PIP_VERSION": defaultPipVersion, "PIP_TOOLS_VERSION": defaultPipToolsVersion, "SCANNER_VERSION": defaultPipScanner}
 	default:
 		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("no embedded default toolchain for %s/%s; add a compatible update.toolchain_profiles override", constraints.Stack, constraints.PackageManager)
 	}

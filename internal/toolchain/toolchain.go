@@ -120,6 +120,11 @@ func Detect(ws config.Workspace) (Constraints, error) {
 		if err := detectPython(ws.Path, &constraints); err != nil {
 			return Constraints{}, err
 		}
+	case "python/requirements":
+		if _, err := readManifest(filepath.Join(ws.Path, "requirements.txt")); err != nil {
+			return Constraints{}, err
+		}
+		constraints.LockFormat = "requirements-direct"
 	default:
 		return Constraints{}, fmt.Errorf("no toolchain constraints for %s/%s", ws.Stack, ws.PackageManager)
 	}

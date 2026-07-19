@@ -163,6 +163,18 @@ func TestDetectRejectsManagerConflictAndMalformedLock(t *testing.T) {
 	}
 }
 
+func TestSelectRequirementsOnlyEmbeddedScanner(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "requirements.txt", "requests==2.31.0\n")
+	selection, err := Select(config.Workspace{Path: root, Stack: config.StackPython, PackageManager: "requirements", Platform: "linux/amd64"}, config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Source != SourceDefault || selection.Profile.PackageManager != "requirements" || selection.Profile.Scanner != "vuelta-pip-tools-scan" || selection.Profile.LockFormats[0] != "requirements-direct" || selection.build == nil || selection.build.Dockerfile != "python-pip-tools.Dockerfile" {
+		t.Fatalf("selection = %#v", selection)
+	}
+}
+
 func profile(id, manager, runtime, managerVersion, lock string) config.ToolchainProfile {
 	return config.ToolchainProfile{
 		Version: config.ToolchainProfileVersion, ID: id, Stack: config.StackNode, PackageManager: manager,

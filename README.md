@@ -26,6 +26,10 @@ platform, non-root user, lock support, and security capabilities. See
 - Package managers (`poetry`/`uv`/`pip-tools`, `npm`/`pnpm`) run only inside
   Docker containers, never on the host — their install scripts execute
   arbitrary code and must stay isolated.
+- A root `requirements.txt` without `requirements.in` is detected as the
+  distinct `python/requirements` profile. Its container only parses exact
+  pins and requests bounded PyPI metadata; it never invokes pip or project
+  code and cannot produce an update snapshot.
 
 ## Layout
 
@@ -247,6 +251,13 @@ uses the registered project containing the current directory; use
 `update` accepts exactly one snapshot ID, revalidates it before environment
 checks or writes, displays its plan, and requires confirmation or `--yes`.
 Use `--dry-run` to run checks in a disposable copy without durable changes.
+
+For a `requirements.txt`-only Python project, candidate discovery remains
+read-only and the result is `scan_only`. JSON includes
+`package_updates: {"status":"scan_only","reason":"manifest_has_no_safe_mutation_contract"}`
+plus bounded per-line `diagnostics`; `snapshot_id` and the human `Next: vuelta
+update ...` instruction are absent. Migrate to a reviewed Poetry, uv, or
+pip-tools source/lock contract before enabling package mutation.
 
 Snapshots are stored in `~/.config/vuelta/update-snapshots` by default (or the
 absolute `update.snapshot_state_dir`). They contain only identity metadata,

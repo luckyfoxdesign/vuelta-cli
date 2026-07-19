@@ -36,6 +36,7 @@ type matrixCase struct {
 	Name              string                  `yaml:"name"`
 	FixtureRoot       string                  `yaml:"fixture_root"`
 	Fixture           string                  `yaml:"fixture"`
+	ScanOnly          bool                    `yaml:"scan_only"`
 	MinReleaseAgeDays int                     `yaml:"min_release_age_days"`
 	Profile           config.ToolchainProfile `yaml:"profile"`
 }
@@ -46,7 +47,15 @@ type commandEnvelope struct {
 		SnapshotID      string   `json:"snapshot_id"`
 		Vulnerabilities []string `json:"vulnerabilities"`
 		InputCategories []string `json:"input_categories"`
-		Stages          []struct {
+		Candidates      []struct {
+			Kind string `json:"kind"`
+			Name string `json:"name"`
+		} `json:"candidates"`
+		PackageUpdates *struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"package_updates"`
+		Stages []struct {
 			Name   string `json:"name"`
 			Status string `json:"status"`
 		} `json:"stages"`
@@ -291,7 +300,9 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 	if err := testfixture.SetupProject(ctx, fixtureRoot, testCase.Fixture, project); err != nil {
 		t.Fatalf("[infrastructure] prepare fixture: %v", err)
 	}
-	writeVerificationFixture(t, ctx, project, testCase.Profile)
+	if !testCase.ScanOnly {
+		writeVerificationFixture(t, ctx, project, testCase.Profile)
+	}
 	attachFixtureRemote(t, ctx, caseRoot, project)
 	sentinelName := "credentials.acceptance-sentinel"
 	if err := os.WriteFile(filepath.Join(project, ".git", "info", "exclude"), []byte(sentinelName+"\n"), 0o600); err != nil {
@@ -328,6 +339,19 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 	runJSONFailure(t, ctx, env, "infrastructure", "egress policy unavailable", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
 	writeConfig(t, configPath, cfg)
 	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
+	if testCase.ScanOnly {
+		if len(scan.Results) != 1 || scan.Results[0].Status != config.VerificationScanOnly || scan.Results[0].SnapshotID != "" || len(scan.Results[0].Candidates) == 0 {
+			t.Fatalf("[scanner] requirements scan did not return scan-only candidates without a snapshot")
+		}
+		if scan.Results[0].Candidates[0].Kind != "requirements" || scan.Results[0].PackageUpdates == nil || scan.Results[0].PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" {
+			t.Fatalf("[parsing] requirements scan omitted the machine-readable mutation contract")
+		}
+		if scan.Results[0].Toolchain == nil || scan.Results[0].Toolchain.ProfileID != testCase.Profile.ID {
+			t.Fatalf("[parsing] scan output omitted selected profile identity")
+		}
+		assertClean(t, ctx, project, "after scan-only requirements scan")
+		return
+	}
 	if len(scan.Results) != 1 || scan.Results[0].Status != "ready" || scan.Results[0].SnapshotID == "" {
 		message := "scan did not create a ready snapshot"
 		if len(scan.Results) == 1 && scan.Results[0].Error != nil {
@@ -367,15 +391,20 @@ func workspaceForCase(name, project string, profile config.ToolchainProfile) con
 		"npm": {"package.json", "package-lock.json"}, "pnpm": {"package.json", "pnpm-lock.yaml"},
 		"bun": {"package.json", "bun.lock"}, "poetry": {"pyproject.toml", "poetry.lock"},
 		"uv": {"pyproject.toml", "uv.lock"}, "pip-tools": {"requirements.in", "requirements.txt"},
+		"requirements": {"requirements.txt"},
+	}
+	verification := config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
+		Name: "profile-version", ComposeFile: "compose.vuelta-acceptance.yml", Service: "verify",
+		Command: []string{profile.Scanner, "--version"}, TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+	}}}
+	if profile.PackageManager == "requirements" {
+		verification = config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}
 	}
 	return config.Workspace{
 		Name: name, Path: project, Stack: profile.Stack, PackageManager: profile.PackageManager,
 		ToolchainProfile: profile.ID, Platform: profile.Platform, Branch: "main", Remote: "origin",
 		AllowedChangedPaths: managerFiles[profile.PackageManager],
-		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
-			Name: "profile-version", ComposeFile: "compose.vuelta-acceptance.yml", Service: "verify",
-			Command: []string{profile.Scanner, "--version"}, TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
-		}}},
+		Verification:        verification,
 	}
 }
 

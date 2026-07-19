@@ -42,7 +42,7 @@ var globalOptionDefinitions = []optionDefinition{
 var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
-		description: "find vulnerabilities with adaptive local scanner toolchains and create read-only update snapshots", group: "Everyday commands",
+		description: "find vulnerabilities and package candidates; create snapshots only for safely mutable manifests", group: "Everyday commands",
 		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory . --execution local", "vuelta scan --all --json"},
 		options: []optionDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
@@ -56,7 +56,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan is read-only. Registered projects are container-only; local execution is allowed only for an explicit unregistered directory."},
+		security:    []string{"Scan is read-only. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Registered projects are container-only; local execution is allowed only for an explicit unregistered directory."},
 		takesConfig: true, handler: "scan",
 	},
 	{
@@ -91,7 +91,7 @@ var commandDefinitions = []commandDefinition{
 		options: []optionDefinition{
 			{names: []string{"--name"}, valueName: "NAME", description: "set the persistent project name (defaults to path basename)"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select python, node, or docker"},
-			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the Python or Node package manager"},
+			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the detected manager or requirements scan profile"},
 			{names: []string{"--toolchain-profile"}, valueName: "ID", description: "select an explicit operator override instead of the detected default"},
 			{names: []string{"--platform"}, valueName: "PLATFORM", description: "select linux/amd64 or linux/arm64"},
 			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},

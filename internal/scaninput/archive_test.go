@@ -139,6 +139,17 @@ func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) 
 	if _, err := PackageContract(config.Workspace{Path: root, Stack: config.StackPython}, false); err == nil {
 		t.Fatal("standalone requirements.txt unexpectedly enabled a package contract")
 	}
+	packageContract, err := PackageContract(config.Workspace{Path: root, Stack: config.StackPython, PackageManager: "requirements"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageBundle, err := Build(context.Background(), root, root, Options{}, packageContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := archiveFiles(t, packageBundle.Archive); !reflect.DeepEqual(got, want) {
+		t.Fatalf("package archive files = %v, want only requirements.txt", sortedKeys(got))
+	}
 }
 
 func TestPythonRequirementsContractRejectsUnsafeInputs(t *testing.T) {

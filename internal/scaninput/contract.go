@@ -58,6 +58,9 @@ var packageFiles = map[string][]File{
 		{Path: "requirements.in", Category: CategoryManifest},
 		{Path: "requirements.txt", Category: CategoryLock},
 	},
+	"python/requirements": {
+		{Path: "requirements.txt", Category: CategoryDependency},
+	},
 	"node/npm": {
 		{Path: "package.json", Category: CategoryManifest},
 		{Path: "package-lock.json", Category: CategoryLock},
@@ -73,12 +76,13 @@ var packageFiles = map[string][]File{
 }
 
 var managerConfigs = map[string][]string{
-	"npm":       {".npmrc"},
-	"pnpm":      {".npmrc", "pnpm-workspace.yaml"},
-	"bun":       {".npmrc", "bunfig.toml"},
-	"poetry":    {"poetry.toml"},
-	"uv":        {},
-	"pip-tools": {"pip.conf"},
+	"npm":          {".npmrc"},
+	"pnpm":         {".npmrc", "pnpm-workspace.yaml"},
+	"bun":          {".npmrc", "bunfig.toml"},
+	"poetry":       {"poetry.toml"},
+	"uv":           {},
+	"pip-tools":    {"pip.conf"},
+	"requirements": {},
 }
 
 // PackageContract returns the manifest/lock inputs for candidate discovery.
@@ -105,7 +109,7 @@ func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, er
 // DependencyContract excludes manager configuration because CVE scanners need
 // only recognized manifests and lockfiles.
 func DependencyContract(ws config.Workspace) (Contract, error) {
-	if ws.Stack == config.StackPython && ws.PackageManager == "" {
+	if ws.Stack == config.StackPython && (ws.PackageManager == "" || ws.PackageManager == "requirements") {
 		return PythonRequirementsContract(), nil
 	}
 	contract, err := PackageContract(ws, false)

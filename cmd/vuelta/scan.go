@@ -35,8 +35,6 @@ const (
 	localScannerStderrTailMaxBytes = 64 << 10
 )
 
-var errRequirementsPackageUnsupported = errors.New("package updates are unsupported for a standalone root requirements.txt without a mutable manifest/lock pair")
-
 type scanTarget struct {
 	workspace *config.Workspace
 	name      string
@@ -81,6 +79,11 @@ type scanStageResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+type packageUpdateAvailability struct {
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
 type scanResult struct {
 	Project         string                     `json:"project,omitempty"`
 	Directory       string                     `json:"directory"`
@@ -96,6 +99,8 @@ type scanResult struct {
 	Warnings        []string                   `json:"warnings"`
 	Verification    []string                   `json:"verification"`
 	Toolchain       *toolchain.Identity        `json:"toolchain,omitempty"`
+	PackageUpdates  *packageUpdateAvailability `json:"package_updates,omitempty"`
+	Diagnostics     []updater.ScanDiagnostic   `json:"diagnostics"`
 	Error           *jsonCommandError          `json:"error,omitempty"`
 }
 
@@ -124,6 +129,7 @@ type scanOptions struct {
 	jsonOutput         bool
 	toolchainProfile   *config.ToolchainProfile
 	toolchainIdentity  *toolchain.Identity
+	packageDiagnostics *[]updater.ScanDiagnostic
 }
 
 func executeScan(args []string) error {
@@ -472,7 +478,7 @@ type scanStageRunners struct {
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{},
 	}
 	if target.err != nil {
 		result = recordScanStageFailure(result, stagePreflight, "target_unavailable", target.err, "Fix the configured workspace path, then run scan again")
@@ -509,6 +515,12 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		if options.execution == "local" {
 			identityConfig.VulnScan.PolicyFile = ""
 		}
+	}
+	if isStandaloneRequirementsWorkspace(identityWorkspace) {
+		identityWorkspace.PackageManager = "requirements"
+		result.Status = config.VerificationScanOnly
+		result.PackageUpdates = &packageUpdateAvailability{Status: config.VerificationScanOnly, Reason: "manifest_has_no_safe_mutation_contract"}
+		result.Warnings = appendUniqueStrings(result.Warnings, "requirements.txt candidates are scan-only; the manifest does not prove dependency ownership and no update snapshot will be created")
 	}
 	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
 	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
@@ -580,33 +592,20 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 
 	var candidates []updatesnapshot.Candidate
+	var packageDiagnostics []updater.ScanDiagnostic
+	options.packageDiagnostics = &packageDiagnostics
 	manager := packageToolName(identityWorkspace)
 	var verified bool
 	var err error
-	if isStandaloneRequirementsWorkspace(identityWorkspace) {
-		manager = "package-manager"
-		err = errRequirementsPackageUnsupported
-	} else if target.dockerErr != nil && options.execution == "container" {
+	if target.dockerErr != nil && options.execution == "container" {
 		err = target.dockerErr
 	} else {
 		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
 	}
+	result.Diagnostics = append(result.Diagnostics, packageDiagnostics...)
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
-		code := "package_scan_failed"
-		hint := "Review the package-manager and execution-mode diagnostics"
-		if errors.Is(err, errRequirementsPackageUnsupported) {
-			code = "package_updates_unsupported"
-			hint = "Add a supported Python manifest/lock pair to enable package updates; vulnerability scanning remains available"
-		}
-		result = recordScanStageFailure(result, stageCandidate, code, err, hint)
-		if errors.Is(err, errRequirementsPackageUnsupported) {
-			warning := "package updates unsupported for standalone root requirements.txt; no update snapshot was created"
-			if hasSucceededStage(result, stageVulnerability) {
-				warning = "vulnerabilities scanned; package updates unsupported for standalone root requirements.txt; no update snapshot was created"
-			}
-			result.Warnings = appendUniqueStrings(result.Warnings, warning)
-		}
+		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
 		result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 		result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
 		return finalizeStageOutcomes(result)
@@ -623,13 +622,21 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	case minAge == 0:
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
 	case unverified && len(result.Candidates) > 0:
-		result.Warnings = append(result.Warnings, "release age could not be verified for one or more candidates; update must fail closed unless explicitly authorized")
+		warning := "release age could not be verified for one or more candidates; update must fail closed unless explicitly authorized"
+		if identityWorkspace.PackageManager == "requirements" {
+			warning = "release age could not be verified for one or more requirements.txt candidates; they remain scan-only and cannot be updated"
+		}
+		result.Warnings = append(result.Warnings, warning)
 		result = addStage(result, stageReleaseAge, stageUnverified, "release age could not be verified for one or more candidates")
 	default:
 		result = addStage(result, stageReleaseAge, stageVerified, "")
 	}
-	if options.allowProjectConfig {
+	if options.allowProjectConfig && identityWorkspace.PackageManager != "requirements" {
 		result.Warnings = append(result.Warnings, "reviewed project package-manager configuration was allowed during scan")
+	}
+	if identityWorkspace.PackageManager == "requirements" {
+		result = addStage(result, stageSnapshot, stageSkipped, "manifest has no safe mutation contract")
+		return finalizeStageOutcomes(result)
 	}
 	if len(result.Candidates) == 0 {
 		result = addStage(result, stageSnapshot, stageSkipped, "no package candidates")
@@ -847,29 +854,24 @@ func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) 
 
 func scanWorkspace(target scanTarget) (config.Workspace, error) {
 	if target.workspace != nil {
-		return *target.workspace, nil
+		workspace := *target.workspace
+		if isStandaloneRequirementsWorkspace(workspace) {
+			workspace.PackageManager = "requirements"
+		}
+		return workspace, nil
 	}
 	project, err := localupdate.Detect(target.path)
 	if err == nil {
 		return workspaceForAdhoc(project), nil
 	}
 	if _, requirementsErr := os.Lstat(filepath.Join(target.path, "requirements.txt")); requirementsErr == nil {
-		return config.Workspace{Path: target.path, Stack: config.StackPython}, nil
+		return config.Workspace{Path: target.path, Stack: config.StackPython, PackageManager: "requirements"}, nil
 	}
 	return config.Workspace{}, err
 }
 
 func isStandaloneRequirementsWorkspace(workspace config.Workspace) bool {
-	return workspace.Stack == config.StackPython && workspace.PackageManager == ""
-}
-
-func hasSucceededStage(result scanResult, name string) bool {
-	for _, stage := range result.Stages {
-		if stage.Name == name && stage.Status == string(stageSucceeded) {
-			return true
-		}
-	}
-	return false
+	return workspace.Stack == config.StackPython && (workspace.PackageManager == "" || workspace.PackageManager == "requirements")
 }
 
 func findingRefs(findings []vulnscan.Finding) []string {
@@ -961,17 +963,41 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		minDays = 0
 	}
 	if target.workspace != nil {
+		workspace, err := scanWorkspace(target)
+		if err != nil {
+			return nil, "package-manager", false, err
+		}
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
-		failOpenUnsupportedReleaseAge(&scanConfig, *target.workspace, options.toolchainIdentity)
-		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(*target.workspace, scanConfig, updater.CandidateScannerOptions{
+		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
+		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
 			AllowProjectConfig: options.allowProjectConfig, RequireTracked: false, ToolchainProfile: options.toolchainProfile,
 		})
 		if err != nil {
-			return nil, target.workspace.PackageManager, false, err
+			return nil, workspace.PackageManager, false, err
 		}
-		candidates, err := candidateScanner.Scan(ctx, target.path)
-		return candidates, packageToolName(*target.workspace), workspaceReleaseAgeVerified(*target.workspace, cfg, minAge, options.toolchainIdentity), err
+		report, err := updater.ScanCandidateReport(ctx, candidateScanner, target.path)
+		if options.packageDiagnostics != nil {
+			*options.packageDiagnostics = append(*options.packageDiagnostics, report.Diagnostics...)
+		}
+		return report.Candidates, packageToolName(workspace), workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
+	}
+	if workspace, detectErr := scanWorkspace(target); detectErr == nil && workspace.PackageManager == "requirements" {
+		if options.execution != "container" {
+			return nil, "requirements", false, errors.New("python/requirements candidate scanning requires --execution container")
+		}
+		scanConfig := cfg
+		scanConfig.Update.MinReleaseAgeDays = minDays
+		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
+		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{RequireTracked: false, ToolchainProfile: options.toolchainProfile})
+		if err != nil {
+			return nil, "requirements", false, err
+		}
+		report, err := updater.ScanCandidateReport(ctx, candidateScanner, target.path)
+		if options.packageDiagnostics != nil {
+			*options.packageDiagnostics = append(*options.packageDiagnostics, report.Diagnostics...)
+		}
+		return report.Candidates, "requirements", workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 	}
 	project, err := localupdate.Detect(target.path)
 	if err != nil {
@@ -1265,6 +1291,9 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 				verification = "unverified release age"
 			}
 			fmt.Printf("  %s %s: %s -> %s (%s)\n", candidate.Kind, candidate.Name, candidate.Current, candidate.Target, verification)
+		}
+		for _, diagnostic := range result.Diagnostics {
+			fmt.Fprintf(os.Stderr, "diagnostic: %s: %s:%d [%s] %s\n", label, diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)
 		}
 		for _, warning := range result.Warnings {
 			fmt.Fprintf(os.Stderr, "warning: %s: %s\n", label, warning)

@@ -65,6 +65,61 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	}
 }
 
+func TestDetectRequirementsOnlyProjectAsScanOnly(t *testing.T) {
+	project := filepath.Join(t.TempDir(), "requirements-project")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, project, "requirements.txt", "Requests[socks]==2.31.0\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Stack != "python" || workspace.PackageManager != "requirements" || workspace.Verification.State != "scan_only" {
+		t.Fatalf("workspace = %#v", workspace)
+	}
+	if got := strings.Join(workspace.AllowedChangedPaths, ","); got != "requirements.txt" {
+		t.Fatalf("allowed paths = %q", got)
+	}
+}
+
+func TestRequirementsInTakesPrecedenceOverRequirementsOnlyDetection(t *testing.T) {
+	project := filepath.Join(t.TempDir(), "pip-tools-project")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, project, "requirements.in", "requests==2.31.0\n")
+	writeProjectFile(t, project, "requirements.txt", "requests==2.31.0\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(discovery.PackageManagers["python"], ","); got != "pip-tools" {
+		t.Fatalf("python managers = %q", got)
+	}
+}
+
+func TestManagedPythonLockTakesPrecedenceOverExportedRequirements(t *testing.T) {
+	project := filepath.Join(t.TempDir(), "poetry-project")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, project, "pyproject.toml", "[project]\nname = \"example\"\n")
+	writeProjectFile(t, project, "poetry.lock", "package = []\n")
+	writeProjectFile(t, project, "requirements.txt", "requests==2.31.0\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(discovery.PackageManagers["python"], ","); got != "poetry" {
+		t.Fatalf("python managers = %q", got)
+	}
+}
+
 func TestBuildRejectsPathsOutsideSelectedProject(t *testing.T) {
 	project := nodeProject(t)
 	discovery, err := Detect(project)

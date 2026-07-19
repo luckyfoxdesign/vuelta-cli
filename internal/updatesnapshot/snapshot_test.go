@@ -185,6 +185,7 @@ func TestValidateCandidatesFailsClosedOneGatePerCase(t *testing.T) {
 		mutate func(*Snapshot)
 	}{
 		{"unsupported kind", func(snapshot *Snapshot) { snapshot.Candidates[0].Kind = "shell" }},
+		{"scan-only requirements kind", func(snapshot *Snapshot) { snapshot.Candidates[0].Kind = "requirements" }},
 		{"flag injection", func(snapshot *Snapshot) { snapshot.Candidates[0].Name = "--registry" }},
 		{"duplicate", func(snapshot *Snapshot) { snapshot.Candidates = append(snapshot.Candidates, snapshot.Candidates[0]) }},
 		{"unverified age", func(snapshot *Snapshot) { snapshot.Candidates[0].ReleaseAgeVerified = false }},

@@ -163,7 +163,7 @@ func runProjectAdd(args []string) error {
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "", "persistent project name")
 	stack := fs.String("stack", "", "selected stack: python, node, or docker")
-	manager := fs.String("package-manager", "", "selected package manager for python or node")
+	manager := fs.String("package-manager", "", "selected package manager or requirements scan profile")
 	toolchainProfile := fs.String("toolchain-profile", "", "operator override profile ID (detected default when omitted)")
 	platform := fs.String("platform", "", "scanner platform: linux/amd64 or linux/arm64")
 	branch := fs.String("branch", "", "protected branch")

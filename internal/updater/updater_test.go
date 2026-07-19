@@ -232,6 +232,16 @@ func TestParsePackageCandidates(t *testing.T) {
 	}
 }
 
+func TestParseRequirementsReportKeepsCandidatesAndDiagnostics(t *testing.T) {
+	report, err := parsePackageReport("requirements", []byte(`{"candidates":[{"name":"demo-pkg","current":"1.0","latest_version":"2.0"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","message":"expected one exact pin"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Candidates) != 1 || report.Candidates[0].Kind != "requirements" || len(report.Diagnostics) != 1 || report.Diagnostics[0].Line != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "package.json", `{}`)
@@ -405,6 +415,29 @@ func TestLegacyBunScannerFailsBeforeDockerResolution(t *testing.T) {
 	_, err := ResolveCandidateScannerWithOptions(ws, config.Config{}, CandidateScannerOptions{})
 	if err == nil || !strings.Contains(err.Error(), "mandatory egress proxy") {
 		t.Fatalf("bun scanner error = %v", err)
+	}
+}
+
+func TestProfileRequirementsScannerSelectsReviewedRequirementsFile(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "requirements.txt", "requests==2.31.0\n")
+	image := "registry.example/vuelta/python312-requirements@sha256:" + strings.Repeat("a", 64)
+	profile := config.ToolchainProfile{
+		Version: config.ToolchainProfileVersion, ID: "python312-requirements", Stack: config.StackPython, PackageManager: "requirements",
+		Runtime: "3.12", PackageManagerVersion: "25.0.1", Scanner: "vuelta-pip-tools-scan", ScannerVersion: "1.1.0",
+		Image: image, Platform: "linux/amd64", User: "10001:10001", LockFormats: []string{"requirements-direct"},
+		Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true},
+	}
+	ws := config.Workspace{Path: root, Stack: config.StackPython, PackageManager: "requirements", Platform: "linux/amd64", ToolchainProfile: profile.ID}
+	resolved, err := ResolveCandidateScannerWithOptions(ws, config.Config{Update: config.UpdateConfig{ToolchainProfiles: []config.ToolchainProfile{profile}}}, CandidateScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := resolved.(combinedScanner)
+	packageScan := combined[0].(packageScanner)
+	want := []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}
+	if packageScan.Kind != "requirements" || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, want) {
+		t.Fatalf("profile scanner = %#v", packageScan)
 	}
 }
 
