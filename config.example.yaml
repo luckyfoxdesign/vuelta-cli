@@ -102,47 +102,6 @@ autofix:
   max_turns: 10
   allowed_tools: "Read,Edit,Grep"  # no Bash: test logs/diffs are untrusted input, see part C of the spec
 
-deploy_task:
-  mode: git_tag           # git_tag | queue_file
-  tag_prefix: "deploy-pending"   # for git_tag: deploy-pending/<project>
-  queue_file: "~/.config/vuelta/tasks.jsonl"  # for queue_file
-
-# Server-only worker configuration. Keep the two private signing keys outside
-# this file; these are base64-encoded Ed25519 *public* keys supplied by CI.
-# The configured Compose service must set image: "${VUELTA_IMAGE}".
-# production_worker:
-#   # This deploy endpoint is deliberately separate from docker.developer.
-#   docker:
-#     socket: "/var/run/docker.sock"
-#     expected_daemon:
-#       id: "<exact-production-daemon-id>"
-#       server_version: "<exact-server-version>"
-#       operating_system: "linux"
-#       architecture: "amd64"
-#       minimum_api_version: "1.44"
-#       required_security_options: ["name=seccomp,profile=builtin"]
-#   state_dir: "/var/lib/vuelta/deploy-state"
-#   source_mode: "signed_queue_file" # signed_queue_file | git_tag
-#   queue_file: "/var/lib/vuelta/delivery/candidates.jsonl"
-#   manifest_dir: "/var/lib/vuelta/delivery/manifests"
-#   candidate_public_key: "<base64-ed25519-public-key>"
-#   manifest_public_key: "<base64-ed25519-public-key>"
-#   # git_tag uses a pre-provisioned bare mirror instead of queue_file:
-#   # git_mirror: "/var/lib/vuelta/tag-mirror.git"
-#   # git_remote: "origin"
-#   # git_expected_origin: "ssh://git@example.invalid/project.git"
-#   # git_tag_prefix: "deploy-pending"
-#   # git_trusted_fingerprint: "<40-or-64-hex-fingerprint>"
-#   max_candidate_age_minutes: 60
-#   operation_timeout_seconds: 120
-#   projects:
-#     - name: api-service
-#       image_repository: "registry.example/vuelta/api-service"
-#       compose_file: "/etc/vuelta/api-service.compose.yml"
-#       service: api
-#       health_url: "https://api.example.com/healthz"
-#       smoke_url: "https://api.example.com/smoke"
-
 workspaces:
   # A requirements.txt-only Python project uses package_manager: requirements
   # and must remain verification.state: scan_only. Scan JSON returns candidates

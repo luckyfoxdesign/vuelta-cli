@@ -19,7 +19,7 @@ app/
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
 ├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
-│                        # toolchain, sandbox, testrunner, autofix, gitops, tasks, notify, logging, scheduler
+│                        # toolchain, sandbox, testrunner, autofix, gitops, notify, logging, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
@@ -70,7 +70,6 @@ make build                     # both cross-build targets
 - `internal/capio/` — provides bounded collectors for untrusted subprocess output. Limits are enforced while the child is still streaming, so host memory stays bounded regardless of how much a process writes: Tail soft-truncates diagnostic output to a marked tail, Limit hard-stops structured output that must be parsed in full.
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
 - `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
-- `internal/deployworker/` — applies authenticated, immutable deployment candidates and restores the previous digest when a rollout is unhealthy.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
 - `internal/egress/` — owns the fail-closed Docker network and registry proxy used by networked scanner stages.
 - `internal/egressproxy/` — implements the embedded registry-allowlisting forward proxy used by Vuelta-managed scanner networks.
@@ -90,7 +89,6 @@ make build                     # both cross-build targets
 - `internal/scaninput/` — TODO: describe this package.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
 - `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update still receives exactly one reviewed snapshot ID.
-- `internal/tasks/` — creates and reads immutable deploy candidates. It never deploys anything: delivery verification and rollback are owned by the production worker.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
 - `internal/toolchain/` — resolves declarative project constraints to an operator override or embedded scan default and builds defaults without executing project code.
@@ -107,7 +105,6 @@ make build                     # both cross-build targets
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.
-- Deploy candidates are immutable handoffs. `internal/deployworker` verifies signed queue/manifest delivery, records state atomically, and rolls back a failed digest-pinned Compose rollout.
 
 ## Conventions
 

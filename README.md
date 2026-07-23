@@ -1,8 +1,8 @@
 # vuelta
 
 A one-shot CLI that creates reviewable dependency-update snapshots, applies
-one explicitly selected snapshot inside a sandbox, runs the project's checks,
-and can queue an immutable deploy task. It has no resident daemon. Optional
+one explicitly selected snapshot inside a sandbox, and runs the project's
+checks. It has no resident daemon. Optional
 launchd/systemd automation invokes the separate `vuelta-scheduler` helper,
 which uses the same JSON `scan` → `update` workflow as a human operator.
 
@@ -47,7 +47,6 @@ internal/
   testrunner/     # runs docker compose test
   autofix/        # optional claude -p invocation on test failure
   gitops/         # commit, push, tags
-  tasks/          # deploy task creation/reading
   notify/         # webhook/telegram notifications
   scheduler/      # scan/update JSON orchestration and aggregate policy
 deploy/           # launchd/systemd scheduler examples
@@ -67,9 +66,9 @@ fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.
 See the file for the full schema:
 notification targets, vulnerability scan settings, GitHub advisories,
-optional package-scanner overrides, autofix, deploy task mode, the list of
-`workspaces` to manage, and the git allowlist that gates which files an
-update is allowed to touch.
+optional package-scanner overrides, autofix, the list of `workspaces` to
+manage, and the git allowlist that gates which files an update is allowed to
+touch.
 
 `vuelta` never scans parent directories or auto-discovers projects: only
 paths listed under `workspaces[]` are ever touched.
@@ -82,8 +81,8 @@ Every Docker child is bound to the reviewed local Unix socket with an explicit
 helper settings are never authority. Before the first caller command, Vuelta
 checks the socket type, ownership, and permissions, then attests the daemon ID,
 exact server version, OS/architecture, minimum API version, and required
-security options. A mismatch fails closed before a scanner, updater, test, or
-deploy command runs.
+security options. A mismatch fails closed before a scanner, updater, or test
+command runs.
 
 Configure development under `docker.developer`. Linux Docker Engine normally
 uses `/var/run/docker.sock`; Docker Desktop on macOS normally uses the
@@ -105,9 +104,7 @@ vuelta --no-input environment bootstrap \
 
 The command normalizes `aarch64` to `arm64` and `x86_64` to `amd64` before
 persisting and attesting image platforms. Re-review the identity after an
-intentional Engine or Docker Desktop upgrade. The server-only worker uses the separate
-`production_worker.docker` block; never reuse a developer socket path in a
-deploy configuration.
+intentional Engine or Docker Desktop upgrade.
 
 Each update starts from `git archive <base SHA>` in a fresh `0700` directory.
 Only tracked regular files are extracted; `.git`, ignored/untracked files,
@@ -291,8 +288,8 @@ After reviewing the returned snapshot, apply exactly that snapshot:
 vuelta update --execution local --yes SNAPSHOT_ID
 ```
 
-Adhoc local execution never creates a commit, push, or deploy candidate and
-does not run project tests. Manifests and locks must be regular root files and
+Adhoc local execution never creates a commit or push and does not run project
+tests. Manifests and locks must be regular root files and
 exactly one supported pair must exist: npm, pnpm, Bun, Poetry, uv, or
 pip-tools. Vuelta resolves the manager only from system `PATH`, rejects a
 manager inside the project, supplies a minimal environment without inherited
@@ -303,19 +300,6 @@ Lifecycle/install scripts remain disabled unless update receives the explicit
 records `--allow-project-config` in the snapshot. The final root allowlist
 check is detection and recovery, not process isolation, so local execution
 should be reserved for reviewed projects and policies.
-
-Deploy candidates are created explicitly after a protected merge:
-
-```bash
-vuelta deploy enqueue --project api-service --commit <full-sha> \
-  --image-digest sha256:<verified-image-digest> \
-  --manifest-digest sha256:<verified-manifest-digest>
-```
-
-The digests must come from the build and security-scan stage; mutable tags and
-branch names are refused. `queue_file` candidates can be inspected with
-`vuelta tasks list`. The local queue is only a handoff record, not proof that
-the production worker received it.
 
 Operational records are written to `~/.local/state/vuelta/vuelta.log` with a
 0700 state directory and 0600 files. A command's `--json` option controls only
@@ -339,32 +323,7 @@ JSON document; child plans and diagnostics are kept on stderr. Adjust the
 example units to the intended unprivileged user, binary paths, and writable
 project paths.
 
-### Verified production deploys
-
-`vuelta deploy worker /etc/vuelta/config.yaml` is a separate, one-shot
-server worker. Its `vuelta-deploy-worker.service`/timer template runs as a
-dedicated unprivileged account with a private state directory. It accepts only
-Ed25519-signed queue records or GPG-signed annotated tags from a configured
-bare mirror, plus a signed manifest, then pulls
-`<allowlisted-repository>@sha256:<digest>`, and never uses a mutable tag,
-`git pull`, source checkout, image build, SSH agent, or database migration.
-
-Configure `production_worker` with public keys/fingerprints only; signing keys
-stay in the CI/delivery system. The queue or bare mirror, manifest directory,
-and state directory must be private absolute paths. Each project has a fixed Compose file/service and
-health and smoke URLs; the Compose service must use `${VUELTA_IMAGE}` as its
-image. Before changing the service, the worker writes its currently running
-RepoDigest as the rollback target. A failed deploy, health check, smoke check,
-timeout, or restart from `running` rolls that digest back and verifies health
-again. Notifications contain only project, candidate ID, status, and digest.
-
-The worker schema intentionally has no migration command. Database migrations
-need a separately reviewed adapter, backup, reversibility proof, and rollback
-plan; they are never part of a dependency deploy.
-
 ## Status
 
-Implemented: configuration, update pipeline, security gates, notifications,
-immutable candidate transport, and the signed-queue production worker with
-durable state and automatic rollback. The build pipeline remains responsible
-for producing and scanning the signed OCI artifact/manifest before delivery.
+Implemented: configuration, scan/update pipeline, security gates, and
+notifications. Phase-2 deployment code is parked outside the tracked build.

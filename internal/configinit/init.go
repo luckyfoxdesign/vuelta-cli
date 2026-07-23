@@ -340,7 +340,6 @@ func NewConfig() *config.Config {
 		Autofix: config.AutofixConfig{
 			Enabled: false, ClaudeBin: "claude", MaxTurns: 10, AllowedTools: "Read,Edit,Grep",
 		},
-		DeployTask: config.DeployTaskConfig{Mode: "git_tag", TagPrefix: "deploy-pending"},
 		Workspaces: []config.Workspace{},
 		Git:        config.GitConfig{PushMode: "review_branch"},
 	}

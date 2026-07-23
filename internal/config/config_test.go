@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,27 +142,6 @@ func TestNotificationReferencesDoNotAffectSnapshotPolicyHash(t *testing.T) {
 	}
 	if withNotify != withoutNotify {
 		t.Fatal("notification references changed the snapshot policy hash")
-	}
-}
-
-func TestValidateProductionWorkerRejectsUnsafeOrIncompleteAdapter(t *testing.T) {
-	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	valid := &ProductionWorkerConfig{
-		Docker: &DockerEndpointConfig{Socket: "/var/run/docker.sock", ExpectedDaemon: DockerDaemonIdentity{
-			ID: "daemon-id", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
-			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
-		}},
-		StateDir: "/var/lib/vuelta/state", SourceMode: "signed_queue_file", QueueFile: "/var/lib/vuelta/queue.jsonl", ManifestDir: "/var/lib/vuelta/manifests",
-		CandidatePublicKey: key, ManifestPublicKey: key, MaxCandidateAgeMinutes: 60, OperationTimeoutSecond: 120,
-		Projects: []ProductionProject{{Name: "api", ImageRepository: "registry.example/vuelta/api", ComposeFile: "/etc/vuelta/api.compose.yml", Service: "api", HealthURL: "https://api.example.com/healthz", SmokeURL: "https://api.example.com/smoke"}},
-	}
-	if errs := validateProductionWorker(valid); len(errs) != 0 {
-		t.Fatalf("valid production worker errors = %v", errs)
-	}
-	valid.Projects[0].ImageRepository = "registry.example/vuelta/api:latest"
-	valid.Projects[0].SmokeURL = "http://api.example.com/smoke"
-	if errs := validateProductionWorker(valid); len(errs) == 0 {
-		t.Fatal("expected unsafe production adapter to be rejected")
 	}
 }
 

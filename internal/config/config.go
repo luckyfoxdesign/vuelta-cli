@@ -6,7 +6,6 @@ package config
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,15 +42,12 @@ type Config struct {
 	GithubAdvisories GithubAdvisoriesConfig  `yaml:"github_advisories"`
 	Update           UpdateConfig            `yaml:"update"`
 	Autofix          AutofixConfig           `yaml:"autofix"`
-	DeployTask       DeployTaskConfig        `yaml:"deploy_task"`
-	ProductionWorker *ProductionWorkerConfig `yaml:"production_worker,omitempty"`
 	Workspaces       []Workspace             `yaml:"workspaces"`
 	Git              GitConfig               `yaml:"git"`
 }
 
 // DockerConfig holds the developer-side daemon authority used by scan and
-// update. The production deploy worker has a separate endpoint below so the
-// two trust domains cannot be selected by the same inherited context.
+// update.
 type DockerConfig struct {
 	Developer *DockerEndpointConfig `yaml:"developer,omitempty"`
 }
@@ -198,44 +194,6 @@ type AutofixConfig struct {
 	ClaudeBin      string `yaml:"claude_bin"`
 	MaxTurns       int    `yaml:"max_turns"`
 	AllowedTools   string `yaml:"allowed_tools"`
-}
-
-type DeployTaskConfig struct {
-	Mode      string `yaml:"mode"`
-	TagPrefix string `yaml:"tag_prefix"`
-	QueueFile string `yaml:"queue_file"`
-}
-
-// ProductionWorkerConfig configures the server-only deploy worker. Its public
-// keys authenticate delivery and manifests; private signing keys are never
-// read by vuelta or stored in this file.
-type ProductionWorkerConfig struct {
-	Docker                 *DockerEndpointConfig `yaml:"docker,omitempty"`
-	StateDir               string                `yaml:"state_dir"`
-	SourceMode             string                `yaml:"source_mode"`
-	QueueFile              string                `yaml:"queue_file"`
-	ManifestDir            string                `yaml:"manifest_dir"`
-	CandidatePublicKey     string                `yaml:"candidate_public_key"`
-	GitMirror              string                `yaml:"git_mirror"`
-	GitRemote              string                `yaml:"git_remote"`
-	GitExpectedOrigin      string                `yaml:"git_expected_origin"`
-	GitTagPrefix           string                `yaml:"git_tag_prefix"`
-	GitTrustedFingerprint  string                `yaml:"git_trusted_fingerprint"`
-	ManifestPublicKey      string                `yaml:"manifest_public_key"`
-	MaxCandidateAgeMinutes int                   `yaml:"max_candidate_age_minutes"`
-	OperationTimeoutSecond int                   `yaml:"operation_timeout_seconds"`
-	Projects               []ProductionProject   `yaml:"projects"`
-}
-
-// ProductionProject is a fixed per-project Compose adapter. There are no
-// migration commands or arbitrary shell snippets in the production schema.
-type ProductionProject struct {
-	Name            string `yaml:"name"`
-	ImageRepository string `yaml:"image_repository"`
-	ComposeFile     string `yaml:"compose_file"`
-	Service         string `yaml:"service"`
-	HealthURL       string `yaml:"health_url"`
-	SmokeURL        string `yaml:"smoke_url"`
 }
 
 const (
@@ -573,8 +531,6 @@ func (c *Config) Validate() error {
 
 	errs = append(errs, validateSecurityConfig(*c)...)
 	errs = append(errs, validateNotifyConfig(c.Notify)...)
-	errs = append(errs, validateDeployTask(c.DeployTask)...)
-	errs = append(errs, validateProductionWorker(c.ProductionWorker)...)
 	if c.Git.PushMode != "" && c.Git.PushMode != "review_branch" && c.Git.PushMode != "direct_branch" {
 		errs = append(errs, fmt.Errorf("git.push_mode: %q is not supported (review_branch|direct_branch)", c.Git.PushMode))
 	}
@@ -711,66 +667,6 @@ func validateEgress(c EgressConfig) []error {
 	return errs
 }
 
-func validateProductionWorker(c *ProductionWorkerConfig) []error {
-	if c == nil {
-		return nil
-	}
-	var errs []error
-	errs = append(errs, validateDockerEndpoint("production_worker.docker", c.Docker, true)...)
-	if !filepath.IsAbs(c.StateDir) || !filepath.IsAbs(c.ManifestDir) {
-		errs = append(errs, errors.New("production_worker state_dir and manifest_dir must be absolute paths"))
-	}
-	if c.MaxCandidateAgeMinutes <= 0 || c.OperationTimeoutSecond <= 0 {
-		errs = append(errs, errors.New("production_worker max_candidate_age_minutes and operation_timeout_seconds must be positive"))
-	}
-	for field, encoded := range map[string]string{"manifest_public_key": c.ManifestPublicKey} {
-		decoded, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(decoded) != 32 {
-			errs = append(errs, fmt.Errorf("production_worker.%s must be a base64 Ed25519 public key", field))
-		}
-	}
-	switch c.SourceMode {
-	case "signed_queue_file":
-		if !filepath.IsAbs(c.QueueFile) {
-			errs = append(errs, errors.New("production_worker.queue_file must be an absolute path for signed_queue_file"))
-		}
-		decoded, err := base64.StdEncoding.DecodeString(c.CandidatePublicKey)
-		if err != nil || len(decoded) != 32 {
-			errs = append(errs, errors.New("production_worker.candidate_public_key must be a base64 Ed25519 public key for signed_queue_file"))
-		}
-	case "git_tag":
-		if !filepath.IsAbs(c.GitMirror) || c.GitRemote == "" || c.GitExpectedOrigin == "" || c.GitTagPrefix == "" || !regexp.MustCompile(`^[A-Fa-f0-9]{40,64}$`).MatchString(c.GitTrustedFingerprint) {
-			errs = append(errs, errors.New("production_worker git_tag requires absolute git_mirror, remote, expected_origin, tag_prefix, and an allowlisted signing fingerprint"))
-		}
-	default:
-		errs = append(errs, errors.New("production_worker.source_mode must be signed_queue_file or git_tag"))
-	}
-	if len(c.Projects) == 0 {
-		errs = append(errs, errors.New("production_worker.projects: at least one project is required"))
-	}
-	seen := make(map[string]bool)
-	for i, project := range c.Projects {
-		label := fmt.Sprintf("production_worker.projects[%d]", i)
-		if !projectNamePattern.MatchString(project.Name) || seen[project.Name] {
-			errs = append(errs, fmt.Errorf("%s.name must be a unique project name", label))
-		}
-		seen[project.Name] = true
-		if !validImageRepository(project.ImageRepository) {
-			errs = append(errs, fmt.Errorf("%s.image_repository must be an allowlisted repository without a tag or digest", label))
-		}
-		if !filepath.IsAbs(project.ComposeFile) || !projectNamePattern.MatchString(project.Service) {
-			errs = append(errs, fmt.Errorf("%s.compose_file must be absolute and service must be a compose service name", label))
-		}
-		for name, rawURL := range map[string]string{"health_url": project.HealthURL, "smoke_url": project.SmokeURL} {
-			u, err := url.Parse(rawURL)
-			if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || (u.Scheme == "http" && u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1") {
-				errs = append(errs, fmt.Errorf("%s.%s must be HTTPS or loopback HTTP", label, name))
-			}
-		}
-	}
-	return errs
-}
-
 func validateDockerEndpoint(label string, endpoint *DockerEndpointConfig, required bool) []error {
 	if endpoint == nil {
 		if required {
@@ -803,33 +699,6 @@ func validateDockerEndpoint(label string, endpoint *DockerEndpointConfig, requir
 			errs = append(errs, fmt.Errorf("%s.expected_daemon.required_security_options[%d]: must be a unique bounded exact option", label, i))
 		}
 		seen[option] = true
-	}
-	return errs
-}
-
-func validImageRepository(repository string) bool {
-	if repository == "" || strings.Contains(repository, "@") || strings.ContainsAny(repository, " \t\n") {
-		return false
-	}
-	lastSlash := strings.LastIndexByte(repository, '/')
-	return !strings.Contains(repository[lastSlash+1:], ":")
-}
-
-func validateDeployTask(c DeployTaskConfig) []error {
-	var errs []error
-	switch c.Mode {
-	case "git_tag":
-		if c.TagPrefix == "" {
-			errs = append(errs, errors.New("deploy_task.tag_prefix: required for git_tag"))
-		}
-	case "queue_file":
-		if c.QueueFile == "" {
-			errs = append(errs, errors.New("deploy_task.queue_file: required for queue_file"))
-		}
-	case "":
-		errs = append(errs, errors.New("deploy_task.mode: required (git_tag|queue_file)"))
-	default:
-		errs = append(errs, fmt.Errorf("deploy_task.mode: %q is not supported (git_tag|queue_file)", c.Mode))
 	}
 	return errs
 }

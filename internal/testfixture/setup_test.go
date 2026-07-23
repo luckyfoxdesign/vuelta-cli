@@ -12,7 +12,6 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
-	"github.com/luckyfoxdesign/vuelta/internal/tasks"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 )
 
@@ -70,25 +69,6 @@ func TestRegistryCapturesDigestBeforeMutableTagChanges(t *testing.T) {
 		t.Fatalf("current digest = %q, %v", current, err)
 	}
 	var _ updater.DigestResolver = registry.Resolve
-}
-
-func TestDeployTargetRejectsDuplicateAndRollsBack(t *testing.T) {
-	oldDigest := "sha256:" + strings.Repeat("a", 64)
-	newDigest := "sha256:" + strings.Repeat("b", 64)
-	target := NewDeployTarget(oldDigest)
-	creator := tasks.Creator{Config: config.DeployTaskConfig{Mode: "queue_file", QueueFile: filepath.Join(t.TempDir(), "candidates.jsonl")}}
-	candidate, created, err := creator.Create(context.Background(), tasks.CreateInput{Project: "fixture-app", CommitSHA: strings.Repeat("c", 40), ImageDigest: newDigest, ManifestDigest: "sha256:" + strings.Repeat("d", 64)})
-	if err != nil || !created {
-		t.Fatalf("create queue candidate = %+v, %v, created=%t", candidate, err, created)
-	}
-	target.FailNextHealthCheck()
-	result, err := target.Apply(candidate)
-	if err != nil || result.Status != "rolled_back" || target.CurrentDigest() != oldDigest {
-		t.Fatalf("Apply() = %+v, %v; current=%s", result, err, target.CurrentDigest())
-	}
-	if _, err := target.Apply(candidate); err == nil {
-		t.Fatal("expected duplicate candidate rejection")
-	}
 }
 
 func TestMockClaudeScriptHasExplicitModes(t *testing.T) {

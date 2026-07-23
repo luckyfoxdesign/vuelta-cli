@@ -7,10 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"sync"
-
-	"github.com/luckyfoxdesign/vuelta/internal/tasks"
 )
 
 // GitHubAlertsHandler is a read-only deterministic stand-in for the two
@@ -102,62 +99,6 @@ func (r *Registry) SetTag(ref, digest string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tags[ref] = digest
-}
-
-// DeployTarget models the externally visible lifecycle of a production
-// target. It deliberately accepts only immutable candidate fields; signature
-// verification and the actual rollout adapter remain production-worker work.
-type DeployTarget struct {
-	mu       sync.Mutex
-	seen     map[string]bool
-	current  string
-	previous string
-	failNext bool
-}
-
-// DeployResult is the secret-free result returned by the fixture target.
-type DeployResult struct {
-	Status         string
-	CurrentDigest  string
-	RollbackDigest string
-}
-
-var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
-func NewDeployTarget(currentDigest string) *DeployTarget {
-	return &DeployTarget{seen: make(map[string]bool), current: currentDigest}
-}
-
-// FailNextHealthCheck makes the next otherwise valid apply roll back.
-func (t *DeployTarget) FailNextHealthCheck() { t.mu.Lock(); t.failNext = true; t.mu.Unlock() }
-
-// Apply rejects malformed or repeated candidates before changing state and
-// rolls back on the requested simulated health-check failure.
-func (t *DeployTarget) Apply(candidate tasks.Candidate) (DeployResult, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if candidate.ID == "" || !shaPattern.MatchString(candidate.CommitSHA) || !digestPattern.MatchString(candidate.ImageDigest) || !digestPattern.MatchString(candidate.ManifestDigest) {
-		return DeployResult{}, fmt.Errorf("fixture deploy target: invalid candidate")
-	}
-	if t.seen[candidate.ID] {
-		return DeployResult{}, fmt.Errorf("fixture deploy target: duplicate candidate")
-	}
-	t.seen[candidate.ID] = true
-	t.previous = t.current
-	if t.failNext {
-		t.failNext = false
-		return DeployResult{Status: "rolled_back", CurrentDigest: t.current, RollbackDigest: t.previous}, nil
-	}
-	t.current = candidate.ImageDigest
-	return DeployResult{Status: "healthy", CurrentDigest: t.current, RollbackDigest: t.previous}, nil
-}
-
-// CurrentDigest is exposed only for deterministic test assertions.
-func (t *DeployTarget) CurrentDigest() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.current
 }
 
 // MockClaudeMode documents the two modes supported by testdata/mock-claude.

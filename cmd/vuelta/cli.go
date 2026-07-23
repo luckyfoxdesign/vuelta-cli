@@ -145,37 +145,6 @@ var commandDefinitions = []commandDefinition{
 		takesConfig: true, handler: "environment bootstrap",
 	},
 	{
-		path: []string{"tasks"}, usage: "vuelta tasks <command>",
-		description: "inspect deployment tasks", group: "Operations",
-		examples: []string{"vuelta tasks list"},
-	},
-	{
-		path: []string{"tasks", "list"}, usage: "vuelta tasks list [config-path]",
-		description: "list pending deployment candidates", examples: []string{"vuelta tasks list"},
-		takesConfig: true, handler: "tasks list",
-	},
-	{
-		path: []string{"deploy"}, usage: "vuelta deploy <command>",
-		description: "enqueue or process deployment candidates", group: "CI and server commands", hidden: true,
-		examples: []string{"vuelta deploy enqueue --project api --commit SHA --image-digest SHA256 --manifest-digest SHA256", "vuelta deploy worker"},
-	},
-	{
-		path: []string{"deploy", "enqueue"}, usage: "vuelta deploy enqueue --project NAME --commit SHA --image-digest SHA256 --manifest-digest SHA256 [config-path]",
-		description: "enqueue an approved immutable deployment candidate", hidden: true,
-		options: []optionDefinition{
-			{names: []string{"--project"}, valueName: "NAME", description: "configured project name (required)"},
-			{names: []string{"--commit"}, valueName: "SHA", description: "approved full commit SHA (required)"},
-			{names: []string{"--image-digest"}, valueName: "SHA256", description: "verified OCI image digest (required)"},
-			{names: []string{"--manifest-digest"}, valueName: "SHA256", description: "verified deploy manifest digest (required)"},
-		},
-		takesConfig: true, handler: "deploy enqueue",
-	},
-	{
-		path: []string{"deploy", "worker"}, usage: "vuelta deploy worker [config-path]",
-		description: "process authenticated deployment candidates", hidden: true,
-		takesConfig: true, handler: "deploy worker",
-	},
-	{
 		path: []string{"help"}, usage: "vuelta help [command] [--all]",
 		description: "show top-level or command-specific help", group: "Help",
 		examples: []string{"vuelta help scan", "vuelta help update", "vuelta help --all"},
@@ -507,12 +476,6 @@ func dispatchCommand(handler string, args []string) error {
 		return runProjectList(args)
 	case "project add":
 		return runProjectAdd(args)
-	case "tasks list":
-		return runTasks(append([]string{"list"}, args...))
-	case "deploy enqueue":
-		return runDeploy(append([]string{"enqueue"}, args...))
-	case "deploy worker":
-		return runDeployWorker(args)
 	default:
 		return fail(exitConfig, "command %q is not executable", handler)
 	}

@@ -14,9 +14,6 @@ Configuration:
   config       create or validate configuration
   environment  trust local execution environments
 
-Operations:
-  tasks        inspect deployment tasks
-
 Help:
   help         show top-level or command-specific help
 
