@@ -13,12 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
-	"github.com/luckyfoxdesign/vuelta/internal/localexec"
-	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -29,11 +28,9 @@ import (
 )
 
 const (
-	exitEnv                        = 4
-	exitFindings                   = 5
-	exitPartial                    = 6
-	localScannerStdoutMaxBytes     = 64 << 20
-	localScannerStderrTailMaxBytes = 64 << 10
+	exitEnv      = 4
+	exitFindings = 5
+	exitPartial  = 6
 )
 
 type scanTarget struct {
@@ -125,7 +122,6 @@ type scanOptions struct {
 	policyPath         string
 	minReleaseAge      string
 	allowProjectConfig bool
-	execution          string
 	failOn             string
 	jsonOutput         bool
 	toolchainProfile   *config.ToolchainProfile
@@ -147,22 +143,17 @@ func executeScan(args []string) error {
 	if targetErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", targetErr), "Choose one of --project, --directory, or --all")
 	}
-	if executionErr := validateScanExecution(targets, options); executionErr != nil {
-		return scanTopLevelFailure(options.jsonOutput, "invalid_execution", fail(exitConfig, "%v", executionErr), "Use --execution container or select an unregistered --directory")
-	}
 	dockerReady := false
-	if options.execution == "container" {
-		dockerErr := configureDeveloperDocker(*cfg)
-		if dockerErr == nil {
-			_, dockerErr = dockerexec.Default().Path()
+	dockerErr := configureDeveloperDocker(*cfg)
+	if dockerErr == nil {
+		_, dockerErr = dockerexec.Default().Path()
+	}
+	if dockerErr != nil {
+		for index := range targets {
+			targets[index].dockerErr = fmt.Errorf("approved Docker endpoint is unavailable: %w", dockerErr)
 		}
-		if dockerErr != nil {
-			for index := range targets {
-				targets[index].dockerErr = fmt.Errorf("approved Docker endpoint is unavailable: %w", dockerErr)
-			}
-		} else {
-			dockerReady = true
-		}
+	} else {
+		dockerReady = true
 	}
 	policy, policyIdentity, policyErr := loadScanPolicy(options.policyPath)
 	if policyErr != nil {
@@ -174,7 +165,7 @@ func executeScan(args []string) error {
 	}
 	ctx := context.Background()
 	var egressSession *egress.Session
-	if options.execution == "container" && dockerReady {
+	if dockerReady {
 		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
 		ctx = egress.WithSession(ctx, egressSession)
 	}
@@ -209,15 +200,6 @@ func executeScan(args []string) error {
 	return scanResultError(summary, options.failOn)
 }
 
-func validateScanExecution(targets []scanTarget, options scanOptions) error {
-	for _, target := range targets {
-		if target.origin == updatesnapshot.OriginWorkspace && options.execution == "local" {
-			return fmt.Errorf("registered project %q is container-only; --execution local is allowed only with an unregistered --directory", target.name)
-		}
-	}
-	return nil
-}
-
 func scanResultError(summary scanSummary, failOn string) error {
 	if summary.Failed > 0 && summary.Succeeded == 0 && summary.Partial == 0 {
 		return fail(exitFailure, "%d scan target(s) failed", summary.Failed)
@@ -244,7 +226,6 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.policyPath, "policy", "", "standalone package policy")
 	fs.StringVar(&options.minReleaseAge, "min-release-age", "", "minimum release age")
 	fs.BoolVar(&options.allowProjectConfig, "allow-project-config", false, "honor reviewed package-manager config")
-	fs.StringVar(&options.execution, "execution", "container", "container or local")
 	fs.StringVar(&options.failOn, "fail-on", "", "return 5 for vulnerability findings")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
 	if err := fs.Parse(args); err != nil {
@@ -258,9 +239,6 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	}
 	if options.only != "" && options.only != "vulnerabilities" && options.only != "packages" {
 		return options, "", fail(exitConfig, "--only must be vulnerabilities or packages")
-	}
-	if options.execution != "container" && options.execution != "local" {
-		return options, "", fail(exitConfig, "--execution must be container or local")
 	}
 	if options.failOn != "" && options.failOn != "vulnerabilities" {
 		return options, "", fail(exitConfig, "--fail-on must be vulnerabilities")
@@ -489,7 +467,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 type scanStageRunners struct {
-	vulnerabilities  func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error)
+	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]string, string, bool, error)
 	alerts           func(context.Context, config.Config, scanTarget) ([]string, bool, error)
 	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
@@ -497,7 +475,7 @@ type scanStageRunners struct {
 
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
-		Project: target.name, Directory: target.path, Origin: target.origin, Execution: options.execution,
+		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
 		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{},
 	}
 	if target.err != nil {
@@ -532,9 +510,6 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			return finalizeStageOutcomes(result)
 		}
 		identityWorkspace = detectedWorkspace
-		if options.execution == "local" {
-			identityConfig.VulnScan.PolicyFile = ""
-		}
 	}
 	if isStandaloneRequirementsWorkspace(identityWorkspace) {
 		identityWorkspace.PackageManager = "requirements"
@@ -558,10 +533,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		tool := cfg.VulnScan.DependencySource
 		requested := true
 		var scanErr error
-		if target.dockerErr != nil && vulnerabilityStageUsesDocker(cfg, identityWorkspace, options.execution) {
+		if target.dockerErr != nil && vulnerabilityStageUsesDocker(cfg, identityWorkspace) {
 			scanErr = target.dockerErr
 		} else {
-			findings, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options.execution)
+			findings, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
 		}
 		if !requested {
 			result = addStage(result, stageVulnerability, stageNotRequested, "")
@@ -594,7 +569,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		return finalizeStageOutcomes(result)
 	}
 
-	if options.execution == "container" && identityWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
+	if identityWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
 		prepared, prepareErr := runners.prepareToolchain(ctx, cfg, identityWorkspace)
 		if prepareErr != nil {
 			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(identityWorkspace), Status: "failed", Reason: prepareErr.Error()})
@@ -617,7 +592,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	manager := packageToolName(identityWorkspace)
 	var verified bool
 	var err error
-	if target.dockerErr != nil && options.execution == "container" {
+	if target.dockerErr != nil {
 		err = target.dockerErr
 	} else {
 		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
@@ -625,7 +600,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result.Diagnostics = append(result.Diagnostics, packageDiagnostics...)
 	if err != nil {
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "failed", Reason: err.Error()})
-		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and execution-mode diagnostics")
+		result = recordScanStageFailure(result, stageCandidate, "package_scan_failed", err, "Review the package-manager and container diagnostics")
 		result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 		result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
 		return finalizeStageOutcomes(result)
@@ -680,10 +655,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 
 	var selectedToolchain toolchain.Identity
-	if options.execution == "container" && options.toolchainIdentity != nil {
+	if options.toolchainIdentity != nil {
 		selectedToolchain = *options.toolchainIdentity
 		result.Toolchain = options.toolchainIdentity
-	} else if options.execution == "container" && identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+	} else if identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
 		if resolveErr != nil {
 			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", resolveErr, "Fix the selected toolchain profile before creating an update snapshot")
@@ -827,18 +802,12 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget, execution string) ([]string, string, bool, error) {
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]string, string, bool, error) {
 	workspace, err := scanWorkspace(target)
 	if err != nil {
 		return nil, cfg.VulnScan.DependencySource, true, err
 	}
 	scanner := vulnscan.NewReadOnlyScanner()
-	if execution == "local" {
-		localConfig := cfg
-		localConfig.VulnScan.PolicyFile = ""
-		cfg = localConfig
-		scanner = vulnscan.NewAdhocScanner(localScannerCommand)
-	}
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
 			return nil, "trivy-images", false, nil
@@ -850,10 +819,7 @@ func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanT
 	return findingRefs(report.Findings), cfg.VulnScan.DependencySource, true, scanErr
 }
 
-func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace, execution string) bool {
-	if execution != "container" {
-		return false
-	}
+func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace) bool {
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		return cfg.VulnScan.ImageScan.Enabled && workspace.DockerImages != nil
 	}
@@ -880,7 +846,7 @@ func scanWorkspace(target scanTarget) (config.Workspace, error) {
 		}
 		return workspace, nil
 	}
-	project, err := localupdate.Detect(target.path)
+	project, err := adhoc.Detect(target.path)
 	if err == nil {
 		return workspaceForAdhoc(project), nil
 	}
@@ -917,66 +883,6 @@ func appendUniqueStrings(values []string, additions ...string) []string {
 	return values
 }
 
-func localScannerCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
-	return localScannerCommandWith(nil, localexec.RunStructured)(ctx, dir, name, args...)
-}
-
-type localScannerRunner func(context.Context, string, string, []string, []string, int, int) (localexec.Result, error)
-
-func localScannerCommandWith(resolve localexec.Resolver, run localScannerRunner) vulnscan.Command {
-	return func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
-		binary, err := localexec.Resolve(dir, name, resolve)
-		if err != nil {
-			return nil, fmt.Errorf("resolve local scanner %s: %w", name, err)
-		}
-		environment, err := localexec.NewEnvironment()
-		if err != nil {
-			return nil, fmt.Errorf("prepare local scanner %s: %w", name, err)
-		}
-
-		localArgs := append([]string(nil), args...)
-		for index, argument := range localArgs {
-			if argument == "/project" {
-				localArgs[index] = dir
-			}
-		}
-		result, err := run(ctx, binary, dir, localArgs, environment.Variables(), localScannerStdoutMaxBytes, localScannerStderrTailMaxBytes)
-		if cleanupErr := environment.Close(); cleanupErr != nil {
-			err = errors.Join(err, fmt.Errorf("remove private local-scanner state: %w", cleanupErr))
-		}
-		if err != nil {
-			category, detail := localexec.Classify(err, result)
-			return nil, &localScanError{tool: name, category: category, exitCode: -1, detail: detail, err: err}
-		}
-		if result.ExitCode != 0 {
-			category, detail := localexec.Classify(nil, result)
-			return nil, &localScanError{tool: name, category: category, exitCode: result.ExitCode, detail: detail}
-		}
-		return result.Output, nil
-	}
-}
-
-// localScanError reports a local-tool scanner failure without embedding raw,
-// unbounded, or unredacted subprocess output in its top-level message. The
-// safe category/exit code/bounded detail are recovered via
-// classifySubprocessError.
-type localScanError struct {
-	tool     string
-	category safeerr.Category
-	exitCode int
-	detail   string
-	err      error
-}
-
-func (e *localScanError) Error() string {
-	if e.err != nil {
-		return fmt.Sprintf("run local %s scanner failed", e.tool)
-	}
-	return fmt.Sprintf("local %s scanner exited %d", e.tool, e.exitCode)
-}
-
-func (e *localScanError) Unwrap() error { return e.err }
-
 func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, minAge time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 	minDays := int((minAge + 24*time.Hour - 1) / (24 * time.Hour))
 	if minAge == 0 {
@@ -1003,9 +909,6 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		return report.Candidates, packageToolName(workspace), workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 	}
 	if workspace, detectErr := scanWorkspace(target); detectErr == nil && workspace.PackageManager == "requirements" {
-		if options.execution != "container" {
-			return nil, "requirements", false, errors.New("python/requirements candidate scanning requires --execution container")
-		}
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
 		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
@@ -1019,22 +922,9 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		}
 		return report.Candidates, "requirements", workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 	}
-	project, err := localupdate.Detect(target.path)
+	project, err := adhoc.Detect(target.path)
 	if err != nil {
 		return nil, "package-manager", false, err
-	}
-	if options.execution == "local" {
-		localPolicy := policy
-		localPolicy.MinReleaseAgeDays = minDays
-		result, scanErr := localupdate.NewService().Scan(ctx, target.path, localPolicy, options.allowProjectConfig)
-		if scanErr != nil {
-			return nil, project.Manager, false, scanErr
-		}
-		candidates := make([]updatesnapshot.Candidate, 0, len(result.Candidates))
-		for _, candidate := range result.Candidates {
-			candidates = append(candidates, updatesnapshot.Candidate{Kind: project.Manager, Name: candidate.Name, Current: candidate.Current, Target: candidate.Target})
-		}
-		return candidates, project.Manager, result.ReleaseAgeUsed, nil
 	}
 	workspace := workspaceForAdhoc(project)
 	scanConfig := cfg
@@ -1050,7 +940,7 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 	return candidates, project.Manager, workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 }
 
-func workspaceForAdhoc(project localupdate.Project) config.Workspace {
+func workspaceForAdhoc(project adhoc.Project) config.Workspace {
 	stack := config.StackNode
 	if project.Manager == "poetry" || project.Manager == "uv" || project.Manager == "pip-tools" {
 		stack = config.StackPython
@@ -1246,17 +1136,12 @@ func scanFailureContract(code, hint string, err error) (string, string) {
 }
 
 // classifySubprocessError extracts a safe category, exit code, and bounded
-// redacted diagnostic tail from an error that may originate from a hardened
-// dockerexec or localexec command boundary. It never inspects argv,
-// environment, or unbounded output, and returns zero values when err does
-// not originate from a recognized command boundary.
+// redacted diagnostic tail from an error that may originate from the hardened
+// dockerexec command boundary. It never inspects argv, environment, or
+// unbounded output, and returns zero values for other errors.
 func classifySubprocessError(err error) (category string, exitCode *int, detail string) {
 	if dockerCategory, code, dockerDetail := dockerexec.Classify(err); dockerCategory != safeerr.CategoryUnknown || dockerDetail != "" {
 		return string(dockerCategory), exitCodePtr(code), dockerDetail
-	}
-	var localErr *localScanError
-	if errors.As(err, &localErr) {
-		return string(localErr.category), exitCodePtr(localErr.exitCode), localErr.detail
 	}
 	return "", nil, ""
 }

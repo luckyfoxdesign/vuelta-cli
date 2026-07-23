@@ -269,35 +269,33 @@ changes do not alter the input manifest. A missing, older-format, malformed,
 expired, reconfigured, dirty, rebased, or changed-input snapshot exits with
 code 3 before any package manager runs; create a fresh scan instead.
 
-### Explicit adhoc local execution
+### Explicit adhoc container scans
 
-An unregistered directory can use local package tools only through an explicit
-scan and update mode. Copy `local.example.yaml` to a private policy file,
-restrict `allowed_packages`, and create the snapshot without writing:
+An unregistered directory can be scanned explicitly without adding it to the
+main config. Copy `local.example.yaml` to a private policy file, restrict
+`allowed_packages`, and create the snapshot without writing:
 
 ```bash
-vuelta scan --directory /path/to/project --execution local \
+vuelta scan --directory /path/to/project \
   --policy ./vuelta-local.yaml --only packages
 ```
 
 After reviewing the returned snapshot, apply exactly that snapshot:
 
 ```bash
-vuelta update --execution local --yes SNAPSHOT_ID
+vuelta update --yes SNAPSHOT_ID
 ```
 
-Adhoc local execution never creates a commit or push and does not run project
-tests. Manifests and locks must be regular root files and
-exactly one supported pair must exist: npm, pnpm, Bun, Poetry, uv, or
-pip-tools. Vuelta resolves the manager only from system `PATH`, rejects a
-manager inside the project, supplies a minimal environment without inherited
-credentials, uses a private writable copy, and never runs a shell.
+Adhoc execution never creates a commit or push and does not run project tests.
+Manifests and locks must be regular root files and exactly one supported pair
+must exist: npm, pnpm, Bun, Poetry, uv, or pip-tools. Package-manager and
+scanner processes run only in hardened containers; host PATH is never used.
 
 Lifecycle/install scripts remain disabled unless update receives the explicit
 `--allow-scripts` gate. Project manager configuration is ignored unless scan
-records `--allow-project-config` in the snapshot. The final root allowlist
-check is detection and recovery, not process isolation, so local execution
-should be reserved for reviewed projects and policies.
+records `--allow-project-config` in the snapshot. Updates run against a
+minimal private copy and atomically copy back only the recognized manifest and
+lock files after the changed-path check succeeds.
 
 Operational records are written to `~/.local/state/vuelta/vuelta.log` with a
 0700 state directory and 0600 files. A command's `--json` option controls only

@@ -18,7 +18,7 @@ app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
-├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
+├── internal/            # config, adhoc, scanner, updater, updatesnapshot, vulnscan, githubalerts,
 │                        # toolchain, sandbox, testrunner, gitops, notify, logging, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
@@ -66,6 +66,7 @@ make build                     # both cross-build targets
 
 ## Notable Directories
 
+- `internal/adhoc/` — detects explicit unregistered project roots and prepares minimal private copies for container-only updates.
 - `internal/capio/` — provides bounded collectors for untrusted subprocess output. Limits are enforced while the child is still streaming, so host memory stays bounded regardless of how much a process writes: Tail soft-truncates diagnostic output to a marked tail, Limit hard-stops structured output that must be parsed in full.
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
 - `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
@@ -76,13 +77,11 @@ make build                     # both cross-build targets
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
 - `internal/gitpath/` — defines platform-independent matching for Git repository paths.
-- `internal/localexec/` — is the process boundary for the explicit host-local tools. It resolves only allowlisted executables, gives every child a private state tree and minimal environment, and bounds all captured output.
-- `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
 - `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
 - `internal/repopolicy/` — TODO: describe this package.
-- `internal/safeerr/` — builds safe, bounded, redacted diagnostic text and stable failure categories for hardened command boundaries (dockerexec, localexec). It only ever operates on output a boundary already captured under its own size limits; it never sees full argv, environment, or unbounded output.
+- `internal/safeerr/` — builds safe, bounded, redacted diagnostic text and stable failure categories for hardened command boundaries. It only ever operates on output a boundary already captured under its own size limits; it never sees full argv, environment, or unbounded output.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
 - `internal/scancontainer/` — runs a scanner against an in-memory input archive. Repository contents are copied into a stopped container through Docker's stdin API; no host path is mounted and no host staging copy is created.
 - `internal/scaninput/` — TODO: describe this package.
@@ -100,7 +99,7 @@ make build                     # both cross-build targets
 ## Architecture Notes
 
 - One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
-- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-3 snapshot before environment checks. Registered updates remain container-only; explicit adhoc `--execution local` is the sole narrow host-manager exception and never runs project tests.
+- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-3 snapshot before environment checks. Registered and adhoc execution is container-only; adhoc updates use a minimal private copy and never run project tests.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.

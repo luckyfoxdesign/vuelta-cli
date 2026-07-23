@@ -78,6 +78,8 @@ func TestRemovedCommandsAndFlagsAreRejected(t *testing.T) {
 		{"tasks", "list"},
 		{"deploy", "enqueue"},
 		{"deploy", "worker"},
+		{"scan", "--execution", "local"},
+		{"update", "--execution", "local", "snapshot-id"},
 		{"scan", "--skip-packages"},
 		{"scan", "--skip-vulnerabilities"},
 		{"scan", "--json-logs"},
@@ -93,7 +95,7 @@ func TestRemovedCommandsAndFlagsAreRejected(t *testing.T) {
 	if err := command.run([]string{"help", "--all"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, removed := range []string{"vuelta run", "vuelta package", "vuelta tasks", "vuelta deploy", "--skip-packages", "--skip-vulnerabilities", "--json-logs"} {
+	for _, removed := range []string{"vuelta run", "vuelta package", "vuelta tasks", "vuelta deploy", "--execution", "--skip-packages", "--skip-vulnerabilities", "--json-logs"} {
 		if strings.Contains(stdout.String(), removed) {
 			t.Fatalf("help still contains removed form %q", removed)
 		}

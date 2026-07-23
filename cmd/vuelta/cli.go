@@ -43,7 +43,7 @@ var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
 		description: "find vulnerabilities and package candidates; create snapshots only for safely mutable manifests", group: "Everyday commands",
-		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory . --execution local", "vuelta scan --all --json"},
+		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory .", "vuelta scan --all --json"},
 		options: []optionDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
 			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
@@ -52,11 +52,10 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
-			{names: []string{"--execution"}, valueName: "MODE", description: "container or explicit adhoc local execution"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan is read-only. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Registered projects are container-only; local execution is allowed only for an explicit unregistered directory."},
+		security:    []string{"Scan is read-only. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
 		takesConfig: true, handler: "scan",
 	},
 	{
@@ -67,7 +66,6 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--dry-run"}, description: "run in a disposable copy without durable changes"},
 			{names: []string{"--yes"}, description: "confirm the displayed plan"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
-			{names: []string{"--execution"}, valueName: "MODE", description: "container or explicit adhoc local execution"},
 			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts"},
 			{names: []string{"--allow-unverified-release-age"}, description: "allow candidates whose release age was not verified"},
 		},
@@ -129,7 +127,7 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		path: []string{"environment"}, usage: "vuelta environment <command>",
-		description: "trust local execution environments", group: "Configuration",
+		description: "trust local Docker environments", group: "Configuration",
 		examples: []string{"vuelta environment bootstrap --socket /var/run/docker.sock"},
 	},
 	{

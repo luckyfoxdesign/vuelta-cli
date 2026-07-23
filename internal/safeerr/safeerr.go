@@ -1,5 +1,5 @@
 // Package safeerr builds safe, bounded, redacted diagnostic text and stable
-// failure categories for hardened command boundaries (dockerexec, localexec).
+// failure categories for hardened command boundaries.
 // It only ever operates on output a boundary already captured under its own
 // size limits; it never sees full argv, environment, or unbounded output.
 package safeerr

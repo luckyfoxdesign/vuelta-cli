@@ -1,7 +1,7 @@
 # Copy to ~/.config/vuelta/config.yaml and chmod 0600 it. The file must be a
 # regular, non-symlink file owned by the process uid. Notification credentials
 # are read from the fixed environment variables below only when sending.
-# Adhoc local execution uses scan-time gates and an optional standalone policy
+# Adhoc container scans use scan-time gates and an optional standalone policy
 # supplied explicitly with `vuelta scan --policy`.
 # Docker execution is disabled until this reviewed endpoint is configured.
 # Use /var/run/docker.sock for Linux Engine. Docker Desktop macOS normally uses

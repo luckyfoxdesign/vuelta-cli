@@ -184,12 +184,12 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 	}
 	writeConfig(t, configPath, cfg)
 	vulnerability := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
-		"scan", "--directory", project, "--execution", "container", "--only", "vulnerabilities", "--json", "--config", configPath)
+		"scan", "--directory", project, "--only", "vulnerabilities", "--json", "--config", configPath)
 	if len(vulnerability.Results) != 1 || vulnerability.Results[0].Error != nil || !hasAcceptanceStage(vulnerability.Results[0].Stages, "vulnerability", "succeeded") {
 		t.Fatalf("[scanner] installed vulnerability scan = %#v", vulnerability.Results)
 	}
 	packages := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
-		"scan", "--directory", project, "--execution", "container", "--only", "packages", "--json", "--config", configPath)
+		"scan", "--directory", project, "--only", "packages", "--json", "--config", configPath)
 	if len(packages.Results) != 1 || packages.Results[0].Error != nil || len(packages.Results[0].Candidates) == 0 {
 		t.Fatalf("[scanner] installed package scan = %#v", packages.Results)
 	}
@@ -226,7 +226,7 @@ func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 	configPath := filepath.Join(caseRoot, "config.yaml")
 	writeConfig(t, configPath, cfg)
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(caseRoot, "xdg-config"))
-	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--directory", project, "--execution", "container", "--only", "vulnerabilities", "--json", "--config", configPath)
+	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--directory", project, "--only", "vulnerabilities", "--json", "--config", configPath)
 	if len(scan.Results) != 1 {
 		t.Fatalf("[parsing] scan results = %#v", scan.Results)
 	}

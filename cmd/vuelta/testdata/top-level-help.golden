@@ -12,7 +12,7 @@ Everyday commands:
 Configuration:
   project      list or add configured projects
   config       create or validate configuration
-  environment  trust local execution environments
+  environment  trust local Docker environments
 
 Help:
   help         show top-level or command-specific help

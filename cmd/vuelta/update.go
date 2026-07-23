@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
-	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
@@ -35,7 +35,6 @@ type updateOptions struct {
 	dryRun                    bool
 	yes                       bool
 	jsonOutput                bool
-	execution                 string
 	allowScripts              bool
 	allowUnverifiedReleaseAge bool
 	nonInteractive            bool
@@ -106,12 +105,9 @@ func executeUpdate(args []string) error {
 	}
 
 	var workspace *config.Workspace
-	var adhocProject localupdate.Project
+	var adhocProject adhoc.Project
 	switch snapshot.Origin {
 	case updatesnapshot.OriginWorkspace:
-		if options.execution == "local" {
-			return updateTopLevelFailure(options.jsonOutput, "invalid_execution", fail(exitConfig, "registered projects are container-only; --execution local is allowed only for adhoc snapshots"), "Use --execution container")
-		}
 		selected, selectErr := workspaceForSnapshot(*cfg, snapshot)
 		if selectErr != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", selectErr), "Run vuelta scan again")
@@ -127,7 +123,7 @@ func executeUpdate(args []string) error {
 		}
 		workspace = &selected
 	case updatesnapshot.OriginAdhoc:
-		adhocProject, err = localupdate.Detect(snapshot.AdhocPath)
+		adhocProject, err = adhoc.Detect(snapshot.AdhocPath)
 		if err != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Restore the scanned directory inputs and run vuelta scan again")
 		}
@@ -141,10 +137,8 @@ func executeUpdate(args []string) error {
 	default:
 		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "invalid snapshot origin"), "Run vuelta scan again")
 	}
-	if options.execution == "container" {
-		if dockerErr := configureDeveloperDocker(*cfg); dockerErr != nil {
-			return updateTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", dockerErr), "Configure docker.developer for the approved local daemon")
-		}
+	if dockerErr := configureDeveloperDocker(*cfg); dockerErr != nil {
+		return updateTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", dockerErr), "Configure docker.developer for the approved local daemon")
 	}
 	plan := buildUpdatePlan(snapshot, workspace, adhocProject, *cfg, options)
 	planWriter := os.Stdout
@@ -170,26 +164,19 @@ func executeUpdate(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	var egressSession *egress.Session
-	if options.execution == "container" {
-		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
-		ctx = egress.WithSession(ctx, egressSession)
-	}
+	egressSession := egress.NewSession(cfg.Update.Egress, dockerexec.Default())
+	ctx = egress.WithSession(ctx, egressSession)
 	var result updateResult
 	if workspace != nil {
 		result, err = executeWorkspaceUpdate(ctx, snapshot, *cfg, *workspace, plan, options)
-	} else if options.execution == "local" {
-		result, err = executeLocalAdhocUpdate(ctx, snapshot, adhocProject, plan, options)
 	} else {
 		result, err = executeContainerAdhocUpdate(ctx, snapshot, *cfg, adhocProject, plan, options)
 	}
-	if egressSession != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cleanupErr := egressSession.Close(cleanupCtx)
-		cancel()
-		if cleanupErr != nil && err == nil {
-			err = fail(exitFailure, "managed egress cleanup failed: %v", cleanupErr)
-		}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cleanupErr := egressSession.Close(cleanupCtx)
+	cancel()
+	if cleanupErr != nil && err == nil {
+		err = fail(exitFailure, "managed egress cleanup failed: %v", cleanupErr)
 	}
 	if ctx.Err() != nil {
 		if result.SnapshotID == "" {
@@ -235,16 +222,12 @@ func parseUpdateOptions(args []string) (updateOptions, string, error) {
 	fs.BoolVar(&options.dryRun, "dry-run", false, "run without durable changes")
 	fs.BoolVar(&options.yes, "yes", false, "confirm the plan")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write JSON")
-	fs.StringVar(&options.execution, "execution", "container", "container or local")
 	fs.BoolVar(&options.allowScripts, "allow-scripts", false, "allow lifecycle scripts")
 	fs.BoolVar(&options.allowUnverifiedReleaseAge, "allow-unverified-release-age", false, "allow unverified release age")
 	fs.BoolVar(&options.nonInteractive, "non-interactive", false, "disable prompts")
 	fs.StringVar(&options.configFile, "internal-config", "", "internal config path")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
-	}
-	if options.execution != "container" && options.execution != "local" {
-		return options, "", fail(exitConfig, "--execution must be container or local")
 	}
 	if len(fs.Args()) != 1 {
 		return options, "", fail(exitConfig, "update accepts exactly one SNAPSHOT_ID")
@@ -261,7 +244,7 @@ func updateJSONRequested(args []string) bool {
 	return false
 }
 
-func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspace, project localupdate.Project, cfg config.Config, options updateOptions) updatePlan {
+func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspace, project adhoc.Project, cfg config.Config, options updateOptions) updatePlan {
 	target := snapshot.AdhocPath
 	files := []string{project.Manifest, project.Lock}
 	tests := []string{"disabled: adhoc snapshots have no trusted verification profile"}
@@ -302,7 +285,7 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 		SnapshotID: snapshot.ID, Target: target, Origin: snapshot.Origin, Files: nonNilSorted(files),
 		Candidates: candidates,
 		Checks:     checks,
-		Tests:      tests, Commit: commit, Push: push, Execution: options.execution, DryRun: options.dryRun,
+		Tests:      tests, Commit: commit, Push: push, Execution: "container", DryRun: options.dryRun,
 		SecurityGates: map[string]string{
 			"lifecycle_scripts":   scripts,
 			"project_config":      fmt.Sprintf("scan decision: %t", snapshot.Gates.AllowProjectConfig),
@@ -312,7 +295,7 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 			"toolchain_hash":      snapshot.Toolchain.Hash,
 			"toolchain_platform":  snapshot.Toolchain.Platform,
 			"release_age":         releaseAge,
-			"execution":           options.execution,
+			"execution":           "container",
 			"durable_writes":      writeGate,
 		},
 	}
@@ -442,54 +425,7 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	return result, nil
 }
 
-func executeLocalAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, project localupdate.Project, plan updatePlan, options updateOptions) (updateResult, error) {
-	identity, err := currentAdhocInputIdentity(ctx, project, config.Config{}, snapshot)
-	if err != nil {
-		return updateResult{}, fail(exitSnapshot, "%v", err)
-	}
-	if err := updatesnapshot.ValidateForAdhoc(snapshot, project.Root, identity, time.Now()); err != nil {
-		return updateResult{}, fail(exitSnapshot, "%v", err)
-	}
-	policy := config.LocalPackagePolicy{}
-	if snapshot.Policy.Path != updatesnapshot.PolicyNone {
-		loaded, err := config.LoadLocalPackagePolicy(snapshot.Policy.Path)
-		if err != nil {
-			return updateResult{}, fail(exitSnapshot, "%v", err)
-		}
-		policy = loaded
-	}
-	if len(policy.AllowedPackages) == 0 {
-		for _, candidate := range snapshot.Candidates {
-			policy.AllowedPackages = append(policy.AllowedPackages, candidate.Name)
-		}
-	}
-	if duration, err := time.ParseDuration(snapshot.Gates.MinReleaseAge); err == nil {
-		policy.MinReleaseAgeDays = int((duration + 24*time.Hour - 1) / (24 * time.Hour))
-	}
-	selected := make([]localupdate.Candidate, 0, len(snapshot.Candidates))
-	for _, candidate := range snapshot.Candidates {
-		if candidate.Kind != project.Manager {
-			return updateResult{}, fail(exitSnapshot, "snapshot candidate %s is not applicable to %s", candidate.Name, project.Manager)
-		}
-		selected = append(selected, localupdate.Candidate{Name: candidate.Name, Current: candidate.Current, Target: candidate.Target})
-	}
-	localResult, err := localupdate.NewService().Update(ctx, project.Root, policy, selected, localupdate.UpdateOptions{
-		Apply: !options.dryRun, DryRun: options.dryRun, AllowProjectConfig: snapshot.Gates.AllowProjectConfig, AllowScripts: options.allowScripts,
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "not available on the system PATH") {
-			return updateResult{}, fail(exitEnv, "%v", err)
-		}
-		return updateResult{}, fail(exitFailure, "%v", err)
-	}
-	status := "updated"
-	if options.dryRun {
-		status = "dry_run"
-	}
-	return updateResult{SnapshotID: snapshot.ID, Status: status, Plan: plan, ChangedFiles: nonNilSorted(localResult.ChangedFiles), Tests: "disabled", Commit: "not_created", Push: "not_run"}, nil
-}
-
-func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, cfg config.Config, project localupdate.Project, plan updatePlan, options updateOptions) (updateResult, error) {
+func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, cfg config.Config, project adhoc.Project, plan updatePlan, options updateOptions) (updateResult, error) {
 	if _, err := dockerexec.Default().Path(); err != nil {
 		return updateResult{}, fail(exitEnv, "docker is required for container execution: %v", err)
 	}
@@ -503,7 +439,7 @@ func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Sn
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
-	changed, err := localupdate.InPrivateCopy(project.Root, snapshot.Gates.AllowProjectConfig, !options.dryRun, func(privateProject localupdate.Project) error {
+	changed, err := adhoc.InPrivateCopy(project.Root, snapshot.Gates.AllowProjectConfig, !options.dryRun, func(privateProject adhoc.Project) error {
 		planned := updater.PlannedUpdater{
 			Candidates: snapshot.Candidates, Workspace: workspace, Config: cfg, AllowScripts: options.allowScripts, Recheck: recheck,
 			Validate: func(validationContext context.Context) error {
@@ -572,7 +508,7 @@ func writeUpdateOutcome(jsonOutput bool, warnings []string, result updateResult,
 	return commandErr
 }
 
-func currentAdhocInputIdentity(ctx context.Context, project localupdate.Project, cfg config.Config, snapshot updatesnapshot.Snapshot) (updatesnapshot.InputIdentity, error) {
+func currentAdhocInputIdentity(ctx context.Context, project adhoc.Project, cfg config.Config, snapshot updatesnapshot.Snapshot) (updatesnapshot.InputIdentity, error) {
 	stages, err := scaninput.ParseStages(snapshot.Input.Stages)
 	if err != nil {
 		return updatesnapshot.InputIdentity{}, err

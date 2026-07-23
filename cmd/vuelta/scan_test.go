@@ -13,7 +13,6 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
-	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
@@ -94,107 +93,23 @@ func TestParseScanOptionsRejectsConflictingSelectorsAndKeepsJSON(t *testing.T) {
 	}
 }
 
-func TestParseScanOptionsOnlyModesAndExecution(t *testing.T) {
+func TestParseScanOptionsOnlyModes(t *testing.T) {
 	for _, test := range []struct {
-		args      []string
-		only      string
-		execution string
-		wantErr   bool
+		args    []string
+		only    string
+		wantErr bool
 	}{
-		{args: []string{"--only", "vulnerabilities"}, only: "vulnerabilities", execution: "container"},
-		{args: []string{"--only", "packages", "--execution", "local"}, only: "packages", execution: "local"},
+		{args: []string{"--only", "vulnerabilities"}, only: "vulnerabilities"},
+		{args: []string{"--only", "packages"}, only: "packages"},
 		{args: []string{"--only", "other"}, wantErr: true},
-		{args: []string{"--execution", "automatic"}, wantErr: true},
 	} {
 		options, _, err := parseScanOptions(test.args)
 		if (err != nil) != test.wantErr {
 			t.Fatalf("parse %v error = %v, wantErr %t", test.args, err, test.wantErr)
 		}
-		if !test.wantErr && (options.only != test.only || options.execution != test.execution) {
+		if !test.wantErr && options.only != test.only {
 			t.Fatalf("parse %v = %#v", test.args, options)
 		}
-	}
-}
-
-func TestValidateScanExecutionAllowsLocalOnlyForAdhoc(t *testing.T) {
-	local := scanOptions{execution: "local"}
-	if err := validateScanExecution([]scanTarget{{origin: updatesnapshot.OriginAdhoc}}, local); err != nil {
-		t.Fatalf("adhoc local execution: %v", err)
-	}
-	if err := validateScanExecution([]scanTarget{{origin: updatesnapshot.OriginWorkspace, name: "api"}}, local); err == nil || !strings.Contains(err.Error(), "container-only") {
-		t.Fatalf("workspace local error = %v", err)
-	}
-}
-
-func TestLocalScannerUsesCanonicalBinaryAndPrivateEnvironment(t *testing.T) {
-	t.Setenv("PATH", "/hostile/bin")
-	t.Setenv("HTTPS_PROXY", "http://hostile.invalid")
-	t.Setenv("TRIVY_CONFIG", "/hostile/trivy.yaml")
-	t.Setenv("GITHUB_TOKEN", "must-not-leak")
-	project := t.TempDir()
-	toolRoot := t.TempDir()
-	target := filepath.Join(toolRoot, "trusted-trivy")
-	if err := os.WriteFile(target, []byte("test executable"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(toolRoot, "trivy")
-	if err := os.Symlink(filepath.Base(target), link); err != nil {
-		t.Fatal(err)
-	}
-	wantBinary, err := filepath.EvalSymlinks(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var privateRoot string
-	command := localScannerCommandWith(
-		func(name string) (string, error) {
-			if name != "trivy" {
-				t.Fatalf("resolver name = %q", name)
-			}
-			return link, nil
-		},
-		func(_ context.Context, binary, dir string, args, env []string, stdoutBytes, stderrBytes int) (localexec.Result, error) {
-			if binary != wantBinary || !filepath.IsAbs(binary) || dir != project {
-				t.Fatalf("runner binary=%q dir=%q", binary, dir)
-			}
-			if len(args) == 0 || args[len(args)-1] != project {
-				t.Fatalf("scanner args = %q", args)
-			}
-			if stdoutBytes != localScannerStdoutMaxBytes || stderrBytes != localScannerStderrTailMaxBytes {
-				t.Fatalf("scanner caps = %d/%d", stdoutBytes, stderrBytes)
-			}
-			values := make(map[string]string, len(env))
-			for _, item := range env {
-				name, value, ok := strings.Cut(item, "=")
-				if !ok {
-					t.Fatalf("invalid environment entry %q", item)
-				}
-				values[name] = value
-			}
-			for _, forbidden := range []string{"HTTPS_PROXY", "TRIVY_CONFIG", "GITHUB_TOKEN"} {
-				if _, ok := values[forbidden]; ok {
-					t.Fatalf("hostile variable %s was inherited", forbidden)
-				}
-			}
-			if values["PATH"] == "/hostile/bin" {
-				t.Fatal("caller PATH was inherited")
-			}
-			privateRoot = filepath.Dir(values["HOME"])
-			for _, path := range []string{privateRoot, values["HOME"], values["XDG_CACHE_HOME"], values["XDG_CONFIG_HOME"], values["TMPDIR"]} {
-				info, statErr := os.Stat(path)
-				if statErr != nil || info.Mode().Perm() != 0o700 {
-					t.Fatalf("private path %q info=%v error=%v", path, info, statErr)
-				}
-			}
-			return localexec.Result{Output: []byte("{}")}, nil
-		},
-	)
-	output, err := command(context.Background(), project, "trivy", "fs", "/project")
-	if err != nil || string(output) != "{}" {
-		t.Fatalf("scanner output=%q error=%v", output, err)
-	}
-	if _, err := os.Stat(privateRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("private invocation root still exists: %v", err)
 	}
 }
 
@@ -244,7 +159,7 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 					return nil, "trivy", false, nil
 				},
 				alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
@@ -255,7 +170,7 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 					return []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0"}}, "npm", testCase.verified, nil
 				},
 			}
-			result := scanOneTargetWith(context.Background(), config.Config{}, target, scanOptions{execution: "container", only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
+			result := scanOneTargetWith(context.Background(), config.Config{}, target, scanOptions{only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
 			got := ""
 			for _, stage := range result.Stages {
 				if stage.Name == stageReleaseAge {
@@ -332,7 +247,7 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 					if test.dependencySource == "github-dependabot" {
 						return nil, "trivy-images", false, nil
 					}
@@ -352,7 +267,7 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 				},
 			}
 			cfg := config.Config{VulnScan: config.VulnScanConfig{DependencySource: test.dependencySource}}
-			result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, policyIdentity, 0, runners)
+			result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{}, config.LocalPackagePolicy{}, policyIdentity, 0, runners)
 			if result.Status != "partial" {
 				t.Fatalf("status = %q, want partial; result=%#v", result.Status, result)
 			}
@@ -377,7 +292,7 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
 	vulnerabilityCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			vulnerabilityCalled = true
 			return []string{"CVE-2026-0001"}, "trivy", true, nil
 		},
@@ -389,7 +304,7 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
 		DependencySource: "trivy",
-	}}, target, scanOptions{execution: "container", only: "vulnerabilities"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	}}, target, scanOptions{only: "vulnerabilities"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	if !vulnerabilityCalled || result.Status != config.VerificationScanOnly || len(result.Vulnerabilities) != 1 || result.Error != nil {
 		t.Fatalf("result = %#v; vulnerabilityCalled=%t", result, vulnerabilityCalled)
 	}
@@ -404,7 +319,7 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			return []string{"CVE-2026-0001"}, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
@@ -417,7 +332,7 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
 		DependencySource: "trivy",
-	}}, scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
+	}}, scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}, scanOptions{}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 7*24*time.Hour, runners)
 	if result.Status != config.VerificationScanOnly || result.Error != nil || result.PackageUpdates == nil || result.PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" {
 		t.Fatalf("result = %#v", result)
 	}
@@ -441,7 +356,7 @@ func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			t.Fatal("vulnerability scanner was called for --only packages")
 			return nil, "", false, nil
 		},
@@ -455,7 +370,7 @@ func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{
 		path: root, origin: updatesnapshot.OriginAdhoc,
-	}, scanOptions{execution: "container", only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	}, scanOptions{only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	if result.Status != config.VerificationScanOnly || result.Error != nil || len(result.Candidates) != 1 || result.SnapshotID != "" {
 		t.Fatalf("result = %#v", result)
 	}
@@ -475,7 +390,7 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	}
 	called := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			called = true
 			return nil, "trivy", true, nil
 		},
@@ -488,7 +403,7 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
 		DependencySource: "trivy",
 	}}, scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}, scanOptions{
-		execution: "container", only: "vulnerabilities",
+		only: "vulnerabilities",
 	}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	if !called || result.Status != config.VerificationScanOnly || result.Error != nil || !containsString(result.InputCategories, string(scaninput.CategoryDependency)) {
 		t.Fatalf("result = %#v; called=%t", result, called)
@@ -525,7 +440,7 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	}
 	alertsCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			return nil, "trivy-images", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
@@ -538,7 +453,7 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 		},
 	}
 	cfg := config.Config{VulnScan: config.VulnScanConfig{DependencySource: "github-dependabot"}}
-	result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{execution: "container"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+	result := scanOneTargetWith(context.Background(), cfg, target, scanOptions{}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	if !alertsCalled || result.Status != "partial" || len(result.Vulnerabilities) != 1 || !hasFailedStage(result, stageCandidate) {
 		t.Fatalf("result = %#v", result)
 	}
@@ -548,7 +463,7 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	workspace := config.Workspace{Name: "supported", Path: root, Stack: config.StackNode, PackageManager: "npm"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			return nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
@@ -557,7 +472,7 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 			return nil, "", false, nil
 		},
 	}
-	options := scanOptions{execution: "container", only: "vulnerabilities"}
+	options := scanOptions{only: "vulnerabilities"}
 	broken := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{name: "broken", path: "/missing", origin: updatesnapshot.OriginWorkspace, err: errors.New("configured path is unavailable")}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	supported := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	summary := summarizeScan([]scanResult{broken, supported})
@@ -584,7 +499,7 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	brokenWorkspace := config.Workspace{Name: "broken", Path: brokenRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	supportedWorkspace := config.Workspace{Name: "supported", Path: supportedRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget, string) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
 			return nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
@@ -604,7 +519,7 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 			return toolchain.Prepared{Selection: selection, Identity: identity}, err
 		},
 	}
-	options := scanOptions{execution: "container", only: "packages"}
+	options := scanOptions{only: "packages"}
 	broken := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &brokenWorkspace, name: "broken", path: brokenRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	supported := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &supportedWorkspace, name: "supported", path: supportedRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	if broken.Status != "partial" || broken.Error == nil || broken.Error.Code != "toolchain_incompatible" || !strings.Contains(broken.Error.Hint, "override") {
@@ -739,20 +654,6 @@ func TestFailedScanResultSurfacesSafeCategoryExitCodeAndBoundedDetailForDockerFa
 	}
 	if len(failed.Warnings) != 1 || !strings.Contains(failed.Warnings[0], "category=permission") || strings.Contains(failed.Warnings[0], "supersecret") {
 		t.Fatalf("warning is not actionable and redacted: %#v", failed.Warnings)
-	}
-}
-
-func TestFailedScanResultSurfacesLocalScanErrorCategory(t *testing.T) {
-	localErr := &localScanError{tool: "trivy", category: "permission", exitCode: 5, detail: "permission denied"}
-	wrapped := fmt.Errorf("run local trivy scanner: %w", localErr)
-
-	result := scanResult{Status: "clean", Vulnerabilities: []string{}, Candidates: []updatesnapshot.Candidate{}, Stages: []scanStageResult{}}
-	failed := failedScanResult(result, stageVulnerability, "vulnerability_scan_failed", wrapped, "hint")
-	if failed.Error.Category != "permission" {
-		t.Fatalf("category = %q, want permission", failed.Error.Category)
-	}
-	if failed.Error.ExitCode == nil || *failed.Error.ExitCode != 5 {
-		t.Fatalf("exit code = %v, want 5", failed.Error.ExitCode)
 	}
 }
 

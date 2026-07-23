@@ -49,8 +49,11 @@ Use the full algorithm in workspace `../AGENTS.md`.
 
 - Language: Go. One package per pipeline stage under `internal/`; `cmd/vuelta` stays a thin entrypoint.
 - The CLI is one-shot, no daemon; scheduling is external.
-- Registered workspaces are container-only: package managers (`poetry`/`uv`/`npm`/`pnpm`/`bun`) run inside sandboxed containers, never on the host.
-- The only host package-manager exception is an explicit format-3 adhoc snapshot created by `scan --directory PATH` and applied with `update --execution local SNAPSHOT_ID`. That path runs the resolved system manager in a private writable copy, disables project tests, rejects every change outside the recognized manifest/lock pair, and atomically copies back only those files after confirmation. There is no automatic local fallback.
+- All workspaces, including explicit adhoc directories, are container-only:
+  package managers (`poetry`/`uv`/`npm`/`pnpm`/`bun`) never run on the host.
+- Adhoc updates use a minimal private copy, disable project tests, reject every
+  change outside the recognized manifest/lock pair, and atomically copy back
+  only those files after confirmation.
 
 ## Testing
 
@@ -85,8 +88,6 @@ Full policy: workspace `../AGENTS.md` → Security. Repo-local baseline:
 - Containers: no `privileged: true`, no host network, publish only required ports, prefer non-root users.
 
 - `internal/config` never auto-discovers projects: only `workspaces[].path` from config is scanned, never parent directories.
-- Autofix (`internal/autofix`) never gets shell/`Bash` tool access — test logs/diffs are untrusted input (part C of the spec).
-
 ## Local Permissions
 
 - Do not read `.env` or `.env.*`.

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
-	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -71,8 +71,8 @@ func TestBuildUpdatePlanIsDeterministicAndShowsAllGates(t *testing.T) {
 			{Kind: "npm", Name: "alpha", Current: "1.0.0", Target: "2.0.0"},
 		},
 	}
-	project := localupdate.Project{Root: "/project", Manager: "npm", Manifest: "package.json", Lock: "package-lock.json"}
-	plan := buildUpdatePlan(snapshot, nil, project, config.Config{}, updateOptions{execution: "local", allowScripts: true, allowUnverifiedReleaseAge: true})
+	project := adhoc.Project{Root: "/project", Manager: "npm", Manifest: "package.json", Lock: "package-lock.json"}
+	plan := buildUpdatePlan(snapshot, nil, project, config.Config{}, updateOptions{allowScripts: true, allowUnverifiedReleaseAge: true})
 	if got, want := plan.Files, []string{"package-lock.json", "package.json"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("files = %v, want %v", got, want)
 	}
