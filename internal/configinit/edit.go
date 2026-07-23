@@ -49,6 +49,61 @@ func PlanConfigWrite(cfg *config.Config, path string, replace bool) (EditPlan, e
 	return plan, nil
 }
 
+// PlanDockerBootstrap creates a default config when none exists or updates
+// only docker.developer in an existing config. Existing comments, key order,
+// unrelated settings, and protected file mode are preserved.
+func PlanDockerBootstrap(path string, endpoint config.DockerEndpointConfig) (EditPlan, error) {
+	original, mode, exists, err := readConfigForWrite(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if !exists {
+		cfg := NewConfig()
+		cfg.Docker = &config.DockerConfig{Developer: &endpoint}
+		return PlanConfigWrite(cfg, path, false)
+	}
+	cfg, err := config.Parse(original)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return EditPlan{}, fmt.Errorf("validate config before Docker bootstrap: %w", err)
+	}
+	if cfg.Docker != nil && cfg.Docker.Developer != nil && reflect.DeepEqual(*cfg.Docker.Developer, endpoint) {
+		return EditPlan{Original: original, Updated: original, Mode: mode, Exists: true}, nil
+	}
+	cfg.Docker = &config.DockerConfig{Developer: &endpoint}
+	if err := cfg.Validate(); err != nil {
+		return EditPlan{}, fmt.Errorf("validate bootstrapped config: %w", err)
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(original, &document); err != nil {
+		return EditPlan{}, fmt.Errorf("parse config YAML tree: %w", err)
+	}
+	root, err := documentMapping(&document)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	endpointNode, err := encodeNode(endpoint)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("encode Docker endpoint: %w", err)
+	}
+	dockerNode := mappingValue(root, "docker")
+	if dockerNode == nil {
+		dockerNode = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		setMappingNode(root, "docker", dockerNode)
+	} else if dockerNode.Kind != yaml.MappingNode {
+		return EditPlan{}, errors.New("docker must be a YAML mapping")
+	}
+	setMappingNode(dockerNode, "developer", endpointNode)
+	updated, err := encodeDocument(&document, original)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	return EditPlan{Original: original, Updated: updated, Mode: mode, Exists: true, Changed: !bytes.Equal(original, updated)}, nil
+}
+
 // PlanWorkspaceAdd appends a workspace or persists the name of a matching
 // legacy workspace while retaining unrelated YAML comments and key order.
 func PlanWorkspaceAdd(path string, desired config.Workspace) (EditPlan, error) {
@@ -227,10 +282,10 @@ func readConfigForWrite(path string) ([]byte, os.FileMode, bool, error) {
 }
 
 func workspaceSequence(document *yaml.Node) (*yaml.Node, error) {
-	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
-		return nil, errors.New("config must be a YAML mapping")
+	root, err := documentMapping(document)
+	if err != nil {
+		return nil, err
 	}
-	root := document.Content[0]
 	for index := 0; index+1 < len(root.Content); index += 2 {
 		if root.Content[index].Value != "workspaces" {
 			continue
@@ -245,6 +300,34 @@ func workspaceSequence(document *yaml.Node) (*yaml.Node, error) {
 	sequence := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 	root.Content = append(root.Content, key, sequence)
 	return sequence, nil
+}
+
+func documentMapping(document *yaml.Node) (*yaml.Node, error) {
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return nil, errors.New("config must be a YAML mapping")
+	}
+	return document.Content[0], nil
+}
+
+func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			return mapping.Content[index+1]
+		}
+	}
+	return nil
+}
+
+func setMappingNode(mapping *yaml.Node, key string, value *yaml.Node) {
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			mapping.Content[index+1] = value
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value,
+	)
 }
 
 func setMappingString(mapping *yaml.Node, key, value string) {

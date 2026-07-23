@@ -187,7 +187,7 @@ func (r Runner) newName() (string, error) {
 }
 
 func validateRequest(request Request) error {
-	if !exactDigest.MatchString(request.Image) {
+	if !exactDigest.MatchString(request.Image) && !localImageID.MatchString(request.Image) {
 		return fmt.Errorf("scanner image %q is not pinned to an exact digest", request.Image)
 	}
 	if !dockerName.MatchString(request.Network) {

@@ -12,14 +12,22 @@ import (
 )
 
 func validateEndpoint(endpoint Endpoint) (string, error) {
-	if endpoint.SocketPath == "" {
-		return "", errors.New("approved Docker endpoint is not configured; set docker.developer or production_worker.docker")
-	}
-	if !filepath.IsAbs(endpoint.SocketPath) || strings.ContainsRune(endpoint.SocketPath, '\x00') {
-		return "", errors.New("approved Docker socket must be an absolute local path")
+	canonical, err := validateProbeEndpoint(endpoint)
+	if err != nil {
+		return "", err
 	}
 	if err := validateExpectedIdentity(endpoint.Expected); err != nil {
 		return "", err
+	}
+	return canonical, nil
+}
+
+func validateProbeEndpoint(endpoint Endpoint) (string, error) {
+	if endpoint.SocketPath == "" {
+		return "", errors.New("explicit Docker socket is required")
+	}
+	if !filepath.IsAbs(endpoint.SocketPath) || strings.ContainsRune(endpoint.SocketPath, '\x00') {
+		return "", errors.New("approved Docker socket must be an absolute local path")
 	}
 	canonical, err := filepath.EvalSymlinks(endpoint.SocketPath)
 	if err != nil {

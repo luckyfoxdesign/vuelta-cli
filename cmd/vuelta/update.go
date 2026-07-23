@@ -171,6 +171,11 @@ func executeUpdate(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	var egressSession *egress.Session
+	if options.execution == "container" {
+		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
+		ctx = egress.WithSession(ctx, egressSession)
+	}
 	var result updateResult
 	if workspace != nil {
 		result, err = executeWorkspaceUpdate(ctx, snapshot, *cfg, *workspace, plan, options)
@@ -178,6 +183,14 @@ func executeUpdate(args []string) error {
 		result, err = executeLocalAdhocUpdate(ctx, snapshot, adhocProject, plan, options)
 	} else {
 		result, err = executeContainerAdhocUpdate(ctx, snapshot, *cfg, adhocProject, plan, options)
+	}
+	if egressSession != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupErr := egressSession.Close(cleanupCtx)
+		cancel()
+		if cleanupErr != nil && err == nil {
+			err = fail(exitFailure, "managed egress cleanup failed: %v", cleanupErr)
+		}
 	}
 	if ctx.Err() != nil {
 		if result.SnapshotID == "" {

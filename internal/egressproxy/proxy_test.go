@@ -1,4 +1,4 @@
-package main
+package egressproxy
 
 import (
 	"bufio"

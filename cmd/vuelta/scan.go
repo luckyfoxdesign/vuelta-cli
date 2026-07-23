@@ -15,6 +15,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/localexec"
 	"github.com/luckyfoxdesign/vuelta/internal/localupdate"
@@ -149,6 +150,7 @@ func executeScan(args []string) error {
 	if executionErr := validateScanExecution(targets, options); executionErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_execution", fail(exitConfig, "%v", executionErr), "Use --execution container or select an unregistered --directory")
 	}
+	dockerReady := false
 	if options.execution == "container" {
 		dockerErr := configureDeveloperDocker(*cfg)
 		if dockerErr == nil {
@@ -158,6 +160,8 @@ func executeScan(args []string) error {
 			for index := range targets {
 				targets[index].dockerErr = fmt.Errorf("approved Docker endpoint is unavailable: %w", dockerErr)
 			}
+		} else {
+			dockerReady = true
 		}
 	}
 	policy, policyIdentity, policyErr := loadScanPolicy(options.policyPath)
@@ -168,9 +172,25 @@ func executeScan(args []string) error {
 	if minAgeErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_invocation", fail(exitConfig, "%v", minAgeErr), "Use 0, a Go duration such as 168h, or a day duration such as 7d")
 	}
+	ctx := context.Background()
+	var egressSession *egress.Session
+	if options.execution == "container" && dockerReady {
+		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
+		ctx = egress.WithSession(ctx, egressSession)
+	}
 	results := make([]scanResult, 0, len(targets))
 	for _, target := range targets {
-		results = append(results, scanOneTarget(context.Background(), *cfg, target, options, policy, policyIdentity, minAge))
+		results = append(results, scanOneTarget(ctx, *cfg, target, options, policy, policyIdentity, minAge))
+	}
+	if egressSession != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupErr := egressSession.Close(cleanupCtx)
+		cancel()
+		if cleanupErr != nil {
+			for index := range results {
+				results[index].Warnings = appendUniqueStrings(results[index].Warnings, "managed egress cleanup failed; only Vuelta-owned invocation resources were targeted")
+			}
+		}
 	}
 	summary := summarizeScan(results)
 	if options.jsonOutput {
@@ -1182,6 +1202,7 @@ func failedScanResult(result scanResult, stage, code string, err error, hint str
 }
 
 func recordScanStageFailure(result scanResult, stage, code string, err error, hint string) scanResult {
+	code, hint = scanFailureContract(code, hint, err)
 	result = addStage(result, stage, stageFailed, safeStageReason(err))
 	category, exitCode, detail := classifySubprocessError(err)
 	failure := &jsonCommandError{
@@ -1206,6 +1227,22 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 	}
 	result.Warnings = append(result.Warnings, warning)
 	return result
+}
+
+func scanFailureContract(code, hint string, err error) (string, string) {
+	if errors.Is(err, errDockerBootstrapRequired) {
+		return "endpoint_bootstrap_required", "Run vuelta environment bootstrap with the reviewed local Docker socket"
+	}
+	var attestation *dockerexec.AttestationError
+	if errors.As(err, &attestation) {
+		return "daemon_attestation_failed", "Review the configured daemon identity and bootstrap the endpoint again only if the change is expected"
+	}
+	var egressStage *egress.StageError
+	if errors.As(err, &egressStage) {
+		stage := strings.ReplaceAll(egressStage.Stage, " ", "_")
+		return "egress_" + stage + "_failed", "Inspect only the Vuelta-owned proxy/network diagnostics and retry"
+	}
+	return code, hint
 }
 
 // classifySubprocessError extracts a safe category, exit code, and bounded

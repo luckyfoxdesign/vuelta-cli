@@ -61,7 +61,7 @@ trap 'rm -f "$tmp"' EXIT
   printf 'docker compose run --rm lint   # golangci-lint run\n'
 	printf 'docker compose run --rm tidy   # go mod tidy\n'
 	printf 'docker compose run --rm build  # go build ./...\n'
-	printf 'docker compose up -d egress-proxy # strict local package-registry proxy\n'
+	printf 'vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint\n'
 	printf 'scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite\n'
 	printf 'make build-mac                 # Docker cross-build both binaries for darwin/arm64\n'
 	printf 'make build-linux               # Docker cross-build both binaries for linux/amd64\n'

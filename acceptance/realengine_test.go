@@ -27,6 +27,11 @@ import (
 
 const caseTimeout = 12 * time.Minute
 
+const (
+	acceptanceEgressNetwork   = "vuelta-acceptance-egress"
+	acceptanceEgressContainer = "vuelta-acceptance-egress-proxy"
+)
+
 type matrix struct {
 	Engine string       `yaml:"engine"`
 	Cases  []matrixCase `yaml:"cases"`
@@ -130,6 +135,66 @@ func TestRealEngineDockerEndpointIdentity(t *testing.T) {
 	}
 }
 
+func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
+	matrixPath := os.Getenv("VUELTA_ACCEPTANCE_MATRIX")
+	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
+	if matrixPath == "" || root == "" {
+		t.Skip("manual/networked suite: use scripts/real-engine-acceptance.sh MATRIX")
+	}
+	loaded := loadMatrix(t, matrixPath)
+	_ = checkEngine(t, loaded.Engine)
+	binary := buildProductionBinary(t, root)
+	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
+	defer cancel()
+	caseRoot, err := os.MkdirTemp(root, "vuelta-acceptance-case-")
+	if err != nil {
+		t.Fatalf("[infrastructure] create case directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(caseRoot) })
+	project := filepath.Join(caseRoot, "project")
+	if err := testfixture.SetupProject(ctx, "/src/testdata/fixtures/projects", "py-requirements-only-cve", project); err != nil {
+		t.Fatalf("[infrastructure] prepare fixture: %v", err)
+	}
+	configPath := filepath.Join(caseRoot, "config", "config.yaml")
+	env := append(os.Environ(),
+		"XDG_CONFIG_HOME="+filepath.Join(caseRoot, "xdg-config"),
+		"DOCKER_HOST=tcp://untrusted.invalid:2375", "DOCKER_CONTEXT=untrusted",
+		"DOCKER_CONFIG="+filepath.Join(caseRoot, "untrusted-docker-config"),
+		"HTTP_PROXY=http://untrusted.invalid:8080", "HTTPS_PROXY=http://untrusted.invalid:8080",
+	)
+	bootstrap := runJSONInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"environment", "bootstrap", "--socket", "/var/run/docker.sock", "--yes", "--json", "--config", configPath)
+	if len(bootstrap.Results) != 1 || bootstrap.Results[0].Status != "trusted" {
+		t.Fatalf("[compatibility] bootstrap result = %#v", bootstrap.Results)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("[parsing] load bootstrapped config: %v", err)
+	}
+	if cfg.Docker == nil || cfg.Docker.Developer == nil || (cfg.Docker.Developer.ExpectedDaemon.Architecture != "amd64" && cfg.Docker.Developer.ExpectedDaemon.Architecture != "arm64") {
+		t.Fatalf("[security] bootstrap did not persist a canonical daemon identity")
+	}
+	// The developer host running this suite may retain the old Compose-created
+	// default network, which the installed CLI must correctly reject because it
+	// has no ownership labels. Isolate this acceptance invocation without
+	// deleting or adopting that external resource.
+	cfg.Update.Egress = config.EgressConfig{
+		Network: "vuelta-acceptance-bootstrap-egress", ProxyContainer: "vuelta-acceptance-bootstrap-egress-proxy",
+		ProxyURL: "http://vuelta-acceptance-bootstrap-egress-proxy:3128",
+	}
+	writeConfig(t, configPath, cfg)
+	vulnerability := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
+		"scan", "--directory", project, "--execution", "container", "--only", "vulnerabilities", "--json", "--config", configPath)
+	if len(vulnerability.Results) != 1 || vulnerability.Results[0].Error != nil || !hasAcceptanceStage(vulnerability.Results[0].Stages, "vulnerability", "succeeded") {
+		t.Fatalf("[scanner] installed vulnerability scan = %#v", vulnerability.Results)
+	}
+	packages := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
+		"scan", "--directory", project, "--execution", "container", "--only", "packages", "--json", "--config", configPath)
+	if len(packages.Results) != 1 || packages.Results[0].Error != nil || len(packages.Results[0].Candidates) == 0 {
+		t.Fatalf("[scanner] installed package scan = %#v", packages.Results)
+	}
+}
+
 func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 	matrixPath := os.Getenv("VUELTA_ACCEPTANCE_MATRIX")
 	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
@@ -156,6 +221,7 @@ func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 
 	cfg := configinit.NewConfig()
 	cfg.Docker = dockerConfig
+	configureAcceptanceEgress(cfg)
 	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
 	configPath := filepath.Join(caseRoot, "config.yaml")
 	writeConfig(t, configPath, cfg)
@@ -249,6 +315,10 @@ func checkEngine(t *testing.T, expected string) *config.DockerConfig {
 	if info.ID == "" || version.ServerVersion == "" || version.APIVersion == "" || len(info.SecurityOptions) == 0 {
 		t.Fatal("[infrastructure] Docker daemon omitted required identity fields")
 	}
+	architecture, err := dockerexec.NormalizeArchitecture(version.Architecture)
+	if err != nil {
+		t.Fatalf("[compatibility] Docker architecture: %v", err)
+	}
 	text := strings.ToLower(info.Name)
 	operatingSystem := strings.ToLower(version.OperatingSystem)
 	isDesktop := strings.Contains(text, "docker desktop") || strings.Contains(text, "docker-desktop") || strings.Contains(operatingSystem, "docker desktop")
@@ -259,7 +329,7 @@ func checkEngine(t *testing.T, expected string) *config.DockerConfig {
 		Socket: "/var/run/docker.sock",
 		ExpectedDaemon: config.DockerDaemonIdentity{
 			ID: info.ID, ServerVersion: version.ServerVersion, OperatingSystem: version.OperatingSystem,
-			Architecture: version.Architecture, MinimumAPIVersion: version.APIVersion,
+			Architecture: architecture, MinimumAPIVersion: version.APIVersion,
 			RequiredSecurityOptions: append([]string(nil), info.SecurityOptions...),
 		},
 	}}
@@ -324,6 +394,7 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 
 	cfg := configinit.NewConfig()
 	cfg.Docker = dockerConfig
+	configureAcceptanceEgress(cfg)
 	cfg.Update.MinReleaseAgeDays = testCase.MinReleaseAgeDays
 	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
 	cfg.Update.ToolchainProfiles = []config.ToolchainProfile{testCase.Profile}
@@ -332,12 +403,6 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 	writeConfig(t, configPath, cfg)
 
 	runJSON(t, ctx, env, "compatibility", binary, "config", "validate", "--json", configPath)
-	unavailable := *cfg
-	unavailable.Update = cfg.Update
-	unavailable.Update.Egress.Network = "vuelta-acceptance-missing-network"
-	writeConfig(t, configPath, &unavailable)
-	runJSONFailure(t, ctx, env, "infrastructure", "egress policy unavailable", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
-	writeConfig(t, configPath, cfg)
 	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
 	if testCase.ScanOnly {
 		if len(scan.Results) != 1 || scan.Results[0].Status != config.VerificationScanOnly || scan.Results[0].SnapshotID != "" || len(scan.Results[0].Candidates) == 0 {
@@ -408,6 +473,13 @@ func workspaceForCase(name, project string, profile config.ToolchainProfile) con
 	}
 }
 
+func configureAcceptanceEgress(cfg *config.Config) {
+	cfg.Update.Egress = config.EgressConfig{
+		Network: acceptanceEgressNetwork, ProxyContainer: acceptanceEgressContainer,
+		ProxyURL: "http://" + acceptanceEgressContainer + ":3128", Persistent: true,
+	}
+}
+
 func writeVerificationFixture(t *testing.T, ctx context.Context, project string, profile config.ToolchainProfile) {
 	t.Helper()
 	contents := fmt.Sprintf("services:\n  verify:\n    image: %q\n    platform: %s\n    user: %q\n    read_only: true\n    cap_drop: [\"ALL\"]\n    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n    mem_limit: 256m\n    pids_limit: 64\n    networks: [testnet]\n    command: [%q, \"--version\"]\nnetworks:\n  testnet:\n    internal: true\n", profile.Image, profile.Platform, profile.User, profile.Scanner)
@@ -455,9 +527,14 @@ func writeConfig(t *testing.T, path string, cfg *config.Config) {
 }
 
 func runJSON(t *testing.T, ctx context.Context, env []string, category, binary string, args ...string) commandEnvelope {
+	return runJSONInDir(t, ctx, env, "", category, binary, args...)
+}
+
+func runJSONInDir(t *testing.T, ctx context.Context, env []string, dir, category, binary string, args ...string) commandEnvelope {
 	t.Helper()
 	command := exec.CommandContext(ctx, binary, args...)
 	command.Env = env
+	command.Dir = dir
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	err := command.Run()
@@ -528,11 +605,50 @@ func TestMain(m *testing.M) {
 		os.Exit(2)
 	}
 	code := m.Run()
+	if err := cleanupAcceptanceEgress(); err != nil {
+		fmt.Fprintf(os.Stderr, "real-engine acceptance egress cleanup: %v\n", err)
+		code = 1
+	}
 	if err := cleanupAcceptanceRoot(os.Getenv("VUELTA_ACCEPTANCE_ROOT")); err != nil {
 		fmt.Fprintf(os.Stderr, "real-engine acceptance cleanup: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
+}
+
+func cleanupAcceptanceEgress() error {
+	configDir, err := os.MkdirTemp("", "vuelta-acceptance-docker-config-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(configDir) }()
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte("{}\n"), 0o600); err != nil {
+		return err
+	}
+	run := func(args ...string) ([]byte, error) {
+		command := exec.Command("docker", append([]string{"--host", "unix:///var/run/docker.sock"}, args...)...)
+		command.Env = []string{"DOCKER_CONFIG=" + configDir, "HOME=" + configDir, "TMPDIR=" + configDir}
+		return command.Output()
+	}
+	ownerFormat := `{{index .Config.Labels "com.luckyfoxdesign.vuelta.owner"}}`
+	if owner, inspectErr := run("container", "inspect", "--format", ownerFormat, acceptanceEgressContainer); inspectErr == nil {
+		if strings.TrimSpace(string(owner)) != "managed-egress" {
+			return errors.New("refusing to remove acceptance proxy without the Vuelta ownership label")
+		}
+		if _, err := run("container", "rm", "--force", acceptanceEgressContainer); err != nil {
+			return fmt.Errorf("remove acceptance proxy: %w", err)
+		}
+	}
+	networkOwnerFormat := `{{index .Labels "com.luckyfoxdesign.vuelta.owner"}}`
+	if owner, inspectErr := run("network", "inspect", "--format", networkOwnerFormat, acceptanceEgressNetwork); inspectErr == nil {
+		if strings.TrimSpace(string(owner)) != "managed-egress" {
+			return errors.New("refusing to remove acceptance network without the Vuelta ownership label")
+		}
+		if _, err := run("network", "rm", acceptanceEgressNetwork); err != nil {
+			return fmt.Errorf("remove acceptance network: %w", err)
+		}
+	}
+	return nil
 }
 
 func cleanupAcceptanceRoot(root string) error {

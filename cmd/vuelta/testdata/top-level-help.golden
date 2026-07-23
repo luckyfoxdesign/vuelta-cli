@@ -12,6 +12,7 @@ Everyday commands:
 Configuration:
   project      list or add configured projects
   config       create or validate configuration
+  environment  trust local execution environments
 
 Operations:
   tasks        inspect deployment tasks

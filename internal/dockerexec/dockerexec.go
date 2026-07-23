@@ -109,6 +109,15 @@ type DaemonIdentity struct {
 	RequiredSecurityOptions []string
 }
 
+// AttestationError means the configured daemon failed identity or capability
+// verification before a caller command was allowed to run.
+type AttestationError struct{ Err error }
+
+func (e *AttestationError) Error() string {
+	return "Docker daemon attestation failed: " + e.Err.Error()
+}
+func (e *AttestationError) Unwrap() error { return e.Err }
+
 // Options supplies the approved endpoint plus test seams. A zero Endpoint
 // fails closed. ConfigDir, when set, must name a new or protected empty
 // directory.
@@ -120,15 +129,27 @@ type Options struct {
 	Endpoint          Endpoint
 }
 
+// ProbeOptions supplies the explicit socket plus test seams for trusted
+// endpoint onboarding. Ambient Docker configuration and credentials are never
+// consulted.
+type ProbeOptions struct {
+	Resolver          Resolver
+	CommandRunner     CommandRunner
+	EndpointValidator EndpointValidator
+	ConfigDir         string
+	SocketPath        string
+}
+
 // Executor binds all of its invocations to one resolved Docker CLI and one
 // empty, protected Docker configuration directory.
 type Executor struct {
-	options Options
-	once    sync.Once
-	path    string
-	env     []string
-	err     error
-	host    string
+	options   Options
+	once      sync.Once
+	path      string
+	env       []string
+	err       error
+	host      string
+	configDir string
 
 	verifyMu sync.Mutex
 	verified bool
@@ -137,6 +158,41 @@ type Executor struct {
 // New returns a lazily initialized executor. The first Path or Run call fixes
 // the executable and environment for the lifetime of the executor.
 func New(options Options) *Executor { return &Executor{options: options} }
+
+// Probe inspects one explicit local Unix socket through the same isolated
+// Docker boundary used by normal execution. Callers must present and confirm
+// the returned identity before trusting or persisting it.
+func Probe(ctx context.Context, socketPath string) (DaemonIdentity, error) {
+	return ProbeWithOptions(ctx, ProbeOptions{SocketPath: socketPath})
+}
+
+// ProbeWithOptions is Probe with injectable process seams for tests.
+func ProbeWithOptions(ctx context.Context, options ProbeOptions) (DaemonIdentity, error) {
+	executor := New(Options{
+		Resolver: options.Resolver, CommandRunner: options.CommandRunner,
+		EndpointValidator: options.EndpointValidator, ConfigDir: options.ConfigDir,
+		Endpoint: Endpoint{SocketPath: options.SocketPath},
+	})
+	if options.EndpointValidator == nil {
+		executor.options.EndpointValidator = validateProbeEndpoint
+	}
+	executor.initialize()
+	if executor.err != nil {
+		return DaemonIdentity{}, executor.err
+	}
+	if options.ConfigDir == "" {
+		defer func() { _ = os.RemoveAll(executor.configDir) }()
+	}
+	run := executor.options.CommandRunner
+	if run == nil {
+		run = runCommand
+	}
+	environment := append([]string(nil), executor.env...)
+	sort.Strings(environment)
+	probeCtx, cancel := context.WithTimeout(ctx, daemonProbeTimeout)
+	defer cancel()
+	return executor.probeDaemon(probeCtx, run, environment)
+}
 
 var (
 	defaultMu       sync.RWMutex
@@ -183,7 +239,10 @@ func (e *Executor) Verify(ctx context.Context) error {
 	sort.Strings(environment)
 	probeCtx, cancel := context.WithTimeout(ctx, daemonProbeTimeout)
 	defer cancel()
-	return e.verifyDaemon(probeCtx, run, environment)
+	if err := e.verifyDaemon(probeCtx, run, environment); err != nil {
+		return &AttestationError{Err: err}
+	}
+	return nil
 }
 
 // Run executes one Docker command with the fixed executable and minimal
@@ -282,6 +341,7 @@ func (e *Executor) initialize() {
 			"HOME=" + configDir,
 			"TMPDIR=" + configDir,
 		}
+		e.configDir = configDir
 		e.host = "unix://" + filepath.ToSlash(socketPath)
 	})
 }
@@ -310,6 +370,18 @@ func (e *Executor) verifyDaemon(ctx context.Context, run CommandRunner, environm
 	if e.verified {
 		return nil
 	}
+	actual, err := e.probeDaemon(ctx, run, environment)
+	if err != nil {
+		return err
+	}
+	if err := attestDaemon(e.options.Endpoint.Expected, actual); err != nil {
+		return err
+	}
+	e.verified = true
+	return nil
+}
+
+func (e *Executor) probeDaemon(ctx context.Context, run CommandRunner, environment []string) (DaemonIdentity, error) {
 	versionRequest := Request{
 		Args:   e.boundArgs([]string{"version", "--format", `{"server_version":{{json .Server.Version}},"api_version":{{json .Server.APIVersion}},"os":{{json .Server.Os}},"architecture":{{json .Server.Arch}}}`}),
 		Stdout: Capture{Mode: Limit, Bytes: daemonOutputLimit},
@@ -317,11 +389,11 @@ func (e *Executor) verifyDaemon(ctx context.Context, run CommandRunner, environm
 	}
 	versionResult, err := run(ctx, e.path, versionRequest, environment)
 	if err != nil {
-		return daemonProbeError(ctx, err)
+		return DaemonIdentity{}, daemonProbeError(ctx, err)
 	}
 	var version versionIdentity
 	if err := json.Unmarshal(versionResult.Stdout, &version); err != nil {
-		return errors.New("approved Docker daemon returned an invalid version identity")
+		return DaemonIdentity{}, errors.New("approved Docker daemon returned an invalid version identity")
 	}
 	infoRequest := Request{
 		Args:   e.boundArgs([]string{"info", "--format", `{"id":{{json .ID}},"security_options":{{json .SecurityOptions}}}`}),
@@ -330,17 +402,27 @@ func (e *Executor) verifyDaemon(ctx context.Context, run CommandRunner, environm
 	}
 	infoResult, err := run(ctx, e.path, infoRequest, environment)
 	if err != nil {
-		return daemonProbeError(ctx, err)
+		return DaemonIdentity{}, daemonProbeError(ctx, err)
 	}
 	var info infoIdentity
 	if err := json.Unmarshal(infoResult.Stdout, &info); err != nil {
-		return errors.New("approved Docker daemon returned an invalid capability identity")
+		return DaemonIdentity{}, errors.New("approved Docker daemon returned an invalid capability identity")
 	}
-	if err := attestDaemon(e.options.Endpoint.Expected, version, info); err != nil {
-		return err
+	architecture, err := NormalizeArchitecture(version.Architecture)
+	if err != nil {
+		return DaemonIdentity{}, err
 	}
-	e.verified = true
-	return nil
+	securityOptions := append([]string(nil), info.SecurityOptions...)
+	sort.Strings(securityOptions)
+	actual := DaemonIdentity{
+		ID: info.ID, ServerVersion: version.ServerVersion,
+		OperatingSystem: version.OperatingSystem, Architecture: architecture,
+		MinimumAPIVersion: version.APIVersion, RequiredSecurityOptions: securityOptions,
+	}
+	if err := validateExpectedIdentity(actual); err != nil {
+		return DaemonIdentity{}, errors.New("approved Docker daemon returned an incomplete identity")
+	}
+	return actual, nil
 }
 
 func daemonProbeError(ctx context.Context, err error) error {
@@ -354,21 +436,25 @@ func daemonProbeError(ctx context.Context, err error) error {
 	return fmt.Errorf("approved Docker endpoint identity probe failed (%s)", category)
 }
 
-func attestDaemon(expected DaemonIdentity, version versionIdentity, info infoIdentity) error {
-	if info.ID != expected.ID {
+func attestDaemon(expected, actual DaemonIdentity) error {
+	if actual.ID != expected.ID {
 		return errors.New("approved Docker daemon identity does not match docker configuration")
 	}
-	if version.ServerVersion != expected.ServerVersion {
-		return fmt.Errorf("approved Docker daemon server version is %q; expected %q", version.ServerVersion, expected.ServerVersion)
+	if actual.ServerVersion != expected.ServerVersion {
+		return fmt.Errorf("approved Docker daemon server version is %q; expected %q", actual.ServerVersion, expected.ServerVersion)
 	}
-	if version.OperatingSystem != expected.OperatingSystem || version.Architecture != expected.Architecture {
-		return fmt.Errorf("approved Docker daemon platform is %s/%s; expected %s/%s", version.OperatingSystem, version.Architecture, expected.OperatingSystem, expected.Architecture)
+	expectedArchitecture, err := NormalizeArchitecture(expected.Architecture)
+	if err != nil {
+		return errors.New("approved Docker daemon architecture in configuration is unsupported")
 	}
-	if compareAPIVersions(version.APIVersion, expected.MinimumAPIVersion) < 0 {
-		return fmt.Errorf("approved Docker daemon API version is %q; version %q or newer is required", version.APIVersion, expected.MinimumAPIVersion)
+	if actual.OperatingSystem != expected.OperatingSystem || actual.Architecture != expectedArchitecture {
+		return fmt.Errorf("approved Docker daemon platform is %s/%s; expected %s/%s", actual.OperatingSystem, actual.Architecture, expected.OperatingSystem, expectedArchitecture)
 	}
-	available := make(map[string]bool, len(info.SecurityOptions))
-	for _, option := range info.SecurityOptions {
+	if compareAPIVersions(actual.MinimumAPIVersion, expected.MinimumAPIVersion) < 0 {
+		return fmt.Errorf("approved Docker daemon API version is %q; version %q or newer is required", actual.MinimumAPIVersion, expected.MinimumAPIVersion)
+	}
+	available := make(map[string]bool, len(actual.RequiredSecurityOptions))
+	for _, option := range actual.RequiredSecurityOptions {
 		available[option] = true
 	}
 	for _, required := range expected.RequiredSecurityOptions {
@@ -377,6 +463,19 @@ func attestDaemon(expected DaemonIdentity, version versionIdentity, info infoIde
 		}
 	}
 	return nil
+}
+
+// NormalizeArchitecture maps Docker and kernel aliases to canonical OCI
+// architecture names used by image platform requests.
+func NormalizeArchitecture(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "amd64", "x86_64":
+		return "amd64", nil
+	case "arm64", "aarch64":
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("docker daemon architecture %q is unsupported", value)
+	}
 }
 
 func compareAPIVersions(actual, required string) int {

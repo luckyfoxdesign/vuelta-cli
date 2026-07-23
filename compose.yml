@@ -49,9 +49,6 @@ services:
       - .:/src
       - go-mod-cache:/go/pkg/mod
     command: ["go", "test", "-tags=realengine", "-count=1", "-timeout=45m", "./acceptance"]
-    depends_on:
-      - egress-proxy
-
   egress-proxy:
     build:
       context: .

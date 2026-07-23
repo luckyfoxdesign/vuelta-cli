@@ -37,7 +37,7 @@ docker compose run --rm race   # go test -race ./...
 docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
-docker compose up -d egress-proxy # strict local package-registry proxy
+vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint
 scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
 make build-mac                 # Docker cross-build both binaries for darwin/arm64
 make build-linux               # Docker cross-build both binaries for linux/amd64
@@ -72,7 +72,8 @@ make build                     # both cross-build targets
 - `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
 - `internal/deployworker/` — applies authenticated, immutable deployment candidates and restores the previous digest when a rollout is unhealthy.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
-- `internal/egress/` — resolves the checked-in, fail-closed Docker egress policy shared by containers that need approved registry access.
+- `internal/egress/` — owns the fail-closed Docker network and registry proxy used by networked scanner stages.
+- `internal/egressproxy/` — implements the embedded registry-allowlisting forward proxy used by Vuelta-managed scanner networks.
 - `internal/gitexec/` — is the single process boundary for production Git commands.  Security invariants:   - the executable is selected only from compiled-in absolute system paths;   - children receive a small explicit environment, never the caller's Git,     askpass, proxy, or executable-selection variables;   - system/global config, hooks, fsmonitor, credential helpers, external     diff, automatic maintenance, signing, and unsafe protocols are disabled;   - callers may run only the reviewed command set and may add only a private     absolute GIT_INDEX_FILE.  Repository data and ordinary non-executable repository configuration remain visible to Git. Callers must still validate remote names, refs, and paths at their own trust boundary before placing them in argv.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
@@ -117,6 +118,6 @@ make build                     # both cross-build targets
 ## Known Sharp Edges
 
 - Package scanner defaults are embedded and built locally on demand; `update.toolchain_profiles` is only an explicit digest-pinned operator override.
-- A real package-manager update needs `docker compose up -d egress-proxy`; Vuelta rejects an unavailable proxy/network before an updater starts.
+- Container scans lazily build the embedded egress proxy, verify its exact local image identity, and manage only labeled Vuelta-owned network/container resources; no source checkout or Compose startup is required.
 - `.golangci.yml` targets golangci-lint v2's config schema (`version: "2"`), matching the tag-and-digest-pinned `golangci/golangci-lint:v2.12.2-alpine` image in `compose.yml`; refresh its multi-platform index digest with the controlled process in `README.md`.
 <!-- manual:end -->

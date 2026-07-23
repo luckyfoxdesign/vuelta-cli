@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
+	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
 func TestConfigInitNonInteractive(t *testing.T) {
@@ -53,6 +55,49 @@ func TestConfigInitNonInteractive(t *testing.T) {
 	}
 	if err := run([]string{"--config", path, "config", "init", "--force"}); err == nil || !strings.Contains(err.Error(), "unknown option") {
 		t.Fatalf("removed --force error = %v", err)
+	}
+}
+
+func TestEnvironmentBootstrapPersistsConfirmedCanonicalIdentity(t *testing.T) {
+	previousProbe := probeDockerEndpoint
+	probeDockerEndpoint = func(context.Context, string) (dockerexec.DaemonIdentity, error) {
+		return dockerexec.DaemonIdentity{
+			ID: "daemon-reviewed", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}, nil
+	}
+	t.Cleanup(func() { probeDockerEndpoint = previousProbe })
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	output, err := captureStdout(t, func() error {
+		return run([]string{"--no-input", "--config", path, "environment", "bootstrap", "--socket", "/approved/docker.sock", "--yes", "--json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, `"command":"environment bootstrap"`) || !strings.Contains(output, `"status":"trusted"`) {
+		t.Fatalf("JSON output = %s", output)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Docker == nil || loaded.Docker.Developer == nil || loaded.Docker.Developer.ExpectedDaemon.ID != "daemon-reviewed" {
+		t.Fatalf("Docker config = %#v", loaded.Docker)
+	}
+}
+
+func TestEnvironmentBootstrapNonInteractiveRequiresSocketAndConfirmation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := run([]string{"--no-input", "--config", path, "environment", "bootstrap", "--yes"}); err == nil || !strings.Contains(err.Error(), "requires an explicit --socket") {
+		t.Fatalf("missing socket error = %v", err)
+	}
+	previousProbe := probeDockerEndpoint
+	probeDockerEndpoint = func(context.Context, string) (dockerexec.DaemonIdentity, error) {
+		return dockerexec.DaemonIdentity{ID: "id", ServerVersion: "1", OperatingSystem: "linux", Architecture: "amd64", MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"seccomp"}}, nil
+	}
+	t.Cleanup(func() { probeDockerEndpoint = previousProbe })
+	if err := run([]string{"--no-input", "--config", path, "environment", "bootstrap", "--socket", "/approved/docker.sock"}); err == nil || !strings.Contains(err.Error(), "requires confirmation") {
+		t.Fatalf("missing confirmation error = %v", err)
 	}
 }
 

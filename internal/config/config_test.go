@@ -77,6 +77,20 @@ func TestValidateNotifyConfigRequiresFixedEnvironmentReferences(t *testing.T) {
 	}
 }
 
+func TestValidateEgressBindsProxyURLToManagedContainer(t *testing.T) {
+	valid := EgressConfig{Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy", ProxyURL: "http://vuelta-egress-proxy:3128"}
+	if errs := validateEgress(valid); len(errs) != 0 {
+		t.Fatalf("valid egress errors = %v", errs)
+	}
+	for _, proxyURL := range []string{"http://other:3128", "http://vuelta-egress-proxy:8080"} {
+		candidate := valid
+		candidate.ProxyURL = proxyURL
+		if errs := validateEgress(candidate); len(errs) != 1 {
+			t.Fatalf("proxy URL %q errors = %v", proxyURL, errs)
+		}
+	}
+}
+
 func TestNotificationReferencesDoNotAffectSnapshotPolicyHash(t *testing.T) {
 	workspace := Workspace{Name: "api", Path: "/projects/api"}
 	withoutNotify, err := (Config{}).SnapshotPolicyHash(workspace)

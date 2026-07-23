@@ -60,12 +60,12 @@ type DockerEndpointConfig struct {
 
 // DockerDaemonIdentity is the reviewed daemon attestation contract.
 type DockerDaemonIdentity struct {
-	ID                      string   `yaml:"id"`
-	ServerVersion           string   `yaml:"server_version"`
-	OperatingSystem         string   `yaml:"operating_system"`
-	Architecture            string   `yaml:"architecture"`
-	MinimumAPIVersion       string   `yaml:"minimum_api_version"`
-	RequiredSecurityOptions []string `yaml:"required_security_options"`
+	ID                      string   `yaml:"id" json:"id"`
+	ServerVersion           string   `yaml:"server_version" json:"server_version"`
+	OperatingSystem         string   `yaml:"operating_system" json:"operating_system"`
+	Architecture            string   `yaml:"architecture" json:"architecture"`
+	MinimumAPIVersion       string   `yaml:"minimum_api_version" json:"minimum_api_version"`
+	RequiredSecurityOptions []string `yaml:"required_security_options" json:"required_security_options"`
 }
 
 type NotifyConfig struct {
@@ -183,6 +183,7 @@ type EgressConfig struct {
 	Network        string `yaml:"network"`
 	ProxyContainer string `yaml:"proxy_container"`
 	ProxyURL       string `yaml:"proxy_url"`
+	Persistent     bool   `yaml:"persistent,omitempty"`
 }
 
 type AutofixConfig struct {
@@ -670,6 +671,8 @@ func validateEgress(c EgressConfig) []error {
 	u, err := url.Parse(c.ProxyURL)
 	if err != nil || u.Scheme != "http" || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		errs = append(errs, errors.New("update.egress.proxy_url: must be a plain http://host:port proxy URL without credentials"))
+	} else if u.Hostname() != c.ProxyContainer || u.Port() != "3128" {
+		errs = append(errs, errors.New("update.egress.proxy_url: host must match proxy_container and port must be 3128"))
 	}
 	return errs
 }

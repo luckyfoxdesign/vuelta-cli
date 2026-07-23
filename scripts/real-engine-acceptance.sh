@@ -28,7 +28,6 @@ cleanup() {
   rmdir "$acceptance_root" 2>/dev/null || true
 }
 trap cleanup EXIT
-docker compose up -d egress-proxy
 docker compose --profile acceptance run --rm \
   --volume "$socket:/var/run/docker.sock" \
   --volume "$acceptance_root:$acceptance_root" \

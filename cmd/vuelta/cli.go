@@ -128,6 +128,23 @@ var commandDefinitions = []commandDefinition{
 		security: []string{"Replacement requires --replace and confirmation; --yes confirms only the displayed diff."}, takesConfig: true, handler: "config init",
 	},
 	{
+		path: []string{"environment"}, usage: "vuelta environment <command>",
+		description: "trust local execution environments", group: "Configuration",
+		examples: []string{"vuelta environment bootstrap --socket /var/run/docker.sock"},
+	},
+	{
+		path: []string{"environment", "bootstrap"}, usage: "vuelta environment bootstrap [options] [config-path]",
+		description: "probe and trust one explicit local Docker socket", examples: []string{"vuelta environment bootstrap --socket /var/run/docker.sock", "vuelta --no-input environment bootstrap --socket /var/run/docker.sock --yes --json"},
+		options: []optionDefinition{
+			{names: []string{"--socket"}, valueName: "PATH", description: "probe this explicit local Unix socket"},
+			{names: []string{"--yes"}, description: "confirm the displayed socket and daemon identity"},
+			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
+			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
+		},
+		security:    []string{"Ambient Docker context, config, TLS, proxy, and credential settings are ignored. Trust is persisted only after the exact socket and daemon identity are displayed and confirmed."},
+		takesConfig: true, handler: "environment bootstrap",
+	},
+	{
 		path: []string{"tasks"}, usage: "vuelta tasks <command>",
 		description: "inspect deployment tasks", group: "Operations",
 		examples: []string{"vuelta tasks list"},
@@ -229,7 +246,7 @@ func (c *cli) run(args []string) error {
 	if definition.handler == "" {
 		return c.writeCommandHelp(definition)
 	}
-	if globals.noInput && (definition.handler == "config init" || definition.handler == "project add") {
+	if globals.noInput && (definition.handler == "config init" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
 	if globals.config != "" && definition.takesConfig && definition.handler != "update" {
@@ -243,6 +260,9 @@ func (c *cli) run(args []string) error {
 	if err != nil {
 		if definition.handler == "scan" && scanJSONRequested(commandArgs) {
 			return scanTopLevelFailure(true, "invalid_invocation", err, "Run vuelta help scan for usage")
+		}
+		if definition.handler == "environment bootstrap" && containsArgument(commandArgs, "--json") {
+			return environmentBootstrapFailure(true, "invalid_invocation", err)
 		}
 		return err
 	}
@@ -481,6 +501,8 @@ func dispatchCommand(handler string, args []string) error {
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":
 		return runConfigInit(args)
+	case "environment bootstrap":
+		return runEnvironmentBootstrap(args)
 	case "project list":
 		return runProjectList(args)
 	case "project add":

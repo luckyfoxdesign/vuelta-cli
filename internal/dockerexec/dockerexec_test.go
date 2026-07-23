@@ -265,25 +265,67 @@ func TestExecutorBoundsDaemonIdentityProbe(t *testing.T) {
 
 func TestAttestDaemonRejectsVersionPlatformAPIAndSecurityDrift(t *testing.T) {
 	expected := testEndpoint().Expected
-	validVersion := versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "arm64"}
-	validInfo := infoIdentity{ID: "daemon-approved", SecurityOptions: []string{"name=seccomp,profile=builtin"}}
+	valid := DaemonIdentity{ID: "daemon-approved", ServerVersion: "28.3.2", MinimumAPIVersion: "1.49", OperatingSystem: "linux", Architecture: "arm64", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"}}
 	tests := []struct {
-		name    string
-		version versionIdentity
-		info    infoIdentity
-		want    string
+		name   string
+		actual DaemonIdentity
+		want   string
 	}{
-		{name: "server version", version: versionIdentity{ServerVersion: "28.3.3", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "arm64"}, info: validInfo, want: "server version"},
-		{name: "platform", version: versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.49", OperatingSystem: "linux", Architecture: "amd64"}, info: validInfo, want: "platform"},
-		{name: "api", version: versionIdentity{ServerVersion: "28.3.2", APIVersion: "1.43", OperatingSystem: "linux", Architecture: "arm64"}, info: validInfo, want: "API version"},
-		{name: "security option", version: validVersion, info: infoIdentity{ID: "daemon-approved", SecurityOptions: []string{"name=cgroupns"}}, want: "security option"},
+		{name: "server version", actual: DaemonIdentity{ID: valid.ID, ServerVersion: "28.3.3", MinimumAPIVersion: valid.MinimumAPIVersion, OperatingSystem: valid.OperatingSystem, Architecture: valid.Architecture, RequiredSecurityOptions: valid.RequiredSecurityOptions}, want: "server version"},
+		{name: "platform", actual: DaemonIdentity{ID: valid.ID, ServerVersion: valid.ServerVersion, MinimumAPIVersion: valid.MinimumAPIVersion, OperatingSystem: valid.OperatingSystem, Architecture: "amd64", RequiredSecurityOptions: valid.RequiredSecurityOptions}, want: "platform"},
+		{name: "api", actual: DaemonIdentity{ID: valid.ID, ServerVersion: valid.ServerVersion, MinimumAPIVersion: "1.43", OperatingSystem: valid.OperatingSystem, Architecture: valid.Architecture, RequiredSecurityOptions: valid.RequiredSecurityOptions}, want: "API version"},
+		{name: "security option", actual: DaemonIdentity{ID: valid.ID, ServerVersion: valid.ServerVersion, MinimumAPIVersion: valid.MinimumAPIVersion, OperatingSystem: valid.OperatingSystem, Architecture: valid.Architecture, RequiredSecurityOptions: []string{"name=cgroupns"}}, want: "security option"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := attestDaemon(expected, test.version, test.info); err == nil || !strings.Contains(err.Error(), test.want) {
+			if err := attestDaemon(expected, test.actual); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("attest error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeArchitectureAliases(t *testing.T) {
+	for input, want := range map[string]string{"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64"} {
+		got, err := NormalizeArchitecture(input)
+		if err != nil || got != want {
+			t.Fatalf("NormalizeArchitecture(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	if _, err := NormalizeArchitecture("riscv64"); err == nil {
+		t.Fatal("unsupported architecture succeeded")
+	}
+}
+
+func TestProbeUsesExplicitSocketAndIsolatedEnvironment(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "docker-config")
+	call := 0
+	identity, err := ProbeWithOptions(context.Background(), ProbeOptions{
+		Resolver:  func(string) (string, error) { return executable(t, 0o755), nil },
+		ConfigDir: configDir, SocketPath: "/approved/docker.sock",
+		EndpointValidator: testEndpointValidator,
+		CommandRunner: func(_ context.Context, _ string, request Request, environment []string) (Result, error) {
+			call++
+			joined := strings.Join(environment, "\n")
+			for _, forbidden := range []string{"DOCKER_HOST=", "DOCKER_CONTEXT=", "HTTP_PROXY=", "HTTPS_PROXY="} {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("probe inherited %s in %v", forbidden, environment)
+				}
+			}
+			if len(request.Args) < 3 || request.Args[0] != "--host" || request.Args[1] != "unix:///approved/docker.sock" {
+				t.Fatalf("probe args = %v", request.Args)
+			}
+			if call == 1 {
+				return Result{Stdout: []byte(`{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"aarch64"}`)}, nil
+			}
+			return Result{Stdout: []byte(`{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}`)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call != 2 || identity.Architecture != "arm64" || identity.ID != "daemon-approved" {
+		t.Fatalf("identity = %#v, calls = %d", identity, call)
 	}
 }
 

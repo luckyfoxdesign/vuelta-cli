@@ -167,6 +167,7 @@ func runConfigInit(args []string) error {
 		fmt.Printf("created empty validated config: %s\n", path)
 	}
 	fmt.Println("scanner toolchains: detected defaults are built locally on first scan; update.toolchain_profiles is optional")
+	fmt.Printf("Docker container execution: run `vuelta environment bootstrap --socket PATH --config %s`\n", path)
 	return nil
 }
 

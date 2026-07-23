@@ -217,6 +217,69 @@ func TestWorkspaceEditAtomicRenameFailureLeavesOriginal(t *testing.T) {
 	}
 }
 
+func TestDockerBootstrapCreatesOrPreservesProtectedConfig(t *testing.T) {
+	endpoint := config.DockerEndpointConfig{
+		Socket: "/approved/docker.sock",
+		ExpectedDaemon: config.DockerDaemonIdentity{
+			ID: "daemon-id", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		},
+	}
+	t.Run("create", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		plan, err := PlanDockerBootstrap(path, endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.Changed || plan.Exists {
+			t.Fatalf("plan = %#v", plan)
+		}
+		if err := plan.Apply(path); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Docker == nil || loaded.Docker.Developer == nil || loaded.Docker.Developer.ExpectedDaemon.Architecture != "arm64" {
+			t.Fatalf("Docker endpoint = %#v", loaded.Docker)
+		}
+	})
+	t.Run("preserve", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		cfg := NewConfig()
+		cfg.Git.PushMode = "direct_branch"
+		if err := Write(cfg, path, false); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append([]byte("# retained comment\n"), data...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := PlanDockerBootstrap(path, endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := plan.Apply(path); err != nil {
+			t.Fatal(err)
+		}
+		updated, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(updated), "# retained comment") || !strings.Contains(string(updated), "push_mode: direct_branch") {
+			t.Fatalf("bootstrap rewrote unrelated YAML:\n%s", updated)
+		}
+		repeated, err := PlanDockerBootstrap(path, endpoint)
+		if err != nil || repeated.Changed {
+			t.Fatalf("repeated bootstrap = changed %v, error %v", repeated.Changed, err)
+		}
+	})
+}
+
 func buildNodeWorkspace(t *testing.T, project, name string) config.Workspace {
 	t.Helper()
 	discovery, err := Detect(project)

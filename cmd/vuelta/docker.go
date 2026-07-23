@@ -2,14 +2,17 @@ package main
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 )
 
+var errDockerBootstrapRequired = errors.New("trusted Docker endpoint bootstrap is required")
+
 func configuredDockerEndpoint(endpoint *config.DockerEndpointConfig, label string) (dockerexec.Endpoint, error) {
 	if endpoint == nil {
-		return dockerexec.Endpoint{}, errors.New(label + " is required for Docker execution; configure an approved local socket and expected daemon identity")
+		return dockerexec.Endpoint{}, fmt.Errorf("%w: %s is required; run `vuelta environment bootstrap --socket PATH`", errDockerBootstrapRequired, label)
 	}
 	expected := endpoint.ExpectedDaemon
 	return dockerexec.Endpoint{
@@ -25,7 +28,7 @@ func configuredDockerEndpoint(endpoint *config.DockerEndpointConfig, label strin
 
 func configureDeveloperDocker(cfg config.Config) error {
 	if cfg.Docker == nil {
-		return errors.New("docker.developer is required for container execution; configure an approved local socket and expected daemon identity")
+		return fmt.Errorf("%w: docker.developer is required; run `vuelta environment bootstrap --socket PATH`", errDockerBootstrapRequired)
 	}
 	endpoint, err := configuredDockerEndpoint(cfg.Docker.Developer, "docker.developer")
 	if err != nil {

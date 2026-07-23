@@ -78,6 +78,14 @@ func validRequest(t *testing.T) Request {
 	}
 }
 
+func TestValidateRequestAcceptsValidatedLocalImageID(t *testing.T) {
+	request := validRequest(t)
+	request.Image = "sha256:" + strings.Repeat("a", 64)
+	if err := validateRequest(request); err != nil {
+		t.Fatalf("validated local image ID rejected: %v", err)
+	}
+}
+
 func TestRunUsesCreateCopyStartRemoveWithoutHostMount(t *testing.T) {
 	docker := &fakeDocker{result: dockerexec.Result{Combined: []byte("result")}}
 	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-test", nil }}

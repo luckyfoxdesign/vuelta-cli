@@ -7,8 +7,8 @@
 # Use /var/run/docker.sock for Linux Engine. Docker Desktop macOS normally uses
 # /Users/YOU/.docker/run/docker.sock; keep the absolute path in this private
 # 0600 config rather than expanding HOME or reading an ambient Docker context.
-# Obtain these exact non-secret identity fields with an isolated empty Docker
-# config and an explicit --host, as documented in README.md.
+# Run `vuelta environment bootstrap --socket /absolute/path/to/docker.sock` to
+# display, confirm, normalize, and atomically persist these non-secret fields.
 # docker:
 #   developer:
 #     socket: "/Users/YOU/.docker/run/docker.sock"
@@ -63,9 +63,12 @@ update:
     network: "vuelta-update-egress"
     proxy_container: "vuelta-egress-proxy"
     proxy_url: "http://vuelta-egress-proxy:3128"
-    # Start it before every update run: docker compose up -d egress-proxy.
-    # Its checked-in allowlist is in egress/main.go; add a registry there and
-    # rebuild the proxy before adding a workspace that needs it.
+    # false (default): remove only resources created for this invocation.
+    # true: retain and reuse verified owned resources across invocations.
+    persistent: false
+    # The exact proxy source and registry allowlist are embedded in the binary.
+    # Foreign names, mismatched labels/images, unhealthy state, and unexpected
+    # network attachments fail closed instead of being adopted.
   # Node 20/22/24 and supported Python scanner images are selected from project
   # metadata, built locally from Dockerfiles embedded in the binary, and cached
   # by content hash. No package-scanner image digest is required here.

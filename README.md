@@ -85,23 +85,24 @@ deploy command runs.
 Configure development under `docker.developer`. Linux Docker Engine normally
 uses `/var/run/docker.sock`; Docker Desktop on macOS normally uses the
 per-user `/Users/YOU/.docker/run/docker.sock`. Do not create a system-wide
-socket symlink. To collect the non-secret values without reading ambient Docker
-configuration or credential helpers, create an empty protected directory and
-probe only the selected socket:
+socket symlink. Bootstrap the endpoint through Vuelta so the exact non-secret
+identity is displayed for review and atomically written to the protected
+config without reading ambient Docker configuration or credential helpers:
 
 ```bash
-vuelta_probe_config=$(mktemp -d)
-chmod 700 "$vuelta_probe_config"
-printf '{}\n' > "$vuelta_probe_config/config.json"
-chmod 600 "$vuelta_probe_config/config.json"
-vuelta_socket=/absolute/path/to/docker.sock
-DOCKER_CONFIG="$vuelta_probe_config" docker --host "unix://$vuelta_socket" version --format '{"server_version":{{json .Server.Version}},"api_version":{{json .Server.APIVersion}},"os":{{json .Server.Os}},"architecture":{{json .Server.Arch}}}'
-DOCKER_CONFIG="$vuelta_probe_config" docker --host "unix://$vuelta_socket" info --format '{"id":{{json .ID}},"security_options":{{json .SecurityOptions}}}'
+vuelta environment bootstrap --socket /absolute/path/to/docker.sock
 ```
 
-Copy the exact results into `expected_daemon` and remove the temporary
-`config.json` and directory. Re-review the identity after an intentional Engine
-or Docker Desktop upgrade. The server-only worker uses the separate
+For automation, both authority-bearing flags are mandatory:
+
+```bash
+vuelta --no-input environment bootstrap \
+  --socket /absolute/path/to/docker.sock --yes --json
+```
+
+The command normalizes `aarch64` to `arm64` and `x86_64` to `amd64` before
+persisting and attesting image platforms. Re-review the identity after an
+intentional Engine or Docker Desktop upgrade. The server-only worker uses the separate
 `production_worker.docker` block; never reuse a developer socket path in a
 deploy configuration.
 
@@ -110,15 +111,17 @@ Only tracked regular files are extracted; `.git`, ignored/untracked files,
 `.env*`, host credentials, sockets, and symlinks do not enter the runner. The
 original working tree is never mounted into an update or test container.
 
-Package-manager updates require the checked-in local egress proxy. Start it
-with `docker compose up -d egress-proxy`: update containers attach only to the
-internal `vuelta-update-egress` network and receive the proxy through explicit
-`HTTP(S)_PROXY` variables. The proxy permits only the exact scheme, hostname,
-and port endpoints declared by `VUELTA_EGRESS_ALLOW_RULES` in `compose.yml`;
-Docker's default bridge is not an acceptable substitute.
-Vuelta inspects the network and proxy container before starting an updater and
-fails closed with an actionable diagnostic if either is unavailable. No host
-environment variable or GitHub token is passed to a runner.
+Before the first networked scanner stage, Vuelta builds its exact-version proxy
+from source embedded in the installed binary, validates its local `sha256`
+image identity, and ensures the owned internal network and hardened healthy
+proxy. Scanner containers attach only to `vuelta-update-egress` and receive the
+proxy through explicit `HTTP(S)_PROXY` variables; Docker's default bridge is
+never a scanner fallback. Names, labels, image identity, hardening, health, and
+network attachments are checked before reuse. Foreign collisions and drift
+fail closed. Invocation-created resources are removed after the command;
+`update.egress.persistent: true` explicitly retains verified resources. No
+source checkout, Compose file, host proxy variable, or GitHub token is required
+or passed to a runner.
 
 Dependency vulnerability findings come from exactly one configured source:
 Trivy, OSV-Scanner, or GitHub Dependabot. Selecting Dependabot does not scan
