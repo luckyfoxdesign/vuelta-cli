@@ -28,20 +28,6 @@ func TestLocalPackagePolicyRejectsFlagLikePackage(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultsAutofixToNoShellTools(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("schema_version: 1\nworkspaces: []\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Autofix.AllowedTools != "Read,Edit,Grep" || cfg.Autofix.MaxTurns != 10 || cfg.Autofix.ClaudeBin != "claude" {
-		t.Fatalf("unexpected secure autofix defaults: %+v", cfg.Autofix)
-	}
-}
-
 func TestParseRejectsInlineNotificationCredentials(t *testing.T) {
 	const secret = "fake-inline-notification-secret"
 	for _, data := range []string{
@@ -55,6 +41,13 @@ func TestParseRejectsInlineNotificationCredentials(t *testing.T) {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("parse error leaked inline credential: %v", err)
 		}
+	}
+}
+
+func TestParseRejectsParkedAutofixConfig(t *testing.T) {
+	_, err := Parse([]byte("schema_version: 1\nautofix:\n  enabled: true\nworkspaces: []\n"))
+	if err == nil || !strings.Contains(err.Error(), "field autofix not found") {
+		t.Fatalf("Parse error = %v, want parked autofix field rejection", err)
 	}
 }
 

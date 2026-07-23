@@ -41,7 +41,6 @@ type Config struct {
 	VulnScan         VulnScanConfig          `yaml:"vuln_scan"`
 	GithubAdvisories GithubAdvisoriesConfig  `yaml:"github_advisories"`
 	Update           UpdateConfig            `yaml:"update"`
-	Autofix          AutofixConfig           `yaml:"autofix"`
 	Workspaces       []Workspace             `yaml:"workspaces"`
 	Git              GitConfig               `yaml:"git"`
 }
@@ -186,14 +185,6 @@ type EgressConfig struct {
 	ProxyContainer string `yaml:"proxy_container"`
 	ProxyURL       string `yaml:"proxy_url"`
 	Persistent     bool   `yaml:"persistent,omitempty"`
-}
-
-type AutofixConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	ContainerImage string `yaml:"container_image"`
-	ClaudeBin      string `yaml:"claude_bin"`
-	MaxTurns       int    `yaml:"max_turns"`
-	AllowedTools   string `yaml:"allowed_tools"`
 }
 
 const (
@@ -369,15 +360,7 @@ func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a verification profile
 
-	// Security-sensitive autofix defaults are safe even when an older config
-	// omits the whole block: it stays disabled and, if later enabled, grants no
-	// shell tool. Explicit YAML values still override these defaults and are
-	// validated below.
-	cfg := Config{Autofix: AutofixConfig{
-		ClaudeBin:    "claude",
-		MaxTurns:     10,
-		AllowedTools: "Read,Edit,Grep",
-	}, Update: UpdateConfig{MinReleaseAgeDays: 7, SnapshotTTLHours: 24}}
+	cfg := Config{Update: UpdateConfig{MinReleaseAgeDays: 7, SnapshotTTLHours: 24}}
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
@@ -730,17 +713,6 @@ func validateSecurityConfig(c Config) []error {
 	if c.VulnScan.ImageScan.Enabled && !digestRefPattern.MatchString(c.VulnScan.ImageScan.Image) {
 		errs = append(errs, fmt.Errorf("vuln_scan.image_scan.image: %q is not pinned to a digest (expected an ...@sha256:<64 hex chars> reference)", c.VulnScan.ImageScan.Image))
 	}
-	if c.Autofix.Enabled {
-		if !digestRefPattern.MatchString(c.Autofix.ContainerImage) {
-			errs = append(errs, errors.New("autofix.container_image: must be an immutable sha256 digest when autofix is enabled"))
-		}
-		if c.Autofix.MaxTurns <= 0 {
-			errs = append(errs, errors.New("autofix.max_turns: must be positive when autofix is enabled"))
-		}
-		if !allowedAutofixTools(c.Autofix.AllowedTools) {
-			errs = append(errs, errors.New("autofix.allowed_tools: must be a non-empty subset of Read,Edit,Grep; Bash is prohibited"))
-		}
-	}
 	return errs
 }
 
@@ -781,19 +753,6 @@ func severityRank(value string) int {
 	default:
 		return 0
 	}
-}
-
-func allowedAutofixTools(value string) bool {
-	allowed := map[string]bool{"Read": true, "Edit": true, "Grep": true}
-	seen := make(map[string]bool)
-	for _, tool := range strings.Split(value, ",") {
-		tool = strings.TrimSpace(tool)
-		if !allowed[tool] || seen[tool] {
-			return false
-		}
-		seen[tool] = true
-	}
-	return len(seen) > 0
 }
 
 func validateWorkspace(i int, ws Workspace) []error {

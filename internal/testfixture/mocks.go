@@ -100,18 +100,3 @@ func (r *Registry) SetTag(ref, digest string) {
 	defer r.mu.Unlock()
 	r.tags[ref] = digest
 }
-
-// MockClaudeMode documents the two modes supported by testdata/mock-claude.
-const (
-	MockClaudeFix  = "fix"
-	MockClaudeFail = "fail"
-)
-
-// ValidateMockClaudeMode keeps test configuration explicit and avoids a
-// fallback that could make a failing autofix scenario pass accidentally.
-func ValidateMockClaudeMode(mode string) error {
-	if mode != MockClaudeFix && mode != MockClaudeFail {
-		return fmt.Errorf("unknown mock claude mode %q", mode)
-	}
-	return nil
-}

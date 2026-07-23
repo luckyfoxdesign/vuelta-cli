@@ -337,9 +337,6 @@ func NewConfig() *config.Config {
 				ProxyURL: "http://vuelta-egress-proxy:3128",
 			},
 		},
-		Autofix: config.AutofixConfig{
-			Enabled: false, ClaudeBin: "claude", MaxTurns: 10, AllowedTools: "Read,Edit,Grep",
-		},
 		Workspaces: []config.Workspace{},
 		Git:        config.GitConfig{PushMode: "review_branch"},
 	}

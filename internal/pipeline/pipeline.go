@@ -1,6 +1,6 @@
 // Package pipeline applies one selected workspace snapshot through preflight,
-// sandbox, security gates, update, diff/allowlist checks, tests, optional
-// autofix, commit, push, and notification. The runner uses the hardened
+// sandbox, security gates, update, diff/allowlist checks, tests, commit, push,
+// and notification. The runner uses the hardened
 // isolation provided by sandbox, updater, and testrunner.
 package pipeline
 
@@ -50,18 +50,10 @@ type SecurityGate interface {
 	PostCheck(ctx context.Context, workDir string, ws config.Workspace, cfg config.Config, baseline Report) (Report, error)
 }
 
-// Autofixer runs a single bounded `claude -p` attempt against a failed
-// test run (part C, pipeline step 7). It is only invoked when
-// autofix.enabled is true.
-type Autofixer interface {
-	Attempt(ctx context.Context, sandboxDir, testOutput, allowedDiff string, cfg config.AutofixConfig) (attempted bool, err error)
-}
-
 // Deps wires the pipeline to its stage implementations.
 type Deps struct {
 	Sandbox  Sandbox
 	Security SecurityGate
-	Autofix  Autofixer
 	Notifier *notify.Notifier
 	Logger   *logging.Logger
 	Docker   dockerexec.Runner
@@ -188,38 +180,17 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "security post-check", err)
 	}
 
-	// Step 6: explicit verification, with one optional autofix retry (step 7).
+	// Step 6: explicit verification.
 	result, err := testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
 	if err != nil {
 		return failResult(project, "verification run", err)
-	}
-	autofixApplied := false
-	if !result.Passed && cfg.Autofix.Enabled {
-		allowedDiff, diffErr := gitops.AllowlistedDiff(ctx, landingDir, cfg.AllowedChangedPaths(ws))
-		if diffErr != nil {
-			return failResult(project, "autofix diff policy", diffErr)
-		}
-		attempted, aErr := deps.Autofix.Attempt(ctx, sandboxDir, result.Output, allowedDiff, cfg.Autofix)
-		if aErr != nil {
-			return failResult(project, "autofix", aErr)
-		}
-		if attempted {
-			autofixApplied = true
-			result, err = testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
-			if err != nil {
-				return failResult(project, "verification run after autofix", err)
-			}
-			if result.Passed {
-				return finishAfterAutofix(ctx, project, ws, cfg, sandboxDir, landingDir, now, post, dryRun, &audit)
-			}
-		}
 	}
 	if !result.Passed {
 		return notify.ProjectResult{Project: project, Status: "failed", Reason: "verification failed", CVERefs: post.Findings}
 	}
 
 	if dryRun {
-		return dryRunResult(project, post, autofixApplied)
+		return dryRunResult(project, post)
 	}
 
 	// Step 8: commit.
@@ -245,56 +216,12 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	return notify.ProjectResult{Project: project, Status: "updated", Branch: branch, CVERefs: post.Findings}
 }
 
-// finishAfterAutofix re-syncs the autofix's edits from the sandbox into the
-// landing copy and always pushes to the fixed autofix review branch,
-// regardless of git.push_mode: an AI-touched change never goes straight to
-// a protected branch (part C: "Автоматический push в основную ветку
-// разрешён только для чистых lock-file апдейтов без вмешательства ИИ").
-func finishAfterAutofix(ctx context.Context, project string, ws config.Workspace, cfg config.Config, sandboxDir, landingDir string, now time.Time, post Report, dryRun bool, audit *logging.AuditRecord) notify.ProjectResult {
-	if err := gitops.SyncTree(sandboxDir, landingDir); err != nil {
-		return failResult(project, "sync sandbox to landing copy after autofix", err)
-	}
-	if err := gitops.DiffCheck(ctx, landingDir, cfg.AllowedChangedPaths(ws)); err != nil {
-		return failResult(project, "diff policy after autofix", err)
-	}
-	if changedPaths, err := gitops.ChangedPaths(ctx, landingDir); err != nil {
-		return failResult(project, "audit changed paths after autofix", err)
-	} else {
-		audit.ChangedPaths = changedPaths
-	}
-	if dryRun {
-		return dryRunResult(project, post, true)
-	}
-	summary := gitops.CommitSummary{Date: now, CVERefs: post.Findings}
-	if err := gitops.Commit(ctx, landingDir, cfg.AllowedChangedPaths(ws), summary); err != nil {
-		return failResult(project, "autofix commit", err)
-	}
-	if commitSHA, err := gitops.HeadSHA(ctx, landingDir); err != nil {
-		return failResult(project, "resolve autofix commit SHA", err)
-	} else {
-		audit.CommitSHA = commitSHA
-	}
-	branch := gitops.AutofixBranch(project, now)
-	if err := gitops.PushBranch(ctx, landingDir, ws.Remote, branch); err != nil {
-		return failResult(project, "autofix push", err)
-	}
+func dryRunResult(project string, post Report) notify.ProjectResult {
 	return notify.ProjectResult{
-		Project:        project,
-		Status:         "updated",
-		Branch:         branch,
-		Reason:         "autofix applied: review required",
-		AutofixApplied: true,
-		CVERefs:        post.Findings,
-	}
-}
-
-func dryRunResult(project string, post Report, autofixApplied bool) notify.ProjectResult {
-	return notify.ProjectResult{
-		Project:        project,
-		Status:         "dry_run",
-		Reason:         "dry-run: commit/push skipped",
-		AutofixApplied: autofixApplied,
-		CVERefs:        post.Findings,
+		Project: project,
+		Status:  "dry_run",
+		Reason:  "dry-run: commit/push skipped",
+		CVERefs: post.Findings,
 	}
 }
 

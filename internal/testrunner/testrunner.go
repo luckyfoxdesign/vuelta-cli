@@ -27,8 +27,8 @@ import (
 // outputTailBytes bounds host memory spent on untrusted test output
 // (F5-MED-008). Truncation is soft: the run continues until it finishes or
 // times out, only the most recent bytes are retained, and a deterministic
-// marker records the drop. The retained tail stays well under autofix's
-// 1 MiB prompt cap.
+// marker records the drop. The retained tail stays within the bounded
+// diagnostic budget.
 const outputTailBytes = 256 << 10
 
 // waitDelay bounds how long Wait may block on inherited pipes after the

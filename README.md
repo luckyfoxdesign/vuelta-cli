@@ -45,7 +45,6 @@ internal/
   githubalerts/   # read-only GitHub Dependabot/Security Advisories client
   sandbox/        # one-off sandboxed working copy for update/test
   testrunner/     # runs docker compose test
-  autofix/        # optional claude -p invocation on test failure
   gitops/         # commit, push, tags
   notify/         # webhook/telegram notifications
   scheduler/      # scan/update JSON orchestration and aggregate policy
@@ -66,9 +65,8 @@ fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.
 See the file for the full schema:
 notification targets, vulnerability scan settings, GitHub advisories,
-optional package-scanner overrides, autofix, the list of `workspaces` to
-manage, and the git allowlist that gates which files an update is allowed to
-touch.
+optional package-scanner overrides, the list of `workspaces` to manage, and
+the git allowlist that gates which files an update is allowed to touch.
 
 `vuelta` never scans parent directories or auto-discovers projects: only
 paths listed under `workspaces[]` are ever touched.
@@ -327,3 +325,4 @@ project paths.
 
 Implemented: configuration, scan/update pipeline, security gates, and
 notifications. Phase-2 deployment code is parked outside the tracked build.
+The optional autofix runner is parked with the same phase-2 code.

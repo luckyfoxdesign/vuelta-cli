@@ -19,7 +19,7 @@ app/
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
 ├── internal/            # config, localupdate, scanner, updater, updatesnapshot, vulnscan, githubalerts,
-│                        # toolchain, sandbox, testrunner, autofix, gitops, notify, logging, scheduler
+│                        # toolchain, sandbox, testrunner, gitops, notify, logging, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
@@ -66,7 +66,6 @@ make build                     # both cross-build targets
 
 ## Notable Directories
 
-- `internal/autofix/` — optionally invokes `claude -p` when tests fail after an update. Test logs/diffs are untrusted input: the invocation never grants Bash tool access (see part C of the spec).
 - `internal/capio/` — provides bounded collectors for untrusted subprocess output. Limits are enforced while the child is still streaming, so host memory stays bounded regardless of how much a process writes: Tail soft-truncates diagnostic output to a marked tail, Limit hard-stops structured output that must be parsed in full.
 - `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
 - `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
@@ -81,7 +80,7 @@ make build                     # both cross-build targets
 - `internal/localupdate/` — implements explicit adhoc host package-manager updates in a minimal private writable copy. It never calls Git or Docker, rejects changes outside the recognized manifest/lock pair, and is intentionally separate from the registered-workspace pipeline.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
-- `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, optional autofix, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
+- `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
 - `internal/repopolicy/` — TODO: describe this package.
 - `internal/safeerr/` — builds safe, bounded, redacted diagnostic text and stable failure categories for hardened command boundaries (dockerexec, localexec). It only ever operates on output a boundary already captured under its own size limits; it never sees full argv, environment, or unbounded output.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.

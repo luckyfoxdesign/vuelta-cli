@@ -83,8 +83,7 @@ func baseConfig() config.Config {
 // finds it and testrunner.Run's `docker compose run` succeeds/fails
 // deterministically without a real daemon. passOnCall == 0 means always
 // exit 0; passOnCall < 0 means always exit 1; passOnCall > 0 makes the
-// script fail every call before the Nth and succeed from then on
-// (simulating a test failure fixed by autofix).
+// script fail every call before the Nth and succeed from then on.
 func installFakeDocker(t *testing.T, passOnCall int) dockerexec.Runner {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -165,19 +164,12 @@ func (f fakeUpdater) Update(_ context.Context, projectPath string) (bool, error)
 	return true, os.WriteFile(filepath.Join(projectPath, "requirements.txt"), []byte("flask==2.0.1\n"), 0o644)
 }
 
-type fakeAutofixer struct{ attempted bool }
-
-func (f fakeAutofixer) Attempt(context.Context, string, string, string, config.AutofixConfig) (bool, error) {
-	return f.attempted, nil
-}
-
 func fixedNow() time.Time { return time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC) }
 
 func baseDeps(changed bool, docker dockerexec.Runner) Deps {
 	return Deps{
 		Sandbox:  BasicSandbox{},
 		Security: fakeSecurityGate{},
-		Autofix:  NotConfiguredAutofixer{},
 		Now:      fixedNow,
 		Docker:   docker,
 		ResolveUpdater: func(config.Workspace, config.Config) (updater.Updater, error) {
@@ -312,75 +304,6 @@ func TestRunWorkspaceScanOnlyFailsBeforeSandboxMutation(t *testing.T) {
 	result := RunWorkspace(context.Background(), Deps{}, config.Config{}, workspace, true)
 	if result.Status != "failed" || result.Reason != "verification preflight" {
 		t.Fatalf("scan-only update did not fail closed: %+v", result)
-	}
-}
-
-func TestRunWorkspaceAutofixSucceedsPushesAutofixBranch(t *testing.T) {
-	docker := installFakeDocker(t, 2) // fails first call, passes from the second
-	work := newRepoWithRemote(t)
-	ws := baseWorkspace(work)
-	cfg := baseConfig()
-	cfg.Autofix.Enabled = true
-	deps := baseDeps(true, docker)
-	deps.Autofix = fakeAutofixer{attempted: true}
-
-	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
-	if result.Status != "updated" {
-		t.Fatalf("expected status updated after autofix, got %+v", result)
-	}
-	if !result.AutofixApplied {
-		t.Fatalf("expected successful autofix to be recorded, got %+v", result)
-	}
-	wantBranch := "vuelta/autofix/" + filepath.Base(work) + "-2026-07-13"
-	if result.Branch != wantBranch {
-		t.Fatalf("expected autofix branch %q, got %q", wantBranch, result.Branch)
-	}
-	out := run(t, work, "ls-remote", "origin", "refs/heads/"+wantBranch)
-	if strings.TrimSpace(out) == "" {
-		t.Fatal("expected autofix branch to exist on remote")
-	}
-}
-
-func TestRunWorkspaceDryRunAutofixDoesNotCommitOrPush(t *testing.T) {
-	docker := installFakeDocker(t, 2) // fails first call, passes after autofix
-	work := newRepoWithRemote(t)
-	ws := baseWorkspace(work)
-	cfg := baseConfig()
-	cfg.Autofix.Enabled = true
-	deps := baseDeps(true, docker)
-	deps.Autofix = fakeAutofixer{attempted: true}
-
-	beforeHead := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
-	beforeRemoteRefs := run(t, work, "ls-remote", "origin")
-
-	result := RunWorkspace(context.Background(), deps, cfg, ws, true)
-	if result.Status != "dry_run" || !result.AutofixApplied {
-		t.Fatalf("expected dry_run with autofix applied, got %+v", result)
-	}
-	if got := strings.TrimSpace(run(t, work, "rev-parse", "HEAD")); got != beforeHead {
-		t.Fatalf("dry-run must not create a commit in the workspace: got HEAD %s, want %s", got, beforeHead)
-	}
-	if got := run(t, work, "ls-remote", "origin"); got != beforeRemoteRefs {
-		t.Fatalf("dry-run must not change remote refs: got %q, want %q", got, beforeRemoteRefs)
-	}
-	remoteRefs := run(t, work, "ls-remote", "origin", "refs/heads/vuelta/deps/*", "refs/heads/vuelta/autofix/*")
-	if strings.TrimSpace(remoteRefs) != "" {
-		t.Fatalf("dry-run must not push review refs, got: %s", remoteRefs)
-	}
-}
-
-func TestRunWorkspaceAutofixStillFails(t *testing.T) {
-	docker := installFakeDocker(t, -1) // never passes, even after "autofix"
-	work := newRepoWithRemote(t)
-	ws := baseWorkspace(work)
-	cfg := baseConfig()
-	cfg.Autofix.Enabled = true
-	deps := baseDeps(true, docker)
-	deps.Autofix = fakeAutofixer{attempted: true}
-
-	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
-	if result.Status != "failed" || result.Reason != "verification failed" {
-		t.Fatalf("expected failed/verification failed, got %+v", result)
 	}
 }
 

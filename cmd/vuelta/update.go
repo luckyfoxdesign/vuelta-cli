@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luckyfoxdesign/vuelta/internal/autofix"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
@@ -383,7 +382,7 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	}
 	deps := pipeline.Deps{
 		Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}},
-		Autofix: autofix.Runner{}, Notifier: notify.New(cfg.Notify), Logger: logger,
+		Notifier: notify.New(cfg.Notify), Logger: logger,
 	}
 	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
 		return updater.PlannedUpdater{

@@ -71,43 +71,6 @@ func TestRegistryCapturesDigestBeforeMutableTagChanges(t *testing.T) {
 	var _ updater.DigestResolver = registry.Resolve
 }
 
-func TestMockClaudeScriptHasExplicitModes(t *testing.T) {
-	if err := ValidateMockClaudeMode(MockClaudeFix); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateMockClaudeMode("default"); err == nil {
-		t.Fatal("expected implicit mock mode rejection")
-	}
-}
-
-func TestMockClaudeScriptFixesOnlyWhenExplicitlyRequested(t *testing.T) {
-	work := t.TempDir()
-	scriptSource := filepath.Join("..", "..", "testdata", "fixtures", "mock-claude", "claude")
-	script := filepath.Join(work, "claude")
-	data, err := os.ReadFile(scriptSource)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(script, data, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "test-result.txt"), []byte("fail\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(script, "-p")
-	cmd.Dir = work
-	cmd.Env = append(os.Environ(), "VUELTA_MOCK_CLAUDE_MODE=fix")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("mock claude fix: %v: %s", err, out)
-	}
-	if data, err := os.ReadFile(filepath.Join(work, "test-result.txt")); err != nil || string(data) != "pass\n" {
-		t.Fatalf("mock claude did not fix result: %q, %v", data, err)
-	}
-	if _, err := os.Stat(filepath.Join(work, "autofix-untracked.txt")); err != nil {
-		t.Fatalf("mock claude must create its untracked-file rollback fixture: %v", err)
-	}
-}
-
 func TestGitHubHandlerIsReadOnly(t *testing.T) {
 	server := httptest.NewServer(GitHubAlertsHandler{})
 	defer server.Close()
