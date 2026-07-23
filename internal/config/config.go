@@ -29,8 +29,14 @@ var projectNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var toolVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?$`)
 var containerUserPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$`)
 
+// CurrentSchemaVersion is the only config.yaml schema understood by this
+// build. Config changes are intentionally fail-closed: operators recreate an
+// outdated test config instead of relying on an implicit migration.
+const CurrentSchemaVersion = 1
+
 // Config mirrors the config.yaml schema.
 type Config struct {
+	SchemaVersion    int                     `yaml:"schema_version"`
 	Docker           *DockerConfig           `yaml:"docker,omitempty"`
 	Notify           NotifyConfig            `yaml:"notify"`
 	VulnScan         VulnScanConfig          `yaml:"vuln_scan"`
@@ -371,9 +377,37 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// SchemaVersionError reports a missing or unsupported top-level schema
+// version. Vuelta intentionally does not migrate configs: the safe recovery
+// for the current pre-release/test-only installation is explicit recreation.
+type SchemaVersionError struct {
+	Found *int
+}
+
+func (e *SchemaVersionError) Error() string {
+	found := "is missing"
+	if e.Found != nil {
+		found = fmt.Sprintf("%d is unsupported", *e.Found)
+	}
+	return fmt.Sprintf(
+		"config schema_version %s (supported: %d); preserve any settings you still need, then recreate the selected config with `vuelta config init --replace --config PATH`",
+		found, CurrentSchemaVersion,
+	)
+}
+
 // Parse decodes config bytes with the same safe defaults and strict field
 // checking as Load, without reading from the filesystem.
 func Parse(data []byte) (*Config, error) {
+	var header struct {
+		SchemaVersion *int `yaml:"schema_version"`
+	}
+	if err := yaml.Unmarshal(data, &header); err != nil {
+		return nil, err
+	}
+	if header.SchemaVersion == nil || *header.SchemaVersion != CurrentSchemaVersion {
+		return nil, &SchemaVersionError{Found: header.SchemaVersion}
+	}
+
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a verification profile
 

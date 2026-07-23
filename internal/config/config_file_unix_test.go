@@ -12,7 +12,7 @@ import (
 func TestLoadRejectsUnsafeConfigMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	const secret = "fake-inline-secret-must-not-appear"
-	if err := os.WriteFile(path, []byte("workspaces: []\n# "+secret+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("schema_version: 1\nworkspaces: []\n# "+secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err != nil {
@@ -34,7 +34,7 @@ func TestLoadRejectsConfigSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.yaml")
 	link := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(target, []byte("workspaces: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(target, []byte("schema_version: 1\nworkspaces: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {

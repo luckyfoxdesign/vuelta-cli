@@ -9,6 +9,8 @@
 # 0600 config rather than expanding HOME or reading an ambient Docker context.
 # Run `vuelta environment bootstrap --socket /absolute/path/to/docker.sock` to
 # display, confirm, normalize, and atomically persist these non-secret fields.
+schema_version: 1
+
 # docker:
 #   developer:
 #     socket: "/Users/YOU/.docker/run/docker.sock"
@@ -29,7 +31,7 @@ notify:
 vuln_scan:
   # Exactly one dependency/lock-file source: trivy | osv-scanner | github-dependabot.
   # This replaces vuln_scan.tool and github_advisories.enabled. Delete those
-  # legacy keys when migrating: source selection is fail-closed.
+  # legacy keys when recreating the config: source selection is fail-closed.
   dependency_source: trivy
   # Required only for a trivy or osv-scanner dependency source; omit it for
   # github-dependabot. This security-scanner pin is maintained as a reviewed

@@ -58,7 +58,10 @@ config.example.yaml
 
 Copy `config.example.yaml` to `~/.config/vuelta/config.yaml` and set its
 permissions to `0600`. The config must be a regular, non-symlink file owned by
-the process uid; loading fails closed if these checks do not pass. Webhook URLs
+the process uid and declare the current top-level `schema_version`; loading
+fails closed if these checks do not pass. This pre-release build does not
+migrate old test configs: preserve any settings still needed and recreate the
+file with `vuelta config init --replace`. Webhook URLs
 and Telegram bot tokens are never stored in YAML: the config refers only to the
 fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.

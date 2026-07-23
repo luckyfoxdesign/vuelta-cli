@@ -31,7 +31,7 @@ func TestLocalPackagePolicyRejectsFlagLikePackage(t *testing.T) {
 
 func TestLoadDefaultsAutofixToNoShellTools(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("workspaces: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("schema_version: 1\nworkspaces: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -46,8 +46,8 @@ func TestLoadDefaultsAutofixToNoShellTools(t *testing.T) {
 func TestParseRejectsInlineNotificationCredentials(t *testing.T) {
 	const secret = "fake-inline-notification-secret"
 	for _, data := range []string{
-		"notify:\n  webhook_url: https://hooks.example/" + secret + "\n",
-		"notify:\n  telegram:\n    bot_token: " + secret + "\n",
+		"schema_version: 1\nnotify:\n  webhook_url: https://hooks.example/" + secret + "\n",
+		"schema_version: 1\nnotify:\n  telegram:\n    bot_token: " + secret + "\n",
 	} {
 		_, err := Parse([]byte(data))
 		if err == nil {
@@ -56,6 +56,43 @@ func TestParseRejectsInlineNotificationCredentials(t *testing.T) {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("parse error leaked inline credential: %v", err)
 		}
+	}
+}
+
+func TestParseRequiresCurrentSchemaVersionWithoutLeakingValues(t *testing.T) {
+	const secret = "fake-legacy-secret-must-not-appear"
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "missing", data: "legacy_secret: " + secret + "\nworkspaces: []\n", want: "schema_version is missing"},
+		{name: "unsupported", data: "schema_version: 2\nlegacy_secret: " + secret + "\n", want: "schema_version 2 is unsupported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Parse([]byte(test.data))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Parse error = %v, want %q", err, test.want)
+			}
+			if !strings.Contains(err.Error(), "vuelta config init --replace") {
+				t.Fatalf("Parse error lacks recovery command: %v", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Parse error leaked config value: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadSchemaVersionErrorNamesSelectedConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy config.yaml")
+	if err := os.WriteFile(path, []byte("workspaces: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "--config PATH") {
+		t.Fatalf("Load error = %v, want selected config recovery command", err)
 	}
 }
 

@@ -15,6 +15,9 @@ func TestNewConfigIsValidAndEmpty(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate empty config: %v", err)
 	}
+	if cfg.SchemaVersion != config.CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", cfg.SchemaVersion, config.CurrentSchemaVersion)
+	}
 	if len(cfg.Workspaces) != 0 {
 		t.Fatalf("workspaces = %d, want zero", len(cfg.Workspaces))
 	}

@@ -324,6 +324,7 @@ func gitValues(root string, args ...string) []string {
 // It deliberately contains no workspace and no credentials.
 func NewConfig() *config.Config {
 	return &config.Config{
+		SchemaVersion: config.CurrentSchemaVersion,
 		VulnScan: config.VulnScanConfig{
 			DependencySource: "trivy", Image: trivyImage,
 			FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
