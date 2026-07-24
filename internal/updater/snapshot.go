@@ -282,6 +282,15 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 	if err != nil {
 		return CandidateReport{}, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
 	}
+	if s.Kind == "npm" {
+		lock, ok := bundle.Content("package-lock.json")
+		if !ok {
+			return CandidateReport{}, errors.New("npm candidate scan input omitted package-lock.json")
+		}
+		if err := addNPMCurrentVersions(report.Candidates, lock); err != nil {
+			return CandidateReport{}, err
+		}
+	}
 	return report, nil
 }
 
@@ -449,6 +458,33 @@ func firstString(record map[string]any, keys ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func addNPMCurrentVersions(candidates []updatesnapshot.Candidate, lockData []byte) error {
+	var lock struct {
+		Packages map[string]struct {
+			Version string `json:"version"`
+		} `json:"packages"`
+		Dependencies map[string]struct {
+			Version string `json:"version"`
+		} `json:"dependencies"`
+	}
+	if err := json.Unmarshal(lockData, &lock); err != nil {
+		return fmt.Errorf("parse package-lock.json for current candidate versions: %w", err)
+	}
+	for index := range candidates {
+		if candidates[index].Current != "" {
+			continue
+		}
+		current := lock.Packages["node_modules/"+candidates[index].Name].Version
+		if current == "" {
+			current = lock.Dependencies[candidates[index].Name].Version
+		}
+		if current != "" && candidatePartPattern.MatchString(current) {
+			candidates[index].Current = current
+		}
+	}
+	return nil
 }
 
 var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+!/-]+$`)

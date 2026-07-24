@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,16 @@ func TestParseScanOptionsOnlyModes(t *testing.T) {
 		if !test.wantErr && options.only != test.only {
 			t.Fatalf("parse %v = %#v", test.args, options)
 		}
+	}
+}
+
+func TestParseScanOptionsVerbose(t *testing.T) {
+	options, _, err := parseScanOptions([]string{"--verbose", "--only", "packages"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !options.verbose {
+		t.Fatal("--verbose was not preserved")
 	}
 }
 
@@ -566,6 +577,109 @@ func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t 
 			t.Fatalf("error = %#v, want exit %d", resultErr, exitPartial)
 		}
 	}
+}
+
+func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
+	previousExecutable := executableName
+	executableName = "vuelta"
+	t.Cleanup(func() { executableName = previousExecutable })
+
+	result := scanResult{
+		Project: "api", Status: "ready", SnapshotID: "snapshot-id",
+		Candidates: []updatesnapshot.Candidate{{
+			Kind: "npm", Name: "lodash", Current: "4.17.20", Target: "4.17.23", ReleaseAgeVerified: true,
+		}},
+		Vulnerabilities: []string{},
+		Stages: []scanStageResult{
+			{Name: stageCandidate, Status: string(stageSucceeded)},
+			{Name: stageVulnerability, Status: string(stageNotRequested)},
+		},
+		InputCategories: []string{"package-lock", "package-manifest"},
+		Warnings:        []string{"built a local scanner image"},
+	}
+
+	stdout, stderr := captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false)
+	})
+	for _, wanted := range []string{
+		"Scan: api", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
+		"npm", "lodash", "4.17.20", "4.17.23", "available",
+		"Result: 1 package update available.",
+		"Next: vuelta update --config /tmp/config.yaml -- snapshot-id",
+	} {
+		if !strings.Contains(stdout, wanted) {
+			t.Fatalf("compact output %q does not contain %q", stdout, wanted)
+		}
+	}
+	for _, hidden := range []string{"Details:", "stages:", "inputs:", "built a local scanner image"} {
+		if strings.Contains(stdout, hidden) || strings.Contains(stderr, hidden) {
+			t.Fatalf("compact output exposed %q: stdout=%q stderr=%q", hidden, stdout, stderr)
+		}
+	}
+
+	stdout, stderr = captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", true)
+	})
+	for _, wanted := range []string{"Details:", "stages:", "inputs:"} {
+		if !strings.Contains(stdout, wanted) {
+			t.Fatalf("verbose stdout %q does not contain %q", stdout, wanted)
+		}
+	}
+	if !strings.Contains(stderr, "Warning: built a local scanner image") {
+		t.Fatalf("verbose stderr = %q", stderr)
+	}
+}
+
+func TestHumanScanOutputExplainsRequirementsReadOnly(t *testing.T) {
+	result := scanResult{
+		Directory: "/tmp/project", Status: config.VerificationScanOnly,
+		Candidates: []updatesnapshot.Candidate{{Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.3"}},
+		Stages:     []scanStageResult{{Name: stageCandidate, Status: string(stageSucceeded)}},
+		PackageUpdates: &packageUpdateAvailability{
+			Status: config.VerificationScanOnly, Reason: "manifest_has_no_safe_mutation_contract",
+		},
+	}
+	stdout, _ := captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false)
+	})
+	for _, wanted := range []string{
+		"requirements", "flask", "0.5", "3.1.3", "read-only",
+		"Result: 1 package update found (read-only).",
+		"Note: requirements.txt is read-only; automatic updates are unavailable.",
+	} {
+		if !strings.Contains(stdout, wanted) {
+			t.Fatalf("read-only output %q does not contain %q", stdout, wanted)
+		}
+	}
+}
+
+func captureScanOutput(t *testing.T, fn func()) (string, string) {
+	t.Helper()
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousStdout, previousStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+	fn()
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+	os.Stdout, os.Stderr = previousStdout, previousStderr
+	stdout, err := io.ReadAll(stdoutReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := io.ReadAll(stderrReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stdoutReader.Close()
+	_ = stderrReader.Close()
+	return string(stdout), string(stderr)
 }
 
 func TestFinalizeCleanOrFindingsPromotesOnlyDefaultClean(t *testing.T) {

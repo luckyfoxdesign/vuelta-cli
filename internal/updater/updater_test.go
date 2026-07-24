@@ -244,8 +244,8 @@ func TestParseRequirementsReportKeepsCandidatesAndDiagnostics(t *testing.T) {
 
 func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, root, "package.json", `{}`)
-	writeFile(t, root, "package-lock.json", `{}`)
+	writeFile(t, root, "package.json", `{"dependencies":{"example":"1.0.0"}}`)
+	writeFile(t, root, "package-lock.json", `{"lockfileVersion":3,"packages":{"node_modules/example":{"version":"1.0.0"}}}`)
 	writeFile(t, root, "unrelated-source.js", "sentinel")
 	contract, err := scaninput.PackageContract(config.Workspace{Stack: config.StackNode, PackageManager: "npm"}, false)
 	if err != nil {
@@ -267,7 +267,7 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 		},
 	}
 	candidates, err := scanner.Scan(context.Background(), root)
-	if err != nil || len(candidates) != 1 || candidates[0].Name != "example" {
+	if err != nil || len(candidates) != 1 || candidates[0].Name != "example" || candidates[0].Current != "1.0.0" {
 		t.Fatalf("Scan() = %#v, %v", candidates, err)
 	}
 }

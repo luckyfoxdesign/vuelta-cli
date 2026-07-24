@@ -73,7 +73,7 @@ trap 'rm -f "$tmp"' EXIT
   printf -- '- `go.mod` — Go module definition.\n'
   printf -- '- `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.\n'
 	printf -- '- `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.\n'
-	printf -- '- `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy, opt-in real-engine.\n'
+	printf -- '- `compose.yml` — Docker services: test, race, lint, tidy, build, and opt-in real-engine.\n'
 	printf -- '- `scanner-images/` — embedded exact-version scanner build inputs.\n'
 	printf -- '- `acceptance/` — environment-gated real-engine matrix and example catalog.\n'
 	printf -- '- `egress/` — local fail-closed proxy and its scratch-image Dockerfile.\n'

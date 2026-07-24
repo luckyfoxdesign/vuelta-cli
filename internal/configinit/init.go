@@ -333,8 +333,8 @@ func NewConfig() *config.Config {
 			MinReleaseAgeDays: 7,
 			SnapshotTTLHours:  24,
 			Egress: config.EgressConfig{
-				Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy",
-				ProxyURL: "http://vuelta-egress-proxy:3128",
+				Network: "vuelta-cli-update-egress", ProxyContainer: "vuelta-cli-egress-proxy",
+				ProxyURL: "http://vuelta-cli-egress-proxy:3128",
 			},
 		},
 		Workspaces: []config.Workspace{},

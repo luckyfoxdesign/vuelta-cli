@@ -49,38 +49,6 @@ services:
       - .:/src
       - go-mod-cache:/go/pkg/mod
     command: ["go", "test", "-tags=realengine", "-count=1", "-timeout=45m", "./acceptance"]
-  egress-proxy:
-    build:
-      context: .
-      dockerfile: egress/Dockerfile
-    container_name: vuelta-egress-proxy
-    environment:
-      VUELTA_EGRESS_ALLOW_RULES: >-
-        https://pypi.org:443,https://files.pythonhosted.org:443,
-        https://registry.npmjs.org:443,https://registry.yarnpkg.com:443,
-        https://registry.bun.sh:443,https://github.com:443,
-        https://objects.githubusercontent.com:443,https://ghcr.io:443,
-        https://pkg-containers.githubusercontent.com:443,https://api.osv.dev:443,
-        https://registry-1.docker.io:443,https://auth.docker.io:443,
-        https://production.cloudflare.docker.com:443
-    user: "65532:65532"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    cpus: "0.50"
-    mem_limit: 64m
-    pids_limit: 64
-    networks:
-      - default
-      - update-egress
-    restart: "no"
 
 volumes:
   go-mod-cache:
-
-networks:
-  update-egress:
-    name: vuelta-update-egress
-    internal: true

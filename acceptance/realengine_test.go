@@ -65,6 +65,7 @@ type commandEnvelope struct {
 			Status string `json:"status"`
 		} `json:"stages"`
 		Toolchain *toolchain.Identity `json:"toolchain"`
+		Warnings  []string            `json:"warnings"`
 		Error     *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
@@ -162,6 +163,11 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 		"DOCKER_CONFIG="+filepath.Join(caseRoot, "untrusted-docker-config"),
 		"HTTP_PROXY=http://untrusted.invalid:8080", "HTTPS_PROXY=http://untrusted.invalid:8080",
 	)
+	initOutput := runTextInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"config", "init", "--config", configPath)
+	if !strings.Contains(initOutput, "Next:") || !strings.Contains(initOutput, configPath) {
+		t.Fatalf("[compatibility] config init omitted the selected config from its next command: %q", initOutput)
+	}
 	bootstrap := runJSONInDir(t, ctx, env, caseRoot, "compatibility", binary,
 		"environment", "bootstrap", "--socket", "/var/run/docker.sock", "--yes", "--json", "--config", configPath)
 	if len(bootstrap.Results) != 1 || bootstrap.Results[0].Status != "trusted" {
@@ -174,25 +180,37 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 	if cfg.Docker == nil || cfg.Docker.Developer == nil || (cfg.Docker.Developer.ExpectedDaemon.Architecture != "amd64" && cfg.Docker.Developer.ExpectedDaemon.Architecture != "arm64") {
 		t.Fatalf("[security] bootstrap did not persist a canonical daemon identity")
 	}
-	// The developer host running this suite may retain the old Compose-created
-	// default network, which the installed CLI must correctly reject because it
-	// has no ownership labels. Isolate this acceptance invocation without
-	// deleting or adopting that external resource.
-	cfg.Update.Egress = config.EgressConfig{
-		Network: "vuelta-acceptance-bootstrap-egress", ProxyContainer: "vuelta-acceptance-bootstrap-egress-proxy",
-		ProxyURL: "http://vuelta-acceptance-bootstrap-egress-proxy:3128",
+	validateOutput := runTextInDir(t, ctx, env, project, "compatibility", binary,
+		"config", "validate", "--config", configPath)
+	if !strings.Contains(validateOutput, "Next:") || !strings.Contains(validateOutput, "scan --directory .") {
+		t.Fatalf("[compatibility] config validate omitted the next local scan: %q", validateOutput)
 	}
-	writeConfig(t, configPath, cfg)
+	conflicts := createComposeOwnedProxyConflict(t, ctx, cfg)
+	t.Cleanup(func() { conflicts.cleanup(t) })
 	vulnerability := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
 		"scan", "--directory", project, "--only", "vulnerabilities", "--json", "--config", configPath)
 	if len(vulnerability.Results) != 1 || vulnerability.Results[0].Error != nil || !hasAcceptanceStage(vulnerability.Results[0].Stages, "vulnerability", "succeeded") {
 		t.Fatalf("[scanner] installed vulnerability scan = %#v", vulnerability.Results)
+	}
+	if !containsAcceptanceText(vulnerability.Results[0].Warnings, "left those resources unchanged") {
+		t.Fatalf("[security] conflict fallback warning = %#v", vulnerability.Results[0].Warnings)
 	}
 	packages := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
 		"scan", "--directory", project, "--only", "packages", "--json", "--config", configPath)
 	if len(packages.Results) != 1 || packages.Results[0].Error != nil || len(packages.Results[0].Candidates) == 0 {
 		t.Fatalf("[scanner] installed package scan = %#v", packages.Results)
 	}
+
+	npmProject := filepath.Join(caseRoot, "npm-project")
+	if err := testfixture.SetupProject(ctx, "/src/testdata/fixtures/projects", "node-npm-ok", npmProject); err != nil {
+		t.Fatalf("[infrastructure] prepare npm fixture: %v", err)
+	}
+	npmPackages := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
+		"scan", "--directory", npmProject, "--only", "packages", "--json", "--config", configPath)
+	if len(npmPackages.Results) != 1 || npmPackages.Results[0].Error != nil || len(npmPackages.Results[0].Candidates) == 0 {
+		t.Fatalf("[scanner] installed npm package scan = %#v", npmPackages.Results)
+	}
+	conflicts.assertPresent(t, ctx)
 }
 
 func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
@@ -526,8 +544,104 @@ func writeConfig(t *testing.T, path string, cfg *config.Config) {
 	}
 }
 
+type composeOwnedProxyConflict struct {
+	docker    dockerexec.Runner
+	container string
+}
+
+func createComposeOwnedProxyConflict(t *testing.T, ctx context.Context, cfg *config.Config) composeOwnedProxyConflict {
+	t.Helper()
+	developer := cfg.Docker.Developer
+	docker := dockerexec.New(dockerexec.Options{Endpoint: dockerexec.Endpoint{
+		SocketPath: developer.Socket,
+		Expected: dockerexec.DaemonIdentity{
+			ID: developer.ExpectedDaemon.ID, ServerVersion: developer.ExpectedDaemon.ServerVersion,
+			OperatingSystem: developer.ExpectedDaemon.OperatingSystem, Architecture: developer.ExpectedDaemon.Architecture,
+			MinimumAPIVersion:       developer.ExpectedDaemon.MinimumAPIVersion,
+			RequiredSecurityOptions: append([]string(nil), developer.ExpectedDaemon.RequiredSecurityOptions...),
+		},
+	}})
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("[infrastructure] resolve acceptance container ID: %v", err)
+	}
+	imageResult, err := docker.Run(ctx, dockerexec.Request{
+		Args:   []string{"container", "inspect", "--format", `{{.Image}}`, hostname},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		t.Fatalf("[infrastructure] resolve acceptance container image: %v", err)
+	}
+	imageID := strings.TrimSpace(string(imageResult.Stdout))
+	if !strings.HasPrefix(imageID, "sha256:") {
+		t.Fatalf("[infrastructure] acceptance container image is not content-addressed")
+	}
+	conflict := composeOwnedProxyConflict{docker: docker, container: cfg.Update.Egress.ProxyContainer}
+	if _, err := docker.Run(ctx, dockerexec.Request{
+		Args: []string{
+			"container", "create", "--name", conflict.container,
+			"--label", "com.docker.compose.project=vuelta-acceptance",
+			"--label", "com.docker.compose.service=egress-proxy",
+			imageID, "true",
+		},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	}); err != nil {
+		t.Fatalf("[infrastructure] create Compose-owned conflict container: %v", err)
+	}
+	return conflict
+}
+
+func (c composeOwnedProxyConflict) assertPresent(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if _, err := c.docker.Run(ctx, dockerexec.Request{
+		Args: []string{"container", "inspect", "--format", `{{.Id}}`, c.container}, Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	}); err != nil {
+		t.Fatalf("[security] Vuelta mutated the Compose-owned container %q: %v", c.container, err)
+	}
+}
+
+func (c composeOwnedProxyConflict) cleanup(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	owner, err := c.docker.Run(ctx, dockerexec.Request{
+		Args:   []string{"container", "inspect", "--format", `{{index .Config.Labels "com.docker.compose.project"}}`, c.container},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		t.Errorf("[infrastructure] inspect conflict container before cleanup: %v", err)
+		return
+	}
+	if strings.TrimSpace(string(owner.Stdout)) != "vuelta-acceptance" {
+		t.Errorf("[security] refusing to remove conflict container without the acceptance Compose label")
+		return
+	}
+	if _, err := c.docker.Run(ctx, dockerexec.Request{
+		Args: []string{"container", "rm", "--force", c.container}, Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	}); err != nil {
+		t.Errorf("[infrastructure] remove conflict container: %v", err)
+	}
+}
+
 func runJSON(t *testing.T, ctx context.Context, env []string, category, binary string, args ...string) commandEnvelope {
 	return runJSONInDir(t, ctx, env, "", category, binary, args...)
+}
+
+func runTextInDir(t *testing.T, ctx context.Context, env []string, dir, category, binary string, args ...string) string {
+	t.Helper()
+	command := exec.CommandContext(ctx, binary, args...)
+	command.Env = env
+	command.Dir = dir
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("[%s] command failed: %s", category, failureMessage(stdout.Bytes(), stderr.String(), err))
+	}
+	return stdout.String()
 }
 
 func runJSONInDir(t *testing.T, ctx context.Context, env []string, dir, category, binary string, args ...string) commandEnvelope {
@@ -546,6 +660,15 @@ func runJSONInDir(t *testing.T, ctx context.Context, env []string, dir, category
 		t.Fatalf("[parsing] decode command JSON: %v", err)
 	}
 	return envelope
+}
+
+func containsAcceptanceText(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func runJSONFailure(t *testing.T, ctx context.Context, env []string, category, contains, binary string, args ...string) {

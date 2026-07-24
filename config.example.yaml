@@ -62,15 +62,16 @@ update:
   snapshot_ttl_hours: 24
   # snapshot_state_dir: "/Users/you/.config/vuelta/update-snapshots"
   egress:
-    network: "vuelta-update-egress"
-    proxy_container: "vuelta-egress-proxy"
-    proxy_url: "http://vuelta-egress-proxy:3128"
+    network: "vuelta-cli-update-egress"
+    proxy_container: "vuelta-cli-egress-proxy"
+    proxy_url: "http://vuelta-cli-egress-proxy:3128"
     # false (default): remove only resources created for this invocation.
     # true: retain and reuse verified owned resources across invocations.
     persistent: false
     # The exact proxy source and registry allowlist are embedded in the binary.
-    # Foreign names, mismatched labels/images, unhealthy state, and unexpected
-    # network attachments fail closed instead of being adopted.
+    # Occupied names are left untouched and get an isolated deterministic
+    # fallback. Every resource Vuelta actually uses must still pass the full
+    # ownership, identity, hardening, health, and attachment contract.
   # Node 20/22/24 and supported Python scanner images are selected from project
   # metadata, built locally from Dockerfiles embedded in the binary, and cached
   # by content hash. No package-scanner image digest is required here.

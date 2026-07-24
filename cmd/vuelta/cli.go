@@ -53,6 +53,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
+			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
 		security:    []string{"Scan is read-only. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},

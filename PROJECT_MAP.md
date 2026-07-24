@@ -54,7 +54,7 @@ make build                     # both cross-build targets
 - `go.mod` — Go module definition.
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
 - `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
-- `compose.yml` — Docker services: test, race, lint, tidy, build, egress-proxy, opt-in real-engine.
+- `compose.yml` — Docker services: test, race, lint, tidy, build, and opt-in real-engine.
 - `scanner-images/` — embedded exact-version scanner build inputs.
 - `acceptance/` — environment-gated real-engine matrix and example catalog.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.

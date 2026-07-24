@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
@@ -123,6 +124,7 @@ type scanOptions struct {
 	minReleaseAge      string
 	allowProjectConfig bool
 	failOn             string
+	verbose            bool
 	jsonOutput         bool
 	toolchainProfile   *config.ToolchainProfile
 	toolchainIdentity  *toolchain.Identity
@@ -177,6 +179,11 @@ func executeScan(args []string) error {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		cleanupErr := egressSession.Close(cleanupCtx)
 		cancel()
+		if notice := egressSession.Notice(); notice != "" {
+			for index := range results {
+				results[index].Warnings = appendUniqueStrings(results[index].Warnings, notice)
+			}
+		}
 		if cleanupErr != nil {
 			for index := range results {
 				results[index].Warnings = appendUniqueStrings(results[index].Warnings, "managed egress cleanup failed; only Vuelta-owned invocation resources were targeted")
@@ -195,7 +202,7 @@ func executeScan(args []string) error {
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, "warning:", warning)
 		}
-		writeHumanScanResults(results, configFile)
+		writeHumanScanResults(results, configFile, options.verbose)
 	}
 	return scanResultError(summary, options.failOn)
 }
@@ -227,6 +234,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.minReleaseAge, "min-release-age", "", "minimum release age")
 	fs.BoolVar(&options.allowProjectConfig, "allow-project-config", false, "honor reviewed package-manager config")
 	fs.StringVar(&options.failOn, "fail-on", "", "return 5 for vulnerability findings")
+	fs.BoolVar(&options.verbose, "verbose", false, "show technical stages, inputs, warnings, and error details")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
@@ -460,7 +468,11 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		packages:        scanPackages,
 		prepareToolchain: func(ctx context.Context, cfg config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
 			return toolchain.Prepare(ctx, workspace, cfg, dockerexec.Default(), func(message string) {
-				fmt.Fprintln(os.Stderr, "toolchain:", message)
+				if options.verbose {
+					fmt.Fprintln(os.Stderr, "Toolchain:", message)
+				} else {
+					fmt.Fprintln(os.Stderr, "Preparing scanner for the first run...")
+				}
 			})
 		},
 	})
@@ -1130,6 +1142,10 @@ func scanFailureContract(code, hint string, err error) (string, string) {
 	var egressStage *egress.StageError
 	if errors.As(err, &egressStage) {
 		stage := strings.ReplaceAll(egressStage.Stage, " ", "_")
+		_, _, detail := dockerexec.Classify(err)
+		if strings.Contains(detail, "predefined address pools have been fully subnetted") {
+			return "egress_" + stage + "_failed", "Docker has no free network subnet; stop an unused Compose project in Docker Desktop, then rerun this same Vuelta scan. Vuelta did not remove any existing network"
+		}
 		return "egress_" + stage + "_failed", "Inspect only the Vuelta-owned proxy/network diagnostics and retry"
 	}
 	return code, hint
@@ -1184,54 +1200,68 @@ func summarizeScan(results []scanResult) scanSummary {
 	return summary
 }
 
-func writeHumanScanResults(results []scanResult, configFile string) {
-	for _, result := range results {
+func writeHumanScanResults(results []scanResult, configFile string, verbose bool) {
+	for resultIndex, result := range results {
+		if resultIndex > 0 {
+			fmt.Println()
+		}
 		label := result.Project
 		if label == "" {
 			label = result.Directory
 		}
-		fmt.Printf("%s: %s (%d vulnerabilities, %d package candidates)\n", label, result.Status, len(result.Vulnerabilities), len(result.Candidates))
-		if len(result.Stages) > 0 {
+		fmt.Printf("Scan: %s\n", label)
+		writePackageCandidateTable(result)
+		fmt.Printf("Result: %s\n", conciseScanSummary(result))
+		for _, finding := range result.Vulnerabilities {
+			fmt.Printf("Vulnerability: %s\n", finding)
+		}
+		if result.PackageUpdates != nil && result.PackageUpdates.Reason == "manifest_has_no_safe_mutation_contract" {
+			fmt.Println("Note: requirements.txt is read-only; automatic updates are unavailable.")
+		}
+		for _, diagnostic := range result.Diagnostics {
+			fmt.Fprintf(os.Stderr, "Issue: %s:%d [%s] %s\n", diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)
+		}
+		if verbose {
+			fmt.Printf("Details:\n  status: %s\n", result.Status)
+		}
+		if verbose && len(result.Stages) > 0 {
 			stages := make([]string, 0, len(result.Stages))
 			for _, stage := range result.Stages {
 				stages = append(stages, fmt.Sprintf("%s=%s", stage.Name, stage.Status))
 			}
 			fmt.Printf("  stages: %s\n", strings.Join(stages, ", "))
 		}
-		if len(result.InputCategories) > 0 {
-			fmt.Printf("  scan inputs: %s\n", strings.Join(result.InputCategories, ", "))
+		if verbose && len(result.InputCategories) > 0 {
+			fmt.Printf("  inputs: %s\n", strings.Join(result.InputCategories, ", "))
 		}
-		for _, step := range result.Verification {
-			fmt.Printf("  verification: %s\n", step)
-		}
-		for _, finding := range result.Vulnerabilities {
-			fmt.Printf("  vulnerability: %s\n", finding)
-		}
-		for _, candidate := range result.Candidates {
-			verification := "verified"
-			if !candidate.ReleaseAgeVerified {
-				verification = "unverified release age"
+		if verbose {
+			for _, step := range result.Verification {
+				fmt.Printf("  verification: %s\n", step)
 			}
-			fmt.Printf("  %s %s: %s -> %s (%s)\n", candidate.Kind, candidate.Name, candidate.Current, candidate.Target, verification)
 		}
-		for _, diagnostic := range result.Diagnostics {
-			fmt.Fprintf(os.Stderr, "diagnostic: %s: %s:%d [%s] %s\n", label, diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)
+		if verbose && result.PackageUpdates != nil {
+			fmt.Printf("  package updates: %s (%s)\n", result.PackageUpdates.Status, result.PackageUpdates.Reason)
 		}
-		for _, warning := range result.Warnings {
-			fmt.Fprintf(os.Stderr, "warning: %s: %s\n", label, warning)
+		if verbose {
+			for _, warning := range result.Warnings {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+			}
 		}
 		if result.Error != nil {
-			fmt.Fprintf(os.Stderr, "%s: %s\nHint: %s\n", label, result.Error.Message, result.Error.Hint)
-			if result.Error.Stage != "" {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", result.Error.Message)
+			if result.Error.Hint != "" {
+				fmt.Fprintf(os.Stderr, "Hint: %s\n", result.Error.Hint)
+			}
+			if verbose && result.Error.Stage != "" {
 				fmt.Fprintf(os.Stderr, "  stage: %s\n", result.Error.Stage)
 			}
-			if result.Error.Category != "" {
+			if verbose && result.Error.Category != "" {
 				fmt.Fprintf(os.Stderr, "  category: %s\n", result.Error.Category)
 			}
-			if result.Error.ExitCode != nil {
+			if verbose && result.Error.ExitCode != nil {
 				fmt.Fprintf(os.Stderr, "  exit code: %d\n", *result.Error.ExitCode)
 			}
-			if result.Error.StderrTail != "" {
+			if verbose && result.Error.StderrTail != "" {
 				fmt.Fprintf(os.Stderr, "  detail: %s\n", result.Error.StderrTail)
 			}
 		}
@@ -1244,13 +1274,84 @@ func writeHumanScanResults(results []scanResult, configFile string) {
 	}
 	sort.SliceStable(ready, func(i, j int) bool { return ready[i].Project < ready[j].Project })
 	for _, result := range ready {
-		defaultPath, _ := defaultConfigPath()
-		if configFile != "" && configFile != defaultPath {
-			fmt.Printf("Next: vuelta update --config %s -- %s\n", configFile, result.SnapshotID)
-		} else {
-			fmt.Printf("Next: vuelta update -- %s\n", result.SnapshotID)
+		fmt.Printf("Next: %s\n", displayCommand("update", "--config", configFile, "--", result.SnapshotID))
+	}
+}
+
+func writePackageCandidateTable(result scanResult) {
+	if len(result.Candidates) == 0 {
+		return
+	}
+	table := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(table, "MANAGER\tPACKAGE\tCURRENT\tLATEST\tSTATUS")
+	for _, candidate := range result.Candidates {
+		current := candidate.Current
+		if current == "" {
+			current = "unknown"
+		}
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n",
+			candidate.Kind, candidate.Name, current, candidate.Target, packageCandidateStatus(result, candidate))
+	}
+	_ = table.Flush()
+}
+
+func packageCandidateStatus(result scanResult, candidate updatesnapshot.Candidate) string {
+	if result.Status == config.VerificationScanOnly ||
+		(result.PackageUpdates != nil && result.PackageUpdates.Status == config.VerificationScanOnly) {
+		return "read-only"
+	}
+	if !candidate.ReleaseAgeVerified {
+		return "age unverified"
+	}
+	return "available"
+}
+
+func conciseScanSummary(result scanResult) string {
+	if result.Status == "failed" {
+		return "scan failed."
+	}
+	var parts []string
+	if result.Status == "partial" {
+		parts = append(parts, "partial scan")
+	}
+	packagesRequested := scanStageRequested(result, stageCandidate) || len(result.Candidates) > 0 || result.PackageUpdates != nil
+	if packagesRequested {
+		switch {
+		case len(result.Candidates) == 0 && result.Status != "partial":
+			parts = append(parts, "no package updates found")
+		case len(result.Candidates) > 0 && result.Status == config.VerificationScanOnly:
+			parts = append(parts, fmt.Sprintf("%s found (read-only)", countPhrase(len(result.Candidates), "package update", "package updates")))
+		case len(result.Candidates) > 0:
+			parts = append(parts, fmt.Sprintf("%s available", countPhrase(len(result.Candidates), "package update", "package updates")))
 		}
 	}
+	if scanStageRequested(result, stageVulnerability) || len(result.Vulnerabilities) > 0 {
+		if len(result.Vulnerabilities) == 0 && result.Status != "partial" {
+			parts = append(parts, "no vulnerabilities found")
+		} else if len(result.Vulnerabilities) > 0 {
+			parts = append(parts, fmt.Sprintf("%s found", countPhrase(len(result.Vulnerabilities), "vulnerability", "vulnerabilities")))
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "scan complete")
+	}
+	return strings.Join(parts, "; ") + "."
+}
+
+func scanStageRequested(result scanResult, name string) bool {
+	for _, stage := range result.Stages {
+		if stage.Name == name {
+			return stage.Status != string(stageNotRequested)
+		}
+	}
+	return false
+}
+
+func countPhrase(count int, singular, plural string) string {
+	if count == 1 {
+		return fmt.Sprintf("%d %s", count, singular)
+	}
+	return fmt.Sprintf("%d %s", count, plural)
 }
 
 func scanTopLevelFailure(jsonOutput bool, code string, err error, hint string) error {

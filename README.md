@@ -31,6 +31,39 @@ platform, non-root user, lock support, and security capabilities. See
   pins and requests bounded PyPI metadata; it never invokes pip or project
   code and cannot produce an update snapshot.
 
+## Local Quick Start (macOS)
+
+From a fresh `app` checkout, build the Apple Silicon CLI in Docker, select the
+local npm or Python project to inspect, and follow the four commands below:
+
+```bash
+make build-mac
+VUELTA="$PWD/bin/vuelta-darwin-arm64"
+PROJECT="/absolute/path/to/your/npm-or-python-project"
+
+"$VUELTA" config init
+"$VUELTA" environment bootstrap --socket "$HOME/.docker/run/docker.sock"
+"$VUELTA" config validate
+"$VUELTA" scan --directory "$PROJECT" --only packages
+```
+
+`make build-mac` always writes the CLI to
+`bin/vuelta-darwin-arm64`; installation on `PATH` is not required. Docker
+Desktop must be running. The bootstrap command displays the exact socket and
+daemon identity and asks for confirmation before saving them. Each successful
+onboarding command prints the next command with the selected config path and
+the same invoked binary preserved.
+
+No YAML editing, Compose startup, Docker resource inspection, or cleanup is
+part of this flow. If another application already occupies the configured
+egress names, Vuelta leaves those resources unchanged and uses deterministic
+isolated names for its own invocation. The final scan prints one result per
+project as a compact `manager / package / current / latest / status` table. A
+standalone `requirements.txt` is explicitly reported as a read-only result
+because it has no safe automatic mutation contract. Add `--verbose` to the
+scan command only when technical stages, selected inputs, warnings, and Docker
+error details are needed; `--json` remains the stable automation interface.
+
 ## Layout
 
 ```text
@@ -54,12 +87,14 @@ config.example.yaml
 
 ## Configuration
 
-Copy `config.example.yaml` to `~/.config/vuelta/config.yaml` and set its
-permissions to `0600`. The config must be a regular, non-symlink file owned by
-the process uid and declare the current top-level `schema_version`; loading
-fails closed if these checks do not pass. This pre-release build does not
-migrate old test configs: preserve any settings still needed and recreate the
-file with `vuelta config init --replace`. Webhook URLs
+For local scanning, create the protected default config with `vuelta config
+init`; no manual YAML edit is required. `config.example.yaml` is the reference
+for advanced server and notification settings. The config must be a regular,
+non-symlink file owned by the process uid, use mode `0600`, and declare the
+current top-level `schema_version`; loading fails closed if these checks do not
+pass. This pre-release build does not migrate old test configs: preserve any
+settings still needed and recreate the file with `vuelta config init
+--replace`. Webhook URLs
 and Telegram bot tokens are never stored in YAML: the config refers only to the
 fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.
@@ -112,11 +147,14 @@ original working tree is never mounted into an update or test container.
 Before the first networked scanner stage, Vuelta builds its exact-version proxy
 from source embedded in the installed binary, validates its local `sha256`
 image identity, and ensures the owned internal network and hardened healthy
-proxy. Scanner containers attach only to `vuelta-update-egress` and receive the
-proxy through explicit `HTTP(S)_PROXY` variables; Docker's default bridge is
-never a scanner fallback. Names, labels, image identity, hardening, health, and
-network attachments are checked before reuse. Foreign collisions and drift
-fail closed. Invocation-created resources are removed after the command;
+proxy. Scanner containers attach only to the invocation's verified internal
+egress network and receive the proxy through explicit `HTTP(S)_PROXY`
+variables; Docker's default bridge is never a scanner fallback. Names, labels,
+image identity, hardening, health, and network attachments are checked before
+reuse. Foreign name collisions are left untouched and routed to deterministic
+isolated Vuelta names. Every resource actually selected for a scan must pass
+the full ownership, identity, hardening, health, and attachment contract.
+Invocation-created resources are removed after the command;
 `update.egress.persistent: true` explicitly retains verified resources. No
 source checkout, Compose file, host proxy variable, or GitHub token is required
 or passed to a runner.

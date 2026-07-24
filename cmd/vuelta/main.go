@@ -23,6 +23,7 @@ const (
 
 // version is set at build time with -ldflags when a release is produced.
 var version = "dev"
+var executableName = "vuelta"
 
 type commandError struct {
 	code int
@@ -37,6 +38,9 @@ func fail(code int, format string, args ...any) error {
 }
 
 func main() {
+	if os.Args[0] != "" {
+		executableName = os.Args[0]
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "vuelta:", err)
 		var command commandError
@@ -143,8 +147,29 @@ func runConfigInit(args []string) error {
 		fmt.Printf("created empty validated config: %s\n", path)
 	}
 	fmt.Println("scanner toolchains: detected defaults are built locally on first scan; update.toolchain_profiles is optional")
-	fmt.Printf("Docker container execution: run `vuelta environment bootstrap --socket PATH --config %s`\n", path)
+	fmt.Printf("Next: %s\n", displayCommand("environment", "bootstrap", "--config", path))
 	return nil
+}
+
+func displayCommand(args ...string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellArgument(executableName))
+	for _, argument := range args {
+		parts = append(parts, shellArgument(argument))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellArgument(value string) string {
+	if value != "" && strings.IndexFunc(value, func(r rune) bool {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return false
+		}
+		return !strings.ContainsRune("_@%+=:,./-", r)
+	}) == -1 {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func promptChoice(flag string, options []string) (string, error) {

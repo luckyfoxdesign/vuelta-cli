@@ -74,7 +74,10 @@ func runConfigValidate(args []string) error {
 		}
 		return writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "config validate",
-			Results:  []any{map[string]any{"path": path, "valid": true, "projects": len(cfg.Workspaces), "verification_plans": plans}},
+			Results: []any{map[string]any{
+				"path": path, "valid": true, "projects": len(cfg.Workspaces), "verification_plans": plans,
+				"next": displayCommand("scan", "--directory", ".", "--only", "packages", "--config", path),
+			}},
 			Summary:  map[string]any{"valid": true, "projects": len(cfg.Workspaces)},
 			Warnings: warnings, Errors: []jsonCommandError{},
 		})
@@ -91,6 +94,7 @@ func runConfigValidate(args []string) error {
 			fmt.Printf("toolchain %s: %s (source=%s)\n", config.WorkspaceName(workspace), profileID, source)
 		}
 	}
+	fmt.Printf("Next: %s\n", displayCommand("scan", "--directory", ".", "--only", "packages", "--config", path))
 	return nil
 }
 

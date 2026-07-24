@@ -76,11 +76,13 @@ type sessionContextKey struct{}
 // safe for repeated stage calls; Close removes only resources this session
 // created unless persistence is explicitly configured.
 type Session struct {
-	cfg    config.EgressConfig
-	docker dockerexec.Runner
+	requested config.EgressConfig
+	cfg       config.EgressConfig
+	docker    dockerexec.Runner
 
 	mu               sync.Mutex
 	lock             lifecycleLock
+	fallbackUsed     bool
 	ensured          bool
 	networkCreated   bool
 	containerCreated bool
@@ -90,7 +92,7 @@ type Session struct {
 
 // NewSession creates a lazy managed egress session.
 func NewSession(cfg config.EgressConfig, docker dockerexec.Runner) *Session {
-	return &Session{cfg: cfg, docker: docker}
+	return &Session{requested: cfg, cfg: cfg, docker: docker}
 }
 
 // WithSession attaches one invocation-scoped session to stage contexts.
@@ -109,7 +111,7 @@ func Resolve(ctx context.Context, cfg config.EgressConfig) (network, proxyURL st
 // responsibility across an API boundary.
 func ResolveWith(ctx context.Context, cfg config.EgressConfig, docker dockerexec.Runner) (network, proxyURL string, err error) {
 	if session, ok := ctx.Value(sessionContextKey{}).(*Session); ok && session != nil {
-		if session.cfg != cfg {
+		if session.requested != cfg {
 			return "", "", &StageError{Stage: "configuration", Err: errors.New("stage egress configuration differs from invocation configuration")}
 		}
 		return session.Resolve(ctx)
@@ -149,6 +151,21 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 		return "", "", &StageError{Stage: "coordination", Err: err}
 	}
 	s.lock = lock
+	fallback, err := collisionFreeConfig(ctx, s.docker, s.cfg)
+	if err != nil {
+		s.releaseLock()
+		return "", "", &StageError{Stage: "resource inspection", Err: err}
+	}
+	if fallback != s.cfg {
+		s.releaseLock()
+		s.cfg = fallback
+		s.fallbackUsed = true
+		lock, err = acquireLifecycleLock(ctx, s.cfg.Network)
+		if err != nil {
+			return "", "", &StageError{Stage: "coordination", Err: err}
+		}
+		s.lock = lock
+	}
 	imageID, contract, err := ensureAsset(ctx, s.docker)
 	if err != nil {
 		s.releaseLock()
@@ -175,6 +192,17 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 		s.releaseLock()
 	}
 	return s.cfg.Network, s.cfg.ProxyURL, nil
+}
+
+// Notice reports when Vuelta avoided configured names that were already
+// occupied. It does not expose ownership labels or require manual recovery.
+func (s *Session) Notice() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.fallbackUsed {
+		return ""
+	}
+	return "configured Docker egress names were already in use; Vuelta left those resources unchanged and used an isolated managed egress for this command"
 }
 
 // Close cleans resources created only for this invocation. Reused resources
@@ -325,6 +353,55 @@ type networkIdentity struct {
 	Owner          string `json:"owner"`
 	Contract       string `json:"contract"`
 	ContainerCount int    `json:"container_count"`
+}
+
+func collisionFreeConfig(ctx context.Context, docker dockerexec.Runner, configured config.EgressConfig) (config.EgressConfig, error) {
+	conflict := false
+	if identity, err := inspectNetwork(ctx, docker, configured.Network); err == nil {
+		if identity.Name != configured.Network || !identity.Internal || identity.Owner != ownerValue || identity.Contract != networkContractValue {
+			conflict = true
+		} else {
+			containers, attachmentsErr := networkContainers(ctx, docker, configured.Network)
+			if attachmentsErr != nil {
+				return config.EgressConfig{}, attachmentsErr
+			}
+			if len(containers) > 1 || (len(containers) == 1 && containers[0] != configured.ProxyContainer) {
+				conflict = true
+			}
+		}
+	}
+	if owner, err := inspectContainerOwner(ctx, docker, configured.ProxyContainer); err == nil && owner != ownerValue {
+		conflict = true
+	}
+	if !conflict {
+		return configured, nil
+	}
+	sum := sha256.Sum256([]byte(configured.Network + "\x00" + configured.ProxyContainer + "\x00" + configured.ProxyURL))
+	suffix := fmt.Sprintf("%x", sum[:6])
+	proxy := "vuelta-managed-egress-proxy-" + suffix
+	configured.Network = "vuelta-managed-egress-" + suffix
+	configured.ProxyContainer = proxy
+	configured.ProxyURL = "http://" + proxy + ":3128"
+	return configured, nil
+}
+
+func inspectContainerOwner(ctx context.Context, docker dockerexec.Runner, name string) (string, error) {
+	format := `{"owner":{{json (index .Config.Labels "` + ownerLabel + `")}}}`
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:   []string{"container", "inspect", "--format", format, name},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		return "", err
+	}
+	var identity struct {
+		Owner string `json:"owner"`
+	}
+	if err := json.Unmarshal(result.Stdout, &identity); err != nil {
+		return "", errors.New("approved Docker daemon returned malformed container ownership metadata")
+	}
+	return identity.Owner, nil
 }
 
 func ensureNetwork(ctx context.Context, docker dockerexec.Runner, name, proxyContainer, contract string) (bool, error) {

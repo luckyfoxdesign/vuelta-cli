@@ -74,7 +74,8 @@ func TestEnvironmentBootstrapPersistsConfirmedCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, `"command":"environment bootstrap"`) || !strings.Contains(output, `"status":"trusted"`) {
+	if !strings.Contains(output, `"command":"environment bootstrap"`) || !strings.Contains(output, `"status":"trusted"`) ||
+		!strings.Contains(output, `"next":"vuelta config validate --config `) {
 		t.Fatalf("JSON output = %s", output)
 	}
 	loaded, err := config.Load(path)
@@ -83,6 +84,46 @@ func TestEnvironmentBootstrapPersistsConfirmedCanonicalIdentity(t *testing.T) {
 	}
 	if loaded.Docker == nil || loaded.Docker.Developer == nil || loaded.Docker.Developer.ExpectedDaemon.ID != "daemon-reviewed" {
 		t.Fatalf("Docker config = %#v", loaded.Docker)
+	}
+}
+
+func TestOnboardingPrintsRunnableNextCommandsWithSelectedConfig(t *testing.T) {
+	previousExecutable := executableName
+	executableName = "/Applications/Vuelta Dev/bin/vuelta-darwin-arm64"
+	t.Cleanup(func() { executableName = previousExecutable })
+
+	previousProbe := probeDockerEndpoint
+	probeDockerEndpoint = func(context.Context, string) (dockerexec.DaemonIdentity, error) {
+		return dockerexec.DaemonIdentity{
+			ID: "daemon-reviewed", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}, nil
+	}
+	t.Cleanup(func() { probeDockerEndpoint = previousProbe })
+
+	configPath := filepath.Join(t.TempDir(), "selected config.yaml")
+	quotedExecutable := `'/Applications/Vuelta Dev/bin/vuelta-darwin-arm64'`
+	quotedConfig := shellArgument(configPath)
+
+	output, err := captureStdout(t, func() error {
+		return run([]string{"config", "init", "--config", configPath})
+	})
+	if err != nil || !strings.Contains(output, "Next: "+quotedExecutable+" environment bootstrap --config "+quotedConfig) {
+		t.Fatalf("config init output = %q, error = %v", output, err)
+	}
+
+	output, err = captureStdout(t, func() error {
+		return run([]string{"environment", "bootstrap", "--socket", "/approved/docker.sock", "--yes", "--config", configPath})
+	})
+	if err != nil || !strings.Contains(output, "Next: "+quotedExecutable+" config validate --config "+quotedConfig) {
+		t.Fatalf("environment bootstrap output = %q, error = %v", output, err)
+	}
+
+	output, err = captureStdout(t, func() error {
+		return run([]string{"config", "validate", "--config", configPath})
+	})
+	if err != nil || !strings.Contains(output, "Next: "+quotedExecutable+" scan --directory . --only packages --config "+quotedConfig) {
+		t.Fatalf("config validate output = %q, error = %v", output, err)
 	}
 }
 

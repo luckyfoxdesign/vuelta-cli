@@ -24,6 +24,7 @@ type environmentBootstrapResult struct {
 	Socket  string                      `json:"socket"`
 	Daemon  config.DockerDaemonIdentity `json:"daemon"`
 	Changed bool                        `json:"changed"`
+	Next    string                      `json:"next"`
 }
 
 func runEnvironmentBootstrap(args []string) error {
@@ -95,7 +96,10 @@ func runEnvironmentBootstrap(args []string) error {
 	if err := plan.Apply(path); err != nil {
 		return environmentBootstrapFailure(*jsonOutput, "config_update_failed", fail(exitConfig, "%v", err))
 	}
-	result := environmentBootstrapResult{Status: "trusted", Config: path, Socket: *socket, Daemon: daemon, Changed: plan.Changed}
+	result := environmentBootstrapResult{
+		Status: "trusted", Config: path, Socket: *socket, Daemon: daemon, Changed: plan.Changed,
+		Next: displayCommand("config", "validate", "--config", path),
+	}
 	if *jsonOutput {
 		return writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "environment bootstrap", Results: []environmentBootstrapResult{result},
@@ -105,6 +109,7 @@ func runEnvironmentBootstrap(args []string) error {
 	}
 	fmt.Printf("trusted Docker endpoint: %s\n", *socket)
 	fmt.Printf("updated protected config: %s\n", path)
+	fmt.Printf("Next: %s\n", result.Next)
 	return nil
 }
 

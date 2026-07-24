@@ -15,9 +15,13 @@ const testImageID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 type lifecycleDocker struct {
 	networkExists      bool
+	networkName        string
 	networkAttachments []string
 	networkContract    string
+	foreignNetwork     bool
 	containerExists    bool
+	containerName      string
+	containerContract  string
 	foreign            bool
 	stale              bool
 	running            bool
@@ -36,19 +40,25 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 	}
 	switch strings.Join(args[:2], " ") {
 	case "network inspect":
-		if !d.networkExists {
+		requested := args[len(args)-1]
+		if !d.networkExists || (d.networkName != "" && d.networkName != requested) {
 			return dockerexec.Result{}, errors.New("missing network")
 		}
 		if len(args) > 3 && strings.Contains(args[3], "range .Containers") {
 			return dockerexec.Result{Stdout: []byte(strings.Join(d.networkAttachments, "\n"))}, nil
 		}
+		owner := ownerValue
+		if d.foreignNetwork {
+			owner = "another-application"
+		}
 		contract := d.networkContract
 		if contract == "" {
 			contract = networkContractValue
 		}
-		return dockerexec.Result{Stdout: []byte(`{"name":"vuelta-update-egress","internal":true,"owner":"managed-egress","contract":"` + contract + `","container_count":0}`)}, nil
+		return dockerexec.Result{Stdout: []byte(`{"name":"` + requested + `","internal":true,"owner":"` + owner + `","contract":"` + contract + `","container_count":0}`)}, nil
 	case "network create":
-		d.networkExists = true
+		d.networkExists, d.networkName, d.foreignNetwork = true, args[len(args)-1], false
+		d.networkAttachments = nil
 		return dockerexec.Result{Stdout: []byte("network-id")}, nil
 	case "network connect":
 		return dockerexec.Result{}, nil
@@ -56,7 +66,8 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 		d.networkExists = false
 		return dockerexec.Result{}, nil
 	case "container inspect":
-		if !d.containerExists {
+		requested := args[len(args)-1]
+		if !d.containerExists || (d.containerName != "" && d.containerName != requested) {
 			return dockerexec.Result{}, errors.New("missing container")
 		}
 		owner := ownerValue
@@ -64,6 +75,9 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 			owner = "another-application"
 		}
 		contract := "contract"
+		if d.containerContract != "" {
+			contract = d.containerContract
+		}
 		image := testImageID
 		networkCount := 2
 		if d.stale {
@@ -81,7 +95,7 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 		d.containerExists, d.running, d.healthy, d.stale = false, false, false, false
 		return dockerexec.Result{}, nil
 	case "container create":
-		d.containerExists = true
+		d.containerExists, d.containerName, d.foreign = true, optionValue(args, "--name"), false
 		return dockerexec.Result{Stdout: []byte("container-id")}, nil
 	case "container start":
 		d.running, d.healthy = true, !d.neverHealthy
@@ -105,6 +119,15 @@ func intJSON(value int) string {
 		return "2"
 	}
 	return "3"
+}
+
+func optionValue(args []string, option string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == option {
+			return args[index+1]
+		}
+	}
+	return ""
 }
 
 func testEgressConfig() config.EgressConfig {
@@ -163,6 +186,37 @@ func TestEnsureNetworkRejectsUnexpectedAttachmentWithoutRemovingIt(t *testing.T)
 	}
 	if commandSeen(docker.calls, "network", "rm") {
 		t.Fatalf("network with foreign attachment was targeted: %v", docker.calls)
+	}
+}
+
+func TestSessionAvoidsForeignConfiguredResourcesWithoutMutatingThem(t *testing.T) {
+	docker := &lifecycleDocker{
+		networkExists: true, networkName: "vuelta-update-egress", foreignNetwork: true,
+		containerExists: true, containerName: "vuelta-egress-proxy", containerContract: assetContract(),
+		foreign: true, running: true, healthy: true,
+	}
+	session := NewSession(testEgressConfig(), docker)
+	network, proxy, err := session.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("resolve with foreign configured resources: %v", err)
+	}
+	if !strings.HasPrefix(network, "vuelta-managed-egress-") ||
+		!strings.HasPrefix(proxy, "http://vuelta-managed-egress-proxy-") {
+		t.Fatalf("fallback network/proxy = %q, %q", network, proxy)
+	}
+	if session.Notice() == "" {
+		t.Fatal("fallback session omitted its user-facing notice")
+	}
+	if commandTargeted(docker.calls, "network", "rm", "vuelta-update-egress") ||
+		commandTargeted(docker.calls, "container", "rm", "vuelta-egress-proxy") {
+		t.Fatalf("foreign resources were targeted: %v", docker.calls)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("close fallback session: %v", err)
+	}
+	if commandTargeted(docker.calls, "network", "rm", "vuelta-update-egress") ||
+		commandTargeted(docker.calls, "container", "rm", "vuelta-egress-proxy") {
+		t.Fatalf("foreign resources were targeted during cleanup: %v", docker.calls)
 	}
 }
 
@@ -263,6 +317,15 @@ func commandSeen(calls [][]string, prefix ...string) bool {
 			match = match && call[index] == prefix[index]
 		}
 		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func commandTargeted(calls [][]string, kind, action, target string) bool {
+	for _, call := range calls {
+		if len(call) >= 3 && call[0] == kind && call[1] == action && call[len(call)-1] == target {
 			return true
 		}
 	}
