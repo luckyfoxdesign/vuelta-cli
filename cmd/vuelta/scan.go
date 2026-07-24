@@ -49,6 +49,12 @@ type scanToolResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+type scanCapability struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // stageStatus is the outcome of one independent, observable scan stage.
 type stageStatus string
 
@@ -100,6 +106,7 @@ type scanResult struct {
 	Toolchain       *toolchain.Identity        `json:"toolchain,omitempty"`
 	PackageUpdates  *packageUpdateAvailability `json:"package_updates,omitempty"`
 	Diagnostics     []updater.ScanDiagnostic   `json:"diagnostics"`
+	Capabilities    []scanCapability           `json:"capabilities"`
 	Error           *jsonCommandError          `json:"error,omitempty"`
 }
 
@@ -129,6 +136,7 @@ type scanOptions struct {
 	toolchainProfile   *config.ToolchainProfile
 	toolchainIdentity  *toolchain.Identity
 	packageDiagnostics *[]updater.ScanDiagnostic
+	explicitConfig     bool
 }
 
 func executeScan(args []string) error {
@@ -136,11 +144,18 @@ func executeScan(args []string) error {
 	if err != nil {
 		return scanTopLevelFailure(options.jsonOutput || scanJSONRequested(args), "invalid_invocation", err, "Run vuelta help scan for usage")
 	}
-	cfg, loadErr := config.Load(configFile)
+	cfg, selection, loadErr := selectScanConfiguration(options, configFile)
 	if loadErr != nil {
-		return scanTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", loadErr), "Create or select a valid config with --config")
+		return scanTopLevelFailure(options.jsonOutput, "project_config_unavailable", fail(exitConfig, "%v", loadErr), "Select a supported project with --directory or an explicit config with --config")
 	}
+	configFile = selection.Path
 	warnings := configWarnings(cfg)
+	if selection.Scope == "project" && (cfg.Docker == nil || cfg.Docker.Developer == nil) {
+		warnings = append(warnings, fmt.Sprintf(
+			"machine Docker trust is not configured; run %s",
+			displayCommand("environment", "bootstrap", "--socket", "/path/to/docker.sock", "--config", selection.MachineConfig),
+		))
+	}
 	targets, targetErr := resolveScanTargets(*cfg, options, currentDirectory)
 	if targetErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", targetErr), "Choose one of --project, --directory, or --all")
@@ -194,11 +209,19 @@ func executeScan(args []string) error {
 	if options.jsonOutput {
 		if err := writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "scan", Results: results, Summary: summary,
-			Warnings: warnings, Errors: []jsonCommandError{},
+			Warnings: warnings, Errors: []jsonCommandError{}, Config: &selection,
 		}); err != nil {
 			return err
 		}
 	} else {
+		if selection.Scope == "project" {
+			if selection.Status == "created" {
+				fmt.Printf("Created project config: %s\n", selection.Path)
+			} else {
+				fmt.Printf("Using project config: %s\n", selection.Path)
+			}
+			fmt.Printf("Scanning %s...\n", cfg.Workspaces[0].Path)
+		}
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, "warning:", warning)
 		}
@@ -263,6 +286,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	if selectors > 1 {
 		return options, "", fail(exitConfig, "--project, --directory, and --all are mutually exclusive")
 	}
+	options.explicitConfig = len(fs.Args()) == 1
 	configFile, err := configPath(fs.Args())
 	return options, configFile, err
 }
@@ -488,7 +512,7 @@ type scanStageRunners struct {
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{},
 	}
 	if target.err != nil {
 		result = recordScanStageFailure(result, stagePreflight, "target_unavailable", target.err, "Fix the configured workspace path, then run scan again")
@@ -505,6 +529,15 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Status = config.VerificationScanOnly
 			result.Warnings = append(result.Warnings, "updates and update --dry-run are disabled until a ready verification profile is configured")
 		}
+	}
+	gitAvailable := projectHasGitMetadata(target.path)
+	if gitAvailable {
+		result.Capabilities = append(result.Capabilities, scanCapability{Name: "git_update_snapshot", Status: "available"})
+	} else {
+		result.Capabilities = append(result.Capabilities, scanCapability{
+			Name: "git_update_snapshot", Status: "unavailable", Reason: "git_repository_not_found",
+		})
+		result.Warnings = appendUniqueStrings(result.Warnings, "Git metadata was not found; scan findings remain available but Git-bound snapshots and updates are disabled")
 	}
 	identityConfig := cfg
 	var identityWorkspace config.Workspace
@@ -647,6 +680,12 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 	if len(result.Candidates) == 0 {
 		result = addStage(result, stageSnapshot, stageSkipped, "no package candidates")
+		return finalizeStageOutcomes(result)
+	}
+	if target.workspace != nil && !gitAvailable {
+		result.Status = config.VerificationScanOnly
+		result.PackageUpdates = &packageUpdateAvailability{Status: config.VerificationScanOnly, Reason: "git_repository_not_found"}
+		result = addStage(result, stageSnapshot, stageSkipped, "git_repository_not_found")
 		return finalizeStageOutcomes(result)
 	}
 	if target.workspace != nil && target.workspace.Verification.State == config.VerificationScanOnly {
@@ -1218,6 +1257,11 @@ func writeHumanScanResults(results []scanResult, configFile string, verbose bool
 		if result.PackageUpdates != nil && result.PackageUpdates.Reason == "manifest_has_no_safe_mutation_contract" {
 			fmt.Println("Note: requirements.txt is read-only; automatic updates are unavailable.")
 		}
+		for _, capability := range result.Capabilities {
+			if capability.Name == "git_update_snapshot" && capability.Reason == "git_repository_not_found" {
+				fmt.Println("Note: Git metadata was not found; findings remain available, but Git-bound snapshots and updates are disabled.")
+			}
+		}
 		for _, diagnostic := range result.Diagnostics {
 			fmt.Fprintf(os.Stderr, "Issue: %s:%d [%s] %s\n", diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)
 		}
@@ -1241,6 +1285,15 @@ func writeHumanScanResults(results []scanResult, configFile string, verbose bool
 		}
 		if verbose && result.PackageUpdates != nil {
 			fmt.Printf("  package updates: %s (%s)\n", result.PackageUpdates.Status, result.PackageUpdates.Reason)
+		}
+		if verbose {
+			for _, capability := range result.Capabilities {
+				if capability.Reason == "" {
+					fmt.Printf("  capability %s: %s\n", capability.Name, capability.Status)
+				} else {
+					fmt.Printf("  capability %s: %s (%s)\n", capability.Name, capability.Status, capability.Reason)
+				}
+			}
 		}
 		if verbose {
 			for _, warning := range result.Warnings {

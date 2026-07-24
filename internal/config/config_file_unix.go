@@ -67,3 +67,42 @@ func validateConfigFile(path string, info os.FileInfo, processUID uint32) error 
 	}
 	return nil
 }
+
+// ReadProjectFile reads repository-controlled project policy without imposing
+// machine-config ownership or 0600 requirements. It still requires a bounded
+// regular non-symlink file and verifies the opened inode.
+func ReadProjectFile(path string) ([]byte, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat project config %s: %w", path, err)
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("project config %s must be a regular file and must not be a symlink", path)
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open project config %s without following symlinks: %w", path, err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("open project config %s: invalid file descriptor", path)
+	}
+	defer func() { _ = file.Close() }()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat opened project config %s: %w", path, err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		return nil, fmt.Errorf("project config %s changed while it was being opened", path)
+	}
+	const maximumProjectConfigSize = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(file, maximumProjectConfigSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read project config %s: %w", path, err)
+	}
+	if len(data) > maximumProjectConfigSize {
+		return nil, fmt.Errorf("project config %s exceeds the 1 MiB limit", path)
+	}
+	return data, nil
+}

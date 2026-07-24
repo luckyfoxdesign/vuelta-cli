@@ -30,7 +30,7 @@ type commandDefinition struct {
 }
 
 var globalOptionDefinitions = []optionDefinition{
-	{names: []string{"-c", "--config"}, valueName: "PATH", description: "use an alternate config.yaml"},
+	{names: []string{"-c", "--config"}, valueName: "PATH", description: "use only this machine or project config"},
 	{names: []string{"--no-input"}, description: "disable prompts; does not confirm changes"},
 	{names: []string{"--no-color"}, description: "disable color and terminal formatting"},
 	{names: []string{"-h", "--help"}, description: "show help and exit"},
@@ -56,7 +56,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan is read-only. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
+		security:    []string{"Scan never modifies manifests, lock files, or source. On first use in a supported project it may atomically create .vuelta.yaml. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
 		takesConfig: true, handler: "scan",
 	},
 	{

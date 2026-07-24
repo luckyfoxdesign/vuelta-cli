@@ -496,6 +496,45 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	}
 }
 
+func TestGitlessWorkspaceKeepsCandidatesAndReportsCapability(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := config.Workspace{
+		Name: "gitless", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+	}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+			return nil, "trivy", false, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+			return nil, false, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0"}}, "npm", true, nil
+		},
+	}
+	result := scanOneTargetWith(
+		context.Background(), config.Config{}, scanTarget{workspace: &workspace, name: workspace.Name, path: root},
+		scanOptions{only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners,
+	)
+	if result.Status != config.VerificationScanOnly || len(result.Candidates) != 1 || result.Error != nil {
+		t.Fatalf("gitless result = %#v", result)
+	}
+	if result.PackageUpdates == nil || result.PackageUpdates.Reason != "git_repository_not_found" {
+		t.Fatalf("gitless package capability = %#v", result.PackageUpdates)
+	}
+	if len(result.Capabilities) != 1 || result.Capabilities[0].Reason != "git_repository_not_found" {
+		t.Fatalf("gitless capabilities = %#v", result.Capabilities)
+	}
+}
+
 func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	brokenRoot := t.TempDir()
 	supportedRoot := t.TempDir()

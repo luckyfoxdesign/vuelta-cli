@@ -18,7 +18,7 @@ app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
-├── internal/            # config, adhoc, scanner, updater, updatesnapshot, vulnscan, githubalerts,
+├── internal/            # config, configinit, adhoc, scanner, updater, updatesnapshot, vulnscan,
 │                        # toolchain, sandbox, testrunner, gitops, notify, logging, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
@@ -53,6 +53,7 @@ make build                     # both cross-build targets
 
 - `go.mod` — Go module definition.
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
+- `.vuelta.yaml` — generated project-local policy; `workspace.path` is always `.`.
 - `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
 - `compose.yml` — Docker services: test, race, lint, tidy, build, and opt-in real-engine.
 - `scanner-images/` — embedded exact-version scanner build inputs.
@@ -68,8 +69,8 @@ make build                     # both cross-build targets
 
 - `internal/adhoc/` — detects explicit unregistered project roots and prepares minimal private copies for container-only updates.
 - `internal/capio/` — provides bounded collectors for untrusted subprocess output. Limits are enforced while the child is still streaming, so host memory stays bounded regardless of how much a process writes: Tail soft-truncates diagnostic output to a marked tail, Limit hard-stops structured output that must be parsed in full.
-- `internal/config/` — loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).  Validation never walks parent directories or discovers projects: only the paths explicitly listed under workspaces[] are ever scanned or updated.
-- `internal/configinit/` — creates protected config containers, deterministically detects a selected project's supported files, and applies reviewed project edits. It never walks parent directories or reads unallowlisted files.
+- `internal/config/` — strictly loads machine config and the narrow project-owned .vuelta.yaml schema. Project paths resolve relative to their config without granting project policy control over machine authority.  Validation never walks parent directories or discovers projects; the CLI resolver supplies an exact selected root or configured workspace.
+- `internal/configinit/` — creates protected config containers, guards unsafe roots, deterministically detects a selected project's supported files without requiring Git, and applies atomic reviewed edits. It never walks parent directories or reads unallowlisted files.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
 - `internal/egress/` — owns the fail-closed Docker network and registry proxy used by networked scanner stages.
 - `internal/egressproxy/` — implements the embedded registry-allowlisting forward proxy used by Vuelta-managed scanner networks.
@@ -106,7 +107,7 @@ make build                     # both cross-build targets
 
 ## Conventions
 
-- `internal/config` never auto-discovers projects: only `workspaces[].path` from the config is ever touched.
+- `internal/config` never auto-discovers projects. The CLI onboarding resolver checks only the exact selected root and passes a resolved workspace into config validation.
 - New workspaces persist stable names and project-scoped changed-path allowlists; unnamed legacy workspaces use a warning-only basename fallback without automatic rewrites.
 - Go module dependencies are managed only via `docker compose run --rm tidy`, never a host-installed `go`.
 

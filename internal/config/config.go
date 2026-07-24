@@ -1,7 +1,9 @@
-// Package config loads and validates vuelta's config.yaml (~/.config/vuelta/config.yaml).
+// Package config strictly loads machine config and the narrow project-owned
+// .vuelta.yaml schema. Project paths resolve relative to their config without
+// granting project policy control over machine authority.
 //
-// Validation never walks parent directories or discovers projects: only the
-// paths explicitly listed under workspaces[] are ever scanned or updated.
+// Validation never walks parent directories or discovers projects; the CLI
+// resolver supplies an exact selected root or configured workspace.
 package config
 
 import (
@@ -35,14 +37,14 @@ const CurrentSchemaVersion = 1
 
 // Config mirrors the config.yaml schema.
 type Config struct {
-	SchemaVersion    int                     `yaml:"schema_version"`
-	Docker           *DockerConfig           `yaml:"docker,omitempty"`
-	Notify           NotifyConfig            `yaml:"notify"`
-	VulnScan         VulnScanConfig          `yaml:"vuln_scan"`
-	GithubAdvisories GithubAdvisoriesConfig  `yaml:"github_advisories"`
-	Update           UpdateConfig            `yaml:"update"`
-	Workspaces       []Workspace             `yaml:"workspaces"`
-	Git              GitConfig               `yaml:"git"`
+	SchemaVersion    int                    `yaml:"schema_version"`
+	Docker           *DockerConfig          `yaml:"docker,omitempty"`
+	Notify           NotifyConfig           `yaml:"notify"`
+	VulnScan         VulnScanConfig         `yaml:"vuln_scan"`
+	GithubAdvisories GithubAdvisoriesConfig `yaml:"github_advisories"`
+	Update           UpdateConfig           `yaml:"update"`
+	Workspaces       []Workspace            `yaml:"workspaces"`
+	Git              GitConfig              `yaml:"git"`
 }
 
 // DockerConfig holds the developer-side daemon authority used by scan and
@@ -425,7 +427,7 @@ func (c Config) AllowedChangedPaths(ws Workspace) []string {
 }
 
 // Validate checks the loaded config against the invariants in the spec:
-// every workspace path must exist and be a git repository, stack/package_manager
+// every workspace path must exist, stack/package_manager
 // pairs must be valid, image references must be pinned by digest, the git
 // allowlist must be present for every configured workspace, and
 // docker_images.files must stay inside the project directory as plain files.
@@ -781,10 +783,6 @@ func validateWorkspace(i int, ws Workspace) []error {
 	if !info.IsDir() {
 		errs = append(errs, fmt.Errorf("%s.path %s: not a directory", label, ws.Path))
 		return errs
-	}
-
-	if _, err := os.Stat(filepath.Join(ws.Path, ".git")); err != nil {
-		errs = append(errs, fmt.Errorf("%s.path %s: not a git repository", label, ws.Path))
 	}
 
 	managers, ok := packageManagersByStack[ws.Stack]

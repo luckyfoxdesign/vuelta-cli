@@ -25,12 +25,13 @@ type jsonCommandError struct {
 }
 
 type jsonCommandEnvelope struct {
-	Format   int                `json:"format"`
-	Command  string             `json:"command"`
-	Results  any                `json:"results"`
-	Summary  any                `json:"summary"`
-	Warnings []string           `json:"warnings"`
-	Errors   []jsonCommandError `json:"errors"`
+	Format   int                  `json:"format"`
+	Command  string               `json:"command"`
+	Results  any                  `json:"results"`
+	Summary  any                  `json:"summary"`
+	Warnings []string             `json:"warnings"`
+	Errors   []jsonCommandError   `json:"errors"`
+	Config   *scanConfigSelection `json:"config,omitempty"`
 }
 
 type projectListResult struct {

@@ -273,20 +273,49 @@ notes the remaining prerequisites for a full manual end-to-end run.
 
 ## Operations
 
-`vuelta scan`, `vuelta update`, and `vuelta config validate` use
-`~/.config/vuelta/config.yaml` by default. Select another file with the global
-`--config PATH` option. The normal dependency workflow is deliberately two
-steps:
+Inside a supported project, the primary scan flow is zero-setup:
+
+```bash
+cd /path/to/project
+vuelta scan
+```
+
+The first run atomically creates a protected `.vuelta.yaml` containing only
+project policy with `workspace.path: .`; the same invocation continues the
+scan. Later runs reuse that file byte-for-byte. `.` is always resolved
+relative to `.vuelta.yaml`, not the process CWD. An explicit `--config PATH`
+has highest priority and disables automatic neighboring config creation.
+
+Machine authority remains in `~/.config/vuelta/config.yaml`: the approved
+Docker endpoint and daemon identity, snapshot state, scanner/update defaults,
+and allowlisted credential-variable names. A project-controlled
+`.vuelta.yaml` cannot choose a socket, executable, credential source, or
+weaken machine security policy. If Docker trust is not configured, the
+project config remains saved and scan reports the existing explicit
+`environment bootstrap` flow.
+
+Global multi-project operations (`scan --all`, `scan --project`, scheduler,
+and administrative commands) continue to use the machine config. Select a
+specific config with the global `--config PATH` option. The normal dependency
+workflow remains two steps:
+
+Legacy scripts that intentionally use a machine-config workspace with
+`--directory` must now pass that machine config explicitly; local scan never
+silently falls back to an unrelated global workspace.
 
 ```bash
 vuelta scan --all
 vuelta update --yes SNAPSHOT_ID
 ```
 
-`scan` is read-only. It reports vulnerabilities and package candidates and
-creates one short-lived snapshot for each ready project. With no selector it
-uses the registered project containing the current directory; use
-`--project NAME`, `--directory PATH`, or explicit `--all` for another scope.
+After the documented first-run `.vuelta.yaml` creation, `scan` is read-only:
+it never changes manifests, lock files, or source. It reports vulnerabilities
+and package candidates and creates one short-lived snapshot for each ready
+Git project. Gitless projects remain scannable and report
+`git_update_snapshot=unavailable` with reason `git_repository_not_found`;
+their findings and candidates remain visible while Git-bound snapshots and
+updates are disabled. Use `--project NAME` or `--all` for global configured
+workspaces, or `--directory PATH` to select an exact local root.
 `update` accepts exactly one snapshot ID, revalidates it before environment
 checks or writes, displays its plan, and requires confirmation or `--yes`.
 Use `--dry-run` to run checks in a disposable copy without durable changes.

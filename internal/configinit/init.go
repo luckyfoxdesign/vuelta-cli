@@ -30,7 +30,7 @@ var (
 )
 
 // Discovery contains only values found in allowlisted, project-root files or
-// Git metadata explicitly associated with Root.
+// optional Git metadata explicitly associated with Root.
 type Discovery struct {
 	Root                   string
 	Stacks                 []string
@@ -81,10 +81,6 @@ func Detect(selectedRoot string) (Discovery, error) {
 	if err != nil || !info.IsDir() {
 		return Discovery{}, fmt.Errorf("project path %s is not a directory", root)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
-		return Discovery{}, fmt.Errorf("project path %s is not a git repository", root)
-	}
-
 	d := Discovery{Root: root, PackageManagers: make(map[string][]string), Services: make(map[string][]string)}
 	if regular(root, "pyproject.toml") {
 		if regular(root, "poetry.lock") {
@@ -120,9 +116,7 @@ func Detect(selectedRoot string) (Discovery, error) {
 			d.RuntimeImages = append(d.RuntimeImages, images...)
 		}
 	}
-	if len(d.DockerFiles) > 0 {
-		d.Stacks = append(d.Stacks, config.StackDocker)
-	}
+	hasDockerfile := len(d.DockerFiles) > 0
 	for _, name := range composeNames {
 		if !regular(root, name) {
 			continue
@@ -133,6 +127,17 @@ func Detect(selectedRoot string) (Discovery, error) {
 			return Discovery{}, fmt.Errorf("read compose file %s: %w", name, err)
 		}
 		d.Services[name] = services
+		images, err := composeRuntimeImages(filepath.Join(root, name))
+		if err != nil {
+			return Discovery{}, fmt.Errorf("read compose file %s images: %w", name, err)
+		}
+		if len(images) > 0 {
+			d.DockerFiles = append(d.DockerFiles, name)
+			d.RuntimeImages = append(d.RuntimeImages, images...)
+		}
+	}
+	if hasDockerfile || (len(d.Stacks) == 0 && len(d.DockerFiles) > 0) {
+		d.Stacks = append(d.Stacks, config.StackDocker)
 	}
 	d.VerificationCandidates, err = verificationCandidates(root, d)
 	if err != nil {
@@ -191,6 +196,28 @@ func composeServices(path string) ([]string, error) {
 	}
 	sort.Strings(services)
 	return services, nil
+}
+
+func composeRuntimeImages(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var document struct {
+		Services map[string]struct {
+			Image string `yaml:"image"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, err
+	}
+	images := make([]string, 0, len(document.Services))
+	for _, service := range document.Services {
+		if service.Image != "" {
+			images = append(images, service.Image)
+		}
+	}
+	return uniqueSorted(images), nil
 }
 
 var verificationFactories = []string{"test", "lint", "typecheck", "check", "build"}
@@ -385,11 +412,11 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 	if err != nil {
 		return config.Workspace{}, err
 	}
-	branch, err := choose("--branch", input.Branch, d.Branches)
+	branch, err := chooseOptional("--branch", input.Branch, d.Branches)
 	if err != nil {
 		return config.Workspace{}, err
 	}
-	remote, err := choose("--remote", input.Remote, d.Remotes)
+	remote, err := chooseOptional("--remote", input.Remote, d.Remotes)
 	if err != nil {
 		return config.Workspace{}, err
 	}
@@ -511,6 +538,20 @@ func choose(flag, supplied string, options []string) (string, error) {
 		return options[0], nil
 	}
 	return "", &MissingValueError{Flag: flag, Options: options}
+}
+
+func chooseOptional(flag, supplied string, options []string) (string, error) {
+	if supplied != "" {
+		return supplied, nil
+	}
+	switch len(options) {
+	case 0:
+		return "", nil
+	case 1:
+		return options[0], nil
+	default:
+		return "", &MissingValueError{Flag: flag, Options: options}
+	}
 }
 
 func defaultAllowedPaths(stack, manager string, dockerFiles []string) []string {

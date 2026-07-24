@@ -18,7 +18,7 @@ Help:
   help         show top-level or command-specific help
 
 Global options:
-  -c, --config PATH          use an alternate config.yaml
+  -c, --config PATH          use only this machine or project config
   --no-input                 disable prompts; does not confirm changes
   --no-color                 disable color and terminal formatting
   -h, --help                 show help and exit

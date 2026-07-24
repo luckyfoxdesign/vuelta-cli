@@ -49,6 +49,30 @@ func PlanConfigWrite(cfg *config.Config, path string, replace bool) (EditPlan, e
 	return plan, nil
 }
 
+// PlanProjectConfigWrite prepares an atomic no-overwrite write for the narrow
+// project-local schema.
+func PlanProjectConfigWrite(project *config.ProjectConfig, path string) (EditPlan, error) {
+	workspace, err := project.ResolvedWorkspace(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if err := config.ValidateWorkspace(workspace); err != nil {
+		return EditPlan{}, fmt.Errorf("validate generated project config: %w", err)
+	}
+	updated, err := yaml.Marshal(project)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("serialize project config: %w", err)
+	}
+	original, mode, exists, err := readConfigForWrite(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if exists {
+		return EditPlan{}, fmt.Errorf("config %s already exists", path)
+	}
+	return EditPlan{Original: original, Updated: updated, Mode: mode, Exists: false, Changed: true}, nil
+}
+
 // PlanDockerBootstrap creates a default config when none exists or updates
 // only docker.developer in an existing config. Existing comments, key order,
 // unrelated settings, and protected file mode are preserved.
