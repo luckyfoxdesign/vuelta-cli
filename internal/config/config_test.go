@@ -67,7 +67,7 @@ func TestParseRequiresCurrentSchemaVersionWithoutLeakingValues(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Parse error = %v, want %q", err, test.want)
 			}
-			if !strings.Contains(err.Error(), "vuelta config init --replace") {
+			if !strings.Contains(err.Error(), "vuelta config migrate") {
 				t.Fatalf("Parse error lacks recovery command: %v", err)
 			}
 			if strings.Contains(err.Error(), secret) {
@@ -368,5 +368,16 @@ func TestUnnamedWorkspaceUsesFallbackWithoutMutation(t *testing.T) {
 	}
 	if cfg.Workspaces[0].Name != "" {
 		t.Fatal("fallback mutated the loaded workspace")
+	}
+}
+
+func TestRetiredMachineConfigFieldsAreExplicit(t *testing.T) {
+	fields := RetiredMachineConfigFields()
+	if len(fields) != 1 || fields[0] != "update.snapshot_state_dir" {
+		t.Fatalf("retired fields = %v", fields)
+	}
+	fields[0] = "changed"
+	if RetiredMachineConfigFields()[0] != "update.snapshot_state_dir" {
+		t.Fatal("caller mutated retired field registry")
 	}
 }

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -21,12 +24,12 @@ func updateDefinition(t *testing.T) commandDefinition {
 	return commandDefinition{}
 }
 
-func TestUpdateAcceptsFlagsBeforeOrAfterExactlyOneSnapshotID(t *testing.T) {
+func TestUpdateAcceptsDirectoryAndOptionalProjectLocalSnapshot(t *testing.T) {
 	definition := updateDefinition(t)
 	for _, args := range [][]string{
-		{"--dry-run", "--json", "abcdefghijklmnopqrstuv"},
-		{"abcdefghijklmnopqrstuv", "--dry-run", "--json"},
-		{"--dry-run", "--json", "--", "-snapshot-leading-hyphen"},
+		{"--dry-run", "--json"},
+		{"--snapshot", "abcdefghijklmnopqrstuv", "--dry-run", "--json"},
+		{"--dry-run", "--json", "--directory", "/project", "--snapshot", "abcdefghijklmnopqrstuv"},
 	} {
 		normalized, err := normalizeCommandArgs(definition, args)
 		if err != nil {
@@ -36,29 +39,64 @@ func TestUpdateAcceptsFlagsBeforeOrAfterExactlyOneSnapshotID(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %v: %v", args, err)
 		}
-		if id != "abcdefghijklmnopqrstuv" && id != "-snapshot-leading-hyphen" || !options.dryRun || !options.jsonOutput {
+		if id != "" && id != "abcdefghijklmnopqrstuv" || !options.dryRun || !options.jsonOutput {
 			t.Fatalf("parsed update = id %q options %#v", id, options)
 		}
 	}
-	if _, _, err := parseUpdateOptions([]string{"one", "two"}); err == nil || !strings.Contains(err.Error(), "exactly one") {
-		t.Fatalf("two-ID error = %v", err)
+	if _, _, err := parseUpdateOptions([]string{"legacy-id"}); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("positional-ID error = %v", err)
 	}
 }
 
 func TestUpdateAutomationFlagsAreIndependent(t *testing.T) {
-	options, _, err := parseUpdateOptions([]string{"--json", "--non-interactive", "abcdefghijklmnopqrstuv"})
+	options, _, err := parseUpdateOptions([]string{"--json", "--non-interactive", "--snapshot", "abcdefghijklmnopqrstuv"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if options.yes || !options.jsonOutput || !options.nonInteractive {
 		t.Fatalf("--json or --non-interactive implied confirmation: %#v", options)
 	}
-	options, _, err = parseUpdateOptions([]string{"--yes", "abcdefghijklmnopqrstuv"})
+	options, _, err = parseUpdateOptions([]string{"--yes", "--snapshot", "abcdefghijklmnopqrstuv"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !options.yes || options.jsonOutput || options.nonInteractive {
 		t.Fatalf("--yes changed unrelated automation controls: %#v", options)
+	}
+}
+
+func TestLoadUpdateConfigurationDoesNotWalkToParentProjectPolicy(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	project := &config.ProjectConfig{
+		SchemaVersion: config.CurrentSchemaVersion,
+		Workspace: config.Workspace{
+			Path: ".", Stack: config.StackNode, PackageManager: "npm",
+			Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+			AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+		},
+	}
+	projectPath := filepath.Join(parent, projectConfigName)
+	plan, err := configinit.PlanProjectConfigWrite(project, projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Apply(projectPath); err != nil {
+		t.Fatal(err)
+	}
+	machinePath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(configinit.NewConfig(), machinePath, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadUpdateConfiguration(child, machinePath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Workspaces) != 0 {
+		t.Fatalf("parent project policy was discovered: %#v", cfg.Workspaces)
 	}
 }
 

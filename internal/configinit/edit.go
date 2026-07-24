@@ -16,11 +16,13 @@ import (
 // EditPlan is an immutable, reviewable config mutation. Apply verifies that
 // the source has not changed since planning before replacing it atomically.
 type EditPlan struct {
-	Original []byte
-	Updated  []byte
-	Mode     os.FileMode
-	Exists   bool
-	Changed  bool
+	Original       []byte
+	Updated        []byte
+	Mode           os.FileMode
+	Exists         bool
+	Changed        bool
+	Review         []string
+	RepositoryFile bool
 }
 
 var atomicRename = os.Rename
@@ -47,6 +49,187 @@ func PlanConfigWrite(cfg *config.Config, path string, replace bool) (EditPlan, e
 		plan.Changed = false
 	}
 	return plan, nil
+}
+
+// PlanSchemaMigration prepares the only supported in-place machine-config
+// migration: a legacy config with no schema_version to the current schema.
+// It preserves the YAML tree and validates the complete migrated config before
+// returning an atomic edit plan. Explicit unsupported versions fail closed.
+func PlanSchemaMigration(path string) (EditPlan, error) {
+	original, mode, exists, err := readConfigForWrite(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if !exists {
+		return EditPlan{}, fmt.Errorf("config %s does not exist", path)
+	}
+
+	var header struct {
+		SchemaVersion *int `yaml:"schema_version"`
+	}
+	if err := yaml.Unmarshal(original, &header); err != nil {
+		return EditPlan{}, fmt.Errorf("parse config schema header: %w", err)
+	}
+	if header.SchemaVersion != nil && *header.SchemaVersion != config.CurrentSchemaVersion {
+		return EditPlan{}, fmt.Errorf(
+			"config schema_version %d cannot be migrated by this build (supported: %d)",
+			*header.SchemaVersion, config.CurrentSchemaVersion,
+		)
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(original, &document); err != nil {
+		return EditPlan{}, fmt.Errorf("parse legacy config YAML tree: %w", err)
+	}
+	root, err := documentMapping(&document)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	var review []string
+	if header.SchemaVersion == nil {
+		review = append(review, fmt.Sprintf("add schema_version: %d", config.CurrentSchemaVersion))
+		legacyReview, migrateErr := migrateLegacyMachineConfig(root)
+		if migrateErr != nil {
+			return EditPlan{}, migrateErr
+		}
+		review = append(review, legacyReview...)
+		key := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "schema_version"}
+		value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", config.CurrentSchemaVersion)}
+		root.Content = append([]*yaml.Node{key, value}, root.Content...)
+	}
+	update := mappingValue(root, "update")
+	if update != nil {
+		if update.Kind != yaml.MappingNode {
+			return EditPlan{}, errors.New("update must be a YAML mapping")
+		}
+		if deleteMappingNode(update, "snapshot_state_dir") {
+			review = append(review, "remove retired "+config.RetiredMachineConfigFields()[0]+" (project-local state is selected from the exact target)")
+		}
+	}
+	if len(review) == 0 {
+		return EditPlan{
+			Original: original, Updated: original, Mode: mode, Exists: true, Changed: false,
+		}, nil
+	}
+
+	updated, err := encodeDocument(&document, original)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	migrated, err := config.Parse(updated)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("validate migrated config schema: %w", err)
+	}
+	if err := migrated.Validate(); err != nil {
+		return EditPlan{}, fmt.Errorf("validate migrated config: %w", err)
+	}
+	return EditPlan{
+		Original: original, Updated: updated, Mode: mode, Exists: true, Changed: !bytes.Equal(original, updated),
+		Review: review,
+	}, nil
+}
+
+func migrateLegacyMachineConfig(root *yaml.Node) ([]string, error) {
+	var review []string
+	vulnerability := mappingValue(root, "vuln_scan")
+	github := mappingValue(root, "github_advisories")
+	if vulnerability != nil {
+		if vulnerability.Kind != yaml.MappingNode {
+			return nil, errors.New("vuln_scan must be a YAML mapping")
+		}
+		enabled, present, err := optionalBool(vulnerability, "enabled")
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			if !enabled {
+				return nil, errors.New("legacy vuln_scan.enabled is false; migration cannot enable a security gate without a separate policy decision")
+			}
+			deleteMappingNode(vulnerability, "enabled")
+			review = append(review, "remove legacy vuln_scan.enabled (current dependency scanning is always enabled)")
+		}
+		tool := mappingValue(vulnerability, "tool")
+		if tool != nil {
+			if tool.Kind != yaml.ScalarNode || (tool.Value != "trivy" && tool.Value != "osv-scanner") {
+				return nil, errors.New("legacy vuln_scan.tool must be trivy or osv-scanner")
+			}
+			if selected := mappingValue(vulnerability, "dependency_source"); selected != nil && selected.Value != tool.Value {
+				return nil, errors.New("legacy vuln_scan.tool conflicts with vuln_scan.dependency_source")
+			}
+			setMappingString(vulnerability, "dependency_source", tool.Value)
+			deleteMappingNode(vulnerability, "tool")
+			review = append(review, "move legacy vuln_scan.tool to vuln_scan.dependency_source")
+		}
+	}
+	if github != nil {
+		if github.Kind != yaml.MappingNode {
+			return nil, errors.New("github_advisories must be a YAML mapping")
+		}
+		githubEnabled, present, err := optionalBool(github, "enabled")
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			deleteMappingNode(github, "enabled")
+			review = append(review, "remove legacy github_advisories.enabled")
+			if vulnerability != nil && mappingValue(vulnerability, "dependency_source") == nil && githubEnabled {
+				setMappingString(vulnerability, "dependency_source", "github-dependabot")
+				review = append(review, "select github-dependabot as vuln_scan.dependency_source")
+			}
+		}
+		if deleteMappingNode(github, "required_for_github_remotes") {
+			review = append(review, "remove legacy github_advisories.required_for_github_remotes")
+		}
+	}
+
+	for _, key := range []string{"autofix", "deploy_task", "production_worker"} {
+		if deleteMappingNode(root, key) {
+			review = append(review, fmt.Sprintf("remove parked %s section", key))
+		}
+	}
+
+	workspaces := mappingValue(root, "workspaces")
+	if workspaces != nil {
+		if workspaces.Kind != yaml.SequenceNode {
+			return nil, errors.New("workspaces must be a YAML sequence")
+		}
+		for index, workspace := range workspaces.Content {
+			if workspace.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("workspaces[%d] must be a YAML mapping", index)
+			}
+			if mappingValue(workspace, "test") == nil {
+				continue
+			}
+			if mappingValue(workspace, "verification") != nil {
+				return nil, fmt.Errorf("workspaces[%d] contains both legacy test and verification", index)
+			}
+			deleteMappingNode(workspace, "test")
+			verification, err := encodeNode(config.VerificationProfile{
+				Version: config.VerificationVersion,
+				State:   config.VerificationScanOnly,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("encode scan-only verification: %w", err)
+			}
+			setMappingNode(workspace, "verification", verification)
+			review = append(review, fmt.Sprintf(
+				"replace workspaces[%d].test with verification.state=scan_only", index,
+			))
+		}
+	}
+	return review, nil
+}
+
+func optionalBool(mapping *yaml.Node, key string) (bool, bool, error) {
+	value := mappingValue(mapping, key)
+	if value == nil {
+		return false, false, nil
+	}
+	var decoded bool
+	if err := value.Decode(&decoded); err != nil {
+		return false, true, fmt.Errorf("%s must be a boolean", key)
+	}
+	return decoded, true, nil
 }
 
 // PlanProjectConfigWrite prepares an atomic no-overwrite write for the narrow
@@ -222,7 +405,7 @@ func (p EditPlan) Apply(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	current, currentMode, exists, err := readConfigForWrite(path)
+	current, currentMode, exists, err := readEditSource(path, p.RepositoryFile)
 	if err != nil {
 		return err
 	}
@@ -233,6 +416,24 @@ func (p EditPlan) Apply(path string) error {
 		return writeNewAtomic(path, p.Updated, p.Mode)
 	}
 	return replaceAtomic(path, p.Updated, p.Mode)
+}
+
+func readEditSource(path string, repositoryFile bool) ([]byte, os.FileMode, bool, error) {
+	if !repositoryFile {
+		return readConfigForWrite(path)
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0o644, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("inspect repository file: %w", err)
+	}
+	data, err := config.ReadProjectFile(path)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return data, info.Mode().Perm(), true, nil
 }
 
 // Diff returns a compact line-oriented representation suitable for review
@@ -352,6 +553,17 @@ func setMappingNode(mapping *yaml.Node, key string, value *yaml.Node) {
 	mapping.Content = append(mapping.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value,
 	)
+}
+
+func deleteMappingNode(mapping *yaml.Node, key string) bool {
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value != key {
+			continue
+		}
+		mapping.Content = append(mapping.Content[:index], mapping.Content[index+2:]...)
+		return true
+	}
+	return false
 }
 
 func setMappingString(mapping *yaml.Node, key, value string) {

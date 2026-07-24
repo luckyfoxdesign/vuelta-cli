@@ -56,21 +56,23 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan never modifies manifests, lock files, or source. On first use in a supported project it may atomically create .vuelta.yaml. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
+		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
 		takesConfig: true, handler: "scan",
 	},
 	{
-		path: []string{"update"}, usage: "vuelta update [options] SNAPSHOT_ID",
-		description: "apply exactly one validated update snapshot", group: "Everyday commands",
-		examples: []string{"vuelta update abc123", "vuelta update --dry-run abc123", "vuelta update abc123 --yes --json"},
+		path: []string{"update"}, usage: "vuelta update [options]",
+		description: "apply the newest validated snapshot from one exact project", group: "Everyday commands",
+		examples: []string{"vuelta update", "vuelta update --directory /path/to/project", "vuelta update --directory /path/to/project --snapshot SNAPSHOT_ID --yes --json"},
 		options: []optionDefinition{
+			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "select one exact project root (default: current directory)"},
+			{names: []string{"--snapshot"}, valueName: "ID", description: "select one exact snapshot from that project"},
 			{names: []string{"--dry-run"}, description: "run in a disposable copy without durable changes"},
 			{names: []string{"--yes"}, description: "confirm the displayed plan"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts"},
 			{names: []string{"--allow-unverified-release-age"}, description: "allow candidates whose release age was not verified"},
 		},
-		security:    []string{"Every snapshot is validated before environment checks. Registered projects are container-only; all durable updates require confirmation."},
+		security:    []string{"The target root is selected before any snapshot is opened. Only that project's bounded .vuelta/snapshots directory is considered; every plan is validated before environment checks and durable updates require confirmation."},
 		takesConfig: true, handler: "update",
 	},
 	{
@@ -125,6 +127,15 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
 		},
 		security: []string{"Replacement requires --replace and confirmation; --yes confirms only the displayed diff."}, takesConfig: true, handler: "config init",
+	},
+	{
+		path: []string{"config", "migrate"}, usage: "vuelta config migrate [options] [config-path]",
+		description: "upgrade a recognized legacy machine config without replacing its settings", examples: []string{"vuelta config migrate", "vuelta config migrate --yes"},
+		options: []optionDefinition{
+			{names: []string{"--yes"}, description: "confirm the reviewed schema migration"},
+			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
+		},
+		security: []string{"Only recognized schema migrations are applied. Compatible settings, comments, key order, ownership, and protected mode are preserved; retired fields are named before confirmation and unsupported versions fail closed."}, takesConfig: true, handler: "config migrate",
 	},
 	{
 		path: []string{"environment"}, usage: "vuelta environment <command>",
@@ -214,7 +225,7 @@ func (c *cli) run(args []string) error {
 	if definition.handler == "" {
 		return c.writeCommandHelp(definition)
 	}
-	if globals.noInput && (definition.handler == "config init" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
+	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
 	if globals.config != "" && definition.takesConfig && definition.handler != "update" {
@@ -236,6 +247,9 @@ func (c *cli) run(args []string) error {
 	}
 	if globals.noInput && definition.handler == "update" {
 		normalized = append([]string{"--non-interactive"}, normalized...)
+	}
+	if globals.noInput && definition.handler == "scan" {
+		normalized = append([]string{"--internal-no-input"}, normalized...)
 	}
 	if globals.config != "" && definition.handler == "update" {
 		normalized = append([]string{"--internal-config", globals.config}, normalized...)
@@ -469,6 +483,8 @@ func dispatchCommand(handler string, args []string) error {
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":
 		return runConfigInit(args)
+	case "config migrate":
+		return runConfigMigrate(args)
 	case "environment bootstrap":
 		return runEnvironmentBootstrap(args)
 	case "project list":

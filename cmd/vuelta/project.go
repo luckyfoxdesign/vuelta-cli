@@ -53,7 +53,7 @@ func runConfigValidate(args []string) error {
 	if err != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "invalid_invocation", err, nil)
 	}
-	cfg, loadErr := config.Load(path)
+	cfg, loadErr := loadMachineConfig(path, !*jsonOutput && configinit.IsTerminal(os.Stdin))
 	if loadErr != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "config_unreadable", fail(exitConfig, "%v", loadErr), nil)
 	}
@@ -110,7 +110,7 @@ func runProjectList(args []string) error {
 	if err != nil {
 		return jsonCommandFailure(*jsonOutput, "project list", "invalid_invocation", err, nil)
 	}
-	cfg, loadErr := config.Load(path)
+	cfg, loadErr := loadMachineConfig(path, !*jsonOutput && configinit.IsTerminal(os.Stdin))
 	if loadErr != nil {
 		return jsonCommandFailure(*jsonOutput, "project list", "config_unreadable", fail(exitConfig, "%v", loadErr), nil)
 	}
@@ -220,7 +220,7 @@ func runProjectAdd(args []string) error {
 	}
 	workspace.ToolchainProfile = *toolchainProfile
 	workspace.Platform = *platform
-	configured, loadErr := config.Load(configFile)
+	configured, loadErr := loadMachineConfig(configFile, !*nonInteractive && configinit.IsTerminal(os.Stdin))
 	if loadErr != nil {
 		return fail(exitConfig, "%v", loadErr)
 	}

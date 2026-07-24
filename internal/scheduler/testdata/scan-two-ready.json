@@ -2,8 +2,8 @@
   "format": 1,
   "command": "scan",
   "results": [
-    {"project": "api", "status": "ready", "snapshot_id": "snapshot-api"},
-    {"project": "worker", "status": "ready", "snapshot_id": "snapshot-worker"}
+    {"project": "api", "directory": "/projects/api", "status": "ready", "snapshot_id": "snapshot-api"},
+    {"project": "worker", "directory": "/projects/worker", "status": "ready", "snapshot_id": "snapshot-worker"}
   ],
   "summary": {"succeeded": 2, "failed": 0},
   "warnings": [],

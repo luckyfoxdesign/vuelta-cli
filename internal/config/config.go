@@ -31,9 +31,17 @@ var toolVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Z
 var containerUserPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$`)
 
 // CurrentSchemaVersion is the only config.yaml schema understood by this
-// build. Config changes are intentionally fail-closed: operators recreate an
-// outdated test config instead of relying on an implicit migration.
+// build. Missing-version legacy configs may be upgraded only through the
+// reviewed config migration flow; explicit unsupported versions fail closed.
 const CurrentSchemaVersion = 1
+
+var retiredMachineConfigFields = []string{"update.snapshot_state_dir"}
+
+// RetiredMachineConfigFields lists fields removable only through the reviewed
+// config migration flow. Active parsing remains strict and never accepts them.
+func RetiredMachineConfigFields() []string {
+	return append([]string(nil), retiredMachineConfigFields...)
+}
 
 // Config mirrors the config.yaml schema.
 type Config struct {
@@ -142,7 +150,6 @@ func AllowedGithubTokenEnv(name string) bool {
 type UpdateConfig struct {
 	MinReleaseAgeDays int                `yaml:"min_release_age_days"`
 	SnapshotTTLHours  int                `yaml:"snapshot_ttl_hours"`
-	SnapshotStateDir  string             `yaml:"snapshot_state_dir"`
 	Egress            EgressConfig       `yaml:"egress"`
 	Images            map[string]string  `yaml:"images,omitempty"`
 	Tools             map[string]string  `yaml:"tools,omitempty"`
@@ -329,8 +336,8 @@ func Load(path string) (*Config, error) {
 }
 
 // SchemaVersionError reports a missing or unsupported top-level schema
-// version. Vuelta intentionally does not migrate configs: the safe recovery
-// for the current pre-release/test-only installation is explicit recreation.
+// version. A missing version can be handled by the reviewed migration flow;
+// explicit unsupported versions must never be rewritten automatically.
 type SchemaVersionError struct {
 	Found *int
 }
@@ -341,7 +348,7 @@ func (e *SchemaVersionError) Error() string {
 		found = fmt.Sprintf("%d is unsupported", *e.Found)
 	}
 	return fmt.Sprintf(
-		"config schema_version %s (supported: %d); preserve any settings you still need, then recreate the selected config with `vuelta config init --replace --config PATH`",
+		"config schema_version %s (supported: %d); run `vuelta config migrate --config PATH`",
 		found, CurrentSchemaVersion,
 	)
 }
@@ -497,10 +504,6 @@ func (c *Config) Validate() error {
 	if c.Update.SnapshotTTLHours != 0 && (c.Update.SnapshotTTLHours < 1 || c.Update.SnapshotTTLHours > 168) {
 		errs = append(errs, errors.New("update.snapshot_ttl_hours: must be between 1 and 168"))
 	}
-	if c.Update.SnapshotStateDir != "" && !filepath.IsAbs(c.Update.SnapshotStateDir) {
-		errs = append(errs, errors.New("update.snapshot_state_dir: must be absolute when set"))
-	}
-
 	if len(c.Workspaces) > 0 && len(c.Git.AllowedChangedPaths) == 0 {
 		missingAllowlist := false
 		for _, ws := range c.Workspaces {
@@ -597,20 +600,6 @@ func (c Config) SnapshotTTL() time.Duration {
 		return 24 * time.Hour
 	}
 	return time.Duration(c.Update.SnapshotTTLHours) * time.Hour
-}
-
-// SnapshotStateDir returns the private local state directory used for package
-// update plans. An explicit config value is preferred; the default is scoped
-// to the user's OS configuration directory.
-func (c Config) SnapshotStateDir() (string, error) {
-	if c.Update.SnapshotStateDir != "" {
-		return c.Update.SnapshotStateDir, nil
-	}
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve user config directory: %w", err)
-	}
-	return filepath.Join(dir, "vuelta", "update-snapshots"), nil
 }
 
 // SnapshotPolicyHash fingerprints only update-relevant, non-secret policy.

@@ -7,7 +7,7 @@ Examples:
 
 Everyday commands:
   scan         find vulnerabilities and package candidates; create snapshots only for safely mutable manifests
-  update       apply exactly one validated update snapshot
+  update       apply the newest validated snapshot from one exact project
 
 Configuration:
   project      list or add configured projects

@@ -21,7 +21,7 @@ func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selection.Status != "created" || selection.Scope != "project" || len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Path != project {
+	if selection.Status != "created" || selection.Scope != "project" || !selection.OnboardingChanged || len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Path != project {
 		t.Fatalf("selection/config = %#v %#v", selection, cfg)
 	}
 	before, err := os.ReadFile(selection.Path)
@@ -30,6 +30,13 @@ func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
 	}
 	if !bytes.Contains(before, []byte("path: .")) || bytes.Contains(before, []byte("docker:")) || bytes.Contains(before, []byte("snapshot_state_dir")) {
 		t.Fatalf("project config contains machine authority:\n%s", before)
+	}
+	ignore, err := os.ReadFile(filepath.Join(project, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ignore) != "/.vuelta/\n" {
+		t.Fatalf("project .gitignore = %q", ignore)
 	}
 
 	_, reused, err := selectScanConfiguration(scanOptions{directory: project}, filepath.Join("unused", "config.yaml"))
@@ -40,7 +47,7 @@ func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reused.Status != "reused" || !bytes.Equal(before, after) {
+	if reused.Status != "reused" || reused.OnboardingChanged || !bytes.Equal(before, after) {
 		t.Fatal("second selection rewrote the project config")
 	}
 }

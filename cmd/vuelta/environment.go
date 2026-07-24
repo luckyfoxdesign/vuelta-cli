@@ -44,6 +44,9 @@ func runEnvironmentBootstrap(args []string) error {
 	if err != nil {
 		return environmentBootstrapFailure(*jsonOutput, "invalid_invocation", err)
 	}
+	if err := ensureMachineConfigSchema(path, !*nonInteractive && !*jsonOutput && configinit.IsTerminal(os.Stdin)); err != nil {
+		return environmentBootstrapFailure(*jsonOutput, "config_update_failed", fail(exitConfig, "%v", err))
+	}
 	if *socket == "" {
 		if *nonInteractive {
 			return environmentBootstrapFailure(*jsonOutput, "socket_required", fail(exitConfig, "non-interactive bootstrap requires an explicit --socket PATH"))

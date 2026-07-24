@@ -21,6 +21,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
+	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
@@ -39,10 +40,14 @@ type updateOptions struct {
 	allowUnverifiedReleaseAge bool
 	nonInteractive            bool
 	configFile                string
+	directory                 string
+	snapshotID                string
 }
 
 type updatePlan struct {
 	SnapshotID    string                     `json:"snapshot_id"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	ExpiresAt     time.Time                  `json:"expires_at"`
 	Target        string                     `json:"target"`
 	Origin        string                     `json:"origin"`
 	Files         []string                   `json:"files"`
@@ -77,6 +82,17 @@ func executeUpdate(args []string) error {
 	if err != nil {
 		return updateTopLevelFailure(options.jsonOutput || updateJSONRequested(args), "invalid_invocation", err, "Run vuelta help update for usage")
 	}
+	selectedPath := options.directory
+	if selectedPath == "" {
+		selectedPath, err = currentDirectory()
+		if err != nil {
+			return updateTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "resolve current directory: %v", err), "Use --directory with the exact project root")
+		}
+	}
+	target, err := projectstate.Resolve(selectedPath)
+	if err != nil {
+		return updateTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", err), "Use --directory with the exact project root")
+	}
 	configFile := options.configFile
 	if configFile == "" {
 		configFile, err = defaultConfigPath()
@@ -84,7 +100,7 @@ func executeUpdate(args []string) error {
 			return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Select a valid config with --config")
 		}
 	}
-	cfg, err := config.Load(configFile)
+	cfg, err := loadUpdateConfiguration(target.Root, configFile, !options.nonInteractive && !options.jsonOutput && configinit.IsTerminal(os.Stdin))
 	if err != nil {
 		return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Select a valid config with --config")
 	}
@@ -92,14 +108,20 @@ func executeUpdate(args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return updateTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", err), "Run vuelta config validate for details")
 	}
-	stateDir, err := cfg.SnapshotStateDir()
+	store, err := updatesnapshot.ProjectStore(target.Root)
 	if err != nil {
-		return updateTopLevelFailure(options.jsonOutput, "config_invalid", fail(exitConfig, "%v", err), "Configure an absolute private snapshot directory")
+		return updateTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", err), "Use the exact canonical project root")
 	}
-	snapshot, err := (updatesnapshot.Store{Dir: stateDir}).Load(id)
+	var snapshot updatesnapshot.Snapshot
+	if id == "" {
+		snapshot, err = store.LoadLatest()
+	} else {
+		snapshot, err = store.Load(id)
+	}
 	if err != nil {
-		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Run vuelta scan again")
+		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Run a new targeted vuelta scan in this project")
 	}
+	id = snapshot.ID
 	if err := updatesnapshot.ValidateCandidates(snapshot, options.allowUnverifiedReleaseAge); err != nil {
 		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Review the candidate gate and run scan again if needed")
 	}
@@ -108,10 +130,10 @@ func executeUpdate(args []string) error {
 	var adhocProject adhoc.Project
 	switch snapshot.Origin {
 	case updatesnapshot.OriginWorkspace:
-		selected, selectErr := workspaceForSnapshot(*cfg, snapshot)
-		if selectErr != nil {
-			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", selectErr), "Run vuelta scan again")
+		if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Path != target.Root {
+			return updateTopLevelFailure(options.jsonOutput, "project_config_unavailable", fail(exitConfig, "selected target has no exact .vuelta.yaml project policy"), "Run vuelta scan in the selected project and review the versioned onboarding files")
 		}
+		selected := cfg.Workspaces[0]
 		if selected.Verification.State != config.VerificationReady {
 			return updateTopLevelFailure(options.jsonOutput, "verification_required", fail(exitConfig, "project %q is scan-only; update and update --dry-run are disabled", config.WorkspaceName(selected)), "Configure a ready versioned verification profile and run vuelta scan again")
 		}
@@ -123,7 +145,7 @@ func executeUpdate(args []string) error {
 		}
 		workspace = &selected
 	case updatesnapshot.OriginAdhoc:
-		adhocProject, err = adhoc.Detect(snapshot.AdhocPath)
+		adhocProject, err = adhoc.Detect(target.Root)
 		if err != nil {
 			return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Restore the scanned directory inputs and run vuelta scan again")
 		}
@@ -205,16 +227,6 @@ func executeUpdate(args []string) error {
 	return writeUpdateOutcome(options.jsonOutput, warnings, result, nil)
 }
 
-func workspaceForSnapshot(cfg config.Config, snapshot updatesnapshot.Snapshot) (config.Workspace, error) {
-	for _, workspace := range cfg.Workspaces {
-		canonical, err := filepath.EvalSymlinks(workspace.Path)
-		if err == nil && canonical == snapshot.Workspace.CanonicalPath {
-			return workspace, nil
-		}
-	}
-	return config.Workspace{}, errors.New("snapshot workspace is not configured")
-}
-
 func parseUpdateOptions(args []string) (updateOptions, string, error) {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -226,13 +238,57 @@ func parseUpdateOptions(args []string) (updateOptions, string, error) {
 	fs.BoolVar(&options.allowUnverifiedReleaseAge, "allow-unverified-release-age", false, "allow unverified release age")
 	fs.BoolVar(&options.nonInteractive, "non-interactive", false, "disable prompts")
 	fs.StringVar(&options.configFile, "internal-config", "", "internal config path")
+	fs.StringVar(&options.directory, "directory", "", "exact target project directory")
+	fs.StringVar(&options.directory, "d", "", "exact target project directory")
+	fs.StringVar(&options.snapshotID, "snapshot", "", "select one exact project-local snapshot")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
 	}
-	if len(fs.Args()) != 1 {
-		return options, "", fail(exitConfig, "update accepts exactly one SNAPSHOT_ID")
+	if optionOccurrences(args, "-d", "--directory") > 1 {
+		return options, "", fail(exitConfig, "--directory may be specified only once")
 	}
-	return options, fs.Args()[0], nil
+	if optionOccurrences(args, "-d", "--directory") == 1 && options.directory == "" {
+		return options, "", fail(exitConfig, "--directory must not be empty")
+	}
+	if optionOccurrences(args, "--snapshot") > 1 {
+		return options, "", fail(exitConfig, "--snapshot may be specified only once")
+	}
+	if optionOccurrences(args, "--snapshot") == 1 && options.snapshotID == "" {
+		return options, "", fail(exitConfig, "--snapshot must not be empty")
+	}
+	if len(fs.Args()) != 0 {
+		return options, "", fail(exitConfig, "positional snapshot IDs are retired; select the target with --directory and use --snapshot ID only for a fresh project-local plan")
+	}
+	return options, options.snapshotID, nil
+}
+
+func loadUpdateConfiguration(targetRoot, machinePath string, allowMigrationPrompt bool) (*config.Config, error) {
+	machine, err := loadMachineConfig(machinePath, allowMigrationPrompt)
+	if err != nil {
+		return nil, err
+	}
+	projectPath := filepath.Join(targetRoot, projectConfigName)
+	project, projectErr := config.LoadProject(projectPath)
+	if errors.Is(projectErr, os.ErrNotExist) {
+		machine.Workspaces = nil
+		return machine, nil
+	}
+	if projectErr != nil {
+		return nil, projectErr
+	}
+	workspace, err := project.ResolvedWorkspace(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, registered := range machine.Workspaces {
+		canonical, canonicalErr := canonicalDirectory(registered.Path)
+		if canonicalErr == nil && canonical == targetRoot {
+			workspace.ToolchainProfile = registered.ToolchainProfile
+			break
+		}
+	}
+	machine.Workspaces = []config.Workspace{workspace}
+	return machine, nil
 }
 
 func updateJSONRequested(args []string) bool {
@@ -251,7 +307,7 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 	checks := []string{"snapshot identity and input hashes", "policy identity", "candidate admissibility", "private-copy changed-file allowlist"}
 	commit, push := false, "disabled"
 	if workspace != nil {
-		target = config.WorkspaceName(*workspace)
+		target = workspace.Path
 		files = intendedWorkspaceFiles(snapshot, *workspace)
 		tests = config.VerificationPlan(*workspace)
 		checks = []string{"snapshot identity and input hashes", "policy identity", "verification profile identity", "candidate admissibility", "security baseline and post-check", "configured verification"}
@@ -282,7 +338,8 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 		return left < right
 	})
 	return updatePlan{
-		SnapshotID: snapshot.ID, Target: target, Origin: snapshot.Origin, Files: nonNilSorted(files),
+		SnapshotID: snapshot.ID, CreatedAt: snapshot.CreatedAt, ExpiresAt: snapshot.ExpiresAt,
+		Target: target, Origin: snapshot.Origin, Files: nonNilSorted(files),
 		Candidates: candidates,
 		Checks:     checks,
 		Tests:      tests, Commit: commit, Push: push, Execution: "container", DryRun: options.dryRun,
@@ -332,7 +389,8 @@ func nonNilSorted(values []string) []string {
 func writeHumanUpdatePlan(destination *os.File, plan updatePlan) error {
 	writer := newTextWriter(destination)
 	writer.printf("Update plan for %s (%s)\n", plan.Target, plan.Origin)
-	writer.printf("  Snapshot: %s\n  Execution: %s\n  Files: %s\n", plan.SnapshotID, plan.Execution, strings.Join(plan.Files, ", "))
+	writer.printf("  Snapshot: %s\n  Created: %s\n  Expires: %s\n  Execution: %s\n  Files: %s\n",
+		plan.SnapshotID, plan.CreatedAt.UTC().Format(time.RFC3339), plan.ExpiresAt.UTC().Format(time.RFC3339), plan.Execution, strings.Join(plan.Files, ", "))
 	for _, candidate := range plan.Candidates {
 		writer.printf("  %s %s: %s -> %s\n", candidate.Kind, candidate.Name, candidate.Current, candidate.Target)
 	}

@@ -1,6 +1,7 @@
-// Package updatesnapshot stores short-lived, read-only package update plans.
-// A snapshot deliberately contains only metadata and candidate versions; it
-// never stores project file contents, command output, or configuration secrets.
+// Package updatesnapshot stores short-lived, project-local read-only package
+// update plans. A snapshot deliberately contains only metadata and candidate
+// versions; it never stores project file contents, command output, or
+// configuration secrets.
 package updatesnapshot
 
 import (
@@ -17,10 +18,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
@@ -34,9 +37,9 @@ var (
 )
 
 const (
-	// FormatVersion 6 additionally records whether a toolchain came from an
-	// embedded default or operator override plus its exact image identity.
-	FormatVersion = 6
+	// FormatVersion 7 binds every plan to the exact target root selected before
+	// the snapshot file is opened.
+	FormatVersion = 7
 
 	OriginWorkspace = "workspace"
 	OriginAdhoc     = "adhoc"
@@ -47,6 +50,11 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
 var toolchainIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+:/-]+$`)
 var hashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+const (
+	maxSnapshotBytes   = 1 << 20
+	maxSnapshotEntries = 256
+)
 
 // Candidate is one dependency or image version chosen by a read-only scan.
 // Values are metadata only and are never interpreted as a shell command.
@@ -95,6 +103,7 @@ type Snapshot struct {
 	ID               string             `json:"id"`
 	CreatedAt        time.Time          `json:"created_at"`
 	ExpiresAt        time.Time          `json:"expires_at"`
+	TargetRoot       string             `json:"target_root"`
 	Origin           string             `json:"origin"`
 	Project          string             `json:"project,omitempty"`
 	AdhocPath        string             `json:"adhoc_path,omitempty"`
@@ -121,7 +130,7 @@ func New(now time.Time, ttl time.Duration, identity WorkspaceIdentity, policyHas
 	return NewWorkspace(now, ttl, filepath.Base(identity.CanonicalPath), identity, policy, gates, policyHash, verificationHash, toolchain.Identity{}, effectiveHash, candidates)
 }
 
-// NewWorkspace creates a format-6 plan bound to a registered workspace, the
+// NewWorkspace creates a format-7 plan bound to a registered workspace, the
 // exact verification profile, and the selected toolchain contract.
 func NewWorkspace(now time.Time, ttl time.Duration, project string, identity WorkspaceIdentity, policy PolicyIdentity, gates ScanGates, configHash, verificationHash string, toolchainIdentity toolchain.Identity, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
@@ -130,7 +139,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	}
 	snapshot := Snapshot{
 		Format: FormatVersion, ID: id, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl),
-		Origin: OriginWorkspace, Project: project, Workspace: identity, Policy: policy,
+		TargetRoot: identity.CanonicalPath, Origin: OriginWorkspace, Project: project, Workspace: identity, Policy: policy,
 		Gates: gates, ConfigHash: configHash, VerificationHash: verificationHash, Toolchain: toolchainIdentity, PolicyHash: effectivePolicyHash,
 		Candidates: append([]Candidate(nil), candidates...),
 	}
@@ -143,7 +152,7 @@ func NewWorkspace(now time.Time, ttl time.Duration, project string, identity Wor
 	return snapshot, nil
 }
 
-// NewAdhoc creates a format-6 plan bound to an explicit unregistered path.
+// NewAdhoc creates a format-7 plan bound to an explicit unregistered path.
 func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input InputIdentity, policy PolicyIdentity, gates ScanGates, effectivePolicyHash string, candidates []Candidate) (Snapshot, error) {
 	id, err := newID()
 	if err != nil {
@@ -151,7 +160,7 @@ func NewAdhoc(now time.Time, ttl time.Duration, canonicalPath string, input Inpu
 	}
 	snapshot := Snapshot{
 		Format: FormatVersion, ID: id, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl),
-		Origin: OriginAdhoc, AdhocPath: canonicalPath, Input: cloneInputIdentity(input),
+		TargetRoot: canonicalPath, Origin: OriginAdhoc, AdhocPath: canonicalPath, Input: cloneInputIdentity(input),
 		Policy: policy, Gates: gates, PolicyHash: effectivePolicyHash,
 		Candidates: append([]Candidate(nil), candidates...),
 	}
@@ -184,14 +193,30 @@ func newID() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-// Store persists snapshots under a caller-selected private state directory.
-type Store struct{ Dir string }
+// Store persists snapshots in one private directory. ProjectStore should be
+// used by production callers so loading is bound to an exact target root.
+type Store struct {
+	Dir        string
+	TargetRoot string
+}
+
+// ProjectStore returns a target-bound project-local snapshot store.
+func ProjectStore(root string) (Store, error) {
+	target, err := projectstate.FromCanonical(root)
+	if err != nil {
+		return Store{}, err
+	}
+	return Store{Dir: target.SnapshotsDir(), TargetRoot: target.Root}, nil
+}
 
 func (s Store) Save(snapshot Snapshot) error {
 	if err := validateSnapshot(snapshot); err != nil {
 		return err
 	}
-	if err := ensureDir(s.Dir); err != nil {
+	if s.TargetRoot != "" && snapshot.TargetRoot != s.TargetRoot {
+		return fmt.Errorf("%w: snapshot target does not match the selected project", ErrInvalid)
+	}
+	if err := s.ensureDir(); err != nil {
 		return err
 	}
 	data, err := json.Marshal(snapshot)
@@ -226,6 +251,11 @@ func (s Store) Save(snapshot Snapshot) error {
 		}
 		return fmt.Errorf("publish update snapshot: %w", err)
 	}
+	if err := syncDirectory(s.Dir); err != nil {
+		_ = os.Remove(s.path(snapshot.ID))
+		_ = syncDirectory(s.Dir)
+		return fmt.Errorf("sync snapshot state directory: %w", err)
+	}
 	return nil
 }
 
@@ -239,7 +269,7 @@ func (s Store) Load(id string) (Snapshot, error) {
 	if !idPattern.MatchString(id) {
 		return Snapshot{}, fmt.Errorf("%w: malformed snapshot ID", ErrInvalid)
 	}
-	if err := validateExistingDir(s.Dir); err != nil {
+	if err := s.validateExistingDir(); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Snapshot{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 		}
@@ -256,7 +286,7 @@ func (s Store) Load(id string) (Snapshot, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return Snapshot{}, fmt.Errorf("%w: snapshot file is not a regular file", ErrInvalid)
 	}
-	data, err := os.ReadFile(path)
+	data, err := projectstate.ReadBoundedRegular(path, "update snapshot", maxSnapshotBytes)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("read update snapshot: %w", err)
 	}
@@ -266,16 +296,169 @@ func (s Store) Load(id string) (Snapshot, error) {
 	if err := dec.Decode(&snapshot); err != nil {
 		return Snapshot{}, fmt.Errorf("%w: parse snapshot: %v", ErrInvalid, err)
 	}
+	if err := requireJSONEOF(dec); err != nil {
+		return Snapshot{}, fmt.Errorf("%w: parse snapshot: %v", ErrInvalid, err)
+	}
 	if snapshot.Format < FormatVersion {
 		return Snapshot{}, fmt.Errorf("%w: snapshot format %d is no longer supported; rerun vuelta scan", ErrInvalid, snapshot.Format)
 	}
 	if err := validateSnapshot(snapshot); err != nil {
 		return Snapshot{}, err
 	}
+	if s.TargetRoot != "" && snapshot.TargetRoot != s.TargetRoot {
+		return Snapshot{}, fmt.Errorf("%w: snapshot belongs to a different project", ErrStale)
+	}
 	return snapshot, nil
 }
 
 func (s Store) path(id string) string { return filepath.Join(s.Dir, id+".json") }
+
+// LoadLatest deterministically selects the newest strictly valid snapshot in
+// this one store. A malformed recognized snapshot fails closed; it is never
+// skipped in favor of an older plan.
+func (s Store) LoadLatest() (Snapshot, error) {
+	entries, err := s.boundedEntries()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	var snapshots []Snapshot
+	for _, entry := range entries {
+		id, recognized := snapshotIDFromName(entry.Name())
+		if !recognized {
+			continue
+		}
+		snapshot, loadErr := s.Load(id)
+		if loadErr != nil {
+			return Snapshot{}, fmt.Errorf("newest snapshot cannot be selected safely: %w", loadErr)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if len(snapshots) == 0 {
+		return Snapshot{}, fmt.Errorf("%w: no project-local snapshots; run vuelta scan", ErrNotFound)
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].CreatedAt.Equal(snapshots[j].CreatedAt) {
+			return snapshots[i].ID > snapshots[j].ID
+		}
+		return snapshots[i].CreatedAt.After(snapshots[j].CreatedAt)
+	})
+	return snapshots[0], nil
+}
+
+// CleanupExpired removes only expired, recognized, strictly loaded regular
+// snapshots from this exact directory. Unknown or malformed entries are
+// preserved and returned as bounded diagnostics.
+func (s Store) CleanupExpired(now time.Time) ([]string, error) {
+	entries, err := s.boundedEntries()
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	diagnostics := make([]string, 0)
+	removed := false
+	for _, entry := range entries {
+		id, recognized := snapshotIDFromName(entry.Name())
+		if !recognized {
+			if len(diagnostics) < 32 {
+				diagnostics = append(diagnostics, fmt.Sprintf("preserved unrecognized snapshot entry %q", entry.Name()))
+			}
+			continue
+		}
+		snapshot, loadErr := s.Load(id)
+		if loadErr != nil {
+			if len(diagnostics) < 32 {
+				diagnostics = append(diagnostics, fmt.Sprintf("preserved invalid snapshot %q: %v", id, loadErr))
+			}
+			continue
+		}
+		if now.Before(snapshot.ExpiresAt) {
+			continue
+		}
+		if err := os.Remove(s.path(id)); err != nil {
+			return diagnostics, fmt.Errorf("remove expired snapshot %s: %w", id, err)
+		}
+		removed = true
+	}
+	if removed {
+		if err := syncDirectory(s.Dir); err != nil {
+			return diagnostics, fmt.Errorf("sync snapshot cleanup: %w", err)
+		}
+	}
+	return diagnostics, nil
+}
+
+func (s Store) boundedEntries() ([]os.DirEntry, error) {
+	if err := s.validateExistingDir(); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: no project-local snapshots; run vuelta scan", ErrNotFound)
+		}
+		return nil, err
+	}
+	directory, err := os.Open(s.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("open snapshot state directory: %w", err)
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.ReadDir(maxSnapshotEntries + 1)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate snapshot state: %w", err)
+	}
+	if len(entries) > maxSnapshotEntries {
+		return nil, fmt.Errorf("%w: snapshot directory exceeds %d entries", ErrInvalid, maxSnapshotEntries)
+	}
+	return entries, nil
+}
+
+func (s Store) ensureDir() error {
+	if s.TargetRoot == "" {
+		return ensureDir(s.Dir)
+	}
+	target, err := projectstate.FromCanonical(s.TargetRoot)
+	if err != nil {
+		return err
+	}
+	if target.SnapshotsDir() != s.Dir {
+		return fmt.Errorf("%w: snapshot directory is outside the selected project", ErrInvalid)
+	}
+	return target.EnsureSnapshots()
+}
+
+func (s Store) validateExistingDir() error {
+	if s.TargetRoot == "" {
+		return validateExistingDir(s.Dir)
+	}
+	target, err := projectstate.FromCanonical(s.TargetRoot)
+	if err != nil {
+		return err
+	}
+	if target.SnapshotsDir() != s.Dir {
+		return fmt.Errorf("%w: snapshot directory is outside the selected project", ErrInvalid)
+	}
+	if err := target.ValidateSnapshots(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func snapshotIDFromName(name string) (string, bool) {
+	if filepath.Ext(name) != ".json" {
+		return "", false
+	}
+	id := strings.TrimSuffix(name, ".json")
+	return id, idPattern.MatchString(id)
+}
+
+func requireJSONEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return errors.New("multiple JSON values")
+}
 
 // ValidateForWorkspace rejects expired, reconfigured, dirty, rebased, or
 // changed-input plans before a sandbox or package manager is started.
@@ -470,11 +653,24 @@ func validateExistingDir(dir string) error {
 	return nil
 }
 
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
+}
+
 func validateSnapshot(snapshot Snapshot) error {
 	if snapshot.Format < FormatVersion {
 		return fmt.Errorf("%w: snapshot format %d is no longer supported; rerun vuelta scan", ErrInvalid, snapshot.Format)
 	}
-	if snapshot.Format != FormatVersion || !idPattern.MatchString(snapshot.ID) || snapshot.CreatedAt.IsZero() || snapshot.ExpiresAt.IsZero() || !snapshot.ExpiresAt.After(snapshot.CreatedAt) {
+	if snapshot.Format != FormatVersion || !idPattern.MatchString(snapshot.ID) || snapshot.CreatedAt.IsZero() || snapshot.ExpiresAt.IsZero() || !snapshot.ExpiresAt.After(snapshot.CreatedAt) ||
+		!filepath.IsAbs(snapshot.TargetRoot) || filepath.Clean(snapshot.TargetRoot) != snapshot.TargetRoot {
 		return fmt.Errorf("%w: malformed snapshot metadata", ErrInvalid)
 	}
 	if snapshot.Policy.Path == "" || snapshot.Policy.Hash == "" || snapshot.Gates.MinReleaseAge == "" || !hashPattern.MatchString(snapshot.PolicyHash) {
@@ -496,6 +692,9 @@ func validateSnapshot(snapshot Snapshot) error {
 			!hashPattern.MatchString(snapshot.ConfigHash) || !hashPattern.MatchString(snapshot.VerificationHash) || !reflect.DeepEqual(snapshot.Input, InputIdentity{}) {
 			return fmt.Errorf("%w: incomplete workspace identity", ErrInvalid)
 		}
+		if snapshot.TargetRoot != snapshot.Workspace.CanonicalPath {
+			return fmt.Errorf("%w: workspace target binding is inconsistent", ErrInvalid)
+		}
 		if err := validateInputIdentity(snapshot.Workspace.Input); err != nil {
 			return err
 		}
@@ -505,6 +704,9 @@ func validateSnapshot(snapshot Snapshot) error {
 	case OriginAdhoc:
 		if snapshot.Project != "" || snapshot.VerificationHash != "" || snapshot.Toolchain.ProfileID != "" || !filepath.IsAbs(snapshot.AdhocPath) || !reflect.DeepEqual(snapshot.Workspace, WorkspaceIdentity{}) {
 			return fmt.Errorf("%w: incomplete adhoc identity", ErrInvalid)
+		}
+		if snapshot.TargetRoot != snapshot.AdhocPath {
+			return fmt.Errorf("%w: adhoc target binding is inconsistent", ErrInvalid)
 		}
 		if err := validateInputIdentity(snapshot.Input); err != nil {
 			return err

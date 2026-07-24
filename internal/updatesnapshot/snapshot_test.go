@@ -29,6 +29,20 @@ func testSnapshot(t *testing.T) Snapshot {
 	return snapshot
 }
 
+func testSnapshotForRoot(t *testing.T, root string, now time.Time, ttl time.Duration) Snapshot {
+	t.Helper()
+	snapshot, err := New(now, ttl, WorkspaceIdentity{
+		CanonicalPath: root, BaseRevision: "abc123", Input: InputIdentity{
+			Stages: []string{"package-candidates"}, ManifestHash: strings.Repeat("c", 64),
+			Hashes: map[string]string{"package.json": strings.Repeat("b", 64)},
+		},
+	}, strings.Repeat("a", 64), strings.Repeat("d", 64), []Candidate{{Kind: "npm", Name: "example", Target: "1.2.3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
 func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "snapshots")
 	store := Store{Dir: dir}
@@ -52,9 +66,9 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFormatSixRecordsRequiredSecurityAndVerificationIdentity(t *testing.T) {
+func TestFormatSevenRecordsTargetSecurityAndVerificationIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
-	if snapshot.Format != 6 || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
+	if snapshot.Format != 7 || snapshot.TargetRoot != "/projects/example" || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {
 		t.Fatalf("snapshot identity = %#v", snapshot)
 	}
 	if snapshot.Policy.Path != PolicyNone || snapshot.Policy.Hash != PolicyNone || snapshot.Gates.MinReleaseAge == "" {
@@ -174,6 +188,212 @@ func TestLoadMissingSnapshotDoesNotCreateStateDirectory(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("state directory was created during validation: %v", statErr)
+	}
+}
+
+func TestProjectStoreSelectsNewestDeterministicallyAndDoesNotFallbackFromExpired(t *testing.T) {
+	root := t.TempDir()
+	store, err := ProjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	older := testSnapshotForRoot(t, root, base, 24*time.Hour)
+	newerExpired := testSnapshotForRoot(t, root, base.Add(time.Hour), time.Minute)
+	for _, snapshot := range []Snapshot{older, newerExpired} {
+		if err := store.Save(snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected, err := store.LoadLatest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != newerExpired.ID {
+		t.Fatalf("selected %s, want newest %s", selected.ID, newerExpired.ID)
+	}
+	if err := ValidateForWorkspace(context.Background(), selected, config.Config{}, config.Workspace{}, newerExpired.ExpiresAt); !errors.Is(err, ErrExpired) {
+		t.Fatalf("newest expired validation = %v", err)
+	}
+}
+
+func TestProjectStoreBreaksCreatedAtTiesByStableID(t *testing.T) {
+	root := t.TempDir()
+	store, err := ProjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	first := testSnapshotForRoot(t, root, now, time.Hour)
+	second := testSnapshotForRoot(t, root, now, time.Hour)
+	if err := store.Save(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(second); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := store.LoadLatest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := first.ID
+	if second.ID > want {
+		want = second.ID
+	}
+	if selected.ID != want {
+		t.Fatalf("tie selected %s, want lexicographically newest %s", selected.ID, want)
+	}
+}
+
+func TestProjectStoreRejectsCrossProjectSnapshotCopy(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	first, err := ProjectStore(firstRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ProjectStore(secondRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshotForRoot(t, firstRoot, time.Now(), time.Hour)
+	if err := first.Save(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.ensureDir(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(first.path(snapshot.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second.path(snapshot.ID), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Load(snapshot.ID); !errors.Is(err, ErrStale) {
+		t.Fatalf("cross-project load error = %v, want stale", err)
+	}
+}
+
+func TestProjectStoreLatestFailsClosedOnMalformedRecognizedSnapshot(t *testing.T) {
+	root := t.TempDir()
+	store, err := ProjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := testSnapshotForRoot(t, root, time.Now(), time.Hour)
+	if err := store.Save(valid); err != nil {
+		t.Fatal(err)
+	}
+	malformedID := "abcdefghijklmnopqrstuv"
+	if err := os.WriteFile(store.path(malformedID), []byte(`{"format":7}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadLatest(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("latest malformed error = %v, want invalid", err)
+	}
+}
+
+func TestProjectStoreRejectsSymlinkPermissiveAndOversizedSnapshotFiles(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{"symlink", func(t *testing.T, path string) {
+			outside := filepath.Join(t.TempDir(), "outside")
+			if err := os.WriteFile(outside, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"permissive", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"oversized", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, make([]byte, maxSnapshotBytes+1), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store, err := ProjectStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ensureDir(); err != nil {
+				t.Fatal(err)
+			}
+			id := "abcdefghijklmnopqrstuv"
+			test.setup(t, store.path(id))
+			if _, err := store.Load(id); err == nil {
+				t.Fatalf("%s snapshot file was accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestProjectStoreCleanupRemovesOnlyExpiredRecognizedSnapshots(t *testing.T) {
+	root := t.TempDir()
+	store, err := ProjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	expired := testSnapshotForRoot(t, root, now.Add(-2*time.Hour), time.Hour)
+	current := testSnapshotForRoot(t, root, now, time.Hour)
+	for _, snapshot := range []Snapshot{expired, current} {
+		if err := store.Save(snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unknown := filepath.Join(store.Dir, "notes.txt")
+	if err := os.WriteFile(unknown, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	malformedID := "abcdefghijklmnopqrstuv"
+	malformed := store.path(malformedID)
+	if err := os.WriteFile(malformed, []byte(`{"format":7}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics, err := store.CleanupExpired(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) < 2 {
+		t.Fatalf("cleanup diagnostics = %v", diagnostics)
+	}
+	if _, err := os.Lstat(store.path(expired.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired snapshot remains: %v", err)
+	}
+	for _, path := range []string{store.path(current.ID), unknown, malformed} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("preserved entry %s: %v", path, err)
+		}
+	}
+}
+
+func TestProjectStoreBoundsDirectoryEnumeration(t *testing.T) {
+	root := t.TempDir()
+	store, err := ProjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ensureDir(); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index <= maxSnapshotEntries; index++ {
+		name := filepath.Join(store.Dir, fmt.Sprintf("unknown-%03d", index))
+		if err := os.WriteFile(name, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.LoadLatest(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unbounded enumeration error = %v", err)
 	}
 }
 

@@ -92,9 +92,15 @@ init`; no manual YAML edit is required. `config.example.yaml` is the reference
 for advanced server and notification settings. The config must be a regular,
 non-symlink file owned by the process uid, use mode `0600`, and declare the
 current top-level `schema_version`; loading fails closed if these checks do not
-pass. This pre-release build does not migrate old test configs: preserve any
-settings still needed and recreate the file with `vuelta config init
---replace`. Webhook URLs
+pass. When an interactive command finds the recognized legacy format without
+`schema_version`, it offers to add the current version while preserving all
+compatible settings, comments, key order, ownership, and protected mode.
+Recognized retired fields are listed by name before confirmation; their values
+are never printed, and ambiguous conversions fail closed. The
+same reviewed operation is available explicitly as `vuelta config migrate`;
+scripts use `vuelta --no-input config migrate --yes`. Explicit unsupported
+versions and configs that do not validate under the current schema still fail
+closed without being changed. Webhook URLs
 and Telegram bot tokens are never stored in YAML: the config refers only to the
 fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
 environment variables, which are resolved only when a notification is sent.
@@ -280,14 +286,15 @@ cd /path/to/project
 vuelta scan
 ```
 
-The first run atomically creates a protected `.vuelta.yaml` containing only
-project policy with `workspace.path: .`; the same invocation continues the
-scan. Later runs reuse that file byte-for-byte. `.` is always resolved
-relative to `.vuelta.yaml`, not the process CWD. An explicit `--config PATH`
-has highest priority and disables automatic neighboring config creation.
+The first run atomically onboards a protected, versioned `.vuelta.yaml`
+containing only project policy with `workspace.path: .` and adds only the
+anchored `/.vuelta/` rule to the root `.gitignore`. The scan continues, but no
+snapshot is published until those versioned changes are reviewed, committed,
+and a clean scan is run again. Later runs reuse both entries byte-for-byte.
+`.` is always resolved relative to `.vuelta.yaml`, not the process CWD.
 
 Machine authority remains in `~/.config/vuelta/config.yaml`: the approved
-Docker endpoint and daemon identity, snapshot state, scanner/update defaults,
+Docker endpoint and daemon identity, scanner/update defaults,
 and allowlisted credential-variable names. A project-controlled
 `.vuelta.yaml` cannot choose a socket, executable, credential source, or
 weaken machine security policy. If Docker trust is not configured, the
@@ -295,8 +302,9 @@ project config remains saved and scan reports the existing explicit
 `environment bootstrap` flow.
 
 Global multi-project operations (`scan --all`, `scan --project`, scheduler,
-and administrative commands) continue to use the machine config. Select a
-specific config with the global `--config PATH` option. The normal dependency
+and administrative commands) continue to use machine authority while each
+target is onboarded and stores state only in its own root. Select a specific
+machine config with the global `--config PATH` option. The normal dependency
 workflow remains two steps:
 
 Legacy scripts that intentionally use a machine-config workspace with
@@ -305,20 +313,26 @@ silently falls back to an unrelated global workspace.
 
 ```bash
 vuelta scan --all
-vuelta update --yes SNAPSHOT_ID
+vuelta update --directory /path/to/project
 ```
 
-After the documented first-run `.vuelta.yaml` creation, `scan` is read-only:
+After onboarding, `scan` is read-only with respect to manifests and source:
 it never changes manifests, lock files, or source. It reports vulnerabilities
-and package candidates and creates one short-lived snapshot for each ready
-Git project. Gitless projects remain scannable and report
+and package candidates, atomically updates `.vuelta/last-scan.md`, and creates
+one short-lived `.vuelta/snapshots/<ID>.json` plan for each ready Git project.
+Gitless projects remain scannable and report
 `git_update_snapshot=unavailable` with reason `git_repository_not_found`;
 their findings and candidates remain visible while Git-bound snapshots and
 updates are disabled. Use `--project NAME` or `--all` for global configured
 workspaces, or `--directory PATH` to select an exact local root.
-`update` accepts exactly one snapshot ID, revalidates it before environment
-checks or writes, displays its plan, and requires confirmation or `--yes`.
-Use `--dry-run` to run checks in a disposable copy without durable changes.
+`update` resolves exactly the current directory, or `--directory PATH`, before
+opening state. Without `--snapshot`, it bounded-enumerates only that project's
+snapshot directory and deterministically selects the newest validated
+`created_at` (ID breaks ties). `--snapshot ID` selects one exact plan from the
+same target for automation. The selected ID, creation/expiry timestamps, and
+candidates are displayed before confirmation. An invalid, stale, or expired
+newest plan fails closed without falling back to an older one. Use `--dry-run`
+to run checks in a disposable copy without durable changes.
 
 For a `requirements.txt`-only Python project, candidate discovery remains
 read-only and the result is `scan_only`. JSON includes
@@ -327,10 +341,21 @@ plus bounded per-line `diagnostics`; `snapshot_id` and the human `Next: vuelta
 update ...` instruction are absent. Migrate to a reviewed Poetry, uv, or
 pip-tools source/lock contract before enabling package mutation.
 
-Snapshots are stored in `~/.config/vuelta/update-snapshots` by default (or the
-absolute `update.snapshot_state_dir`). They contain only identity metadata,
+Project-local operational state is:
+
+```text
+.vuelta.yaml
+.vuelta/
+├── last-scan.md
+└── snapshots/
+    └── <SNAPSHOT_ID>.json
+```
+
+`.vuelta/` and its files use 0700/0600 modes, reject symlinks and foreign
+ownership, and are excluded from scan inputs and update sandboxes. Snapshots
+contain only identity metadata,
 the canonical stage set, exact input-manifest/content hashes, gates, and
-candidate versions—never file contents, credentials, or command logs. Format-3
+candidate versions—never file contents, credentials, or command logs. Format-7
 snapshots are invalidated when any scanned input changes; unrelated source
 changes do not alter the input manifest. A missing, older-format, malformed,
 expired, reconfigured, dirty, rebased, or changed-input snapshot exits with
@@ -339,18 +364,22 @@ code 3 before any package manager runs; create a fresh scan instead.
 ### Explicit adhoc container scans
 
 An unregistered directory can be scanned explicitly without adding it to the
-main config. Copy `local.example.yaml` to a private policy file, restrict
-`allowed_packages`, and create the snapshot without writing:
+machine workspace list. Pass the machine config explicitly so local project
+policy onboarding is not selected, copy `local.example.yaml` to a private
+policy file, and restrict `allowed_packages`. The first invocation may add the
+exact root ignore rule; review/commit it and repeat the scan before updating:
 
 ```bash
 vuelta scan --directory /path/to/project \
-  --policy ./vuelta-local.yaml --only packages
+  --policy ./vuelta-local.yaml --only packages \
+  --config ~/.config/vuelta/config.yaml
 ```
 
 After reviewing the returned snapshot, apply exactly that snapshot:
 
 ```bash
-vuelta update --yes SNAPSHOT_ID
+vuelta update --directory /path/to/project --snapshot SNAPSHOT_ID --yes \
+  --config ~/.config/vuelta/config.yaml
 ```
 
 Adhoc execution never creates a commit or push and does not run project tests.
@@ -372,7 +401,8 @@ notification text or audit fields.
 
 Scheduling is external. `vuelta-scheduler` runs one `scan --all --json`,
 structurally selects only `status: ready` results, and invokes one
-`update --yes --json SNAPSHOT_ID` process per ready snapshot. It never parses
+`update --yes --json --directory PATH --snapshot SNAPSHOT_ID` process per
+ready snapshot. It never parses
 human output or passes result fields through a shell. `--failure-policy` is
 explicitly `continue` or `stop`; `--findings-policy` is `report` or `fail`.
 The continue policy preserves successful independent updates while returning

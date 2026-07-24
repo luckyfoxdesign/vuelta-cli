@@ -79,15 +79,17 @@ func configPath(args []string) (string, error) {
 
 func runConfig(args []string) error {
 	if len(args) < 1 {
-		return fail(exitConfig, "usage: vuelta config validate [--json] [config-path] | vuelta config init [--replace] [--yes] [config-path]")
+		return fail(exitConfig, "usage: vuelta config validate [--json] [config-path] | vuelta config init [--replace] [--yes] [config-path] | vuelta config migrate [--yes] [config-path]")
 	}
 	switch args[0] {
 	case "validate":
 		return runConfigValidate(args[1:])
 	case "init":
 		return runConfigInit(args[1:])
+	case "migrate":
+		return runConfigMigrate(args[1:])
 	default:
-		return fail(exitConfig, "usage: vuelta config validate [--json] [config-path] | vuelta config init [--replace] [--yes] [config-path]")
+		return fail(exitConfig, "usage: vuelta config validate [--json] [config-path] | vuelta config init [--replace] [--yes] [config-path] | vuelta config migrate [--yes] [config-path]")
 	}
 }
 

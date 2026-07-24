@@ -20,7 +20,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
-func TestResolveScanTargetsUsesContainingRegisteredProject(t *testing.T) {
+func TestResolveScanTargetsDoesNotWalkToContainingRegisteredProject(t *testing.T) {
 	root := t.TempDir()
 	nested := filepath.Join(root, "services", "api")
 	working := filepath.Join(nested, "internal")
@@ -33,12 +33,15 @@ func TestResolveScanTargetsUsesContainingRegisteredProject(t *testing.T) {
 		{Name: "root", Path: root},
 		{Name: "api", Path: nested},
 	}}
-	targets, err := resolveScanTargets(cfg, scanOptions{}, func() (string, error) { return working, nil })
+	if _, err := resolveScanTargets(cfg, scanOptions{}, func() (string, error) { return working, nil }); err == nil {
+		t.Fatal("nested current directory unexpectedly selected a parent project")
+	}
+	targets, err := resolveScanTargets(cfg, scanOptions{directory: working}, os.Getwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || targets[0].name != "api" || targets[0].path != nested || targets[0].origin != updatesnapshot.OriginWorkspace {
-		t.Fatalf("targets = %#v", targets)
+	if len(targets) != 1 || targets[0].path != working || targets[0].origin != updatesnapshot.OriginAdhoc {
+		t.Fatalf("exact nested target = %#v", targets)
 	}
 }
 
@@ -81,6 +84,40 @@ func TestResolveScanTargetsExplicitAll(t *testing.T) {
 	}
 	if len(targets) != 2 || targets[0].name != "api" || targets[1].name != "web" {
 		t.Fatalf("targets = %#v", targets)
+	}
+}
+
+func TestMachineScanTargetOnboardingCreatesLocalPolicyAndExactIgnoreOnce(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"package.json":      "{}\n",
+		"package-lock.json": "{}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace := config.Workspace{
+		Name: "api", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+	}
+	targets := onboardMachineScanTargets([]scanTarget{{
+		workspace: &workspace, name: "api", path: root, origin: updatesnapshot.OriginWorkspace,
+	}})
+	if len(targets) != 1 || targets[0].err != nil || !targets[0].onboardingChanged {
+		t.Fatalf("first onboarding = %#v", targets)
+	}
+	for _, path := range []string{filepath.Join(root, projectConfigName), filepath.Join(root, ".gitignore")} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("missing onboarding file %s: %v", path, err)
+		}
+	}
+	repeated := onboardMachineScanTargets([]scanTarget{{
+		workspace: &workspace, name: "api", path: root, origin: updatesnapshot.OriginWorkspace,
+	}})
+	if repeated[0].err != nil || repeated[0].onboardingChanged {
+		t.Fatalf("repeated onboarding = %#v", repeated)
 	}
 }
 
@@ -624,7 +661,7 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 	t.Cleanup(func() { executableName = previousExecutable })
 
 	result := scanResult{
-		Project: "api", Status: "ready", SnapshotID: "snapshot-id",
+		Project: "api", Directory: "/tmp/project", Status: "ready", SnapshotID: "snapshot-id",
 		Candidates: []updatesnapshot.Candidate{{
 			Kind: "npm", Name: "lodash", Current: "4.17.20", Target: "4.17.23", ReleaseAgeVerified: true,
 		}},
@@ -644,7 +681,7 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 		"Scan: api", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
 		"npm", "lodash", "4.17.20", "4.17.23", "available",
 		"Result: 1 package update available.",
-		"Next: vuelta update --config /tmp/config.yaml -- snapshot-id",
+		"Next: vuelta update --directory /tmp/project --config /tmp/config.yaml",
 	} {
 		if !strings.Contains(stdout, wanted) {
 			t.Fatalf("compact output %q does not contain %q", stdout, wanted)
@@ -689,6 +726,53 @@ func TestHumanScanOutputExplainsRequirementsReadOnly(t *testing.T) {
 		if !strings.Contains(stdout, wanted) {
 			t.Fatalf("read-only output %q does not contain %q", stdout, wanted)
 		}
+	}
+}
+
+func TestProjectScanReportIsBoundedEscapedAndNamesSnapshotAuthority(t *testing.T) {
+	created := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	expires := created.Add(time.Hour)
+	result := scanResult{
+		Project: "api<script>", Directory: "/projects/api", Status: "ready",
+		SnapshotID: "abcdefghijklmnopqrstuv", SnapshotCreated: &created, SnapshotExpires: &expires,
+		Candidates: []updatesnapshot.Candidate{{
+			Kind: "npm", Name: "bad|name", Current: "1.0.0", Target: "2.0.0", ReleaseAgeVerified: true,
+		}},
+		Vulnerabilities: []string{"[link](https://example.invalid) <script>"},
+		Warnings:        []string{"warning\nwith newline", "https://user:password@example.invalid/private"},
+	}
+	data, err := buildProjectScanReport(result, scanOptions{directory: "/projects/api"}, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(data)
+	for _, wanted := range []string{
+		"Status: **ready**", "bad\\|name", "&lt;script&gt;", "abcdefghijklmnopqrstuv",
+		"vuelta update --directory /projects/api", "authority is the selected JSON snapshot",
+	} {
+		if !strings.Contains(report, wanted) {
+			t.Fatalf("report lacks %q:\n%s", wanted, report)
+		}
+	}
+	if strings.Contains(report, "<script>") || strings.Contains(report, "\nwith newline") || strings.Contains(report, "user:password") {
+		t.Fatalf("report contains unescaped external Markdown/HTML:\n%s", report)
+	}
+}
+
+func TestProjectScanReportBoundsVulnerabilityList(t *testing.T) {
+	findings := make([]string, 150)
+	for index := range findings {
+		findings[index] = fmt.Sprintf("CVE-%03d", index)
+	}
+	data, err := buildProjectScanReport(scanResult{
+		Project: "api", Directory: "/projects/api", Status: "findings", Vulnerabilities: findings,
+	}, scanOptions{}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(data)
+	if !strings.Contains(report, "full count: 150") || strings.Contains(report, "CVE-149") {
+		t.Fatalf("vulnerability truncation missing:\n%s", report)
 	}
 }
 

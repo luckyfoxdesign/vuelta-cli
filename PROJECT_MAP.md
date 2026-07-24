@@ -18,8 +18,8 @@ app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
-├── internal/            # config, configinit, adhoc, scanner, updater, updatesnapshot, vulnscan,
-│                        # toolchain, sandbox, testrunner, gitops, notify, logging, scheduler
+├── internal/            # config, configinit, projectstate, adhoc, scanner, updater,
+│                        # updatesnapshot, vulnscan, toolchain, sandbox, testrunner, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
@@ -81,18 +81,19 @@ make build                     # both cross-build targets
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
 - `internal/notify/` — sends run results via webhook and/or Telegram.
 - `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
+- `internal/projectstate/` — resolves one exact canonical target and owns its hardened private .vuelta directories plus bounded atomic scan reports.
 - `internal/repopolicy/` — TODO: describe this package.
 - `internal/safeerr/` — builds safe, bounded, redacted diagnostic text and stable failure categories for hardened command boundaries. It only ever operates on output a boundary already captured under its own size limits; it never sees full argv, environment, or unbounded output.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
 - `internal/scancontainer/` — runs a scanner against an in-memory input archive. Repository contents are copied into a stopped container through Docker's stdin API; no host path is mounted and no host staging copy is created.
 - `internal/scaninput/` — TODO: describe this package.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
-- `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update still receives exactly one reviewed snapshot ID.
+- `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update receives one exact target directory and its reviewed snapshot ID.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
 - `internal/toolchain/` — resolves declarative project constraints to an operator override or embedded scan default and builds defaults without executing project code.
 - `internal/updater/` — discovers package candidates in read-only hardened containers and applies validated dependency and Docker image plans inside a sandboxed working copy.
-- `internal/updatesnapshot/` — stores short-lived, read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
+- `internal/updatesnapshot/` — stores short-lived, project-local read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
 - `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
 <!-- generated:end -->
 
@@ -100,7 +101,7 @@ make build                     # both cross-build targets
 ## Architecture Notes
 
 - One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
-- The top-level `scan` → `update SNAPSHOT_ID` workflow validates a single format-3 snapshot before environment checks. Registered and adhoc execution is container-only; adhoc updates use a minimal private copy and never run project tests.
+- The top-level `scan` → `update [--directory PATH] [--snapshot ID]` workflow stores format-7 plans under the exact target's `.vuelta/snapshots/`, selects the target before loading state, and validates one displayed plan before environment checks. Registered and adhoc execution is container-only; adhoc updates use a minimal private copy and never run project tests.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.

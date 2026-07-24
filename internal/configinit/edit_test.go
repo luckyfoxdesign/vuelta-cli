@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestNewConfigIsValidAndEmpty(t *testing.T) {
@@ -20,6 +21,179 @@ func TestNewConfigIsValidAndEmpty(t *testing.T) {
 	}
 	if len(cfg.Workspaces) != 0 {
 		t.Fatalf("workspaces = %d, want zero", len(cfg.Workspaces))
+	}
+}
+
+func TestSchemaMigrationPreservesLegacyConfigAndPermissions(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	data, err := yaml.Marshal(NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(data), "schema_version: 1\n", "", 1)
+	legacy = "# keep migration comment\n" + legacy
+	if err := os.WriteFile(configPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := PlanSchemaMigration(configPath)
+	if err != nil {
+		t.Fatalf("PlanSchemaMigration: %v", err)
+	}
+	if !plan.Changed || !strings.HasPrefix(string(plan.Updated), "schema_version: 1\n# keep migration comment\n") {
+		t.Fatalf("migration did not add only the schema header:\n%s", plan.Updated)
+	}
+	if err := plan.Apply(configPath); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if _, err := config.Load(configPath); err != nil {
+		t.Fatalf("load migrated config: %v", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %04o, want 0600", info.Mode().Perm())
+	}
+
+	repeated, err := PlanSchemaMigration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Changed {
+		t.Fatal("current config planned another migration")
+	}
+}
+
+func TestSchemaMigrationRejectsUnsupportedOrInvalidLegacyConfig(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data string
+	}{
+		{name: "unsupported", data: "schema_version: 2\nworkspaces: []\n"},
+		{name: "unknown field", data: "unknown_credential: fake-secret-must-not-leak\nworkspaces: []\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := PlanSchemaMigration(path)
+			if err == nil {
+				t.Fatal("expected migration rejection")
+			}
+			if strings.Contains(err.Error(), "fake-secret-must-not-leak") {
+				t.Fatalf("migration error leaked config value: %v", err)
+			}
+		})
+	}
+}
+
+func TestSchemaMigrationTransformsKnownPreVersionFields(t *testing.T) {
+	cfg := NewConfig()
+	cfg.Workspaces = []config.Workspace{buildNodeWorkspace(t, nodeProject(t), "api")}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	root, err := documentMapping(&document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteMappingNode(root, "schema_version")
+	vulnerability := mappingValue(root, "vuln_scan")
+	deleteMappingNode(vulnerability, "dependency_source")
+	enabled, err := encodeNode(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setMappingNode(vulnerability, "enabled", enabled)
+	setMappingString(vulnerability, "tool", "trivy")
+	github := mappingValue(root, "github_advisories")
+	setMappingNode(github, "enabled", enabled)
+	setMappingNode(root, "autofix", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+	setMappingNode(root, "deploy_task", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+	workspace := mappingValue(root, "workspaces").Content[0]
+	deleteMappingNode(workspace, "verification")
+	setMappingNode(workspace, "test", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+	legacy, err := encodeDocument(&document, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanSchemaMigration(path)
+	if err != nil {
+		t.Fatalf("PlanSchemaMigration: %v", err)
+	}
+	review := strings.Join(plan.Review, "\n")
+	for _, wanted := range []string{
+		"vuln_scan.tool", "github_advisories.enabled", "parked autofix",
+		"parked deploy_task", "verification.state=scan_only",
+	} {
+		if !strings.Contains(review, wanted) {
+			t.Fatalf("migration review lacks %q:\n%s", wanted, review)
+		}
+	}
+	if err := plan.Apply(path); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load migrated config: %v", err)
+	}
+	if len(migrated.Workspaces) != 1 || migrated.Workspaces[0].Verification.State != config.VerificationScanOnly {
+		t.Fatalf("migrated workspaces = %#v", migrated.Workspaces)
+	}
+}
+
+func TestSchemaMigrationRemovesOnlyRetiredSnapshotStateField(t *testing.T) {
+	cfg := NewConfig()
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDir := filepath.Join(t.TempDir(), "legacy-snapshots")
+	if err := os.Mkdir(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(legacyDir, "keep.json")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withRetired := strings.Replace(
+		string(data),
+		"    snapshot_ttl_hours: 24\n",
+		"    snapshot_ttl_hours: 24\n    snapshot_state_dir: "+legacyDir+"\n",
+		1,
+	)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(withRetired), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanSchemaMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Changed || !strings.Contains(strings.Join(plan.Review, "\n"), "snapshot_state_dir") || strings.Contains(string(plan.Updated), "snapshot_state_dir") {
+		t.Fatalf("retired-field migration = review %v\n%s", plan.Review, plan.Updated)
+	}
+	if err := plan.Apply(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("load migrated config: %v", err)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
+		t.Fatalf("legacy snapshot contents were touched: %q %v", data, err)
 	}
 }
 

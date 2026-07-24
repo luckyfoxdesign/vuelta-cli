@@ -2,7 +2,7 @@
   "format": 1,
   "command": "scan",
   "results": [
-    {"project": "api", "status": "ready", "snapshot_id": "snapshot-api"}
+    {"project": "api", "directory": "/projects/api", "status": "ready", "snapshot_id": "snapshot-api"}
   ],
   "summary": {"succeeded": 1, "failed": 0},
   "warnings": [],

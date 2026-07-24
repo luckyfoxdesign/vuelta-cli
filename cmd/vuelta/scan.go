@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -16,9 +17,11 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
+	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -35,12 +38,13 @@ const (
 )
 
 type scanTarget struct {
-	workspace *config.Workspace
-	name      string
-	path      string
-	origin    string
-	err       error
-	dockerErr error
+	workspace         *config.Workspace
+	name              string
+	path              string
+	origin            string
+	err               error
+	dockerErr         error
+	onboardingChanged bool
 }
 
 type scanToolResult struct {
@@ -74,6 +78,7 @@ const (
 	stageCandidate     = "candidate"
 	stageReleaseAge    = "release_age"
 	stageSnapshot      = "snapshot"
+	stageReport        = "report"
 )
 
 // scanStageResult reports one independent scan stage so a failure in one
@@ -96,6 +101,8 @@ type scanResult struct {
 	Execution       string                     `json:"execution"`
 	Status          string                     `json:"status"`
 	SnapshotID      string                     `json:"snapshot_id,omitempty"`
+	SnapshotCreated *time.Time                 `json:"snapshot_created_at,omitempty"`
+	SnapshotExpires *time.Time                 `json:"snapshot_expires_at,omitempty"`
 	Candidates      []updatesnapshot.Candidate `json:"candidates"`
 	Vulnerabilities []string                   `json:"vulnerabilities"`
 	Tools           []scanToolResult           `json:"tools"`
@@ -137,6 +144,8 @@ type scanOptions struct {
 	toolchainIdentity  *toolchain.Identity
 	packageDiagnostics *[]updater.ScanDiagnostic
 	explicitConfig     bool
+	nonInteractive     bool
+	updateConfigPath   string
 }
 
 func executeScan(args []string) error {
@@ -148,7 +157,10 @@ func executeScan(args []string) error {
 	if loadErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "project_config_unavailable", fail(exitConfig, "%v", loadErr), "Select a supported project with --directory or an explicit config with --config")
 	}
-	configFile = selection.Path
+	options.updateConfigPath = selection.Path
+	if selection.Scope == "project" {
+		options.updateConfigPath = selection.MachineConfig
+	}
 	warnings := configWarnings(cfg)
 	if selection.Scope == "project" && (cfg.Docker == nil || cfg.Docker.Developer == nil) {
 		warnings = append(warnings, fmt.Sprintf(
@@ -159,6 +171,18 @@ func executeScan(args []string) error {
 	targets, targetErr := resolveScanTargets(*cfg, options, currentDirectory)
 	if targetErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", targetErr), "Choose one of --project, --directory, or --all")
+	}
+	if selection.Scope == "machine" {
+		targets = onboardMachineScanTargets(targets)
+	}
+	if selection.OnboardingChanged && len(targets) == 1 {
+		targets[0].onboardingChanged = true
+	}
+	for _, target := range targets {
+		if target.onboardingChanged {
+			warnings = appendUniqueStrings(warnings, "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating")
+			break
+		}
 	}
 	dockerReady := false
 	dockerErr := configureDeveloperDocker(*cfg)
@@ -205,6 +229,7 @@ func executeScan(args []string) error {
 			}
 		}
 	}
+	results = writeProjectScanReports(results, options, time.Now().UTC())
 	summary := summarizeScan(results)
 	if options.jsonOutput {
 		if err := writeJSONEnvelope(jsonCommandEnvelope{
@@ -225,7 +250,7 @@ func executeScan(args []string) error {
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, "warning:", warning)
 		}
-		writeHumanScanResults(results, configFile, options.verbose)
+		writeHumanScanResults(results, options.updateConfigPath, options.verbose)
 	}
 	return scanResultError(summary, options.failOn)
 }
@@ -259,6 +284,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.failOn, "fail-on", "", "return 5 for vulnerability findings")
 	fs.BoolVar(&options.verbose, "verbose", false, "show technical stages, inputs, warnings, and error details")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
+	fs.BoolVar(&options.nonInteractive, "internal-no-input", false, "disable prompts")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
 	}
@@ -319,6 +345,67 @@ func scanJSONRequested(args []string) bool {
 
 var currentDirectory = os.Getwd
 
+func onboardMachineScanTargets(targets []scanTarget) []scanTarget {
+	for index := range targets {
+		target := &targets[index]
+		if target.err != nil {
+			continue
+		}
+		ignorePath := filepath.Join(target.path, ".gitignore")
+		ignorePlan, err := configinit.PlanProjectGitignore(target.path)
+		if err != nil {
+			target.err = err
+			continue
+		}
+		if target.workspace == nil {
+			if err := configinit.ApplyProjectOnboarding(nil, "", ignorePlan, ignorePath); err != nil {
+				target.err = err
+				continue
+			}
+			target.onboardingChanged = ignorePlan.Changed
+			continue
+		}
+		projectPath := filepath.Join(target.path, projectConfigName)
+		var project *config.ProjectConfig
+		var projectPlan *configinit.EditPlan
+		if _, statErr := os.Lstat(projectPath); errors.Is(statErr, os.ErrNotExist) {
+			workspace := *target.workspace
+			workspace.Path = "."
+			workspace.ToolchainProfile = ""
+			project = &config.ProjectConfig{SchemaVersion: config.CurrentSchemaVersion, Workspace: workspace}
+			plan, planErr := configinit.PlanProjectConfigWrite(project, projectPath)
+			if planErr != nil {
+				target.err = planErr
+				continue
+			}
+			projectPlan = &plan
+		} else if statErr != nil {
+			target.err = fmt.Errorf("inspect project config %s: %w", projectPath, statErr)
+			continue
+		} else {
+			project, err = config.LoadProject(projectPath)
+			if err != nil {
+				target.err = err
+				continue
+			}
+		}
+		if err := configinit.ApplyProjectOnboarding(projectPlan, projectPath, ignorePlan, ignorePath); err != nil {
+			target.err = err
+			continue
+		}
+		workspace, err := project.ResolvedWorkspace(projectPath)
+		if err != nil {
+			target.err = err
+			continue
+		}
+		workspace.ToolchainProfile = target.workspace.ToolchainProfile
+		target.workspace = &workspace
+		target.name = config.WorkspaceName(workspace)
+		target.onboardingChanged = projectPlan != nil || ignorePlan.Changed
+	}
+	return targets
+}
+
 func resolveScanTargets(cfg config.Config, options scanOptions, getwd func() (string, error)) ([]scanTarget, error) {
 	registered := make([]scanTarget, 0, len(cfg.Workspaces))
 	for index := range cfg.Workspaces {
@@ -365,7 +452,7 @@ func resolveScanTargets(cfg config.Config, options scanOptions, getwd func() (st
 	if err != nil {
 		return nil, err
 	}
-	matched, err := containingRegisteredTarget(registered, canonical)
+	matched, err := exactRegisteredTarget(registered, canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -373,41 +460,28 @@ func resolveScanTargets(cfg config.Config, options scanOptions, getwd func() (st
 		return []scanTarget{*matched}, nil
 	}
 	if options.directory == "" {
-		return nil, errors.New("current directory is not inside a registered project\nTry: vuelta scan --directory .\n     vuelta project add .\n     vuelta scan --all")
+		return nil, errors.New("current directory is not a registered project root\nTry: vuelta scan --directory .\n     vuelta project add .\n     vuelta scan --all")
 	}
 	return []scanTarget{{path: canonical, origin: updatesnapshot.OriginAdhoc}}, nil
 }
 
-func containingRegisteredTarget(targets []scanTarget, path string) (*scanTarget, error) {
+func exactRegisteredTarget(targets []scanTarget, path string) (*scanTarget, error) {
 	var matches []scanTarget
-	longest := -1
 	for _, target := range targets {
 		if target.err != nil {
 			continue
 		}
-		if !pathContains(target.path, path) {
-			continue
-		}
-		length := len(target.path)
-		if length > longest {
-			matches = []scanTarget{target}
-			longest = length
-		} else if length == longest {
+		if target.path == path {
 			matches = append(matches, target)
 		}
 	}
 	if len(matches) > 1 {
-		return nil, fmt.Errorf("configured projects %q and %q ambiguously contain %s", matches[0].name, matches[1].name, path)
+		return nil, fmt.Errorf("configured projects %q and %q duplicate exact target %s", matches[0].name, matches[1].name, path)
 	}
 	if len(matches) == 0 {
 		return nil, nil
 	}
 	return &matches[0], nil
-}
-
-func pathContains(root, path string) bool {
-	relative, err := filepath.Rel(root, path)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func canonicalDirectory(path string) (string, error) {
@@ -513,6 +587,18 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
 		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{},
+	}
+	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
+	if stateErr == nil {
+		var cleanupDiagnostics []string
+		cleanupDiagnostics, stateErr = stateStore.CleanupExpired(time.Now())
+		result.Warnings = appendUniqueStrings(result.Warnings, cleanupDiagnostics...)
+	}
+	if stateErr != nil {
+		result.Warnings = appendUniqueStrings(result.Warnings, "project-local snapshot cleanup unavailable: "+stateErr.Error())
+	}
+	if target.onboardingChanged {
+		result.Warnings = appendUniqueStrings(result.Warnings, "project onboarding changed .vuelta.yaml or .gitignore; review and commit those versioned files, then repeat the scan before updating")
 	}
 	if target.err != nil {
 		result = recordScanStageFailure(result, stagePreflight, "target_unavailable", target.err, "Fix the configured workspace path, then run scan again")
@@ -692,6 +778,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageSnapshot, stageSkipped, "verification profile is scan-only")
 		return finalizeStageOutcomes(result)
 	}
+	if target.onboardingChanged {
+		result = addStage(result, stageSnapshot, stageSkipped, "project onboarding must be reviewed and committed")
+		return finalizeStageOutcomes(result)
+	}
 	if hasFailedStage(result, stageVulnerability) || hasFailedStage(result, stageAlerts) {
 		result = addStage(result, stageSnapshot, stageSkipped, "a requested security stage did not complete")
 		return finalizeStageOutcomes(result)
@@ -770,16 +860,18 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Run scan again")
 		return finalizeStageOutcomes(result)
 	}
-	stateDir, err := cfg.SnapshotStateDir()
-	if err != nil {
-		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Set a valid snapshot state directory")
+	if stateErr != nil {
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", stateErr, "Review the selected project's .vuelta/snapshots directory")
 		return finalizeStageOutcomes(result)
 	}
-	if err := (updatesnapshot.Store{Dir: stateDir}).Save(snapshot); err != nil {
-		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Check snapshot state-directory permissions")
+	if err := stateStore.Save(snapshot); err != nil {
+		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Check the selected project's .vuelta directory permissions and file types")
 		return finalizeStageOutcomes(result)
 	}
 	result.SnapshotID = snapshot.ID
+	created, expires := snapshot.CreatedAt, snapshot.ExpiresAt
+	result.SnapshotCreated = &created
+	result.SnapshotExpires = &expires
 	result.Status = "ready"
 	result = addStage(result, stageSnapshot, stageSucceeded, "")
 	return result
@@ -1239,7 +1331,7 @@ func summarizeScan(results []scanResult) scanSummary {
 	return summary
 }
 
-func writeHumanScanResults(results []scanResult, configFile string, verbose bool) {
+func writeHumanScanResults(results []scanResult, machineConfig string, verbose bool) {
 	for resultIndex, result := range results {
 		if resultIndex > 0 {
 			fmt.Println()
@@ -1327,9 +1419,153 @@ func writeHumanScanResults(results []scanResult, configFile string, verbose bool
 	}
 	sort.SliceStable(ready, func(i, j int) bool { return ready[i].Project < ready[j].Project })
 	for _, result := range ready {
-		fmt.Printf("Next: %s\n", displayCommand("update", "--config", configFile, "--", result.SnapshotID))
+		args := []string{"update", "--directory", result.Directory}
+		if machineConfig != "" {
+			args = append(args, "--config", machineConfig)
+		}
+		fmt.Printf("Next: %s\n", displayCommand(args...))
 	}
 }
+
+func writeProjectScanReports(results []scanResult, options scanOptions, completedAt time.Time) []scanResult {
+	for index := range results {
+		result := results[index]
+		target, err := projectstate.FromCanonical(result.Directory)
+		if err == nil {
+			var report []byte
+			report, err = buildProjectScanReport(result, options, completedAt)
+			if err == nil {
+				err = target.WriteReport(report)
+			}
+		}
+		if err != nil {
+			result = recordScanStageFailure(result, stageReport, "report_write_failed", err, "Review the selected project's .vuelta path, ownership, and permissions")
+			result = finalizeStageOutcomes(result)
+		} else {
+			result = addStage(result, stageReport, stageSucceeded, "")
+		}
+		results[index] = result
+	}
+	return results
+}
+
+func buildProjectScanReport(result scanResult, options scanOptions, completedAt time.Time) ([]byte, error) {
+	var report strings.Builder
+	report.Grow(4096)
+	status := result.Status
+	if status == config.VerificationScanOnly || (status != "ready" && status != "partial" && status != "failed") {
+		status = "read-only"
+	}
+	project := result.Project
+	if project == "" {
+		project = filepath.Base(result.Directory)
+	}
+	mode := options.only
+	if mode == "" {
+		mode = "vulnerabilities, packages"
+	}
+	fmt.Fprintf(&report, "# Vuelta scan report\n\n")
+	fmt.Fprintf(&report, "- Completed: `%s`\n", completedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&report, "- Status: **%s**\n", markdownValue(status))
+	fmt.Fprintf(&report, "- Project: `%s`\n", markdownValue(project))
+	fmt.Fprintf(&report, "- Scan modes: `%s`\n\n", markdownValue(mode))
+	fmt.Fprintln(&report, "## Package and image candidates")
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "| Manager | Name | Current | Target | Status |")
+	fmt.Fprintln(&report, "|---|---|---|---|---|")
+	candidateLimit := min(len(result.Candidates), 256)
+	for _, candidate := range result.Candidates[:candidateLimit] {
+		fmt.Fprintf(&report, "| %s | %s | %s | %s | %s |\n",
+			markdownValue(candidate.Kind), markdownValue(candidate.Name), markdownValue(candidate.Current),
+			markdownValue(candidate.Target), markdownValue(packageCandidateStatus(result, candidate)),
+		)
+	}
+	if len(result.Candidates) > candidateLimit {
+		fmt.Fprintf(&report, "\n_%d additional candidates omitted._\n", len(result.Candidates)-candidateLimit)
+	}
+	if len(result.Candidates) == 0 {
+		fmt.Fprintln(&report, "| — | — | — | — | none |")
+	}
+
+	fmt.Fprintln(&report)
+	fmt.Fprintf(&report, "## Vulnerabilities (%d)\n\n", len(result.Vulnerabilities))
+	vulnerabilityLimit := min(len(result.Vulnerabilities), 100)
+	for _, finding := range result.Vulnerabilities[:vulnerabilityLimit] {
+		fmt.Fprintf(&report, "- %s\n", markdownValue(finding))
+	}
+	if len(result.Vulnerabilities) == 0 {
+		fmt.Fprintln(&report, "- None reported.")
+	} else if len(result.Vulnerabilities) > vulnerabilityLimit {
+		fmt.Fprintf(&report, "- _%d additional findings omitted; full count: %d._\n", len(result.Vulnerabilities)-vulnerabilityLimit, len(result.Vulnerabilities))
+	}
+
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "## Warnings and blockers")
+	fmt.Fprintln(&report)
+	warnings := append([]string(nil), result.Warnings...)
+	if result.Error != nil {
+		warnings = append(warnings, result.Error.Message)
+	}
+	warningLimit := min(len(warnings), 50)
+	for _, warning := range warnings[:warningLimit] {
+		fmt.Fprintf(&report, "- %s\n", markdownValue(warning))
+	}
+	if len(warnings) == 0 {
+		fmt.Fprintln(&report, "- None.")
+	} else if len(warnings) > warningLimit {
+		fmt.Fprintf(&report, "- _%d additional warnings omitted._\n", len(warnings)-warningLimit)
+	}
+
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "## Update snapshot")
+	fmt.Fprintln(&report)
+	if result.SnapshotID == "" {
+		fmt.Fprintln(&report, "No authoritative update snapshot was created.")
+	} else {
+		fmt.Fprintf(&report, "- ID: `%s`\n", markdownValue(result.SnapshotID))
+		if result.SnapshotCreated != nil {
+			fmt.Fprintf(&report, "- Created: `%s`\n", result.SnapshotCreated.UTC().Format(time.RFC3339))
+		}
+		if result.SnapshotExpires != nil {
+			fmt.Fprintf(&report, "- Expires: `%s`\n", result.SnapshotExpires.UTC().Format(time.RFC3339))
+		}
+		args := []string{"update", "--directory", result.Directory}
+		if options.updateConfigPath != "" {
+			args = append(args, "--config", options.updateConfigPath)
+		}
+		fmt.Fprintf(&report, "- Next: `%s`\n", markdownValueLimit(displayCommand(args...), 4096))
+	}
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "> Update authority is the selected JSON snapshot in `.vuelta/snapshots/`, never this Markdown report.")
+	if report.Len() > projectstate.MaxReportBytes {
+		return nil, fmt.Errorf("scan report exceeds %d bytes after bounded rendering", projectstate.MaxReportBytes)
+	}
+	return []byte(report.String()), nil
+}
+
+func markdownValue(value string) string {
+	return markdownValueLimit(value, 256)
+}
+
+func markdownValueLimit(value string, maximum int) string {
+	value = strings.TrimSpace(value)
+	value = reportUserinfoURL.ReplaceAllString(value, "https://[redacted]/")
+	value = strings.NewReplacer(
+		"\\", "\\\\", "|", "\\|", "\r", " ", "\n", " ",
+		"<", "&lt;", ">", "&gt;", "[", "\\[", "]", "\\]",
+		"`", "'", "*", "\\*", "_", "\\_",
+	).Replace(value)
+	runes := []rune(value)
+	if len(runes) > maximum {
+		value = string(runes[:maximum]) + "…"
+	}
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+var reportUserinfoURL = regexp.MustCompile(`(?i)https?://[^/\s@]+@`)
 
 func writePackageCandidateTable(result scanResult) {
 	if len(result.Candidates) == 0 {

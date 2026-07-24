@@ -116,6 +116,14 @@ func TestMaliciousFixtureSandboxExcludesGitAndHostState(t *testing.T) {
 	}
 }
 
+func TestSafeArchivePathRejectsProjectLocalVueltaState(t *testing.T) {
+	for _, name := range []string{".vuelta", ".vuelta/last-scan.md", ".vuelta/snapshots/id.json"} {
+		if _, err := safeArchivePath(name, defaultArchiveLimits); err == nil {
+			t.Fatalf("safeArchivePath accepted private state %q", name)
+		}
+	}
+}
+
 func TestPrepareRejectsTrackedSymlinkArchiveMember(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink fixture requires a POSIX filesystem")

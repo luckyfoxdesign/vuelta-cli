@@ -56,11 +56,10 @@ github_advisories:
 
 update:
   min_release_age_days: 7  # reject versions younger than N days — protects against freshly-published malicious releases
-  # `vuelta scan` saves a read-only update plan for this period. `vuelta
-  # update SNAPSHOT_ID` rejects expired snapshots before environment checks.
+  # `vuelta scan` saves a project-local read-only update plan for this period.
+  # `vuelta update` rejects expired snapshots before environment checks.
   # The default is 24h; 1..168h is allowed.
   snapshot_ttl_hours: 24
-  # snapshot_state_dir: "/Users/you/.config/vuelta/update-snapshots"
   egress:
     network: "vuelta-cli-update-egress"
     proxy_container: "vuelta-cli-egress-proxy"

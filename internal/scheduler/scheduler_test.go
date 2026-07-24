@@ -45,8 +45,8 @@ func TestRunContinuesAfterPartialScanAndUpdateFailure(t *testing.T) {
 	}
 	wantCalls := [][]string{
 		{"--config", "/etc/vuelta/config.yaml", "scan", "--all", "--json"},
-		{"--config", "/etc/vuelta/config.yaml", "update", "--yes", "--json", "snapshot-api"},
-		{"--config", "/etc/vuelta/config.yaml", "update", "--yes", "--json", "snapshot-worker"},
+		{"--config", "/etc/vuelta/config.yaml", "update", "--yes", "--json", "--directory", "/projects/api", "--snapshot", "snapshot-api"},
+		{"--config", "/etc/vuelta/config.yaml", "update", "--yes", "--json", "--directory", "/projects/worker", "--snapshot", "snapshot-worker"},
 	}
 	if !reflect.DeepEqual(runner.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", runner.calls, wantCalls)
@@ -145,14 +145,15 @@ func TestRunRejectsSuccessfulMismatchedUpdateEnvelope(t *testing.T) {
 	}
 }
 
-func TestRunRejectsDuplicateSnapshotWithoutApplyingItTwice(t *testing.T) {
+func TestRunAllowsSameOpaqueIDInDifferentProjectNamespaces(t *testing.T) {
 	scan := strings.Replace(string(fixture(t, "scan-two-ready.json")), "snapshot-worker", "snapshot-api", 1)
 	runner := &fakeRunner{responses: []Invocation{
 		{Stdout: []byte(scan), ExitCode: ExitOK},
 		{Stdout: updateFixture(t, "update-success.json", "snapshot-api"), ExitCode: ExitOK},
+		{Stdout: updateFixture(t, "update-success.json", "snapshot-api"), ExitCode: ExitOK},
 	}}
 	report, exitCode := Run(context.Background(), runner, Options{FailurePolicy: FailureContinue, FindingsPolicy: FindingsReport})
-	if exitCode != ExitFailure || len(runner.calls) != 2 || report.Summary.Ready != 1 || len(report.Errors) != 1 {
+	if exitCode != ExitOK || len(runner.calls) != 3 || report.Summary.Ready != 2 || report.Summary.Updated != 2 || len(report.Errors) != 0 {
 		t.Fatalf("exit=%d calls=%#v report=%#v", exitCode, runner.calls, report)
 	}
 }

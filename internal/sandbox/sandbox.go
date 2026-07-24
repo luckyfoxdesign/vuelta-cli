@@ -203,7 +203,8 @@ func safeArchivePath(name string, lim archiveLimits) (string, error) {
 	}
 	clean := filepath.Clean(name)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) ||
-		clean == ".git" || strings.HasPrefix(clean, ".git"+string(filepath.Separator)) {
+		clean == ".git" || strings.HasPrefix(clean, ".git"+string(filepath.Separator)) ||
+		clean == ".vuelta" || strings.HasPrefix(clean, ".vuelta"+string(filepath.Separator)) {
 		return "", fmt.Errorf("archive path %q is not allowed", name)
 	}
 	if strings.Count(clean, string(filepath.Separator))+1 > lim.maxPathDepth {

@@ -32,11 +32,13 @@ Use Docker for all runtime, test, lint, and dependency work. Git runs locally.
 
 ## Architecture
 
-`vuelta` is a one-shot Go CLI with no resident daemon. Its public mutation
-surface accepts exactly one reviewed snapshot: `scan` creates snapshots and
-`update SNAPSHOT_ID` applies one. The separate `vuelta-scheduler` binary owns
-optional multi-project automation by parsing `scan --all --json` and invoking
-one `update --yes --json SNAPSHOT_ID` process per ready result. See
+`vuelta` is a one-shot Go CLI with no resident daemon. Each exact project root
+owns `.vuelta/last-scan.md` and `.vuelta/snapshots/`; `update` resolves the
+target from cwd or `--directory` before selecting its newest plan, while
+`--snapshot ID` pins automation to one exact project-local plan. The separate
+`vuelta-scheduler` binary owns optional multi-project automation by parsing
+`scan --all --json` and invoking one update with both exact directory and
+snapshot ID per ready result. See
 `cmd/vuelta/`, `cmd/vuelta-scheduler/`, and `internal/*`.
 
 ## Code Quality

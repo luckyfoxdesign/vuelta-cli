@@ -333,7 +333,7 @@ func approvedManagerConfigName(rel string) bool {
 
 func secretLikeName(rel string) bool {
 	for _, component := range strings.Split(strings.ToLower(rel), "/") {
-		if strings.HasPrefix(component, ".env") || strings.HasPrefix(component, ".git") ||
+		if strings.HasPrefix(component, ".env") || strings.HasPrefix(component, ".git") || component == ".vuelta" ||
 			component == ".npmrc" || component == ".netrc" || component == "pip.conf" || component == "auth.json" ||
 			component == "id_rsa" || component == "id_ed25519" || strings.HasSuffix(component, ".pem") ||
 			strings.HasSuffix(component, ".key") || strings.Contains(component, "credential") ||

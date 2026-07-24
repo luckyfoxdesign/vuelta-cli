@@ -13,13 +13,16 @@ import (
 const projectConfigName = ".vuelta.yaml"
 
 type scanConfigSelection struct {
-	Path          string `json:"path"`
-	Scope         string `json:"scope"`
-	Status        string `json:"status"`
-	MachineConfig string `json:"machine_config,omitempty"`
+	Path              string   `json:"path"`
+	Scope             string   `json:"scope"`
+	Status            string   `json:"status"`
+	MachineConfig     string   `json:"machine_config,omitempty"`
+	OnboardingChanged bool     `json:"onboarding_changed,omitempty"`
+	ChangedFiles      []string `json:"changed_files,omitempty"`
 }
 
 func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*config.Config, scanConfigSelection, error) {
+	allowMigrationPrompt := !options.jsonOutput && !options.nonInteractive && configinit.IsTerminal(os.Stdin)
 	if options.explicitConfig || options.all || options.project != "" {
 		projectFile := filepath.Base(parsedConfigPath) == projectConfigName
 		if options.explicitConfig && !projectFile {
@@ -30,9 +33,9 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 			}
 		}
 		if projectFile {
-			return loadSelectedProjectConfig(parsedConfigPath, "reused")
+			return loadSelectedProjectConfig(parsedConfigPath, "reused", allowMigrationPrompt)
 		}
-		cfg, err := config.Load(parsedConfigPath)
+		cfg, err := loadMachineConfig(parsedConfigPath, allowMigrationPrompt)
 		if err != nil {
 			return nil, scanConfigSelection{}, err
 		}
@@ -55,7 +58,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	_, statErr := os.Lstat(localPath)
 	switch {
 	case statErr == nil:
-		return loadSelectedProjectConfig(localPath, "reused")
+		return loadSelectedProjectConfig(localPath, "reused", allowMigrationPrompt)
 	case !errors.Is(statErr, os.ErrNotExist):
 		return nil, scanConfigSelection{}, fmt.Errorf("inspect project config %s: %w", localPath, statErr)
 	}
@@ -83,21 +86,58 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	if err := plan.Apply(localPath); err != nil {
+	ignorePlan, err := configinit.PlanProjectGitignore(root)
+	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	return mergeProjectWithMachine(project, localPath, "created")
+	ignorePath := filepath.Join(root, ".gitignore")
+	if err := configinit.ApplyProjectOnboarding(&plan, localPath, ignorePlan, ignorePath); err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	cfg, selection, err := mergeProjectWithMachine(project, localPath, "created", allowMigrationPrompt)
+	if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	selection.OnboardingChanged = true
+	selection.ChangedFiles = []string{projectConfigName}
+	if ignorePlan.Changed {
+		selection.ChangedFiles = append(selection.ChangedFiles, ".gitignore")
+	}
+	return cfg, selection, nil
 }
 
-func loadSelectedProjectConfig(path, status string) (*config.Config, scanConfigSelection, error) {
+func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	return mergeProjectWithMachine(project, path, status)
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
+	}
+	root, err := canonicalDirectory(filepath.Dir(absolute))
+	if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	ignorePlan, err := configinit.PlanProjectGitignore(root)
+	if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	if err := configinit.ApplyProjectOnboarding(nil, "", ignorePlan, filepath.Join(root, ".gitignore")); err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	cfg, selection, err := mergeProjectWithMachine(project, path, status, allowMigrationPrompt)
+	if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	selection.OnboardingChanged = ignorePlan.Changed
+	if ignorePlan.Changed {
+		selection.ChangedFiles = []string{".gitignore"}
+	}
+	return cfg, selection, nil
 }
 
-func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status string) (*config.Config, scanConfigSelection, error) {
+func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
 	absoluteProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
@@ -107,9 +147,18 @@ func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status 
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
+	return mergeProjectWithMachinePath(project, projectPath, status, machinePath, allowMigrationPrompt)
+}
+
+func mergeProjectWithMachinePath(project *config.ProjectConfig, projectPath, status, machinePath string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
+	absoluteProjectPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
+	}
+	projectPath = filepath.Clean(absoluteProjectPath)
 	machine := configinit.NewConfig()
 	if _, statErr := os.Lstat(machinePath); statErr == nil {
-		machine, err = config.Load(machinePath)
+		machine, err = loadMachineConfig(machinePath, allowMigrationPrompt)
 		if err != nil {
 			return nil, scanConfigSelection{}, fmt.Errorf("load machine config %s: %w", machinePath, err)
 		}
@@ -119,6 +168,13 @@ func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status 
 	workspace, err := project.ResolvedWorkspace(projectPath)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
+	}
+	for _, registered := range machine.Workspaces {
+		canonical, canonicalErr := canonicalDirectory(registered.Path)
+		if canonicalErr == nil && canonical == workspace.Path {
+			workspace.ToolchainProfile = registered.ToolchainProfile
+			break
+		}
 	}
 	machine.Workspaces = []config.Workspace{workspace}
 	if err := machine.Validate(); err != nil {

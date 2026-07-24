@@ -1,6 +1,6 @@
 // Package scheduler orchestrates the public scan and update CLI contract.
-// It intentionally remains outside the vuelta command tree: each update still
-// receives exactly one reviewed snapshot ID.
+// It intentionally remains outside the vuelta command tree: each update
+// receives one exact target directory and its reviewed snapshot ID.
 package scheduler
 
 import (
@@ -101,6 +101,7 @@ type Error struct {
 // Result records one ready snapshot's update outcome.
 type Result struct {
 	Project    string `json:"project,omitempty"`
+	Directory  string `json:"directory"`
 	SnapshotID string `json:"snapshot_id"`
 	Status     string `json:"status"`
 	ExitCode   int    `json:"exit_code"`
@@ -110,6 +111,7 @@ type Result struct {
 // failure that did not produce a snapshot.
 type ScanOutcome struct {
 	Project    string `json:"project,omitempty"`
+	Directory  string `json:"directory"`
 	Status     string `json:"status"`
 	SnapshotID string `json:"snapshot_id,omitempty"`
 	Error      *Error `json:"error,omitempty"`
@@ -191,11 +193,16 @@ func Run(ctx context.Context, runner Runner, options Options) (Report, int) {
 				addError(&report, "invalid_scan_result", errors.New("ready scan result has no snapshot_id"))
 				continue
 			}
-			if _, exists := seenSnapshots[item.SnapshotID]; exists {
-				addError(&report, "invalid_scan_result", fmt.Errorf("duplicate snapshot_id %q", item.SnapshotID))
+			if item.Directory == "" {
+				addError(&report, "invalid_scan_result", errors.New("ready scan result has no directory"))
 				continue
 			}
-			seenSnapshots[item.SnapshotID] = struct{}{}
+			key := item.Directory + "\x00" + item.SnapshotID
+			if _, exists := seenSnapshots[key]; exists {
+				addError(&report, "invalid_scan_result", fmt.Errorf("duplicate target/snapshot pair %q", item.SnapshotID))
+				continue
+			}
+			seenSnapshots[key] = struct{}{}
 			readyResults = append(readyResults, item)
 			report.Summary.Ready++
 		case "clean":
@@ -232,8 +239,8 @@ func Run(ctx context.Context, runner Runner, options Options) (Report, int) {
 			addError(&report, "interrupted", ctx.Err())
 			return report, ExitInterrupted
 		}
-		invocation := runner.Run(ctx, withConfig(options.ConfigPath, "update", "--yes", "--json", item.SnapshotID))
-		result := Result{Project: item.Project, SnapshotID: item.SnapshotID, Status: "failed", ExitCode: invocation.ExitCode}
+		invocation := runner.Run(ctx, withConfig(options.ConfigPath, "update", "--yes", "--json", "--directory", item.Directory, "--snapshot", item.SnapshotID))
+		result := Result{Project: item.Project, Directory: item.Directory, SnapshotID: item.SnapshotID, Status: "failed", ExitCode: invocation.ExitCode}
 		if interrupted(ctx, invocation) {
 			result.Status = "cancelled"
 			report.Results = append(report.Results, result)
