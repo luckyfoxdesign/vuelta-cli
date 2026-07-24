@@ -21,6 +21,27 @@ type scanConfigSelection struct {
 	ChangedFiles      []string `json:"changed_files,omitempty"`
 }
 
+// resolveAmbiguousWorkspace retries BuildWorkspace, resolving each
+// *configinit.MissingValueError through chooseFlag when interactive; a
+// non-interactive caller or a non-ambiguity error returns immediately.
+func resolveAmbiguousWorkspace(discovery configinit.Discovery, input configinit.Input, interactive bool, chooseFlag func(flag string, options []string) (string, error)) (config.Workspace, error) {
+	for {
+		workspace, err := discovery.BuildWorkspace(input)
+		if err == nil {
+			return workspace, nil
+		}
+		var missing *configinit.MissingValueError
+		if !interactive || !errors.As(err, &missing) {
+			return config.Workspace{}, err
+		}
+		value, promptErr := chooseFlag(missing.Flag, missing.Options)
+		if promptErr != nil {
+			return config.Workspace{}, promptErr
+		}
+		setProjectInput(&input, missing.Flag, value)
+	}
+}
+
 func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*config.Config, scanConfigSelection, error) {
 	allowMigrationPrompt := !options.jsonOutput && !options.nonInteractive && configinit.IsTerminal(os.Stdin)
 	if options.explicitConfig || options.all || options.project != "" {
@@ -76,7 +97,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	if len(discovery.Stacks) == 0 {
 		return nil, scanConfigSelection{}, unsupportedProjectError(root)
 	}
-	workspace, err := discovery.BuildWorkspace(configinit.Input{ScanOnly: true})
+	workspace, err := resolveAmbiguousWorkspace(discovery, configinit.Input{ScanOnly: true}, allowMigrationPrompt, promptChoice)
 	if err != nil {
 		return nil, scanConfigSelection{}, fmt.Errorf("project detection is ambiguous: %w", err)
 	}

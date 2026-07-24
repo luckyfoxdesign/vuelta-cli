@@ -202,21 +202,9 @@ func runProjectAdd(args []string) error {
 		VerificationNames: verificationNames, ScanOnly: *scanOnly,
 	}
 	interactive := !*nonInteractive && configinit.IsTerminal(os.Stdin)
-	var workspace config.Workspace
-	for {
-		workspace, err = discovery.BuildWorkspace(input)
-		if err == nil {
-			break
-		}
-		var missing *configinit.MissingValueError
-		if !interactive || !errors.As(err, &missing) {
-			return fail(exitConfig, "%v", err)
-		}
-		value, promptErr := promptChoice(missing.Flag, missing.Options)
-		if promptErr != nil {
-			return fail(exitConfig, "%v", promptErr)
-		}
-		setProjectInput(&input, missing.Flag, value)
+	workspace, err := resolveAmbiguousWorkspace(discovery, input, interactive, promptChoice)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
 	}
 	workspace.ToolchainProfile = *toolchainProfile
 	workspace.Platform = *platform
