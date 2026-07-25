@@ -802,16 +802,11 @@ func validateWorkspace(i int, ws Workspace) []error {
 		if ws.Stack == StackDocker && len(ws.DockerImages.Files) == 0 {
 			errs = append(errs, fmt.Errorf("%s.docker_images.files: required for docker stack CVE scanning", label))
 		}
-		if ws.Stack == StackDocker && len(ws.DockerImages.RuntimeImages) == 0 {
-			errs = append(errs, fmt.Errorf("%s.docker_images.runtime_images: required to scan the immutable production runtime image", label))
-		}
 		for _, f := range ws.DockerImages.Files {
 			errs = append(errs, validateDockerImageFile(label, ws.Path, f)...)
 		}
 		for _, image := range ws.DockerImages.RuntimeImages {
-			if !digestRefPattern.MatchString(image) {
-				errs = append(errs, fmt.Errorf("%s.docker_images.runtime_images: %q is not pinned to a digest", label, image))
-			}
+			errs = append(errs, validateRuntimeImageReference(label, image)...)
 		}
 	}
 
@@ -1040,6 +1035,26 @@ func builtInAdapter(stack, packageManager string) (ecosystem.Adapter, error) {
 		return nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
 	}
 	return registry.Lookup(stack, packageManager)
+}
+
+// validateRuntimeImageReference accepts either an exact digest pin or a bare
+// tag/name reference recorded as intent for scan-time resolution. A reference
+// that attempts a digest pin but does not match the exact digest grammar
+// still fails hard: a malformed pin must never be silently downgraded to
+// intent.
+func validateRuntimeImageReference(label, image string) []error {
+	if image == "" {
+		return []error{fmt.Errorf("%s.docker_images.runtime_images: empty image reference", label)}
+	}
+	if strings.Contains(image, "@") {
+		if !digestRefPattern.MatchString(image) {
+			return []error{fmt.Errorf("%s.docker_images.runtime_images: %q is not pinned to a valid digest", label, image)}
+		}
+	}
+	if strings.ContainsAny(image, " \t\r\n") {
+		return []error{fmt.Errorf("%s.docker_images.runtime_images: %q is not a valid image reference", label, image)}
+	}
+	return nil
 }
 
 // validateDockerImageFile ensures f stays inside root as a project-relative

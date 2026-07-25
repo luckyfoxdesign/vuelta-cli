@@ -14,6 +14,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
@@ -208,8 +209,8 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-					return nil, "trivy", false, nil
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+					return nil, nil, nil, "trivy", false, nil
 				},
 				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 					return nil, false, nil
@@ -239,12 +240,12 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 }
 
 func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
-	err := scanResultError(scanSummary{Failed: 1, Vulnerabilities: 3}, "vulnerabilities")
+	err := scanResultError(scanSummary{Failed: 1, Vulnerabilities: 3}, "vulnerabilities", false)
 	var coded commandError
 	if !errors.As(err, &coded) || coded.code != exitFailure {
 		t.Fatalf("error = %#v, want exit %d", err, exitFailure)
 	}
-	err = scanResultError(scanSummary{Vulnerabilities: 3}, "vulnerabilities")
+	err = scanResultError(scanSummary{Vulnerabilities: 3}, "vulnerabilities", false)
 	if !errors.As(err, &coded) || coded.code != exitFindings {
 		t.Fatalf("error = %#v, want exit %d", err, exitFindings)
 	}
@@ -252,17 +253,58 @@ func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 
 func TestScanExitCodeDistinguishesMixedResultsFromTotalFailure(t *testing.T) {
 	var coded commandError
-	if err := scanResultError(scanSummary{Failed: 1, Succeeded: 1}, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+	if err := scanResultError(scanSummary{Failed: 1, Succeeded: 1}, "", false); !errors.As(err, &coded) || coded.code != exitPartial {
 		t.Fatalf("mixed result error = %#v, want exit %d", err, exitPartial)
 	}
-	if err := scanResultError(scanSummary{Partial: 1}, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+	if err := scanResultError(scanSummary{Partial: 1}, "", false); !errors.As(err, &coded) || coded.code != exitPartial {
 		t.Fatalf("partial result error = %#v, want exit %d", err, exitPartial)
 	}
-	if err := scanResultError(scanSummary{Failed: 2}, ""); !errors.As(err, &coded) || coded.code != exitFailure {
+	if err := scanResultError(scanSummary{Failed: 2}, "", false); !errors.As(err, &coded) || coded.code != exitFailure {
 		t.Fatalf("total failure error = %#v, want exit %d", err, exitFailure)
 	}
-	if err := scanResultError(scanSummary{Succeeded: 2}, ""); err != nil {
+	if err := scanResultError(scanSummary{Succeeded: 2}, "", false); err != nil {
 		t.Fatalf("clean scan error = %v", err)
+	}
+}
+
+func TestScanExitRequireImageScanGatesOnTierFourSkip(t *testing.T) {
+	summary := scanSummary{Succeeded: 1, ImageScanSkipped: 1}
+	if err := scanResultError(summary, "", false); err != nil {
+		t.Fatalf("without --require-image-scan a tier-4 skip must not fail the scan: %v", err)
+	}
+	var coded commandError
+	if err := scanResultError(summary, "", true); !errors.As(err, &coded) || coded.code != exitImageScanRequired {
+		t.Fatalf("error = %#v, want exit %d", err, exitImageScanRequired)
+	}
+	if err := scanResultError(scanSummary{Succeeded: 1}, "", true); err != nil {
+		t.Fatalf("--require-image-scan must not fail a scan with no tier-4 skips: %v", err)
+	}
+}
+
+func TestBuildImageScanRecordsSurfacesBaseImageDriftAcrossScans(t *testing.T) {
+	root := t.TempDir()
+	first, warnings := buildImageScanRecords(root, []vulnscan.ImageResolution{
+		{Reference: "node:20-alpine", ResolvedDigest: "sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64", Tier: vulnscan.TierBaseImageTag},
+	}, nil)
+	if len(warnings) != 0 {
+		t.Fatalf("first scan has no prior state to drift against: %v", warnings)
+	}
+	target, err := projectstate.FromCanonical(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistImageScanState(target, first); err != nil {
+		t.Fatal(err)
+	}
+
+	second, warnings := buildImageScanRecords(root, []vulnscan.ImageResolution{
+		{Reference: "node:20-alpine", ResolvedDigest: "sha256:" + strings.Repeat("b", 64), Platform: "linux/amd64", Tier: vulnscan.TierBaseImageTag},
+	}, nil)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "drift") {
+		t.Fatalf("second scan must surface base image drift: %#v", warnings)
+	}
+	if second[0].Drift == nil || second[0].Drift.PreviousDigest != "sha256:"+strings.Repeat("a", 64) || second[0].Drift.CurrentDigest != "sha256:"+strings.Repeat("b", 64) {
+		t.Fatalf("drift record = %#v", second[0].Drift)
 	}
 }
 
@@ -298,11 +340,11 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 					if test.dependencySource == "github-dependabot" {
-						return nil, "trivy-images", false, nil
+						return nil, nil, nil, "trivy-images", false, nil
 					}
-					return []vulnscan.Finding{{ID: "CVE-1"}}, "trivy", true, test.vulnerabilityErr
+					return []vulnscan.Finding{{ID: "CVE-1"}}, nil, nil, "trivy", true, test.vulnerabilityErr
 				},
 				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 					if test.dependencySource != "github-dependabot" {
@@ -341,8 +383,8 @@ func TestScanOneTargetWithNonTTYProgressStaysPlain(t *testing.T) {
 	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
 	policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return nil, "trivy", true, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -375,9 +417,9 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
 	vulnerabilityCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			vulnerabilityCalled = true
-			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, "trivy", true, nil
+			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -404,8 +446,8 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, "trivy", true, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -432,7 +474,7 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 	if !containsSubstring(result.Warnings, "release age could not be verified") {
 		t.Fatalf("release-age warnings = %#v", result.Warnings)
 	}
-	if err := scanResultError(summarizeScan([]scanResult{result}), ""); err != nil {
+	if err := scanResultError(summarizeScan([]scanResult{result}), "", false); err != nil {
 		t.Fatalf("scan-only findings returned failure exit: %v", err)
 	}
 }
@@ -443,9 +485,9 @@ func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			t.Fatal("vulnerability scanner was called for --only packages")
-			return nil, "", false, nil
+			return nil, nil, nil, "", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			t.Fatal("alerts scanner was called for --only packages")
@@ -477,9 +519,9 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	}
 	called := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			called = true
-			return nil, "trivy", true, nil
+			return nil, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -529,8 +571,8 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	}
 	alertsCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return nil, "trivy-images", false, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy-images", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			alertsCalled = true
@@ -552,8 +594,8 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	workspace := config.Workspace{Name: "supported", Path: root, Stack: config.StackNode, PackageManager: "npm"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return nil, "trivy", true, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -571,7 +613,7 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 		t.Fatalf("broken=%#v supported=%#v summary=%#v", broken, supported, summary)
 	}
 	var coded commandError
-	if err := scanResultError(summary, ""); !errors.As(err, &coded) || coded.code != exitPartial {
+	if err := scanResultError(summary, "", false); !errors.As(err, &coded) || coded.code != exitPartial {
 		t.Fatalf("mixed workspace exit = %#v, want %d", err, exitPartial)
 	}
 }
@@ -590,8 +632,8 @@ func TestGitlessWorkspaceKeepsCandidatesAndReportsCapability(t *testing.T) {
 		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return nil, "trivy", false, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -629,8 +671,8 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	brokenWorkspace := config.Workspace{Name: "broken", Path: brokenRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	supportedWorkspace := config.Workspace{Name: "supported", Path: supportedRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
-			return nil, "trivy", false, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
@@ -690,7 +732,7 @@ func TestScanJSONEnvelopeRepresentsCleanFindingsReadyScanOnlyPartialAndFailed(t 
 		}
 	}
 	// Partial results have a stable exit code distinct from a total failure.
-	if resultErr := scanResultError(summary, "vulnerabilities"); resultErr == nil {
+	if resultErr := scanResultError(summary, "vulnerabilities", false); resultErr == nil {
 		t.Fatal("expected a failure exit code when a partial result is present")
 	} else {
 		var coded commandError

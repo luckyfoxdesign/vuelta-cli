@@ -28,7 +28,10 @@ var (
 		"compose.verify.yaml", "compose.verify.yml",
 	}
 	dockerNames = []string{"Dockerfile", "dockerfile"}
-	fromPattern = regexp.MustCompile(`(?mi)^\s*FROM\s+(?:--[^\s]+\s+)*([^\s]+)`) // Dockerfile grammar subset; image token only.
+	// fromPattern captures the image reference and, if present, the "AS name"
+	// build-stage alias: a later FROM referencing that alias is an internal
+	// build stage, not an external image reference.
+	fromPattern = regexp.MustCompile(`(?mi)^\s*FROM\s+(?:--[^\s]+\s+)*(\S+)(?:\s+[Aa][Ss]\s+(\S+))?`)
 )
 
 // Discovery contains only values found in allowlisted, project-root files or
@@ -150,15 +153,24 @@ func regular(root, name string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// dockerRuntimeImages records every external base-image reference in a
+// Dockerfile as intent: an exact digest pin, or a bare tag resolved at scan
+// time. "scratch" and references to an earlier build stage's "AS" alias are
+// not external images and are excluded.
 func dockerRuntimeImages(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read Dockerfile: %w", err)
 	}
+	stageNames := make(map[string]bool)
 	var images []string
 	for _, match := range fromPattern.FindAllStringSubmatch(string(data), -1) {
-		if strings.Contains(match[1], "@sha256:") {
-			images = append(images, match[1])
+		reference := match[1]
+		if !stageNames[strings.ToLower(reference)] && !strings.EqualFold(reference, "scratch") {
+			images = append(images, reference)
+		}
+		if len(match) > 2 && match[2] != "" {
+			stageNames[strings.ToLower(match[2])] = true
 		}
 	}
 	return images, nil

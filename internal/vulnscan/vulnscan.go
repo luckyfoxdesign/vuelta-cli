@@ -57,8 +57,48 @@ func (f Finding) Ref() string { return f.ID }
 // caller must fail closed; an empty Findings slice is valid only after a
 // successfully parsed, fresh scanner report.
 type Report struct {
-	Findings   []Finding
-	Suppressed []Finding
+	Findings         []Finding
+	Suppressed       []Finding
+	ImageResolutions []ImageResolution
+	ImageSkips       []ImageSkip
+}
+
+// ImageTier is the resolution ladder rung an image reference was scanned at.
+type ImageTier int
+
+const (
+	// TierExactDigest is a digest already pinned in config or a Dockerfile/
+	// compose file; scanned as-is, unchanged from prior behavior.
+	TierExactDigest ImageTier = 1
+	// TierExplicitTag is a tag reference explicitly declared as the deployed
+	// artifact, either via compose "image:" or docker_images.runtime_images.
+	TierExplicitTag ImageTier = 2
+	// TierBaseImageTag is a Dockerfile "FROM <tag>" reference scanned as a
+	// proxy for a built image ("build: ." in compose); the base image, not
+	// the artifact actually deployed.
+	TierBaseImageTag ImageTier = 3
+)
+
+// ImageResolution records what was actually scanned for one image intent at
+// one platform: the configured/detected reference, the digest it resolved
+// to, and the tier that resolution claim rests on.
+type ImageResolution struct {
+	Reference           string
+	ResolvedDigest       string
+	Platform             string
+	Tier                 ImageTier
+	Dockerfile           string
+	OSPackagesInstalled  bool
+	ResolvedAt           time.Time
+}
+
+// ImageSkip is a structured tier-4 capability outcome: an image intent that
+// could not be resolved to any digest (unreachable registry, no image
+// reference at all, or an unresolvable reference such as "FROM scratch").
+// It is always a visible, structured outcome, never a bare warning string.
+type ImageSkip struct {
+	Reference string
+	Reason    string
 }
 
 // Command runs a scanner command. It is injectable so scanner parsing and
@@ -165,11 +205,14 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 	if err != nil {
 		return Report{}, err
 	}
-	imageFindings, err := s.scanImages(ctx, root, ws, cfg)
+	imageFindings, resolutions, skips, err := s.scanImages(ctx, root, ws, cfg)
 	if err != nil {
 		return Report{}, err
 	}
-	return applyPolicy(append(findings, imageFindings...), policy), nil
+	report := applyPolicy(append(findings, imageFindings...), policy)
+	report.ImageResolutions = resolutions
+	report.ImageSkips = skips
+	return report, nil
 }
 
 // ScanImages checks configured immutable images without scanning repository
@@ -183,11 +226,14 @@ func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspac
 	if err != nil {
 		return Report{}, err
 	}
-	findings, err := s.scanImages(ctx, root, ws, cfg)
+	findings, resolutions, skips, err := s.scanImages(ctx, root, ws, cfg)
 	if err != nil {
 		return Report{}, err
 	}
-	return applyPolicy(findings, policy), nil
+	report := applyPolicy(findings, policy)
+	report.ImageResolutions = resolutions
+	report.ImageSkips = skips
+	return report, nil
 }
 
 func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]Finding, error) {
@@ -211,7 +257,7 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Wo
 		if err != nil {
 			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
-		parsed, updated, err := parseTrivy(out)
+		parsed, updated, _, err := parseTrivy(out)
 		if err != nil {
 			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
@@ -237,13 +283,13 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Wo
 	}
 }
 
-func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]Finding, error) {
+func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) ([]Finding, []ImageResolution, []ImageSkip, error) {
 	scanConfig := cfg.VulnScan
 	if !scanConfig.ImageScan.Enabled || ws.DockerImages == nil {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 	if scanConfig.ImageScan.Tool != "trivy" {
-		return nil, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
+		return nil, nil, nil, fmt.Errorf("unsupported image scanner %q", scanConfig.ImageScan.Tool)
 	}
 	repositoryRoot := ws.Path
 	if repositoryRoot == "" {
@@ -251,36 +297,58 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	}
 	bundle, err := scaninput.Build(ctx, root, repositoryRoot, scaninput.Options{RequireTracked: !s.allowUntrackedInputs}, scaninput.DockerContract(ws))
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	defer bundle.Destroy()
-	images, err := imageDigests(bundle, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
+	intents, err := collectImageIntents(bundle, ws.DockerImages.Files, ws.DockerImages.RuntimeImages)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
+	}
+	if len(intents) == 0 {
+		return nil, nil, []ImageSkip{{
+			Reason: "no image reference was found in the configured Dockerfile(s) or compose file(s)",
+		}}, nil
 	}
 	var findings []Finding
-	for _, image := range images {
+	var resolutions []ImageResolution
+	var skips []ImageSkip
+	for _, intent := range intents {
 		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--format", "json"}
 		if scanConfig.ImageScan.VEX == "auto" {
 			args = append(args, "--vex", "repo")
 		}
 		for _, platform := range imagePlatforms(ws, scanConfig) {
-			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, image)
-			out, err := s.command(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
-			if err != nil {
-				return nil, fmt.Errorf("trivy image scan %s (%s): %w", image, platform, err)
+			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, intent.Reference)
+			out, cmdErr := s.command(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
+			if cmdErr != nil {
+				if intent.Tier == TierExactDigest {
+					return nil, nil, nil, fmt.Errorf("trivy image scan %s (%s): %w", intent.Reference, platform, cmdErr)
+				}
+				skips = append(skips, ImageSkip{
+					Reference: intent.Reference,
+					Reason:    fmt.Sprintf("could not resolve %s for platform %s: %v", intent.Reference, platform, cmdErr),
+				})
+				continue
 			}
-			parsed, updated, err := parseTrivy(out)
-			if err != nil {
-				return nil, fmt.Errorf("trivy image scan %s: %w", image, err)
+			parsed, updated, metadata, parseErr := parseTrivy(out)
+			if parseErr != nil {
+				return nil, nil, nil, fmt.Errorf("trivy image scan %s: %w", intent.Reference, parseErr)
 			}
-			if err := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); err != nil {
-				return nil, fmt.Errorf("trivy image scan %s: %w", image, err)
+			if ageErr := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); ageErr != nil {
+				return nil, nil, nil, fmt.Errorf("trivy image scan %s: %w", intent.Reference, ageErr)
 			}
 			findings = append(findings, parsed...)
+			digest, ok := extractRepoDigest(metadata.RepoDigests)
+			if !ok {
+				digest = intent.Reference
+			}
+			resolutions = append(resolutions, ImageResolution{
+				Reference: intent.Reference, ResolvedDigest: digest, Platform: platform, Tier: intent.Tier,
+				Dockerfile: intent.Dockerfile, OSPackagesInstalled: intent.OSPackagesInstalled, ResolvedAt: s.now(),
+			})
 		}
 	}
-	return findings, nil
+	return findings, resolutions, skips, nil
 }
 
 func imagePlatforms(ws config.Workspace, cfg config.VulnScanConfig) []string {
@@ -294,42 +362,95 @@ func imagePlatforms(ws config.Workspace, cfg config.VulnScanConfig) []string {
 }
 
 var (
-	fromReference  = regexp.MustCompile(`(?im)^\s*FROM(?:\s+--[^\s]+)*\s+([^\s#]+)`)
+	// fromReference captures a Dockerfile "FROM <ref>" base image and, if
+	// present, its "AS <name>" build-stage alias. A later FROM referencing
+	// that alias points at an internal build stage, not an external image.
+	fromReference  = regexp.MustCompile(`(?im)^\s*FROM(?:\s+--[^\s]+)*\s+(\S+)(?:\s+[Aa][Ss]\s+(\S+))?`)
 	imageReference = regexp.MustCompile(`(?im)^\s*image:\s*([^\s#]+)`)
 	exactDigest    = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+	// osPackageInstallPattern statically detects a Dockerfile RUN line that
+	// installs OS packages, which weakens a base image's claim to represent
+	// the built artifact's OS package surface (tier-3 honesty downgrade).
+	osPackageInstallPattern = regexp.MustCompile(`(?im)^\s*RUN\s.*\b(?:apk\s+add|apt(?:-get)?\s+install|yum\s+install|dnf\s+install|microdnf\s+install)\b`)
 )
 
-func imageDigests(bundle scaninput.Bundle, files, runtimeImages []string) ([]string, error) {
-	seen := make(map[string]bool)
+// imageIntent is one image reference collected as scan input, tagged with
+// the resolution-ladder tier its scan result may claim.
+type imageIntent struct {
+	Reference           string
+	Tier                ImageTier
+	Dockerfile          string
+	OSPackagesInstalled bool
+}
+
+// collectImageIntents gathers every image reference declared across the
+// configured Docker inputs as scan-time intent. An exact digest is scanned
+// as-is (tier 1); an explicit compose "image:" or a configured
+// docker_images.runtime_images entry is the strongest tag claim (tier 2); a
+// Dockerfile "FROM <tag>" is only a base-image proxy (tier 3). It never
+// errors on an unpinned reference: resolution and any unresolvable skip
+// happen later, per image, during the scan itself.
+func collectImageIntents(bundle scaninput.Bundle, files, runtimeImages []string) ([]imageIntent, error) {
+	intents := make(map[string]imageIntent)
+	add := func(reference string, tier ImageTier, dockerfile string, osPackagesInstalled bool) {
+		if exactDigest.MatchString(reference) {
+			tier = TierExactDigest
+		}
+		if existing, ok := intents[reference]; ok && existing.Tier <= tier {
+			return
+		}
+		intents[reference] = imageIntent{Reference: reference, Tier: tier, Dockerfile: dockerfile, OSPackagesInstalled: osPackagesInstalled}
+	}
 	for _, rel := range files {
 		data, ok := bundle.Content(rel)
 		if !ok {
 			return nil, fmt.Errorf("validated image scan input %s is unavailable", rel)
 		}
-		for _, pattern := range []*regexp.Regexp{fromReference, imageReference} {
-			for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
-				if !exactDigest.MatchString(match[1]) {
-					return nil, fmt.Errorf("image reference %q in %s is not pinned to an exact digest", match[1], rel)
-				}
-				seen[match[1]] = true
+		content := string(data)
+		for _, match := range imageReference.FindAllStringSubmatch(content, -1) {
+			add(match[1], TierExplicitTag, "", false)
+		}
+		osPackagesInstalled := osPackageInstallPattern.MatchString(content)
+		stageNames := make(map[string]bool)
+		for _, match := range fromReference.FindAllStringSubmatch(content, -1) {
+			reference := match[1]
+			if !stageNames[strings.ToLower(reference)] && !strings.EqualFold(reference, "scratch") {
+				add(reference, TierBaseImageTag, rel, osPackagesInstalled)
+			}
+			if len(match) > 2 && match[2] != "" {
+				stageNames[strings.ToLower(match[2])] = true
 			}
 		}
 	}
 	for _, image := range runtimeImages {
-		if !exactDigest.MatchString(image) {
-			return nil, fmt.Errorf("runtime image %q is not pinned to an exact digest", image)
+		add(image, TierExplicitTag, "", false)
+	}
+	result := make([]imageIntent, 0, len(intents))
+	for _, intent := range intents {
+		result = append(result, intent)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Reference < result[j].Reference })
+	return result, nil
+}
+
+// extractRepoDigest reads the resolved manifest digest Trivy reports for the
+// image it just scanned (populated even when Trivy was given a tag, since
+// resolving that tag to a manifest digest is required to pull it). This
+// reuses Trivy's own registry resolution rather than adding a separate
+// resolution call over a new path.
+func extractRepoDigest(repoDigests []string) (string, bool) {
+	for _, repoDigest := range repoDigests {
+		if index := strings.LastIndex(repoDigest, "@sha256:"); index >= 0 {
+			return repoDigest[index+1:], true
 		}
-		seen[image] = true
 	}
-	if len(seen) == 0 {
-		return nil, errors.New("no exact image digest found in configured docker_images.files")
-	}
-	images := make([]string, 0, len(seen))
-	for image := range seen {
-		images = append(images, image)
-	}
-	sort.Strings(images)
-	return images, nil
+	return "", false
+}
+
+// trivyMetadata carries the subset of Trivy's image scan Metadata needed to
+// record what was actually scanned; it is empty for filesystem scans.
+type trivyMetadata struct {
+	RepoDigests []string
 }
 
 type trivyDocument struct {
@@ -339,6 +460,7 @@ type trivyDocument struct {
 		Database    struct {
 			UpdatedAt string `json:"UpdatedAt"`
 		} `json:"Database"`
+		RepoDigests []string `json:"RepoDigests"`
 	} `json:"Metadata"`
 	Results []struct {
 		Target          string `json:"Target"`
@@ -352,29 +474,29 @@ type trivyDocument struct {
 	} `json:"Results"`
 }
 
-func parseTrivy(data []byte) ([]Finding, time.Time, error) {
+func parseTrivy(data []byte) ([]Finding, time.Time, trivyMetadata, error) {
 	var doc trivyDocument
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, time.Time{}, fmt.Errorf("parse JSON: %w", err)
+		return nil, time.Time{}, trivyMetadata{}, fmt.Errorf("parse JSON: %w", err)
 	}
 	var updated time.Time
 	if value := firstNonEmpty(doc.Metadata.DBUpdatedAt, doc.Metadata.Database.UpdatedAt, doc.Metadata.UpdatedAt); value != "" {
 		var err error
 		updated, err = parseTimestamp(value)
 		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("scanner database timestamp: %w", err)
+			return nil, time.Time{}, trivyMetadata{}, fmt.Errorf("scanner database timestamp: %w", err)
 		}
 	}
 	var findings []Finding
 	for _, result := range doc.Results {
 		for _, vuln := range result.Vulnerabilities {
 			if vuln.ID == "" || vuln.PkgName == "" || vuln.InstalledVersion == "" || vuln.Severity == "" {
-				return nil, time.Time{}, errors.New("scanner returned an incomplete vulnerability finding")
+				return nil, time.Time{}, trivyMetadata{}, errors.New("scanner returned an incomplete vulnerability finding")
 			}
 			findings = append(findings, Finding{ID: vuln.ID, Package: vuln.PkgName, InstalledVersion: vuln.InstalledVersion, FixedVersion: vuln.FixedVersion, Severity: strings.ToUpper(vuln.Severity), Target: result.Target, Source: "trivy"})
 		}
 	}
-	return normalize(findings), updated, nil
+	return normalize(findings), updated, trivyMetadata{RepoDigests: doc.Metadata.RepoDigests}, nil
 }
 
 // freshDatabaseTimestamp accepts current Trivy reports that omit DB metadata.

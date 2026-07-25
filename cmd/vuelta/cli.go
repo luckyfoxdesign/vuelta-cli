@@ -54,10 +54,11 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
+			{names: []string{"--require-image-scan"}, description: "return 7 when an image reference could not be resolved to any digest (tier 4)"},
 			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers."},
+		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers. A Docker image is scanned by exact digest when config or a compose file pins one; otherwise a tag is resolved to a digest through the same registry egress path, labelled by resolution tier, and never written back into .vuelta.yaml. An image that cannot be resolved is a loud, structured skip, not a hidden failure."},
 		takesConfig: true, handler: "scan",
 	},
 	{

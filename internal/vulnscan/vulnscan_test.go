@@ -2,6 +2,7 @@ package vulnscan
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,10 @@ import (
 
 func trivyJSON(updated string) string {
 	return `{"Metadata":{"DBUpdatedAt":"` + updated + `"},"Results":[{"Target":"poetry.lock","Vulnerabilities":[{"VulnerabilityID":"CVE-2026-0001","PkgName":"example","InstalledVersion":"1.0.0","FixedVersion":"1.0.1","Severity":"HIGH"}]}]}`
+}
+
+func trivyImageJSON(updated, repoDigest string) string {
+	return `{"Metadata":{"DBUpdatedAt":"` + updated + `","RepoDigests":["` + repoDigest + `"]},"Results":[]}`
 }
 
 func adhocNPMWorkspace(t *testing.T) (string, config.Workspace) {
@@ -157,6 +162,120 @@ func TestScanImagesUsesOSPackagesOnlyWithoutDependencyScan(t *testing.T) {
 	}
 	if contains(commands[0], "fs") || contains(commands[0], "--include-dev-deps") {
 		t.Fatalf("image scan must not run a dependency filesystem scan: %v", commands[0])
+	}
+}
+
+func TestScanImagesResolvesBareTagAsBaseImageProxyAndRecordsDigest(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM node:20-alpine\nRUN apk add curl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := "node@sha256:" + strings.Repeat("b", 64)
+	scanner := NewAdhocScanner(func(_ context.Context, _ string, _ string, args ...string) ([]byte, error) {
+		if !contains(args, "node:20-alpine") {
+			t.Fatalf("expected trivy to be invoked with the bare tag, got %v", args)
+		}
+		return []byte(trivyImageJSON(now.Format(time.RFC3339), digest)), nil
+	})
+	scanner.Now = func() time.Time { return now }
+	report, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "github-dependabot", DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("c", 64)},
+	}})
+	if err != nil {
+		t.Fatalf("ScanImages() error = %v", err)
+	}
+	if len(report.ImageResolutions) != 1 {
+		t.Fatalf("resolutions = %#v", report.ImageResolutions)
+	}
+	resolution := report.ImageResolutions[0]
+	if resolution.Reference != "node:20-alpine" || resolution.ResolvedDigest != "sha256:"+strings.Repeat("b", 64) {
+		t.Fatalf("resolution = %#v", resolution)
+	}
+	if resolution.Tier != TierBaseImageTag {
+		t.Fatalf("tier = %d, want TierBaseImageTag", resolution.Tier)
+	}
+	if !resolution.OSPackagesInstalled {
+		t.Fatal("Dockerfile installs OS packages; the honesty downgrade flag must be set")
+	}
+	if resolution.Dockerfile != "Dockerfile" {
+		t.Fatalf("dockerfile = %q", resolution.Dockerfile)
+	}
+	if !resolution.ResolvedAt.Equal(now) {
+		t.Fatalf("resolvedAt = %v, want %v", resolution.ResolvedAt, now)
+	}
+}
+
+func TestScanImagesUnresolvableTagIsStructuredSkipNotHardFailure(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM privateregistry.internal/base:unreachable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
+		return nil, errors.New("dial tcp: lookup privateregistry.internal: no such host")
+	})
+	scanner.Now = func() time.Time { return now }
+	report, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "github-dependabot", DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("c", 64)},
+	}})
+	if err != nil {
+		t.Fatalf("an unresolvable tag must be a structured skip, not a hard scan failure: %v", err)
+	}
+	if len(report.ImageSkips) != 1 || report.ImageSkips[0].Reference != "privateregistry.internal/base:unreachable" {
+		t.Fatalf("skips = %#v", report.ImageSkips)
+	}
+	if report.ImageSkips[0].Reason == "" {
+		t.Fatal("skip must carry a visible reason, never a bare warning string")
+	}
+}
+
+func TestScanImagesNoImageReferenceIsStructuredSkip(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
+		t.Fatal("trivy must not be invoked when nothing is resolvable")
+		return nil, nil
+	})
+	report, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "github-dependabot", DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("c", 64)},
+	}})
+	if err != nil {
+		t.Fatalf("FROM scratch must be a structured skip, not a hard failure: %v", err)
+	}
+	if len(report.ImageSkips) != 1 {
+		t.Fatalf("skips = %#v", report.ImageSkips)
+	}
+}
+
+func TestScanImagesExplicitDigestFailureRemainsHardFailure(t *testing.T) {
+	root := t.TempDir()
+	digest := "registry.example/service@sha256:" + strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM "+digest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
+		return nil, errors.New("registry unavailable")
+	})
+	_, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "github-dependabot", DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("c", 64)},
+	}})
+	if err == nil {
+		t.Fatal("a digest-pinned (tier 1) scan failure must remain a hard failure, unchanged from prior behavior")
 	}
 }
 

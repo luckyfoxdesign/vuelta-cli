@@ -189,6 +189,45 @@ func TestValidateWorkspaceAllowsManagerlessPythonOnlyForScanOnly(t *testing.T) {
 	}
 }
 
+func TestValidateWorkspaceRuntimeImagesAcceptTagIntentButRejectMalformedDigest(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM node:20-alpine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := Workspace{
+		Path: dir, Stack: StackDocker,
+		Verification: VerificationProfile{Version: VerificationVersion, State: VerificationScanOnly},
+		DockerImages: &DockerImagesSpec{Files: []string{"Dockerfile"}},
+	}
+
+	noImages := base
+	if errs := validateWorkspace(0, noImages); len(errs) != 0 {
+		t.Fatalf("docker workspace with no runtime_images at all must validate (tier-4 is a scan-time skip, not a config error): %v", errs)
+	}
+
+	tagIntent := base
+	tagIntent.DockerImages = &DockerImagesSpec{Files: []string{"Dockerfile"}, RuntimeImages: []string{"node:20-alpine"}}
+	if errs := validateWorkspace(0, tagIntent); len(errs) != 0 {
+		t.Fatalf("a bare tag reference must validate as intent for scan-time resolution: %v", errs)
+	}
+
+	exactDigest := base
+	exactDigest.DockerImages = &DockerImagesSpec{Files: []string{"Dockerfile"}, RuntimeImages: []string{"node@sha256:" + strings.Repeat("a", 64)}}
+	if errs := validateWorkspace(0, exactDigest); len(errs) != 0 {
+		t.Fatalf("an exact digest must still validate unchanged: %v", errs)
+	}
+
+	malformedDigest := base
+	malformedDigest.DockerImages = &DockerImagesSpec{Files: []string{"Dockerfile"}, RuntimeImages: []string{"node@sha256:tooshort"}}
+	errs := validateWorkspace(0, malformedDigest)
+	if len(errs) == 0 || !strings.Contains(errorsText(errs), "runtime_images") {
+		t.Fatalf("a malformed digest pin must still fail hard: %v", errs)
+	}
+}
+
 func TestValidateWorkspaceRequiresScanOnlyForRequirementsManifest(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {

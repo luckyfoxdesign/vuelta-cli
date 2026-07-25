@@ -97,39 +97,45 @@ func (t Target) WriteReport(data []byte) error {
 	if err := t.EnsureState(); err != nil {
 		return err
 	}
-	path := t.ReportPath()
+	return writeProtectedFile(t.StateDir(), ".last-scan-*", t.ReportPath(), data, "scan report")
+}
+
+// writeProtectedFile atomically replaces one 0600 regular file inside
+// stateDir: write to a temporary file, sync, rename, then sync the
+// directory entry. Shared by every private state file this package owns.
+func writeProtectedFile(stateDir, tmpPattern, path string, data []byte, label string) error {
 	if info, err := os.Lstat(path); err == nil {
-		if err := ValidatePrivateFile(info, "scan report"); err != nil {
+		if err := ValidatePrivateFile(info, label); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect scan report: %w", err)
+		return fmt.Errorf("inspect %s: %w", label, err)
 	}
-	tmp, err := os.CreateTemp(t.StateDir(), ".last-scan-*")
+	tmp, err := os.CreateTemp(stateDir, tmpPattern)
 	if err != nil {
-		return fmt.Errorf("create temporary scan report: %w", err)
+		return fmt.Errorf("create temporary %s: %w", label, err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("restrict temporary scan report: %w", err)
+		return fmt.Errorf("restrict temporary %s: %w", label, err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write temporary scan report: %w", err)
+		return fmt.Errorf("write temporary %s: %w", label, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("sync temporary scan report: %w", err)
+		return fmt.Errorf("sync temporary %s: %w", label, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temporary scan report: %w", err)
+		return fmt.Errorf("close temporary %s: %w", label, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("publish scan report: %w", err)
+		return fmt.Errorf("publish %s: %w", label, err)
 	}
-	if err := syncDirectory(t.StateDir()); err != nil {
+	if err := syncDirectory(stateDir); err != nil {
 		return fmt.Errorf("sync project state directory: %w", err)
 	}
 	return nil

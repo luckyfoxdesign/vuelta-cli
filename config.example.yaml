@@ -142,6 +142,9 @@ workspaces:
       - "Dockerfile*"
     docker_images:                 # only these project-relative files are analyzed/updated
       files: ["Dockerfile"]
+      # A bare tag ("node:22") is intent, resolved to a digest at scan time
+      # and recorded in the scan result; an exact digest here is scanned as-is.
+      # Onboarding never writes a digest into this file itself.
       runtime_images: ["node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"]
       platforms: ["linux/amd64"]
 

@@ -35,9 +35,10 @@ import (
 )
 
 const (
-	exitEnv      = 4
-	exitFindings = 5
-	exitPartial  = 6
+	exitEnv                = 4
+	exitFindings           = 5
+	exitPartial            = 6
+	exitImageScanRequired  = 7
 )
 
 const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
@@ -62,6 +63,30 @@ type scanCapability struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// imageDrift reports that a tier-2/3 intent resolved to a different digest
+// than the previous scan of the same project recorded.
+type imageDrift struct {
+	PreviousDigest string `json:"previous_digest"`
+	CurrentDigest  string `json:"current_digest"`
+}
+
+// imageScanRecord is the structured, always-visible outcome of one image
+// scan intent: either resolved (with the tier that resolution claim rests
+// on) or skipped (tier 4), never a bare warning string.
+type imageScanRecord struct {
+	Reference           string      `json:"reference"`
+	Status              string      `json:"status"` // "resolved" | "skipped"
+	Reason              string      `json:"reason,omitempty"`
+	ResolvedDigest      string      `json:"resolved_digest,omitempty"`
+	Platform            string      `json:"platform,omitempty"`
+	Tier                int         `json:"tier,omitempty"`
+	ResolvedAt          *time.Time  `json:"resolved_at,omitempty"`
+	Dockerfile          string      `json:"dockerfile,omitempty"`
+	BaseImageOnly       bool        `json:"base_image_only,omitempty"`
+	OSPackagesInstalled bool        `json:"os_packages_installed,omitempty"`
+	Drift               *imageDrift `json:"drift,omitempty"`
 }
 
 // stageStatus is the outcome of one independent, observable scan stage.
@@ -120,19 +145,21 @@ type scanResult struct {
 	PackageUpdates        *packageUpdateAvailability `json:"package_updates,omitempty"`
 	Diagnostics           []updater.ScanDiagnostic   `json:"diagnostics"`
 	Capabilities          []scanCapability           `json:"capabilities"`
+	ImageScans            []imageScanRecord          `json:"image_scans"`
 	Error                 *jsonCommandError          `json:"error,omitempty"`
 }
 
 type scanSummary struct {
-	Succeeded       int `json:"succeeded"`
-	Failed          int `json:"failed"`
-	Partial         int `json:"partial"`
-	Ready           int `json:"ready"`
-	Clean           int `json:"clean"`
-	Findings        int `json:"findings"`
-	ScanOnly        int `json:"scan_only"`
-	Candidates      int `json:"candidates"`
-	Vulnerabilities int `json:"vulnerabilities"`
+	Succeeded        int `json:"succeeded"`
+	Failed           int `json:"failed"`
+	Partial          int `json:"partial"`
+	Ready            int `json:"ready"`
+	Clean            int `json:"clean"`
+	Findings         int `json:"findings"`
+	ScanOnly         int `json:"scan_only"`
+	Candidates       int `json:"candidates"`
+	Vulnerabilities  int `json:"vulnerabilities"`
+	ImageScanSkipped int `json:"image_scan_skipped"`
 }
 
 type scanOptions struct {
@@ -145,6 +172,7 @@ type scanOptions struct {
 	minReleaseAge      string
 	allowProjectConfig bool
 	failOn             string
+	requireImageScan   bool
 	verbose            bool
 	jsonOutput         bool
 	toolchainProfile   *config.ToolchainProfile
@@ -263,10 +291,10 @@ func executeScan(args []string) error {
 		}
 		writeHumanScanResults(results, options.updateConfigPath, options.verbose, warnings)
 	}
-	return scanResultError(summary, options.failOn)
+	return scanResultError(summary, options.failOn, options.requireImageScan)
 }
 
-func scanResultError(summary scanSummary, failOn string) error {
+func scanResultError(summary scanSummary, failOn string, requireImageScan bool) error {
 	if summary.Failed > 0 && summary.Succeeded == 0 && summary.Partial == 0 {
 		return fail(exitFailure, "%d scan target(s) failed", summary.Failed)
 	}
@@ -275,6 +303,9 @@ func scanResultError(summary scanSummary, failOn string) error {
 	}
 	if failOn == "vulnerabilities" && summary.Vulnerabilities > 0 {
 		return fail(exitFindings, "%d vulnerability finding(s)", summary.Vulnerabilities)
+	}
+	if requireImageScan && summary.ImageScanSkipped > 0 {
+		return fail(exitImageScanRequired, "%d image scan(s) could not resolve any digest", summary.ImageScanSkipped)
 	}
 	return nil
 }
@@ -294,6 +325,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.minReleaseAge, "min-release-age", "", "minimum release age")
 	fs.BoolVar(&options.allowProjectConfig, "allow-project-config", false, "honor reviewed package-manager config")
 	fs.StringVar(&options.failOn, "fail-on", "", "return 5 for vulnerability findings")
+	fs.BoolVar(&options.requireImageScan, "require-image-scan", false, "return 7 when an image scan could not resolve any digest (tier 4)")
 	fs.BoolVar(&options.verbose, "verbose", false, "show technical stages, inputs, warnings, and error details")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
 	fs.BoolVar(&options.nonInteractive, "internal-no-input", false, "disable prompts")
@@ -593,7 +625,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 type scanStageRunners struct {
-	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error)
+	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
 	alerts           func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
@@ -602,7 +634,7 @@ type scanStageRunners struct {
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{}, ImageScans: []imageScanRecord{},
 	}
 	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
 	if stateErr == nil {
@@ -679,6 +711,8 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageAlerts, stageNotRequested, "")
 	} else {
 		var findings []vulnscan.Finding
+		var imageResolutions []vulnscan.ImageResolution
+		var imageSkips []vulnscan.ImageSkip
 		tool := cfg.VulnScan.DependencySource
 		requested := true
 		var scanErr error
@@ -686,7 +720,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			scanErr = target.dockerErr
 		} else {
 			progress.start("Scanning for vulnerabilities...")
-			findings, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
+			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
 			progress.stop()
 		}
 		if !requested {
@@ -698,6 +732,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.VulnerabilityFindings = appendUniqueFindings(result.VulnerabilityFindings, findings...)
 			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "used"})
 			result = addStage(result, stageVulnerability, stageSucceeded, "")
+			imageScans, driftWarnings := buildImageScanRecords(target.path, imageResolutions, imageSkips)
+			result.ImageScans = imageScans
+			result.Warnings = appendUniqueStrings(result.Warnings, driftWarnings...)
 		}
 
 		progress.start("Checking GitHub security alerts...")
@@ -973,21 +1010,86 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]vulnscan.Finding, string, bool, error) {
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 	workspace, err := scanWorkspace(target)
 	if err != nil {
-		return nil, cfg.VulnScan.DependencySource, true, err
+		return nil, nil, nil, cfg.VulnScan.DependencySource, true, err
 	}
 	scanner := vulnscan.NewReadOnlyScanner()
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
-			return nil, "trivy-images", false, nil
+			return nil, nil, nil, "trivy-images", false, nil
 		}
 		report, scanErr := scanner.ScanImages(ctx, target.path, workspace, cfg)
-		return report.Findings, cfg.VulnScan.ImageScan.Tool, true, scanErr
+		return report.Findings, report.ImageResolutions, report.ImageSkips, cfg.VulnScan.ImageScan.Tool, true, scanErr
 	}
 	report, scanErr := scanner.Scan(ctx, target.path, workspace, cfg)
-	return report.Findings, cfg.VulnScan.DependencySource, true, scanErr
+	return report.Findings, report.ImageResolutions, report.ImageSkips, cfg.VulnScan.DependencySource, true, scanErr
+}
+
+// buildImageScanRecords turns one scan's raw image resolutions/skips into
+// the structured, always-visible records the CLI reports, comparing each
+// resolution against the previous scan's recorded digest to surface base
+// image drift as a distinct, explicit signal.
+func buildImageScanRecords(targetPath string, resolutions []vulnscan.ImageResolution, skips []vulnscan.ImageSkip) ([]imageScanRecord, []string) {
+	if len(resolutions) == 0 && len(skips) == 0 {
+		return nil, nil
+	}
+	previous := make(map[string]string)
+	if state, err := projectstate.FromCanonical(targetPath); err == nil {
+		if records, err := state.ReadImageScanState(); err == nil {
+			for _, record := range records {
+				previous[record.Reference+"\x00"+record.Platform] = record.Digest
+			}
+		}
+	}
+	var records []imageScanRecord
+	var warnings []string
+	for _, resolution := range resolutions {
+		resolvedAt := resolution.ResolvedAt
+		record := imageScanRecord{
+			Reference: resolution.Reference, Status: "resolved", ResolvedDigest: resolution.ResolvedDigest,
+			Platform: resolution.Platform, Tier: int(resolution.Tier), ResolvedAt: &resolvedAt, Dockerfile: resolution.Dockerfile,
+			BaseImageOnly: resolution.Tier == vulnscan.TierBaseImageTag, OSPackagesInstalled: resolution.OSPackagesInstalled,
+		}
+		if previousDigest, ok := previous[resolution.Reference+"\x00"+resolution.Platform]; ok && previousDigest != resolution.ResolvedDigest {
+			record.Drift = &imageDrift{PreviousDigest: previousDigest, CurrentDigest: resolution.ResolvedDigest}
+			warnings = append(warnings, fmt.Sprintf(
+				"base image drift: %s (%s) resolved to %s previously, now %s",
+				resolution.Reference, resolution.Platform, previousDigest, resolution.ResolvedDigest,
+			))
+		}
+		records = append(records, record)
+	}
+	for _, skip := range skips {
+		records = append(records, imageScanRecord{Reference: skip.Reference, Status: "skipped", Reason: skip.Reason})
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].Reference != records[j].Reference {
+			return records[i].Reference < records[j].Reference
+		}
+		return records[i].Platform < records[j].Platform
+	})
+	return records, warnings
+}
+
+// persistImageScanState records this scan's resolved digests so the next
+// scan of the same project can detect base image drift. Skipped (tier-4)
+// intents are never persisted: there is no digest to compare against.
+func persistImageScanState(target projectstate.Target, records []imageScanRecord) error {
+	resolved := make([]projectstate.ImageScanRecord, 0, len(records))
+	for _, record := range records {
+		if record.Status != "resolved" {
+			continue
+		}
+		resolved = append(resolved, projectstate.ImageScanRecord{
+			Reference: record.Reference, Platform: record.Platform, Digest: record.ResolvedDigest,
+		})
+	}
+	if len(resolved) == 0 {
+		return nil
+	}
+	return target.WriteImageScanState(resolved)
 }
 
 func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace) bool {
@@ -1407,6 +1509,11 @@ func summarizeScan(results []scanResult) scanSummary {
 	for _, result := range results {
 		summary.Candidates += len(result.Candidates)
 		summary.Vulnerabilities += len(result.Vulnerabilities)
+		for _, imageScan := range result.ImageScans {
+			if imageScan.Status == "skipped" {
+				summary.ImageScanSkipped++
+			}
+		}
 		switch result.Status {
 		case "failed":
 			summary.Failed++
@@ -1456,6 +1563,25 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 		for _, capability := range result.Capabilities {
 			if capability.Name == "git_update_snapshot" && capability.Reason == "git_repository_not_found" {
 				fmt.Println("Note: Git metadata was not found; findings remain available, but Git-bound snapshots and updates are disabled.")
+			}
+		}
+		for _, imageScan := range result.ImageScans {
+			switch {
+			case imageScan.Status == "skipped":
+				reference := imageScan.Reference
+				if reference == "" {
+					reference = "(no reference detected)"
+				}
+				fmt.Printf("Note: image scan skipped for %s: %s\n", reference, imageScan.Reason)
+			case imageScan.BaseImageOnly:
+				claim := fmt.Sprintf("Note: %s was scanned as the base image for %s, not the built artifact itself.", imageScan.ResolvedDigest, imageScan.Dockerfile)
+				if imageScan.OSPackagesInstalled {
+					claim += " " + imageScan.Dockerfile + " installs OS packages, so this is a weaker proxy for the built artifact's OS package surface."
+				}
+				fmt.Println(claim)
+			}
+			if imageScan.Drift != nil {
+				fmt.Printf("Note: base image drift for %s: previously %s, now %s.\n", imageScan.Reference, imageScan.Drift.PreviousDigest, imageScan.Drift.CurrentDigest)
 			}
 		}
 		for _, diagnostic := range result.Diagnostics {
@@ -1526,6 +1652,9 @@ func writeProjectScanReports(results []scanResult, options scanOptions, complete
 			report, err = buildProjectScanReport(result, options, completedAt)
 			if err == nil {
 				err = target.WriteReport(report)
+			}
+			if err == nil {
+				err = persistImageScanState(target, result.ImageScans)
 			}
 		}
 		if err != nil {
@@ -1728,6 +1857,13 @@ func writeScanDetails(result scanResult) {
 		} else {
 			_, _ = fmt.Fprintf(details, "  capability %s:\t%s (%s)\n", capability.Name, capability.Status, capability.Reason)
 		}
+	}
+	for _, imageScan := range result.ImageScans {
+		if imageScan.Status == "skipped" {
+			_, _ = fmt.Fprintf(details, "  image scan %s:\ttier 4, skipped (%s)\n", imageScan.Reference, imageScan.Reason)
+			continue
+		}
+		_, _ = fmt.Fprintf(details, "  image scan %s:\ttier %d, %s (%s)\n", imageScan.Reference, imageScan.Tier, imageScan.ResolvedDigest, imageScan.Platform)
 	}
 	_ = details.Flush()
 }

@@ -30,6 +30,28 @@ func TestDetectOnlyInspectsSelectedProjectRoot(t *testing.T) {
 	}
 }
 
+func TestDetectRecordsTagIntentAndExcludesStageAliasesAndScratch(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, project, "Dockerfile", strings.Join([]string{
+		"FROM node:20-alpine AS builder",
+		"RUN echo build",
+		"FROM builder AS test",
+		"FROM scratch",
+		"COPY --from=builder /app /app",
+		"",
+	}, "\n"))
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if len(discovery.RuntimeImages) != 1 || discovery.RuntimeImages[0] != "node:20-alpine" {
+		t.Fatalf("runtime images = %#v, want only the external tag reference", discovery.RuntimeImages)
+	}
+}
+
 func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	project := nodeProject(t)
 	discovery, err := Detect(project)

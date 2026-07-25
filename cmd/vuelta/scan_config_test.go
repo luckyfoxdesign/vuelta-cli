@@ -219,18 +219,29 @@ func TestSelectScanConfigurationAmbiguousStackNamesWorkingFix(t *testing.T) {
 	}
 }
 
-func TestSelectScanConfigurationMissingRuntimeDigestSurfacesValidationNotAmbiguity(t *testing.T) {
+func TestSelectScanConfigurationTagPinnedDockerfileOnboardsWithoutHandDigest(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
 	writeScanProjectFile(t, project, "Dockerfile", "FROM node:20-alpine\n")
 	writeScanProjectFile(t, project, "compose.yml", "services:\n  app:\n    build: .\n")
 
-	_, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
-	if err == nil || !strings.Contains(err.Error(), "docker_images.runtime_images") {
-		t.Fatalf("err = %v, want validation failure naming docker_images.runtime_images", err)
+	cfg, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err != nil {
+		t.Fatalf("a tag-pinned Dockerfile with build: . must onboard without a hand-written digest: %v", err)
 	}
-	if strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("err = %v, a resolved single stack must not be reported as ambiguous", err)
+	if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].DockerImages == nil {
+		t.Fatalf("workspace = %#v", cfg.Workspaces)
+	}
+	images := cfg.Workspaces[0].DockerImages.RuntimeImages
+	if len(images) != 1 || images[0] != "node:20-alpine" {
+		t.Fatalf("docker_images.runtime_images = %#v, want [node:20-alpine]", images)
+	}
+	data, err := os.ReadFile(filepath.Join(project, projectConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "sha256:") {
+		t.Fatalf("onboarding must never write a sha256 digest into .vuelta.yaml:\n%s", data)
 	}
 }
 
