@@ -91,6 +91,8 @@ func TestSelectScanConfigurationExplicitConfigNeverCreatesLocalFile(t *testing.T
 func TestSelectScanConfigurationRecognizesExplicitProjectConfigBySchema(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
 	custom := filepath.Join(project, "project-policy.yaml")
 	projectConfig := &config.ProjectConfig{
 		SchemaVersion: config.CurrentSchemaVersion,
@@ -179,6 +181,110 @@ func TestResolveAmbiguousWorkspacePropagatesPromptError(t *testing.T) {
 	_, err := resolveAmbiguousWorkspace(discovery, configinit.Input{ScanOnly: true}, true, chooseFlag)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("err = %v, want propagated prompt error", err)
+	}
+}
+
+func writeAmbiguousDockerPythonProject(t *testing.T, root string) {
+	t.Helper()
+	digest := "alpine@sha256:" + strings.Repeat("a", 64)
+	writeScanProjectFile(t, root, "Dockerfile", "FROM "+digest+"\n")
+	writeScanProjectFile(t, root, "requirements.txt", "requests==2.0.0\n")
+}
+
+func TestSelectScanConfigurationStackFlagResolvesAmbiguity(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeAmbiguousDockerPythonProject(t, project)
+
+	cfg, selection, err := selectScanConfiguration(scanOptions{directory: project, stack: "docker", nonInteractive: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Status != "created" || cfg.Workspaces[0].Stack != config.StackDocker {
+		t.Fatalf("selection/config = %#v %#v", selection, cfg)
+	}
+}
+
+func TestSelectScanConfigurationAmbiguousStackNamesWorkingFix(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeAmbiguousDockerPythonProject(t, project)
+
+	_, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err == nil || !strings.Contains(err.Error(), "vuelta scan --directory") || !strings.Contains(err.Error(), "--stack") {
+		t.Fatalf("ambiguous stack error = %v, want actionable --stack guidance", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(project, projectConfigName)); !os.IsNotExist(statErr) {
+		t.Fatalf("ambiguous detection created config: %v", statErr)
+	}
+}
+
+func TestSelectScanConfigurationExplicitStackConflictsWithPersistedValue(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+
+	if _, _, err := selectScanConfiguration(scanOptions{directory: project}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := selectScanConfiguration(scanOptions{directory: project, stack: "docker"}, "")
+	if err == nil || !strings.Contains(err.Error(), "already configured with workspace.stack") {
+		t.Fatalf("conflicting --stack error = %v", err)
+	}
+}
+
+func TestSelectScanConfigurationDriftFailsClosedNonInteractive(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+	if _, _, err := selectScanConfiguration(scanOptions{directory: project}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(filepath.Join(project, "package.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(project, "package-lock.json")); err != nil {
+		t.Fatal(err)
+	}
+	writeScanProjectFile(t, project, "requirements.txt", "requests==2.0.0\n")
+
+	_, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
+		t.Fatalf("drift error = %v", err)
+	}
+}
+
+func TestDetectStackDriftWarnsWhenInteractiveFailsClosedOtherwise(t *testing.T) {
+	root := t.TempDir()
+	writeScanProjectFile(t, root, "requirements.txt", "requests==2.0.0\n")
+	workspace := config.Workspace{Stack: config.StackNode}
+
+	warning, err := detectStackDrift(workspace, root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, "no longer matches freshly detected") {
+		t.Fatalf("warning = %q", warning)
+	}
+
+	if _, err := detectStackDrift(workspace, root, false); err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
+		t.Fatalf("non-interactive drift error = %v", err)
+	}
+}
+
+func TestDetectStackDriftNoDisagreement(t *testing.T) {
+	root := t.TempDir()
+	writeScanProjectFile(t, root, "package.json", "{}\n")
+	writeScanProjectFile(t, root, "package-lock.json", "{}\n")
+	workspace := config.Workspace{Stack: config.StackNode}
+
+	warning, err := detectStackDrift(workspace, root, false)
+	if err != nil || warning != "" {
+		t.Fatalf("warning = %q, err = %v", warning, err)
 	}
 }
 

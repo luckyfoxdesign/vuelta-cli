@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"gopkg.in/yaml.v3"
 )
@@ -270,14 +272,6 @@ const (
 	StackNode   = "node"
 	StackDocker = "docker"
 )
-
-// packageManagersByStack lists the package managers valid for each stack.
-// The docker stack has no package manager of its own.
-var packageManagersByStack = map[string]map[string]bool{
-	StackPython: {"poetry": true, "uv": true, "pip-tools": true, "requirements": true},
-	StackNode:   {"npm": true, "pnpm": true, "bun": true},
-	StackDocker: {},
-}
 
 var localPackageNamePattern = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
@@ -535,8 +529,8 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	if !projectNamePattern.MatchString(profile.ID) {
 		errs = append(errs, fmt.Errorf("%s.id: must be a stable alphanumeric profile ID", label))
 	}
-	managers, ok := packageManagersByStack[profile.Stack]
-	if !ok || profile.Stack == StackDocker || !managers[profile.PackageManager] {
+	adapter, adapterErr := builtInAdapter(profile.Stack, profile.PackageManager)
+	if adapterErr != nil || profile.Stack == StackDocker {
 		errs = append(errs, fmt.Errorf("%s: unsupported stack/package_manager %q/%q", label, profile.Stack, profile.PackageManager))
 	}
 	if !toolVersionPattern.MatchString(profile.Runtime) {
@@ -547,8 +541,8 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	}
 	if profile.Scanner == "" || !projectNamePattern.MatchString(profile.Scanner) || !toolVersionPattern.MatchString(profile.ScannerVersion) {
 		errs = append(errs, fmt.Errorf("%s.scanner: name and exact scanner_version are required", label))
-	} else if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan", "requirements": "vuelta-pip-tools-scan"}[profile.PackageManager]; expected != "" && profile.Scanner != expected {
-		errs = append(errs, fmt.Errorf("%s.scanner: must be %q for package manager %q", label, expected, profile.PackageManager))
+	} else if policy, ok := adapter.(ecosystem.ProfilePolicyProvider); ok && profile.Scanner != policy.ProfilePolicy().ExpectedScanner {
+		errs = append(errs, fmt.Errorf("%s.scanner: must be %q for package manager %q", label, policy.ProfilePolicy().ExpectedScanner, profile.PackageManager))
 	}
 	if !digestRefPattern.MatchString(profile.Image) {
 		errs = append(errs, fmt.Errorf("%s.image: %q is not pinned to an exact digest", label, profile.Image))
@@ -559,11 +553,12 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	if !containerUserPattern.MatchString(profile.User) {
 		errs = append(errs, fmt.Errorf("%s.user: must be an explicit non-root numeric uid:gid", label))
 	}
-	allowedLocks := map[string]map[string]bool{
-		"npm": {"npm-v2": true, "npm-v3": true}, "pnpm": {"pnpm-v6": true, "pnpm-v9": true},
-		"bun": {"bun-text": true}, "poetry": {"poetry-v2": true}, "uv": {"uv-v1": true},
-		"pip-tools": {"requirements": true}, "requirements": {"requirements-direct": true},
-	}[profile.PackageManager]
+	allowedLocks := make(map[string]bool)
+	if policy, ok := adapter.(ecosystem.ProfilePolicyProvider); ok {
+		for _, format := range policy.ProfilePolicy().AllowedLockFormats {
+			allowedLocks[format] = true
+		}
+	}
 	if len(profile.LockFormats) == 0 {
 		errs = append(errs, fmt.Errorf("%s.lock_formats: at least one format is required", label))
 	}
@@ -774,8 +769,12 @@ func validateWorkspace(i int, ws Workspace) []error {
 		return errs
 	}
 
-	managers, ok := packageManagersByStack[ws.Stack]
-	if !ok {
+	stackSupported := ws.Stack == StackDocker
+	if !stackSupported {
+		registry, err := catalog.New()
+		stackSupported = err == nil && len(registry.PackageManagers(ws.Stack)) > 0
+	}
+	if !stackSupported {
 		errs = append(errs, fmt.Errorf("%s.stack: %q is not a supported stack (python|node|docker)", label, ws.Stack))
 	} else if ws.Stack == StackDocker {
 		if ws.PackageManager != "" {
@@ -785,11 +784,13 @@ func validateWorkspace(i int, ws Workspace) []error {
 		// A scan-only Python workspace may expose a root requirements.txt to
 		// scanners without claiming that pip-tools owns it. This legacy form is
 		// retained until the explicit config-schema migration.
-	} else if !managers[ws.PackageManager] {
+	} else if _, err := builtInAdapter(ws.Stack, ws.PackageManager); err != nil {
 		errs = append(errs, fmt.Errorf("%s.package_manager: %q is not valid for stack %q", label, ws.PackageManager, ws.Stack))
 	}
-	if ws.Stack == StackPython && ws.PackageManager == "requirements" && ws.Verification.State != VerificationScanOnly {
-		errs = append(errs, fmt.Errorf("%s.verification.state: python/requirements has no safe mutation contract and must be scan_only", label))
+	if adapter, err := builtInAdapter(ws.Stack, ws.PackageManager); err == nil {
+		if _, mutable := adapter.(ecosystem.MutationProvider); !mutable && adapter.Metadata().UnsupportedReason == "" && ws.Verification.State != VerificationScanOnly {
+			errs = append(errs, fmt.Errorf("%s.verification.state: %s has no safe mutation contract and must be scan_only", label, adapter.Key().String()))
+		}
 	}
 
 	errs = append(errs, validateVerificationProfile(label, ws)...)
@@ -853,8 +854,10 @@ func validateVerificationProfile(label string, ws Workspace) []error {
 		if err := validateVerificationCommand(step.Command); err != nil {
 			errs = append(errs, fmt.Errorf("%s.command: %w", stepLabel, err))
 		}
-		if ws.Stack == StackNode && len(step.Command) > 0 && (step.Command[0] == "npm" || step.Command[0] == "pnpm" || step.Command[0] == "bun") && step.Command[0] != ws.PackageManager {
-			errs = append(errs, fmt.Errorf("%s.command: package factory %q does not match workspace package_manager %q", stepLabel, step.Command[0], ws.PackageManager))
+		if len(step.Command) > 0 {
+			if _, err := builtInAdapter(ws.Stack, step.Command[0]); err == nil && step.Command[0] != ws.PackageManager {
+				errs = append(errs, fmt.Errorf("%s.command: package factory %q does not match workspace package_manager %q", stepLabel, step.Command[0], ws.PackageManager))
+			}
 		}
 		if err := validatePackageVerificationCommand(ws.Path, step.Command); err != nil {
 			errs = append(errs, fmt.Errorf("%s.command: %w", stepLabel, err))
@@ -908,14 +911,25 @@ func ValidateVerificationCommand(command []string) error {
 }
 
 func validatePackageVerificationCommand(root string, command []string) error {
-	if len(command) == 0 || (command[0] != "npm" && command[0] != "pnpm" && command[0] != "bun") {
+	if len(command) == 0 {
 		return nil
 	}
 	script := ""
-	if command[0] == "npm" && len(command) >= 2 && command[1] == "test" {
-		script = "test"
-	} else if len(command) >= 3 && command[1] == "run" {
-		script = command[2]
+	registry, err := catalog.New()
+	if err != nil {
+		return fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	for _, adapter := range registry.Adapters() {
+		provider, ok := adapter.(ecosystem.VerificationProvider)
+		if !ok {
+			continue
+		}
+		if detected, ok := provider.VerificationScript(command); ok {
+			if script != "" {
+				return errors.New("package verification factory is ambiguous")
+			}
+			script = detected
+		}
 	}
 	if script == "" {
 		return nil
@@ -1018,6 +1032,14 @@ func canonicalWorkspacePath(path string) (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(abs)
+}
+
+func builtInAdapter(stack, packageManager string) (ecosystem.Adapter, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	return registry.Lookup(stack, packageManager)
 }
 
 // validateDockerImageFile ensures f stays inside root as a project-relative

@@ -135,17 +135,21 @@ func TestPrepareRejectsScannerContractBeforePublishingCacheTag(t *testing.T) {
 
 func TestMatchesScannerVersion(t *testing.T) {
 	for _, testCase := range []struct {
-		scanner, version, output string
-		want                     bool
+		stack, manager, scanner, version, output string
+		want                                     bool
 	}{
-		{"ncu", "22.2.9", "22.2.9", true},
-		{"pnpm", "9.15.0", "9.15.0", true},
-		{"poetry", "2.1.1", "Poetry (version 2.1.1)", true},
-		{"uv", "0.6.14", "uv 0.6.14 (abcdef 2025-01-01)", true},
-		{"uv", "0.6.14", "uv 0.6.140", false},
-		{"unknown", "1.0.0", "1.0.0", false},
+		{"node", "npm", "ncu", "22.2.9", "22.2.9", true},
+		{"node", "pnpm", "pnpm", "9.15.0", "9.15.0", true},
+		{"python", "poetry", "poetry", "2.1.1", "Poetry (version 2.1.1)", true},
+		{"python", "uv", "uv", "0.6.14", "uv 0.6.14 (abcdef 2025-01-01)", true},
+		{"python", "uv", "uv", "0.6.14", "uv 0.6.140", false},
+		{"unknown", "manager", "unknown", "1.0.0", "1.0.0", false},
 	} {
-		if got := matchesScannerVersion(testCase.scanner, testCase.version, testCase.output); got != testCase.want {
+		profile := config.ToolchainProfile{
+			Stack: testCase.stack, PackageManager: testCase.manager,
+			Scanner: testCase.scanner, ScannerVersion: testCase.version,
+		}
+		if got := matchesScannerVersion(profile, testCase.output); got != testCase.want {
 			t.Fatalf("matchesScannerVersion(%q, %q, %q) = %t", testCase.scanner, testCase.version, testCase.output, got)
 		}
 	}

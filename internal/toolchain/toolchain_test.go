@@ -190,3 +190,27 @@ func write(t *testing.T, root, name, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestIdentityBindsAdapterAndAcceptsOnlyLegacyUnboundCompatibility(t *testing.T) {
+	t.Parallel()
+	selected := profile("node22-npm", "npm", "22", "10.9.2", "npm-v3")
+	current, err := IdentityForResolvedProfile(selected, SourceOverride, selected.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.AdapterID != "node/npm" || current.AdapterVersion == "" {
+		t.Fatalf("adapter identity = %#v", current)
+	}
+	legacy, err := identityForResolvedProfile(selected, SourceOverride, selected.Image, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !MatchesResolvedIdentity(legacy, selected, current) {
+		t.Fatal("legacy short-lived snapshot identity was not accepted")
+	}
+	tampered := current
+	tampered.AdapterVersion = "different"
+	if MatchesResolvedIdentity(tampered, selected, current) {
+		t.Fatal("changed adapter version was accepted")
+	}
+}

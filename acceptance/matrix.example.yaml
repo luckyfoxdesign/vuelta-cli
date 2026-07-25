@@ -1,70 +1,47 @@
-# Copy this file outside secret-bearing directories, replace every placeholder
-# with a released exact digest, and add one case per supported profile.
-engine: docker-desktop # docker-desktop | docker-engine
+# This matrix exercises the embedded adaptive defaults. Keep it outside
+# secret-bearing directories and add one case per supported phase-1 profile.
+engine: docker-engine # docker-desktop | docker-engine
 cases:
-  - name: node22-pnpm9-amd64
+  - name: node22-pnpm9
     fixture_root: testdata/fixtures/projects
     fixture: node-pnpm-ok
-    # Set a positive value only when this exact profile has a tested release-age
-    # implementation. Zero still tests the real scanner command and snapshot.
+    stack: node
+    package_manager: pnpm
+    expected_profile_id: default-node22-pnpm
     min_release_age_days: 0
-    profile:
-      version: 1
-      id: node22-pnpm9-amd64
-      stack: node
-      package_manager: pnpm
-      runtime: "22"
-      package_manager_version: 9.15.0
-      scanner: pnpm
-      scanner_version: 9.15.0
-      image: registry.example/vuelta/node22-pnpm9@sha256:<released-digest>
-      platform: linux/amd64
-      user: "10001:10001"
-      lock_formats: [pnpm-v9]
-      capabilities:
-        read_only_discovery: true
-        release_age: false
-        project_config: false
-  - name: python312-pip-tools-amd64
+  - name: node22-npm
+    fixture_root: testdata/fixtures/projects
+    fixture: node-npm-ok
+    stack: node
+    package_manager: npm
+    expected_profile_id: default-node22-npm
+    min_release_age_days: 0
+  - name: python312-poetry
+    fixture_root: testdata/fixtures/projects
+    fixture: py-poetry-real-ok
+    stack: python
+    package_manager: poetry
+    expected_profile_id: default-python312-poetry
+    min_release_age_days: 0
+  - name: python312-uv
+    fixture_root: testdata/fixtures/projects
+    fixture: py-uv-ok
+    stack: python
+    package_manager: uv
+    expected_profile_id: default-python312-uv
+    min_release_age_days: 0
+  - name: python312-pip-tools
     fixture_root: testdata/fixtures/projects
     fixture: py-pip-tools-ok
+    stack: python
+    package_manager: pip-tools
+    expected_profile_id: default-python312-pip-tools
     min_release_age_days: 0
-    profile:
-      version: 1
-      id: python312-pip-tools-amd64
-      stack: python
-      package_manager: pip-tools
-      runtime: "3.12"
-      package_manager_version: 7.5.0
-      scanner: vuelta-pip-tools-scan
-      scanner_version: 1.1.0
-      image: registry.example/vuelta/python312-pip-tools@sha256:<released-digest>
-      platform: linux/amd64
-      user: "10001:10001"
-      lock_formats: [requirements]
-      capabilities:
-        read_only_discovery: true
-        release_age: false
-        project_config: false
-  - name: python312-requirements-amd64
+  - name: python312-requirements
     fixture_root: testdata/fixtures/projects
     fixture: py-requirements-only-cve
+    stack: python
+    package_manager: requirements
+    expected_profile_id: default-python312-requirements
     scan_only: true
     min_release_age_days: 0
-    profile:
-      version: 1
-      id: python312-requirements-amd64
-      stack: python
-      package_manager: requirements
-      runtime: "3.12"
-      package_manager_version: 25.0.1
-      scanner: vuelta-pip-tools-scan
-      scanner_version: 1.1.0
-      image: registry.example/vuelta/python312-pip-tools@sha256:<released-digest>
-      platform: linux/amd64
-      user: "10001:10001"
-      lock_formats: [requirements-direct]
-      capabilities:
-        read_only_discovery: true
-        release_age: false
-        project_config: false

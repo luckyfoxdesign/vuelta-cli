@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
@@ -29,11 +30,16 @@ func fakeRunWritingLock(lockFile, newContent string, callCount *int) DockerRunne
 	}
 }
 
-func TestPoetryUpdaterDetectsChange(t *testing.T) {
+func TestSpecUpdaterDetectsChange(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "poetry.lock", "old\n")
 	var calls int
-	u := PoetryUpdater{Image: "python@sha256:x", Run: fakeRunWritingLock("poetry.lock", "new\n", &calls)}
+	u, err := NewSpecUpdater("python@sha256:x", ecosystem.MutationSpec{
+		LockFile: "poetry.lock", Commands: [][]string{{"poetry", "update"}},
+	}, fakeRunWritingLock("poetry.lock", "new\n", &calls))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	changed, err := u.Update(context.Background(), dir)
 	if err != nil {
@@ -47,11 +53,16 @@ func TestPoetryUpdaterDetectsChange(t *testing.T) {
 	}
 }
 
-func TestPoetryUpdaterNoChange(t *testing.T) {
+func TestSpecUpdaterNoChange(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "poetry.lock", "same\n")
 	var calls int
-	u := PoetryUpdater{Image: "python@sha256:x", Run: fakeRunWritingLock("poetry.lock", "same\n", &calls)}
+	u, err := NewSpecUpdater("python@sha256:x", ecosystem.MutationSpec{
+		LockFile: "poetry.lock", Commands: [][]string{{"poetry", "update"}},
+	}, fakeRunWritingLock("poetry.lock", "same\n", &calls))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	changed, err := u.Update(context.Background(), dir)
 	if err != nil {
@@ -62,20 +73,22 @@ func TestPoetryUpdaterNoChange(t *testing.T) {
 	}
 }
 
-func TestPoetryUpdaterPropagatesTimeout(t *testing.T) {
+func TestSpecUpdaterPropagatesTimeout(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "poetry.lock", "old\n")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	<-ctx.Done()
-	u := PoetryUpdater{
-		Image: "python@sha256:x",
-		Run: func(ctx context.Context, _ string, _ []string, _ string) (string, error) {
-			return "", ctx.Err()
-		},
+	u, err := NewSpecUpdater("python@sha256:x", ecosystem.MutationSpec{
+		LockFile: "poetry.lock", Commands: [][]string{{"poetry", "update"}},
+	}, func(ctx context.Context, _ string, _ []string, _ string) (string, error) {
+		return "", ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	_, err := u.Update(ctx, dir)
+	_, err = u.Update(ctx, dir)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context deadline exceeded, got %v", err)
 	}
@@ -101,86 +114,13 @@ func TestResolveDigestViaManifestHonorsCanceledContext(t *testing.T) {
 	}
 }
 
-func TestNPMUpdaterUsesPinnedNCUVersion(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "package-lock.json", "old\n")
-	var capturedArgs [][]string
-	run := func(_ context.Context, _ string, args []string, workDir string) (string, error) {
-		capturedArgs = append(capturedArgs, append([]string(nil), args...))
-		if len(capturedArgs) == 2 {
-			return "", os.WriteFile(filepath.Join(workDir, "package-lock.json"), []byte("new\n"), 0o644)
-		}
-		return "", nil
-	}
-	u := NPMUpdater{Image: "node@sha256:x", NCUVersion: "17.1.16", Run: run}
-
-	changed, err := u.Update(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if !changed {
-		t.Fatal("expected changed=true")
-	}
-	want := [][]string{
-		{"npx", "npm-check-updates@17.1.16", "-u"},
-		{"npm", "install"},
-	}
-	if !reflect.DeepEqual(capturedArgs, want) {
-		t.Fatalf("unexpected npm argv: got %#v, want %#v", capturedArgs, want)
-	}
-}
-
-func TestNPMUpdaterRejectsInvalidNCUVersionBeforeRunning(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "package-lock.json", "old\n")
-	calls := 0
-	u := NPMUpdater{
-		Image:      "node@sha256:x",
-		NCUVersion: "17.1.16; touch /tmp/pwned",
-		Run: func(context.Context, string, []string, string) (string, error) {
-			calls++
-			return "", nil
-		},
-	}
-
-	_, err := u.Update(context.Background(), dir)
+func TestRequireToolRejectsInvalidNCUVersion(t *testing.T) {
+	cfg := config.Config{Update: config.UpdateConfig{Tools: map[string]string{
+		"npm_check_updates": "17.1.16; touch /tmp/pwned",
+	}}}
+	_, err := requireTool(cfg, "npm_check_updates")
 	if err == nil || !strings.Contains(err.Error(), "exact semantic version") {
 		t.Fatalf("expected invalid version error, got %v", err)
-	}
-	if calls != 0 {
-		t.Fatalf("runner was called %d times for an invalid version", calls)
-	}
-}
-
-func TestBunUpdaterUsesSeparateArgv(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "bun.lock", "old\n")
-	var capturedArgs [][]string
-	u := BunUpdater{
-		Image:      "bun@sha256:x",
-		NCUVersion: "17.1.16",
-		Run: func(_ context.Context, _ string, args []string, workDir string) (string, error) {
-			capturedArgs = append(capturedArgs, append([]string(nil), args...))
-			if len(capturedArgs) == 2 {
-				return "", os.WriteFile(filepath.Join(workDir, "bun.lock"), []byte("new\n"), 0o644)
-			}
-			return "", nil
-		},
-	}
-
-	changed, err := u.Update(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if !changed {
-		t.Fatal("expected changed=true")
-	}
-	want := [][]string{
-		{"bunx", "npm-check-updates@17.1.16", "-u"},
-		{"bun", "install"},
-	}
-	if !reflect.DeepEqual(capturedArgs, want) {
-		t.Fatalf("unexpected bun argv: got %#v, want %#v", capturedArgs, want)
 	}
 }
 
@@ -287,6 +227,7 @@ func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
 	}
 	scanner := packageScanner{
 		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
+		AcceptedExitCodes: []int{1},
 		Run: func(context.Context, string, []string, scaninput.Bundle) (string, error) {
 			return `{"lodash":{"latest":"4.18.1","wanted":"4.17.20","dependencyType":"dependencies"}}`, fakeExitCode(1)
 		},
@@ -328,8 +269,9 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"ncu", "--jsonUpgraded", "--removeRange", "--cooldown", "168"}) {
 		t.Fatalf("profile scanner = %#v", combined[0])
 	}
-	if args, err := plannedArgs("npm", updatesnapshot.Candidate{Kind: "npm", Name: "example", Target: "2.0.0"}, cfg, &profile, false); err != nil || !reflect.DeepEqual(args, []string{"ncu", "--filter", "example", "--cooldown", "168", "-u"}) {
-		t.Fatalf("plannedArgs() = %#v, %v", args, err)
+	spec, err := resolvePlannedMutationSpec(ws, cfg, &profile, []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, false)
+	if err != nil || len(spec.Mutations) != 1 || !reflect.DeepEqual(spec.Mutations[0].Commands, [][]string{{"ncu", "--filter", "example", "--cooldown", "168", "-u"}}) {
+		t.Fatalf("planned adapter mutation = %#v, %v", spec, err)
 	}
 }
 
@@ -544,8 +486,12 @@ func TestResolvePoetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if _, ok := u.(PoetryUpdater); !ok {
-		t.Fatalf("expected PoetryUpdater, got %T", u)
+	specUpdater, ok := u.(SpecUpdater)
+	if !ok {
+		t.Fatalf("expected SpecUpdater, got %T", u)
+	}
+	if specUpdater.Spec.LockFile != "poetry.lock" || !reflect.DeepEqual(specUpdater.Spec.Commands, [][]string{{"poetry", "update"}}) {
+		t.Fatalf("poetry adapter mutation = %#v", specUpdater.Spec)
 	}
 }
 

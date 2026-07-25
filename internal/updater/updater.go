@@ -11,6 +11,8 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/scancontainer"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
@@ -265,66 +267,61 @@ func ResolveWithDocker(ws config.Workspace, cfg config.Config, docker dockerexec
 		platform = profile.Platform
 	}
 	runner := NewDockerRunnerWithProfile(docker, cfg.Update.Egress, user, platform)
-	image := func(key string) (string, error) {
-		if profile != nil {
-			return profile.Image, nil
-		}
-		return requireImage(cfg, key)
-	}
-
 	switch {
-	case ws.Stack == config.StackPython && ws.PackageManager == "poetry":
-		img, err := image("python-poetry")
-		if err != nil {
-			return nil, err
-		}
-		updaters = append(updaters, PoetryUpdater{Image: img, Run: runner})
-	case ws.Stack == config.StackPython && ws.PackageManager == "uv":
-		img, err := image("python-uv")
-		if err != nil {
-			return nil, err
-		}
-		updaters = append(updaters, UVUpdater{Image: img, Run: runner})
-	case ws.Stack == config.StackPython && ws.PackageManager == "pip-tools":
-		img, err := image("python-pip-tools")
-		if err != nil {
-			return nil, err
-		}
-		updaters = append(updaters, PipToolsUpdater{Image: img, Run: runner})
-	case ws.Stack == config.StackNode && ws.PackageManager == "npm":
-		img, err := image("node")
-		if err != nil {
-			return nil, err
-		}
-		ncuVersion := ""
-		if profile == nil {
-			ncuVersion, err = requireTool(cfg, "npm_check_updates")
-			if err != nil {
-				return nil, err
-			}
-		}
-		updaters = append(updaters, NPMUpdater{Image: img, NCUVersion: ncuVersion, DirectNCU: profile != nil, Run: runner})
-	case ws.Stack == config.StackNode && ws.PackageManager == "bun":
-		img, err := image("bun")
-		if err != nil {
-			return nil, err
-		}
-		ncuVersion := ""
-		if profile == nil {
-			ncuVersion, err = requireTool(cfg, "npm_check_updates")
-			if err != nil {
-				return nil, err
-			}
-		}
-		updaters = append(updaters, BunUpdater{Image: img, NCUVersion: ncuVersion, DirectNCU: profile != nil, Run: runner})
-	case ws.Stack == config.StackNode && ws.PackageManager == "pnpm":
-		img, err := image("node")
-		if err != nil {
-			return nil, err
-		}
-		updaters = append(updaters, PNPMUpdater{Image: img, Run: runner})
 	case ws.Stack == config.StackDocker:
 		// No package-manager updater; docker_images (below) is the only update source.
+	case ws.PackageManager != "":
+		registry, err := catalog.New()
+		if err != nil {
+			return nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+		}
+		adapter, err := registry.Lookup(ws.Stack, ws.PackageManager)
+		if err != nil {
+			return nil, err
+		}
+		mutator, ok := adapter.(ecosystem.MutationProvider)
+		if !ok {
+			return nil, &ecosystem.CapabilityError{
+				Key: adapter.Key(), Capability: "mutation", ScanOnly: adapter.Metadata().UnsupportedReason == "",
+				Reason: adapter.Metadata().UnsupportedReason,
+			}
+		}
+		request := ecosystem.MutationRequest{}
+		if profile != nil {
+			request.ProfileScanner = profile.Scanner
+			request.ScannerVersion = profile.ScannerVersion
+			request.InstalledTool = true
+		} else if policy, ok := adapter.(ecosystem.ProfilePolicyProvider); ok {
+			request.ProfileScanner = policy.ProfilePolicy().ExpectedScanner
+		}
+		spec, err := mutator.Mutation(request)
+		if err != nil {
+			return nil, err
+		}
+		if profile == nil && spec.LegacyToolKey != "" {
+			request.ScannerVersion, err = requireTool(cfg, spec.LegacyToolKey)
+			if err != nil {
+				return nil, err
+			}
+			spec, err = mutator.Mutation(request)
+			if err != nil {
+				return nil, err
+			}
+		}
+		image := ""
+		if profile != nil {
+			image = profile.Image
+		} else {
+			image, err = requireImage(cfg, spec.LegacyImageKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+		packageUpdater, err := NewSpecUpdater(image, spec, runner)
+		if err != nil {
+			return nil, fmt.Errorf("validate %s mutation: %w", adapter.Key().String(), err)
+		}
+		updaters = append(updaters, packageUpdater)
 	default:
 		return nil, fmt.Errorf("no updater for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
 	}

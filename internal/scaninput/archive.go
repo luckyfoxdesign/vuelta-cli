@@ -17,6 +17,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 )
 
@@ -321,9 +323,17 @@ func validateRelativePath(spec File) (string, error) {
 }
 
 func approvedManagerConfigName(rel string) bool {
-	for _, configs := range managerConfigs {
-		for _, allowed := range configs {
-			if rel == allowed {
+	registry, err := catalog.New()
+	if err != nil {
+		return false
+	}
+	for _, adapter := range registry.Adapters() {
+		provider, ok := adapter.(ecosystem.InputProvider)
+		if !ok {
+			continue
+		}
+		for _, file := range provider.PackageInput(true).Files {
+			if file.ReviewedManagerConfig && rel == file.Path {
 				return true
 			}
 		}

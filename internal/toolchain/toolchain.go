@@ -3,21 +3,15 @@ package toolchain
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"regexp"
+	"reflect"
 	"runtime"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
-	"gopkg.in/yaml.v3"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 )
-
-const manifestLimit = 1 << 20
 
 // Constraints is the allowlisted project metadata used during resolution.
 type Constraints struct {
@@ -32,6 +26,8 @@ type Constraints struct {
 // Identity is persisted in snapshots so update cannot silently switch image,
 // runtime, scanner, platform, user, lock support, or capability semantics.
 type Identity struct {
+	AdapterID             string                       `json:"adapter_id,omitempty"`
+	AdapterVersion        string                       `json:"adapter_version,omitempty"`
 	Source                string                       `json:"source"`
 	ProfileID             string                       `json:"profile_id"`
 	Hash                  string                       `json:"hash"`
@@ -66,8 +62,19 @@ func Resolve(ws config.Workspace, cfg config.Config) (config.ToolchainProfile, I
 // ValidateManagerSupport rejects manager families without a safe structured
 // scanner before a project is onboarded or Docker is called.
 func ValidateManagerSupport(stack, manager string) error {
-	if stack == config.StackNode && manager == "bun" {
-		return errors.New("node/bun package scanning is unsupported: npm-check-updates cannot use the mandatory egress proxy under Bun; use npm or pnpm until a Bun scanner with stable structured output is available")
+	registry, err := catalog.New()
+	if err != nil {
+		return fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	adapter, err := registry.Lookup(stack, manager)
+	if err != nil {
+		return err
+	}
+	if _, ok := adapter.(ecosystem.ScannerProvider); !ok {
+		return &ecosystem.CapabilityError{
+			Key: adapter.Key(), Capability: "candidate-scanner",
+			Reason: adapter.Metadata().UnsupportedReason,
+		}
 	}
 	return nil
 }
@@ -81,11 +88,31 @@ func IdentityForProfile(profile config.ToolchainProfile) (Identity, error) {
 // in snapshots. imageID is a local sha256 ID for defaults and the immutable
 // configured image identity for overrides.
 func IdentityForResolvedProfile(profile config.ToolchainProfile, source, imageID string) (Identity, error) {
+	return identityForResolvedProfile(profile, source, imageID, true)
+}
+
+func identityForResolvedProfile(profile config.ToolchainProfile, source, imageID string, bindAdapter bool) (Identity, error) {
+	adapterID := ""
+	adapterVersion := ""
+	if bindAdapter {
+		registry, err := catalog.New()
+		if err != nil {
+			return Identity{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+		}
+		adapter, err := registry.Lookup(profile.Stack, profile.PackageManager)
+		if err != nil {
+			return Identity{}, err
+		}
+		adapterID = adapter.Key().String()
+		adapterVersion = adapter.Metadata().Version
+	}
 	contract := struct {
-		Profile config.ToolchainProfile `json:"profile"`
-		Source  string                  `json:"source"`
-		ImageID string                  `json:"image_id"`
-	}{Profile: profile, Source: source, ImageID: imageID}
+		Profile        config.ToolchainProfile `json:"profile"`
+		AdapterID      string                  `json:"adapter_id,omitempty"`
+		AdapterVersion string                  `json:"adapter_version,omitempty"`
+		Source         string                  `json:"source"`
+		ImageID        string                  `json:"image_id"`
+	}{Profile: profile, AdapterID: adapterID, AdapterVersion: adapterVersion, Source: source, ImageID: imageID}
 	data, err := json.Marshal(contract)
 	if err != nil {
 		return Identity{}, fmt.Errorf("encode toolchain profile: %w", err)
@@ -94,11 +121,22 @@ func IdentityForResolvedProfile(profile config.ToolchainProfile, source, imageID
 	locks := append([]string(nil), profile.LockFormats...)
 	sort.Strings(locks)
 	return Identity{
+		AdapterID: adapterID, AdapterVersion: adapterVersion,
 		Source: source, ProfileID: profile.ID, Hash: fmt.Sprintf("%x", sum), Runtime: profile.Runtime,
 		PackageManager: profile.PackageManager, PackageManagerVersion: profile.PackageManagerVersion,
 		Scanner: profile.Scanner, ScannerVersion: profile.ScannerVersion, Image: profile.Image, ImageID: imageID,
 		Platform: profile.Platform, User: profile.User, LockFormats: locks, Capabilities: profile.Capabilities,
 	}, nil
+}
+
+// MatchesResolvedIdentity accepts current adapter-bound identities and the
+// legacy unbound form only for already-created short-lived snapshots.
+func MatchesResolvedIdentity(persisted Identity, profile config.ToolchainProfile, actual Identity) bool {
+	if persisted.AdapterID != "" || persisted.AdapterVersion != "" {
+		return reflect.DeepEqual(persisted, actual)
+	}
+	legacy, err := identityForResolvedProfile(profile, actual.Source, actual.ImageID, false)
+	return err == nil && reflect.DeepEqual(persisted, legacy)
 }
 
 // Detect reads only the selected workspace's supported root manifest and lock
@@ -111,119 +149,30 @@ func Detect(ws config.Workspace) (Constraints, error) {
 		}
 		constraints.Platform = "linux/" + runtime.GOARCH
 	}
-	switch ws.Stack + "/" + ws.PackageManager {
-	case "node/npm", "node/pnpm", "node/bun":
-		if err := detectNode(ws.Path, &constraints); err != nil {
-			return Constraints{}, err
-		}
-	case "python/poetry", "python/uv", "python/pip-tools":
-		if err := detectPython(ws.Path, &constraints); err != nil {
-			return Constraints{}, err
-		}
-	case "python/requirements":
-		if _, err := readManifest(filepath.Join(ws.Path, "requirements.txt")); err != nil {
-			return Constraints{}, err
-		}
-		constraints.LockFormat = "requirements-direct"
-	default:
-		return Constraints{}, fmt.Errorf("no toolchain constraints for %s/%s", ws.Stack, ws.PackageManager)
-	}
-	return constraints, nil
-}
-
-func detectNode(root string, constraints *Constraints) error {
-	data, err := readManifest(filepath.Join(root, "package.json"))
+	registry, err := catalog.New()
 	if err != nil {
-		return err
+		return Constraints{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
 	}
-	var manifest struct {
-		Engines        map[string]string `json:"engines"`
-		PackageManager string            `json:"packageManager"`
-	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return fmt.Errorf("parse package.json toolchain metadata: %w", err)
-	}
-	constraints.Runtime = strings.TrimSpace(manifest.Engines["node"])
-	if manifest.PackageManager != "" {
-		family, version, ok := strings.Cut(manifest.PackageManager, "@")
-		if !ok || family == "" || version == "" {
-			return fmt.Errorf("package.json packageManager %q must be family@exact-version", manifest.PackageManager)
-		}
-		if family != constraints.PackageManager {
-			return fmt.Errorf("package.json packageManager %q conflicts with configured manager %q", family, constraints.PackageManager)
-		}
-		constraints.PackageManagerVersion = version
-	}
-	switch constraints.PackageManager {
-	case "npm":
-		lock, err := readManifest(filepath.Join(root, "package-lock.json"))
-		if err != nil {
-			return err
-		}
-		var metadata struct {
-			LockfileVersion int `json:"lockfileVersion"`
-		}
-		if err := json.Unmarshal(lock, &metadata); err != nil || metadata.LockfileVersion == 0 {
-			return errors.New("package-lock.json has malformed lockfileVersion")
-		}
-		constraints.LockFormat = fmt.Sprintf("npm-v%d", metadata.LockfileVersion)
-	case "pnpm":
-		lock, err := readManifest(filepath.Join(root, "pnpm-lock.yaml"))
-		if err != nil {
-			return err
-		}
-		var metadata struct {
-			LockfileVersion any `yaml:"lockfileVersion"`
-		}
-		if err := yaml.Unmarshal(lock, &metadata); err != nil {
-			return fmt.Errorf("parse pnpm lock metadata: %w", err)
-		}
-		major := strings.Split(strings.Trim(fmt.Sprint(metadata.LockfileVersion), "'\""), ".")[0]
-		if _, err := strconv.Atoi(major); err != nil {
-			return errors.New("pnpm-lock.yaml has malformed lockfileVersion")
-		}
-		constraints.LockFormat = "pnpm-v" + major
-	case "bun":
-		if _, err := readManifest(filepath.Join(root, "bun.lock")); err != nil {
-			return err
-		}
-		constraints.LockFormat = "bun-text"
-	}
-	return nil
-}
-
-var (
-	requiresPythonPattern = regexp.MustCompile(`(?m)^\s*requires-python\s*=\s*["']([^"']+)["']`)
-	poetryPythonPattern   = regexp.MustCompile(`(?m)^\s*python\s*=\s*["']([^"']+)["']`)
-)
-
-func detectPython(root string, constraints *Constraints) error {
-	data, err := readManifest(filepath.Join(root, "pyproject.toml"))
+	adapter, err := registry.Lookup(ws.Stack, ws.PackageManager)
 	if err != nil {
-		return err
+		return Constraints{}, err
 	}
-	if match := requiresPythonPattern.FindSubmatch(data); match != nil {
-		constraints.Runtime = string(match[1])
-	} else if match := poetryPythonPattern.FindSubmatch(data); match != nil {
-		constraints.Runtime = string(match[1])
+	detector, ok := adapter.(ecosystem.ConstraintDetector)
+	if !ok {
+		return Constraints{}, &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "toolchain-constraints"}
 	}
-	lock := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock", "pip-tools": "requirements.txt"}[constraints.PackageManager]
-	if _, err := readManifest(filepath.Join(root, lock)); err != nil {
-		return err
-	}
-	constraints.LockFormat = map[string]string{"poetry": "poetry-v2", "uv": "uv-v1", "pip-tools": "requirements"}[constraints.PackageManager]
-	return nil
-}
-
-func readManifest(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
+	detected, err := detector.DetectConstraints(ws.Path, constraints.Platform)
 	if err != nil {
-		return nil, fmt.Errorf("read toolchain metadata %s: %w", filepath.Base(path), err)
+		return Constraints{}, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > manifestLimit {
-		return nil, fmt.Errorf("toolchain metadata %s must be a regular file no larger than %d bytes", filepath.Base(path), manifestLimit)
+	if detected.Key != adapter.Key() {
+		return Constraints{}, fmt.Errorf("adapter %s returned constraints for %s", adapter.Key().String(), detected.Key.String())
 	}
-	return os.ReadFile(path)
+	return Constraints{
+		Stack: detected.Key.Stack, PackageManager: detected.Key.PackageManager,
+		Runtime: detected.Runtime, PackageManagerVersion: detected.PackageManagerVersion,
+		LockFormat: detected.LockFormat, Platform: detected.Platform,
+	}, nil
 }
 
 func incompatibility(profile config.ToolchainProfile, constraints Constraints) string {
@@ -239,7 +188,7 @@ func incompatibility(profile config.ToolchainProfile, constraints Constraints) s
 	if constraints.PackageManagerVersion != "" && profile.PackageManagerVersion != constraints.PackageManagerVersion {
 		return "package manager version mismatch"
 	}
-	if constraints.Runtime != "" && !versionMatches(profile.Runtime, constraints.Runtime) {
+	if constraints.Runtime != "" && !ecosystem.VersionMatches(profile.Runtime, constraints.Runtime) {
 		return "runtime constraint " + constraints.Runtime + " is not satisfied"
 	}
 	if !profile.Capabilities.ReadOnlyDiscovery {
@@ -255,78 +204,4 @@ func contains(values []string, wanted string) bool {
 		}
 	}
 	return false
-}
-
-var comparatorPattern = regexp.MustCompile(`(>=|<=|>|<|\^|~|=)?\s*v?([0-9]+(?:\.[0-9]+)?)`)
-
-func versionMatches(version, constraint string) bool {
-	actual, ok := numericVersion(version)
-	if !ok {
-		return false
-	}
-	for _, alternative := range strings.Split(constraint, "||") {
-		matches := comparatorPattern.FindAllStringSubmatch(alternative, -1)
-		if len(matches) == 0 {
-			continue
-		}
-		allowed := true
-		for _, match := range matches {
-			expected, valid := numericVersion(match[2])
-			if !valid || !compareVersion(actual, expected, match[1]) {
-				allowed = false
-				break
-			}
-		}
-		if allowed {
-			return true
-		}
-	}
-	return false
-}
-
-func numericVersion(value string) ([2]int, bool) {
-	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(value), "v"), ".")
-	if len(parts) == 0 || len(parts) > 2 {
-		return [2]int{}, false
-	}
-	var result [2]int
-	for index, part := range parts {
-		n, err := strconv.Atoi(part)
-		if err != nil {
-			return [2]int{}, false
-		}
-		result[index] = n
-	}
-	return result, true
-}
-
-func compareVersion(actual, expected [2]int, operator string) bool {
-	cmp := 0
-	if actual[0] != expected[0] {
-		if actual[0] < expected[0] {
-			cmp = -1
-		} else {
-			cmp = 1
-		}
-	} else if actual[1] != expected[1] {
-		if actual[1] < expected[1] {
-			cmp = -1
-		} else {
-			cmp = 1
-		}
-	}
-	switch operator {
-	case ">=":
-		return cmp >= 0
-	case "<=":
-		return cmp <= 0
-	case ">":
-		return cmp > 0
-	case "<":
-		return cmp < 0
-	case "^", "~", "", "=":
-		return actual[0] == expected[0] && (strings.Contains(operator, "~") || expected[1] == 0 || actual[1] == expected[1])
-	default:
-		return false
-	}
 }

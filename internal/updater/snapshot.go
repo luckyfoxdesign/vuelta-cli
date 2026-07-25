@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,11 +9,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
@@ -86,6 +85,10 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 	if err != nil {
 		return nil, err
 	}
+	adapter, scannerProvider, err := candidateScannerProvider(ws)
+	if err != nil && ws.PackageManager != "" {
+		return nil, err
+	}
 	if ws.PackageManager != "" && options.ToolchainProfile != nil {
 		scanner, err := profilePackageScanner(*options.ToolchainProfile, cfg, ws, packageContract, options)
 		if err != nil {
@@ -104,57 +107,33 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 		scanners = append(scanners, scanner)
 	} else {
 		run := NewReadOnlyDockerRunner(cfg.Update.Egress)
-		switch ws.Stack + "/" + ws.PackageManager {
-		case "python/poetry":
-			image, err := requireImage(cfg, "python-poetry")
+		if ws.PackageManager != "" {
+			request := ecosystem.ScannerRequest{MinReleaseAgeDays: cfg.Update.MinReleaseAgeDays}
+			policy := adapter.(ecosystem.ProfilePolicyProvider).ProfilePolicy()
+			request.ProfileScanner = policy.ExpectedScanner
+			preview, err := scannerProvider.Scanner(request)
 			if err != nil {
 				return nil, err
 			}
-			scanners = append(scanners, packageScanner{Kind: "poetry", Image: image, Args: []string{"poetry", "show", "--outdated", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "python/uv":
-			image, err := requireImage(cfg, "python-uv")
+			if preview.LegacyToolKey != "" {
+				request.ScannerVersion, err = requireTool(cfg, preview.LegacyToolKey)
+				if err != nil {
+					return nil, err
+				}
+			}
+			spec, err := scannerProvider.Scanner(request)
 			if err != nil {
 				return nil, err
 			}
-			scanners = append(scanners, packageScanner{Kind: "uv", Image: image, Args: []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "python/pip-tools":
-			image, err := requireImage(cfg, "python-pip-tools")
+			image, err := requireImage(cfg, spec.LegacyImageKey)
 			if err != nil {
 				return nil, err
 			}
-			scanners = append(scanners, packageScanner{Kind: "pip-tools", Image: image, Args: []string{"vuelta-pip-tools-scan"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "python/requirements":
-			image, err := requireImage(cfg, "python-pip-tools")
-			if err != nil {
-				return nil, err
-			}
-			scanners = append(scanners, packageScanner{Kind: "requirements", Image: image, Args: []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "node/npm", "node/bun":
-			key := "node"
-			launcher := "npx"
-			if ws.PackageManager == "bun" {
-				key, launcher = "bun", "bunx"
-			}
-			image, err := requireImage(cfg, key)
-			if err != nil {
-				return nil, err
-			}
-			version, err := requireTool(cfg, "npm_check_updates")
-			if err != nil {
-				return nil, err
-			}
-			args := []string{launcher, "npm-check-updates@" + version, "--jsonUpgraded", "--removeRange", "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays * 24)}
-			scanners = append(scanners, packageScanner{Kind: ws.PackageManager, Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "node/pnpm":
-			image, err := requireImage(cfg, "node")
-			if err != nil {
-				return nil, err
-			}
-			args := []string{"pnpm", "outdated", "--format", "json", "--config.minimumReleaseAge=" + strconv.Itoa(cfg.Update.MinReleaseAgeDays)}
-			scanners = append(scanners, packageScanner{Kind: "pnpm", Image: image, Args: args, Run: run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked})
-		case "docker/":
-		default:
-			return nil, fmt.Errorf("no snapshot scanner for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
+			scanners = append(scanners, packageScanner{
+				Kind: spec.Kind, Image: image, Args: spec.Args, AcceptedExitCodes: spec.AcceptedExitCodes,
+				Decode: adapter.(ecosystem.CandidateDecoder),
+				Run:    run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
+			})
 		}
 	}
 	if ws.DockerImages != nil {
@@ -180,45 +159,48 @@ func ResolveToolchainProfile(ws config.Workspace, cfg config.Config) (*config.To
 }
 
 func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, ws config.Workspace, contract scaninput.Contract, options CandidateScannerOptions) (packageScanner, error) {
-	if expected := map[string]string{"npm": "ncu", "pnpm": "pnpm", "bun": "ncu", "poetry": "poetry", "uv": "uv", "pip-tools": "vuelta-pip-tools-scan", "requirements": "vuelta-pip-tools-scan"}[ws.PackageManager]; profile.Scanner != expected {
-		return packageScanner{}, fmt.Errorf("toolchain profile %q scanner %q is incompatible with %s", profile.ID, profile.Scanner, ws.PackageManager)
+	adapter, provider, err := candidateScannerProvider(ws)
+	if err != nil {
+		return packageScanner{}, err
 	}
-	var args []string
-	switch ws.PackageManager {
-	case "npm", "bun":
-		// Snapshot candidates must contain exact versions. By default ncu
-		// preserves the manifest range (for example "^4.0.3") in JSON output.
-		args = []string{"ncu", "--jsonUpgraded", "--removeRange"}
-		if cfg.Update.MinReleaseAgeDays > 0 {
-			if !profile.Capabilities.ReleaseAge {
-				return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
-			}
-			args = append(args, "--cooldown", strconv.Itoa(cfg.Update.MinReleaseAgeDays*24))
-		}
-	case "pnpm":
-		args = []string{"pnpm", "outdated", "--format", "json"}
-		if cfg.Update.MinReleaseAgeDays > 0 {
-			if !profile.Capabilities.ReleaseAge {
-				return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
-			}
-			args = append(args, "--config.minimumReleaseAge="+strconv.Itoa(cfg.Update.MinReleaseAgeDays*24*60))
-		}
-	case "poetry":
-		args = []string{"poetry", "show", "--outdated", "--format", "json"}
-	case "uv":
-		args = []string{"uv", "tree", "--outdated", "--frozen", "--format", "json"}
-	case "pip-tools":
-		args = []string{"vuelta-pip-tools-scan"}
-	case "requirements":
-		args = []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}
-	default:
-		return packageScanner{}, fmt.Errorf("no profile scanner for package manager %q", ws.PackageManager)
+	if cfg.Update.MinReleaseAgeDays > 0 && !profile.Capabilities.ReleaseAge {
+		return packageScanner{}, fmt.Errorf("toolchain profile %q cannot enforce the configured release-age gate", profile.ID)
+	}
+	spec, err := provider.Scanner(ecosystem.ScannerRequest{
+		ProfileScanner: profile.Scanner, ScannerVersion: profile.ScannerVersion,
+		InstalledTool: true, MinReleaseAgeDays: cfg.Update.MinReleaseAgeDays,
+	})
+	if err != nil {
+		return packageScanner{}, fmt.Errorf("toolchain profile %q: %w", profile.ID, err)
 	}
 	return packageScanner{
-		Kind: ws.PackageManager, Image: profile.Image, Args: args,
-		Run: NewReadOnlyDockerRunnerForProfile(cfg.Update.Egress, profile.User, profile.Platform), Contract: contract,
+		Kind: spec.Kind, Image: profile.Image, Args: spec.Args, AcceptedExitCodes: spec.AcceptedExitCodes,
+		Decode: adapter.(ecosystem.CandidateDecoder),
+		Run:    NewReadOnlyDockerRunnerForProfile(cfg.Update.Egress, profile.User, profile.Platform), Contract: contract,
 		RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
 	}, nil
+}
+
+func candidateScannerProvider(ws config.Workspace) (ecosystem.Adapter, ecosystem.ScannerProvider, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return nil, nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	adapter, err := registry.Lookup(ws.Stack, ws.PackageManager)
+	if err != nil {
+		return nil, nil, err
+	}
+	provider, ok := adapter.(ecosystem.ScannerProvider)
+	if !ok {
+		return nil, nil, &ecosystem.CapabilityError{
+			Key: adapter.Key(), Capability: "candidate-scanner",
+			Reason: adapter.Metadata().UnsupportedReason,
+		}
+	}
+	if _, ok := adapter.(ecosystem.CandidateDecoder); !ok {
+		return nil, nil, &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "candidate-decoder"}
+	}
+	return adapter, provider, nil
 }
 
 type combinedScanner []CandidateScanner
@@ -255,12 +237,14 @@ func (s combinedScanner) ScanReport(ctx context.Context, projectPath string) (Ca
 }
 
 type packageScanner struct {
-	Kind, Image    string
-	Args           []string
-	Run            ReadOnlyDockerRunner
-	Contract       scaninput.Contract
-	RepositoryRoot string
-	RequireTracked bool
+	Kind, Image       string
+	Args              []string
+	AcceptedExitCodes []int
+	Decode            ecosystem.CandidateDecoder
+	Run               ReadOnlyDockerRunner
+	Contract          scaninput.Contract
+	RepositoryRoot    string
+	RequireTracked    bool
 }
 
 func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
@@ -275,20 +259,39 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 	}
 	defer bundle.Destroy()
 	out, err := s.Run(ctx, s.Image, s.Args, bundle)
-	if err != nil && !acceptedDiscoveryExit(s.Kind, err) {
+	if err != nil && !acceptedDiscoveryExit(s.AcceptedExitCodes, err) {
 		return CandidateReport{}, err
 	}
-	report, err := parsePackageReport(s.Kind, []byte(out))
+	decoder := s.Decode
+	if decoder == nil {
+		decoder, err = decoderForKind(s.Kind)
+		if err != nil {
+			return CandidateReport{}, err
+		}
+	}
+	inputs := make(map[string][]byte, len(s.Contract.Files))
+	for _, file := range s.Contract.Files {
+		if content, ok := bundle.Content(file.Path); ok {
+			inputs[file.Path] = content
+		}
+	}
+	decoded, err := decoder.DecodeCandidates([]byte(out), inputs)
 	if err != nil {
 		return CandidateReport{}, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
 	}
-	if s.Kind == "npm" {
-		lock, ok := bundle.Content("package-lock.json")
-		if !ok {
-			return CandidateReport{}, errors.New("npm candidate scan input omitted package-lock.json")
+	report := CandidateReport{
+		Candidates:  make([]updatesnapshot.Candidate, len(decoded.Candidates)),
+		Diagnostics: make([]ScanDiagnostic, len(decoded.Diagnostics)),
+	}
+	for index, candidate := range decoded.Candidates {
+		report.Candidates[index] = updatesnapshot.Candidate{
+			Kind: candidate.Kind, Name: candidate.Name, Current: candidate.Current,
+			Target: candidate.Target, File: candidate.File,
 		}
-		if err := addNPMCurrentVersions(report.Candidates, lock); err != nil {
-			return CandidateReport{}, err
+	}
+	for index, diagnostic := range decoded.Diagnostics {
+		report.Diagnostics[index] = ScanDiagnostic{
+			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code, Message: diagnostic.Message,
 		}
 	}
 	return report, nil
@@ -301,12 +304,17 @@ type exitCoder interface {
 // pnpm outdated deliberately exits 1 when it successfully finds outdated
 // dependencies. The output is still treated as untrusted and must pass the
 // same strict JSON/candidate validation before it can become a plan.
-func acceptedDiscoveryExit(kind string, err error) bool {
-	if kind != "pnpm" {
+func acceptedDiscoveryExit(allowed []int, err error) bool {
+	var exit exitCoder
+	if !errors.As(err, &exit) {
 		return false
 	}
-	var exit exitCoder
-	return errors.As(err, &exit) && exit.ExitCode() == 1
+	for _, code := range allowed {
+		if exit.ExitCode() == code {
+			return true
+		}
+	}
+	return false
 }
 
 // parsePackageCandidates accepts the JSON shapes emitted by Poetry, the
@@ -319,178 +327,75 @@ func parsePackageCandidates(kind string, data []byte) ([]updatesnapshot.Candidat
 }
 
 func parsePackageReport(kind string, data []byte) (CandidateReport, error) {
-	// Some scanner tools write an informational notice (venv creation, a
-	// version-check nag) on the same stream as their JSON output despite a
-	// machine-readable flag being requested. Tolerate surrounding text but
-	// still require one well-formed JSON value, not an arbitrary blob.
-	start := bytes.IndexAny(data, "{[")
-	if start < 0 {
-		return CandidateReport{}, errors.New("scanner output contains no JSON value")
-	}
-	var value any
-	if err := json.NewDecoder(bytes.NewReader(data[start:])).Decode(&value); err != nil {
+	decoder, err := decoderForKind(kind)
+	if err != nil {
 		return CandidateReport{}, err
 	}
-	diagnostics := []ScanDiagnostic{}
-	if kind == "requirements" {
-		root, ok := value.(map[string]any)
-		if !ok {
-			return CandidateReport{}, errors.New("requirements scanner report must be an object")
-		}
-		if err := decodeRequirementsDiagnostics(root["diagnostics"], &diagnostics); err != nil {
-			return CandidateReport{}, err
-		}
-		value = root["candidates"]
-		if value == nil {
-			return CandidateReport{}, errors.New("requirements scanner report has no candidates array")
-		}
+	inputs := make(map[string][]byte)
+	registry, err := catalog.New()
+	if err != nil {
+		return CandidateReport{}, err
 	}
-	var candidates []updatesnapshot.Candidate
-	collectCandidates(kind, value, &candidates)
-	if candidates == nil {
-		candidates = []updatesnapshot.Candidate{}
-	}
-	for _, candidate := range candidates {
-		if !validCandidate(candidate) {
-			return CandidateReport{}, fmt.Errorf("invalid candidate %q", candidate.Name)
+	for _, adapter := range registry.Adapters() {
+		if adapter.Key().PackageManager != kind {
+			continue
 		}
-		if kind == "requirements" && !requirementsNamePattern.MatchString(candidate.Name) {
-			return CandidateReport{}, fmt.Errorf("requirements candidate name %q is not canonical", candidate.Name)
-		}
-	}
-	return CandidateReport{Candidates: candidates, Diagnostics: diagnostics}, nil
-}
-
-var (
-	diagnosticCodePattern   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
-	requirementsNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
-)
-
-func decodeRequirementsDiagnostics(value any, diagnostics *[]ScanDiagnostic) error {
-	items, ok := value.([]any)
-	if !ok {
-		return errors.New("requirements scanner diagnostics must be an array")
-	}
-	if len(items) > 256 {
-		return errors.New("requirements scanner diagnostics exceed 256 records")
-	}
-	for _, item := range items {
-		record, ok := item.(map[string]any)
-		if !ok {
-			return errors.New("requirements scanner diagnostic is malformed")
-		}
-		file, _ := record["file"].(string)
-		code, _ := record["code"].(string)
-		message, _ := record["message"].(string)
-		line, lineOK := record["line"].(float64)
-		if file != "requirements.txt" || !diagnosticCodePattern.MatchString(code) || message == "" || len(message) > 512 || strings.IndexFunc(message, unicode.IsControl) >= 0 || !lineOK || line < 1 || line > 1_000_000 || line != float64(int(line)) {
-			return errors.New("requirements scanner diagnostic is invalid")
-		}
-		*diagnostics = append(*diagnostics, ScanDiagnostic{File: file, Line: int(line), Code: code, Message: message})
-	}
-	return nil
-}
-
-func collectCandidates(kind string, value any, candidates *[]updatesnapshot.Candidate) {
-	// uv tree --format json returns a dependency graph keyed by opaque
-	// "name==version@source" identifiers, not a flat name->record map, so it
-	// needs its own extraction instead of the generic heuristic below.
-	if kind == "uv" {
-		collectUVCandidates(value, candidates)
-		return
-	}
-	switch v := value.(type) {
-	case []any:
-		for _, item := range v {
-			collectCandidates(kind, item, candidates)
-		}
-	case map[string]any:
-		name, _ := v["name"].(string)
-		current, _ := firstString(v, "version", "current", "installed_version")
-		target, _ := firstString(v, "latest", "latest_version", "wanted", "target")
-		if name != "" && target != "" {
-			*candidates = append(*candidates, updatesnapshot.Candidate{Kind: kind, Name: name, Current: current, Target: target})
-			return
-		}
-		for key, item := range v {
-			if target, ok := item.(string); ok {
-				*candidates = append(*candidates, updatesnapshot.Candidate{Kind: kind, Name: key, Target: target})
-				continue
-			}
-			if record, ok := item.(map[string]any); ok {
-				if latest, ok := firstString(record, "latest", "latest_version", "wanted"); ok {
-					current, _ := firstString(record, "current", "version")
-					*candidates = append(*candidates, updatesnapshot.Candidate{Kind: kind, Name: key, Current: current, Target: latest})
+		if provider, ok := adapter.(ecosystem.InputProvider); ok {
+			for _, file := range provider.PackageInput(false).Files {
+				if file.Category == ecosystem.InputCategoryLock {
+					inputs[file.Path] = []byte("{}")
 				}
 			}
 		}
 	}
-}
-
-func collectUVCandidates(value any, candidates *[]updatesnapshot.Candidate) {
-	root, ok := value.(map[string]any)
-	if !ok {
-		return
+	decoded, err := decoder.DecodeCandidates(data, inputs)
+	if err != nil {
+		return CandidateReport{}, err
 	}
-	resolution, ok := root["resolution"].(map[string]any)
-	if !ok {
-		return
+	report := CandidateReport{
+		Candidates:  make([]updatesnapshot.Candidate, len(decoded.Candidates)),
+		Diagnostics: make([]ScanDiagnostic, len(decoded.Diagnostics)),
 	}
-	for _, item := range resolution {
-		record, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := record["name"].(string)
-		latest, hasLatest := firstString(record, "latest_version")
-		if name == "" || !hasLatest {
-			continue
-		}
-		current, _ := firstString(record, "version")
-		*candidates = append(*candidates, updatesnapshot.Candidate{Kind: "uv", Name: name, Current: current, Target: latest})
-	}
-}
-
-func firstString(record map[string]any, keys ...string) (string, bool) {
-	for _, key := range keys {
-		if value, ok := record[key].(string); ok {
-			return value, true
+	for index, candidate := range decoded.Candidates {
+		report.Candidates[index] = updatesnapshot.Candidate{
+			Kind: candidate.Kind, Name: candidate.Name, Current: candidate.Current,
+			Target: candidate.Target, File: candidate.File,
 		}
 	}
-	return "", false
-}
-
-func addNPMCurrentVersions(candidates []updatesnapshot.Candidate, lockData []byte) error {
-	var lock struct {
-		Packages map[string]struct {
-			Version string `json:"version"`
-		} `json:"packages"`
-		Dependencies map[string]struct {
-			Version string `json:"version"`
-		} `json:"dependencies"`
-	}
-	if err := json.Unmarshal(lockData, &lock); err != nil {
-		return fmt.Errorf("parse package-lock.json for current candidate versions: %w", err)
-	}
-	for index := range candidates {
-		if candidates[index].Current != "" {
-			continue
-		}
-		current := lock.Packages["node_modules/"+candidates[index].Name].Version
-		if current == "" {
-			current = lock.Dependencies[candidates[index].Name].Version
-		}
-		if current != "" && candidatePartPattern.MatchString(current) {
-			candidates[index].Current = current
+	for index, diagnostic := range decoded.Diagnostics {
+		report.Diagnostics[index] = ScanDiagnostic{
+			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code, Message: diagnostic.Message,
 		}
 	}
-	return nil
+	return report, nil
 }
 
 var candidatePartPattern = regexp.MustCompile(`^[A-Za-z0-9@._+!/-]+$`)
 
 func validCandidate(candidate updatesnapshot.Candidate) bool {
 	return candidatePartPattern.MatchString(candidate.Name) && candidatePartPattern.MatchString(candidate.Target) && (candidate.Current == "" || candidatePartPattern.MatchString(candidate.Current))
+}
+
+func decoderForKind(kind string) (ecosystem.CandidateDecoder, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	var decoder ecosystem.CandidateDecoder
+	for _, adapter := range registry.Adapters() {
+		if adapter.Key().PackageManager != kind {
+			continue
+		}
+		candidateDecoder, ok := adapter.(ecosystem.CandidateDecoder)
+		if !ok || decoder != nil {
+			return nil, fmt.Errorf("candidate decoder %q is unavailable or ambiguous", kind)
+		}
+		decoder = candidateDecoder
+	}
+	if decoder == nil {
+		return nil, fmt.Errorf("candidate decoder %q is unavailable or ambiguous", kind)
+	}
+	return decoder, nil
 }
 
 type dockerCandidateScanner struct {
@@ -611,117 +516,168 @@ func (u PlannedUpdater) apply(ctx context.Context, projectPath string) (bool, er
 	if runner == nil {
 		runner = NewDockerRunnerForProfile(u.Config.Update.Egress, user, platform)
 	}
-	image, err := plannedImage(u.Workspace, u.Config, profile)
-	if err != nil {
-		return false, err
-	}
-	before, err := plannedLockDigest(u.Workspace, projectPath)
-	if err != nil {
-		return false, err
-	}
 	packageCandidates := nonDockerCandidates(u.Candidates)
-	if u.Workspace.PackageManager == "pip-tools" && len(packageCandidates) > 0 {
-		for _, candidate := range packageCandidates {
+	spec, err := resolvePlannedMutationSpec(u.Workspace, u.Config, profile, packageCandidates, u.AllowScripts)
+	if err != nil {
+		return false, err
+	}
+	image := ""
+	if profile != nil {
+		image = profile.Image
+	} else {
+		image, err = requireImage(u.Config, spec.LegacyImageKey)
+		if err != nil {
+			return false, err
+		}
+	}
+	if err := validatePlannedMutationSpec(spec, packageCandidates); err != nil {
+		return false, err
+	}
+	before, err := lockDigest(projectPath, spec.LockFile)
+	if err != nil {
+		return false, err
+	}
+	for _, mutation := range spec.Mutations {
+		candidate := updatesnapshot.Candidate{
+			Kind: mutation.Candidate.Kind, Name: mutation.Candidate.Name,
+			Current: mutation.Candidate.Current, Target: mutation.Candidate.Target, File: mutation.Candidate.File,
+		}
+		switch mutation.Rewrite {
+		case "":
+		case "python-requirement-exact-pin":
 			if err := rewritePipToolsPin(projectPath, candidate); err != nil {
 				return false, err
 			}
+		default:
+			return false, fmt.Errorf("adapter returned unsupported manifest rewrite %q", mutation.Rewrite)
 		}
-		if _, err := runner(ctx, image, []string{"pip-compile", "requirements.in"}, projectPath); err != nil {
-			return false, err
-		}
-	} else {
-		for _, candidate := range packageCandidates {
-			args, err := plannedArgs(u.Workspace.PackageManager, candidate, u.Config, profile, u.AllowScripts)
-			if err != nil {
-				return false, err
-			}
+		for _, args := range mutation.Commands {
 			if _, err := runner(ctx, image, args, projectPath); err != nil {
 				return false, err
 			}
 		}
 	}
-	if u.Workspace.PackageManager == "npm" {
-		args := []string{"npm", "install", "--no-audit", "--no-fund"}
-		if !u.AllowScripts {
-			args = append(args, "--ignore-scripts")
-		}
-		_, err = runner(ctx, image, args, projectPath)
-		if err == nil {
-			err = validateNPMCandidateTargets(projectPath, packageCandidates)
+	for _, args := range spec.FinalCommands {
+		if _, err := runner(ctx, image, args, projectPath); err != nil {
+			return false, err
 		}
 	}
-	if u.Workspace.PackageManager == "bun" {
-		args := []string{"bun", "install", "--lockfile-only"}
-		if !u.AllowScripts {
-			args = append(args, "--ignore-scripts")
+	switch spec.Validation {
+	case "":
+	case "npm-exact-targets":
+		if err := validateNPMCandidateTargets(projectPath, packageCandidates); err != nil {
+			return false, err
 		}
-		_, err = runner(ctx, image, args, projectPath)
+	default:
+		return false, fmt.Errorf("adapter returned unsupported mutation validation %q", spec.Validation)
 	}
-	if err != nil {
-		return false, err
-	}
-	after, err := plannedLockDigest(u.Workspace, projectPath)
+	after, err := lockDigest(projectPath, spec.LockFile)
 	if err != nil {
 		return false, err
 	}
 	return changed || before != after, nil
 }
 
-func plannedArgs(manager string, candidate updatesnapshot.Candidate, cfg config.Config, profile *config.ToolchainProfile, allowScripts bool) ([]string, error) {
-	if !validCandidate(candidate) {
-		return nil, errors.New("invalid snapshot candidate")
+func resolvePlannedMutationSpec(
+	workspace config.Workspace,
+	cfg config.Config,
+	profile *config.ToolchainProfile,
+	candidates []updatesnapshot.Candidate,
+	allowScripts bool,
+) (ecosystem.PlannedMutationSpec, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return ecosystem.PlannedMutationSpec{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
 	}
-	switch manager {
-	case "poetry":
-		// poetry update respects an existing exact pin in pyproject.toml and
-		// silently no-ops instead of moving past it; poetry add rewrites the
-		// pin itself, matching how the other managers' updaters behave.
-		return []string{"poetry", "add", candidate.Name + "==" + candidate.Target}, nil
-	case "uv":
-		// uv lock --upgrade-package only nudges resolution and fails closed
-		// ("unsatisfiable") against an existing exact pin; uv add rewrites the
-		// pin itself. --no-sync keeps this to a manifest/lock change instead
-		// of installing into a project-local .venv inside the sandbox.
-		return []string{"uv", "add", candidate.Name + "==" + candidate.Target, "--no-sync"}, nil
-	case "pip-tools":
-		return nil, errors.New("pip-tools updates require manifest pin rewriting before pip-compile")
-	case "npm":
-		if profile != nil {
-			return plannedNCUArgs("ncu", candidate.Name, cfg.Update.MinReleaseAgeDays), nil
-		}
-		version, err := requireTool(cfg, "npm_check_updates")
-		if err != nil {
-			return nil, err
-		}
-		return plannedNCUArgs("npx", candidate.Name, cfg.Update.MinReleaseAgeDays, "npm-check-updates@"+version), nil
-	case "pnpm":
-		args := []string{"pnpm", "update", "--lockfile-only"}
-		if !allowScripts {
-			args = append(args, "--ignore-scripts")
-		}
-		return append(args, candidate.Name+"@"+candidate.Target), nil
-	case "bun":
-		if profile != nil {
-			return []string{"ncu", "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
-		}
-		version, err := requireTool(cfg, "npm_check_updates")
-		if err != nil {
-			return nil, err
-		}
-		return []string{"bunx", "npm-check-updates@" + version, "--filter", candidate.Name + "@" + candidate.Target, "-u"}, nil
-	default:
-		return nil, fmt.Errorf("no planned update command for %q", manager)
+	adapter, err := registry.Lookup(workspace.Stack, workspace.PackageManager)
+	if err != nil {
+		return ecosystem.PlannedMutationSpec{}, err
 	}
+	provider, ok := adapter.(ecosystem.PlannedMutationProvider)
+	if !ok {
+		return ecosystem.PlannedMutationSpec{}, &ecosystem.CapabilityError{
+			Key: adapter.Key(), Capability: "planned-mutation",
+			ScanOnly: adapter.Metadata().UnsupportedReason == "", Reason: adapter.Metadata().UnsupportedReason,
+		}
+	}
+	request := ecosystem.PlannedMutationRequest{
+		Candidates:   make([]ecosystem.Candidate, len(candidates)),
+		AllowScripts: allowScripts, MinReleaseAgeDays: cfg.Update.MinReleaseAgeDays,
+	}
+	for index, candidate := range candidates {
+		if !validCandidate(candidate) {
+			return ecosystem.PlannedMutationSpec{}, errors.New("invalid snapshot candidate")
+		}
+		request.Candidates[index] = ecosystem.Candidate{
+			Kind: candidate.Kind, Name: candidate.Name, Current: candidate.Current,
+			Target: candidate.Target, File: candidate.File,
+		}
+	}
+	if profile != nil {
+		request.ProfileScanner = profile.Scanner
+		request.ScannerVersion = profile.ScannerVersion
+		request.InstalledTool = true
+	} else if policy, ok := adapter.(ecosystem.ProfilePolicyProvider); ok {
+		request.ProfileScanner = policy.ProfilePolicy().ExpectedScanner
+	}
+	spec, err := provider.PlannedMutation(request)
+	if err != nil {
+		return ecosystem.PlannedMutationSpec{}, err
+	}
+	if profile == nil && spec.LegacyToolKey != "" {
+		request.ScannerVersion, err = requireTool(cfg, spec.LegacyToolKey)
+		if err != nil {
+			return ecosystem.PlannedMutationSpec{}, err
+		}
+		spec, err = provider.PlannedMutation(request)
+	}
+	return spec, err
 }
 
-func plannedNCUArgs(launcher, name string, minReleaseAgeDays int, prefix ...string) []string {
-	args := []string{launcher}
-	args = append(args, prefix...)
-	args = append(args, "--filter", name)
-	if minReleaseAgeDays > 0 {
-		args = append(args, "--cooldown", strconv.Itoa(minReleaseAgeDays*24))
+func validatePlannedMutationSpec(spec ecosystem.PlannedMutationSpec, candidates []updatesnapshot.Candidate) error {
+	if spec.LockFile == "" || filepath.Base(spec.LockFile) != spec.LockFile || strings.ContainsAny(spec.LockFile, `/\`+"\x00") {
+		return fmt.Errorf("adapter returned invalid mutation lock file %q", spec.LockFile)
 	}
-	return append(args, "-u")
+	if len(spec.Mutations) != len(candidates) {
+		return errors.New("adapter mutation plan does not bind every candidate exactly once")
+	}
+	expected := make(map[string]int, len(candidates))
+	for _, candidate := range candidates {
+		expected[candidateKey(candidate)]++
+	}
+	for _, mutation := range spec.Mutations {
+		candidate := updatesnapshot.Candidate{
+			Kind: mutation.Candidate.Kind, Name: mutation.Candidate.Name,
+			Current: mutation.Candidate.Current, Target: mutation.Candidate.Target, File: mutation.Candidate.File,
+		}
+		key := candidateKey(candidate)
+		if expected[key] == 0 {
+			return errors.New("adapter mutation plan introduced an unreviewed candidate")
+		}
+		expected[key]--
+		if err := validateAdapterCommands(mutation.Commands); err != nil {
+			return err
+		}
+	}
+	return validateAdapterCommands(spec.FinalCommands)
+}
+
+func validateAdapterCommands(commands [][]string) error {
+	for commandIndex, command := range commands {
+		if len(command) == 0 {
+			return fmt.Errorf("adapter mutation command %d is empty", commandIndex)
+		}
+		for argumentIndex, argument := range command {
+			if argument == "" || strings.ContainsRune(argument, '\x00') {
+				return fmt.Errorf("adapter mutation command %d argument %d is invalid", commandIndex, argumentIndex)
+			}
+		}
+	}
+	return nil
+}
+
+func candidateKey(candidate updatesnapshot.Candidate) string {
+	return candidate.Kind + "\x00" + candidate.Name + "\x00" + candidate.Current + "\x00" + candidate.Target + "\x00" + candidate.File
 }
 
 func validateNPMCandidateTargets(root string, candidates []updatesnapshot.Candidate) error {
@@ -768,30 +724,6 @@ func npmSpecTargets(spec, target string) bool {
 	}
 	value = strings.TrimPrefix(value, "v")
 	return value == target
-}
-
-func plannedImage(ws config.Workspace, cfg config.Config, profile *config.ToolchainProfile) (string, error) {
-	if profile != nil {
-		return profile.Image, nil
-	}
-	switch ws.PackageManager {
-	case "poetry":
-		return requireImage(cfg, "python-poetry")
-	case "uv":
-		return requireImage(cfg, "python-uv")
-	case "pip-tools":
-		return requireImage(cfg, "python-pip-tools")
-	case "npm", "pnpm":
-		return requireImage(cfg, "node")
-	case "bun":
-		return requireImage(cfg, "bun")
-	}
-	return "", fmt.Errorf("no image for package manager %q", ws.PackageManager)
-}
-
-func plannedLockDigest(ws config.Workspace, projectPath string) (string, error) {
-	file := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock", "pip-tools": "requirements.txt", "npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "bun": "bun.lock"}[ws.PackageManager]
-	return lockDigest(projectPath, file)
 }
 
 func nonDockerCandidates(candidates []updatesnapshot.Candidate) []updatesnapshot.Candidate {

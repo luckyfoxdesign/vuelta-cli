@@ -17,9 +17,12 @@ from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
 from pip._vendor.packaging.version import InvalidVersion, Version
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 MAX_REQUIREMENTS_BYTES = 1 << 20
-MAX_METADATA_BYTES = 1 << 20
+# Popular projects with long release histories (for example matplotlib) can
+# legitimately exceed 1 MiB because PyPI's project endpoint includes every
+# release. Keep the response bounded while allowing common project metadata.
+MAX_METADATA_BYTES = 16 << 20
 MAX_PACKAGES = 256
 MAX_DIAGNOSTICS = 256
 MAX_RECORD_BYTES = 4096

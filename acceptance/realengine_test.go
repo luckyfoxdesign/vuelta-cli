@@ -38,12 +38,15 @@ type matrix struct {
 }
 
 type matrixCase struct {
-	Name              string                  `yaml:"name"`
-	FixtureRoot       string                  `yaml:"fixture_root"`
-	Fixture           string                  `yaml:"fixture"`
-	ScanOnly          bool                    `yaml:"scan_only"`
-	MinReleaseAgeDays int                     `yaml:"min_release_age_days"`
-	Profile           config.ToolchainProfile `yaml:"profile"`
+	Name              string                   `yaml:"name"`
+	FixtureRoot       string                   `yaml:"fixture_root"`
+	Fixture           string                   `yaml:"fixture"`
+	ScanOnly          bool                     `yaml:"scan_only"`
+	MinReleaseAgeDays int                      `yaml:"min_release_age_days"`
+	Stack             string                   `yaml:"stack"`
+	PackageManager    string                   `yaml:"package_manager"`
+	ExpectedProfileID string                   `yaml:"expected_profile_id"`
+	Profile           *config.ToolchainProfile `yaml:"profile"`
 }
 
 type commandEnvelope struct {
@@ -240,7 +243,6 @@ func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 	cfg := configinit.NewConfig()
 	cfg.Docker = dockerConfig
 	configureAcceptanceEgress(cfg)
-	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
 	configPath := filepath.Join(caseRoot, "config.yaml")
 	writeConfig(t, configPath, cfg)
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(caseRoot, "xdg-config"))
@@ -249,10 +251,10 @@ func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 		t.Fatalf("[parsing] scan results = %#v", scan.Results)
 	}
 	result := scan.Results[0]
-	if result.Error != nil || (result.Status != "clean" && result.Status != "findings") {
+	if result.Error != nil || result.Status != config.VerificationScanOnly {
 		t.Fatalf("[scanner] requirements-only scan result = %#v", result)
 	}
-	if result.SnapshotID != "" || !containsAcceptance(result.InputCategories, "dependency-input") || !hasAcceptanceStage(result.Stages, "vulnerability", "succeeded") {
+	if result.SnapshotID != "" || result.PackageUpdates == nil || result.PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" || !containsAcceptance(result.InputCategories, "dependency-input") || !hasAcceptanceStage(result.Stages, "vulnerability", "succeeded") {
 		t.Fatalf("[security] requirements-only scan boundaries = %#v", result)
 	}
 }
@@ -295,6 +297,31 @@ func loadMatrix(t *testing.T, path string) matrix {
 	}
 	if len(result.Cases) == 0 {
 		t.Fatal("[infrastructure] matrix has no cases")
+	}
+	names := make(map[string]struct{}, len(result.Cases))
+	for index, testCase := range result.Cases {
+		if strings.TrimSpace(testCase.Name) == "" || strings.TrimSpace(testCase.Fixture) == "" {
+			t.Fatalf("[infrastructure] matrix case %d must have a name and fixture", index)
+		}
+		if _, exists := names[testCase.Name]; exists {
+			t.Fatalf("[infrastructure] matrix case name %q is duplicated", testCase.Name)
+		}
+		names[testCase.Name] = struct{}{}
+		if testCase.Profile != nil {
+			if testCase.Stack != "" || testCase.PackageManager != "" || testCase.ExpectedProfileID != "" {
+				t.Fatalf("[infrastructure] matrix case %q mixes an override profile with adaptive fields", testCase.Name)
+			}
+			continue
+		}
+		if testCase.Stack == "" || testCase.PackageManager == "" || testCase.ExpectedProfileID == "" {
+			t.Fatalf("[infrastructure] adaptive matrix case %q must set stack, package_manager, and expected_profile_id", testCase.Name)
+		}
+		if err := toolchain.ValidateManagerSupport(testCase.Stack, testCase.PackageManager); err != nil {
+			t.Fatalf("[infrastructure] adaptive matrix case %q: %v", testCase.Name, err)
+		}
+		if testCase.PackageManager == "requirements" && !testCase.ScanOnly {
+			t.Fatalf("[infrastructure] requirements matrix case %q must be scan_only", testCase.Name)
+		}
 	}
 	return result
 }
@@ -388,9 +415,6 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 	if err := testfixture.SetupProject(ctx, fixtureRoot, testCase.Fixture, project); err != nil {
 		t.Fatalf("[infrastructure] prepare fixture: %v", err)
 	}
-	if !testCase.ScanOnly {
-		writeVerificationFixture(t, ctx, project, testCase.Profile)
-	}
 	attachFixtureRemote(t, ctx, caseRoot, project)
 	sentinelName := "credentials.acceptance-sentinel"
 	if err := os.WriteFile(filepath.Join(project, ".git", "info", "exclude"), []byte(sentinelName+"\n"), 0o600); err != nil {
@@ -414,14 +438,18 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 	cfg.Docker = dockerConfig
 	configureAcceptanceEgress(cfg)
 	cfg.Update.MinReleaseAgeDays = testCase.MinReleaseAgeDays
-	cfg.Update.SnapshotStateDir = filepath.Join(caseRoot, "snapshots")
-	cfg.Update.ToolchainProfiles = []config.ToolchainProfile{testCase.Profile}
-	cfg.Workspaces = []config.Workspace{workspaceForCase(testCase.Name, project, testCase.Profile)}
+	platform := "linux/" + dockerConfig.Developer.ExpectedDaemon.Architecture
+	cfg.Workspaces = []config.Workspace{workspaceForCase(testCase, project, platform)}
+	if testCase.Profile != nil {
+		cfg.Update.ToolchainProfiles = []config.ToolchainProfile{*testCase.Profile}
+	}
 	configPath := filepath.Join(caseRoot, "config.yaml")
 	writeConfig(t, configPath, cfg)
 
 	runJSON(t, ctx, env, "compatibility", binary, "config", "validate", "--json", configPath)
 	scan := runJSON(t, ctx, env, "scanner", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
+	assertSelectedToolchain(t, scan, testCase, platform)
+	commitProjectOnboarding(t, ctx, project)
 	if testCase.ScanOnly {
 		if len(scan.Results) != 1 || scan.Results[0].Status != config.VerificationScanOnly || scan.Results[0].SnapshotID != "" || len(scan.Results[0].Candidates) == 0 {
 			t.Fatalf("[scanner] requirements scan did not return scan-only candidates without a snapshot")
@@ -429,12 +457,17 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 		if scan.Results[0].Candidates[0].Kind != "requirements" || scan.Results[0].PackageUpdates == nil || scan.Results[0].PackageUpdates.Reason != "manifest_has_no_safe_mutation_contract" {
 			t.Fatalf("[parsing] requirements scan omitted the machine-readable mutation contract")
 		}
-		if scan.Results[0].Toolchain == nil || scan.Results[0].Toolchain.ProfileID != testCase.Profile.ID {
-			t.Fatalf("[parsing] scan output omitted selected profile identity")
-		}
 		assertClean(t, ctx, project, "after scan-only requirements scan")
 		return
 	}
+	if len(scan.Results) != 1 || scan.Results[0].Status != config.VerificationScanOnly || scan.Results[0].SnapshotID != "" || len(scan.Results[0].Candidates) == 0 {
+		t.Fatalf("[scanner] scanner-image preparation scan did not return candidates without a snapshot")
+	}
+	writeProjectVerificationPolicy(t, project, readyVerification())
+	writeVerificationFixture(t, ctx, project, cfg.VulnScan.Image, platform)
+	runJSON(t, ctx, env, "compatibility", binary, "config", "validate", "--json", configPath)
+	scan = runJSON(t, ctx, env, "scanner", binary, "scan", "--project", testCase.Name, "--only", "packages", "--json", configPath)
+	assertSelectedToolchain(t, scan, testCase, platform)
 	if len(scan.Results) != 1 || scan.Results[0].Status != "ready" || scan.Results[0].SnapshotID == "" {
 		message := "scan did not create a ready snapshot"
 		if len(scan.Results) == 1 && scan.Results[0].Error != nil {
@@ -442,15 +475,16 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 		}
 		t.Fatalf("[scanner] %s", message)
 	}
-	if scan.Results[0].Toolchain == nil || scan.Results[0].Toolchain.ProfileID != testCase.Profile.ID {
-		t.Fatalf("[parsing] scan output omitted selected profile identity")
-	}
 
-	snapshot, err := (updatesnapshot.Store{Dir: cfg.Update.SnapshotStateDir}).Load(scan.Results[0].SnapshotID)
+	store, err := updatesnapshot.ProjectStore(project)
+	if err != nil {
+		t.Fatalf("[parsing] project snapshot store: %v", err)
+	}
+	snapshot, err := store.Load(scan.Results[0].SnapshotID)
 	if err != nil {
 		t.Fatalf("[parsing] load snapshot: %v", err)
 	}
-	if snapshot.Toolchain.ProfileID != testCase.Profile.ID || snapshot.Toolchain.Image != testCase.Profile.Image {
+	if snapshot.Toolchain.ProfileID != scan.Results[0].Toolchain.ProfileID || snapshot.Toolchain.Image != scan.Results[0].Toolchain.Image {
 		t.Fatalf("[parsing] snapshot toolchain identity does not match the selected profile")
 	}
 	encoded, _ := json.Marshal(snapshot)
@@ -458,37 +492,63 @@ func runCase(t *testing.T, binary, sharedRoot string, dockerConfig *config.Docke
 		t.Fatalf("[security] secret-like sentinel entered snapshot identity")
 	}
 
-	drifted := *cfg
-	drifted.Update = cfg.Update
-	drifted.Update.ToolchainProfiles = append([]config.ToolchainProfile(nil), cfg.Update.ToolchainProfiles...)
-	drifted.Update.ToolchainProfiles[0].Capabilities.ProjectConfig = !drifted.Update.ToolchainProfiles[0].Capabilities.ProjectConfig
-	writeConfig(t, configPath, &drifted)
-	runJSONFailure(t, ctx, env, "compatibility", "snapshot", binary, "--config", configPath, "update", "--dry-run", "--yes", "--json", "--", scan.Results[0].SnapshotID)
-	writeConfig(t, configPath, cfg)
-	runJSON(t, ctx, env, "compatibility", binary, "--config", configPath, "update", "--dry-run", "--yes", "--json", "--", scan.Results[0].SnapshotID)
+	if testCase.Profile != nil {
+		drifted := *cfg
+		drifted.Update = cfg.Update
+		drifted.Update.ToolchainProfiles = append([]config.ToolchainProfile(nil), cfg.Update.ToolchainProfiles...)
+		drifted.Update.ToolchainProfiles[0].Capabilities.ProjectConfig = !drifted.Update.ToolchainProfiles[0].Capabilities.ProjectConfig
+		writeConfig(t, configPath, &drifted)
+		runJSONFailure(t, ctx, env, "compatibility", "snapshot", binary, "--config", configPath, "update", "--directory", project, "--snapshot", scan.Results[0].SnapshotID, "--dry-run", "--yes", "--json")
+		writeConfig(t, configPath, cfg)
+		runJSON(t, ctx, env, "compatibility", binary, "--config", configPath, "update", "--directory", project, "--snapshot", scan.Results[0].SnapshotID, "--dry-run", "--yes", "--json")
+	}
 	assertClean(t, ctx, project, "after update --dry-run")
 }
 
-func workspaceForCase(name, project string, profile config.ToolchainProfile) config.Workspace {
+func assertSelectedToolchain(t *testing.T, scan commandEnvelope, testCase matrixCase, platform string) {
+	t.Helper()
+	if len(scan.Results) != 1 || scan.Results[0].Toolchain == nil {
+		t.Fatalf("[parsing] scan output omitted selected profile identity")
+	}
+	identity := scan.Results[0].Toolchain
+	expectedID := testCase.ExpectedProfileID
+	expectedSource := toolchain.SourceDefault
+	if testCase.Profile != nil {
+		expectedID = testCase.Profile.ID
+		expectedSource = toolchain.SourceOverride
+	}
+	if identity.ProfileID != expectedID || identity.Source != expectedSource || identity.Platform != platform {
+		t.Fatalf("[compatibility] selected toolchain = %#v, want profile=%q source=%q platform=%q", identity, expectedID, expectedSource, platform)
+	}
+	if expectedSource == toolchain.SourceDefault && (identity.Image != identity.ImageID || !strings.HasPrefix(identity.ImageID, "sha256:")) {
+		t.Fatalf("[security] adaptive profile did not use a content-addressed local image ID")
+	}
+}
+
+func workspaceForCase(testCase matrixCase, project, platform string) config.Workspace {
 	managerFiles := map[string][]string{
 		"npm": {"package.json", "package-lock.json"}, "pnpm": {"package.json", "pnpm-lock.yaml"},
 		"bun": {"package.json", "bun.lock"}, "poetry": {"pyproject.toml", "poetry.lock"},
 		"uv": {"pyproject.toml", "uv.lock"}, "pip-tools": {"requirements.in", "requirements.txt"},
 		"requirements": {"requirements.txt"},
 	}
-	verification := config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
-		Name: "profile-version", ComposeFile: "compose.vuelta-acceptance.yml", Service: "verify",
-		Command: []string{profile.Scanner, "--version"}, TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
-	}}}
-	if profile.PackageManager == "requirements" {
-		verification = config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}
+	stack, manager, profileID := testCase.Stack, testCase.PackageManager, ""
+	if testCase.Profile != nil {
+		stack, manager, profileID = testCase.Profile.Stack, testCase.Profile.PackageManager, testCase.Profile.ID
 	}
 	return config.Workspace{
-		Name: name, Path: project, Stack: profile.Stack, PackageManager: profile.PackageManager,
-		ToolchainProfile: profile.ID, Platform: profile.Platform, Branch: "main", Remote: "origin",
-		AllowedChangedPaths: managerFiles[profile.PackageManager],
-		Verification:        verification,
+		Name: testCase.Name, Path: project, Stack: stack, PackageManager: manager,
+		ToolchainProfile: profileID, Platform: platform, Branch: "main", Remote: "origin",
+		AllowedChangedPaths: managerFiles[manager],
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
 	}
+}
+
+func readyVerification() config.VerificationProfile {
+	return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
+		Name: "profile-version", ComposeFile: "compose.vuelta-acceptance.yml", Service: "verify",
+		Command: []string{"trivy", "--version"}, TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+	}}}
 }
 
 func configureAcceptanceEgress(cfg *config.Config) {
@@ -498,19 +558,47 @@ func configureAcceptanceEgress(cfg *config.Config) {
 	}
 }
 
-func writeVerificationFixture(t *testing.T, ctx context.Context, project string, profile config.ToolchainProfile) {
+func writeVerificationFixture(t *testing.T, ctx context.Context, project, image, platform string) {
 	t.Helper()
-	contents := fmt.Sprintf("services:\n  verify:\n    image: %q\n    platform: %s\n    user: %q\n    read_only: true\n    cap_drop: [\"ALL\"]\n    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n    mem_limit: 256m\n    pids_limit: 64\n    networks: [testnet]\n    command: [%q, \"--version\"]\nnetworks:\n  testnet:\n    internal: true\n", profile.Image, profile.Platform, profile.User, profile.Scanner)
+	contents := fmt.Sprintf("services:\n  verify:\n    image: %q\n    platform: %s\n    user: %q\n    read_only: true\n    cap_drop: [\"ALL\"]\n    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n    mem_limit: 256m\n    pids_limit: 64\n    networks: [testnet]\n    command: [\"trivy\", \"--version\"]\nnetworks:\n  testnet:\n    internal: true\n", image, platform, "65532:65532")
 	path := filepath.Join(project, "compose.vuelta-acceptance.yml")
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("[infrastructure] write verification fixture: %v", err)
 	}
-	for _, args := range [][]string{{"add", "compose.vuelta-acceptance.yml"}, {"commit", "-q", "-m", "fixture: real-engine verification"}} {
+	for _, args := range [][]string{{"add", "compose.vuelta-acceptance.yml", ".vuelta.yaml"}, {"commit", "-q", "-m", "fixture: real-engine verification"}} {
 		command := exec.CommandContext(ctx, "git", args...)
 		command.Dir = project
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("[infrastructure] git fixture update: %v: %s", err, output)
 		}
+	}
+}
+
+func commitProjectOnboarding(t *testing.T, ctx context.Context, project string) {
+	t.Helper()
+	for _, args := range [][]string{{"add", ".gitignore", ".vuelta.yaml"}, {"commit", "-q", "-m", "fixture: accept vuelta onboarding"}} {
+		command := exec.CommandContext(ctx, "git", args...)
+		command.Dir = project
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("[infrastructure] commit Vuelta onboarding: %v: %s", err, output)
+		}
+	}
+}
+
+func writeProjectVerificationPolicy(t *testing.T, project string, verification config.VerificationProfile) {
+	t.Helper()
+	path := filepath.Join(project, ".vuelta.yaml")
+	projectConfig, err := config.LoadProject(path)
+	if err != nil {
+		t.Fatalf("[parsing] load project policy: %v", err)
+	}
+	projectConfig.Workspace.Verification = verification
+	data, err := yaml.Marshal(projectConfig)
+	if err != nil {
+		t.Fatalf("[parsing] encode project policy: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("[infrastructure] update project policy: %v", err)
 	}
 }
 

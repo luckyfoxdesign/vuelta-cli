@@ -24,7 +24,7 @@ through the mandatory egress proxy and never invokes pip, follows includes,
 or installs project dependencies. Exact pins survive alongside bounded
 per-line diagnostics for ranges, URLs, editable installs, hashes, includes,
 malformed records, and ambiguous duplicate pins. Pass
-`SCANNER_VERSION=1.1.0` when building that image; the Docker build runs the
+`SCANNER_VERSION=1.1.1` when building that image; the Docker build runs the
 helper's hermetic parser and response tests and verifies the version.
 
 `node/bun` is intentionally not a supported profile. `npm-check-updates`
@@ -37,11 +37,14 @@ must declare `10001:10001`, except `bun-ncu`, which uses the base image's known
 `1000:1000` Bun user. Vuelta still runs the final container with a read-only
 root filesystem, `cap_drop=ALL`, `no-new-privileges`, and a `noexec` tmpfs.
 
-The embedded default table and exact tool versions live in
-`internal/toolchain/defaults.go`. `update.toolchain_profiles` is not a catalog;
-it is an optional full, digest-pinned operator override for exceptional
-environments. Vuelta never pushes locally built defaults and the isolated
-Docker boundary does not read registry credentials.
+The embedded toolchain specifications and exact tool versions live with their
+pair-specific implementations in `internal/ecosystems/`; the explicit
+registration order lives in `internal/ecosystems/catalog`. Core
+`internal/toolchain` validates and builds those data-only specifications.
+`update.toolchain_profiles` is not a catalog; it is an optional full,
+digest-pinned operator override for exceptional environments. Vuelta never
+pushes locally built defaults and the isolated Docker boundary does not read
+registry credentials.
 
 ## Controlled refresh
 
@@ -54,11 +57,17 @@ Refreshing a scanner is a reviewed source change, not a background download:
    pinned Trivy image against each locally built image ID when performing the
    review; do not make this network/database-dependent audit part of live
    `scan`.
-3. Update only exact versions in `internal/toolchain/defaults.go` and the
-   matching build arguments. The build contract and embedded inputs change
-   the cache key; `docker build --pull` refreshes the reviewed base tag.
+3. Update only exact versions in the matching adapter under
+   `internal/ecosystems/` and its build arguments. The build contract and
+   embedded inputs change the cache key; `docker build --pull` refreshes the
+   reviewed base tag.
 4. Run the Docker test, race, and lint services plus the real-engine matrix
    for npm, pnpm, Poetry, and uv. That matrix is the registry/network command
    smoke test; the pre-cache probe separately proves hardened startup.
 5. Review the diff for provenance, unexpected downloads, credentials, and
    weakened container flags before committing the refresh.
+
+For a new stack/package-manager pair, implement the bounded capabilities and
+contract tests described in
+`../../docs/product/architecture/ecosystem-adapters.md`. Scanner images never own
+Docker execution, egress, mounts, credentials, or host access.

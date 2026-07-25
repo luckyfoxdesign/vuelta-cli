@@ -7,7 +7,7 @@ FROM ${BASE_IMAGE}
 ARG UV_VERSION
 COPY --from=uv /uv /usr/local/bin/uv
 RUN test -n "${UV_VERSION}" \
-    && uv --version | grep -F "uv ${UV_VERSION} " \
+    && uv --version | grep -E "^uv ${UV_VERSION}( |$)" \
     && groupadd --gid 10001 vuelta \
     && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin vuelta
 

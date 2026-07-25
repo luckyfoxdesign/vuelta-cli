@@ -48,6 +48,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
 			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
 			{names: []string{"--all"}, description: "scan every configured project"},
+			{names: []string{"--stack"}, valueName: "STACK", description: "resolve first-run ambiguous stack detection: python, node, or docker"},
 			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},

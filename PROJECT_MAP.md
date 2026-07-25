@@ -18,8 +18,8 @@ app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
-├── internal/            # config, configinit, projectstate, adhoc, scanner, updater,
-│                        # updatesnapshot, vulnscan, toolchain, sandbox, testrunner, scheduler
+├── internal/            # ecosystem adapters, config, scanner, updater, toolchain,
+│                        # projectstate, updatesnapshot, vulnscan, sandbox, scheduler
 ├── acceptance/          # opt-in real Docker engine scan/update matrix
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
@@ -72,6 +72,8 @@ make build                     # both cross-build targets
 - `internal/config/` — strictly loads machine config and the narrow project-owned .vuelta.yaml schema. Project paths resolve relative to their config without granting project policy control over machine authority.  Validation never walks parent directories or discovers projects; the CLI resolver supplies an exact selected root or configured workspace.
 - `internal/configinit/` — creates protected config containers, guards unsafe roots, deterministically detects a selected project's supported files without requiring Git, and applies atomic reviewed edits. It never walks parent directories or reads unallowlisted files.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
+- `internal/ecosystem/` — defines immutable adapter identity, normalized data contracts, typed capability errors, and deterministic registry construction. It owns no command or container execution boundary.
+- `internal/ecosystems/` — contains concrete built-in stack/package-manager adapters, structured candidate decoders, and data-only mutation policies.
 - `internal/egress/` — owns the fail-closed Docker network and registry proxy used by networked scanner stages.
 - `internal/egressproxy/` — implements the embedded registry-allowlisting forward proxy used by Vuelta-managed scanner networks.
 - `internal/gitexec/` — is the single process boundary for production Git commands.  Security invariants:   - the executable is selected only from compiled-in absolute system paths;   - children receive a small explicit environment, never the caller's Git,     askpass, proxy, or executable-selection variables;   - system/global config, hooks, fsmonitor, credential helpers, external     diff, automatic maintenance, signing, and unsafe protocols are disabled;   - callers may run only the reviewed command set and may add only a private     absolute GIT_INDEX_FILE.  Repository data and ordinary non-executable repository configuration remain visible to Git. Callers must still validate remote names, refs, and paths at their own trust boundary before placing them in argv.
@@ -86,13 +88,13 @@ make build                     # both cross-build targets
 - `internal/safeerr/` — builds safe, bounded, redacted diagnostic text and stable failure categories for hardened command boundaries. It only ever operates on output a boundary already captured under its own size limits; it never sees full argv, environment, or unbounded output.
 - `internal/sandbox/` — prepares a one-off, cleaned working copy (no .git, no .env, no untracked files) for running updates and tests in a container. See part F of the spec for the isolation model.
 - `internal/scancontainer/` — runs a scanner against an in-memory input archive. Repository contents are copied into a stopped container through Docker's stdin API; no host path is mounted and no host staging copy is created.
-- `internal/scaninput/` — TODO: describe this package.
+- `internal/scaninput/` — validates and archives only exact files declared by an ecosystem adapter or a core Docker/policy stage. It never discovers files and denies secret-like inputs unless a reviewed adapter config explicitly opts in.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
 - `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update receives one exact target directory and its reviewed snapshot ID.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
 - `internal/toolchain/` — resolves declarative project constraints to an operator override or embedded scan default and builds defaults without executing project code.
-- `internal/updater/` — discovers package candidates in read-only hardened containers and applies validated dependency and Docker image plans inside a sandboxed working copy.
+- `internal/updater/` — executes adapter-provided reviewed scanner and mutation argv inside core-owned hardened containers, then applies validated dependency and Docker image plans inside a sandboxed working copy.
 - `internal/updatesnapshot/` — stores short-lived, project-local read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
 - `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
 <!-- generated:end -->
@@ -103,7 +105,7 @@ make build                     # both cross-build targets
 - One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
 - The top-level `scan` → `update [--directory PATH] [--snapshot ID]` workflow stores format-7 plans under the exact target's `.vuelta/snapshots/`, selects the target before loading state, and validates one displayed plan before environment checks. Registered and adhoc execution is container-only; adhoc updates use a minimal private copy and never run project tests.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
-- One `internal/` package per pipeline stage; `internal/updater` exposes an `Updater` interface with one implementation per stack (python/node/docker).
+- Package ecosystem behavior is selected through one explicit built-in catalog; core orchestration has no manager-name registry tables or switches.
 - `deploy/` contains scheduler examples only; the binary remains a one-shot CLI.
 
 ## Conventions
@@ -117,4 +119,5 @@ make build                     # both cross-build targets
 - Package scanner defaults are embedded and built locally on demand; `update.toolchain_profiles` is only an explicit digest-pinned operator override.
 - Container scans lazily build the embedded egress proxy, verify its exact local image identity, and manage only labeled Vuelta-owned network/container resources; no source checkout or Compose startup is required.
 - `.golangci.yml` targets golangci-lint v2's config schema (`version: "2"`), matching the tag-and-digest-pinned `golangci/golangci-lint:v2.12.2-alpine` image in `compose.yml`; refresh its multi-platform index digest with the controlled process in `README.md`.
+- `configinit.IsTerminal` classifies stdin as interactive whenever it is a character device, which also matches `/dev/null`; unattended invocations without an explicit `--no-input` are misclassified as interactive (no hang, but the wrong error shape). See `../docs/product/architecture/stack-resolution.md`.
 <!-- manual:end -->

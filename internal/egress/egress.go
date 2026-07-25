@@ -188,9 +188,10 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 	}
 	s.containerCreated = created
 	s.ensured = true
-	if s.cfg.Persistent {
-		s.releaseLock()
-	}
+	// Keep the lifecycle lock until Close even for persistent resources.
+	// Scanner containers temporarily attach to the managed network, so another
+	// process must not mistake a concurrent Vuelta scan for a foreign
+	// attachment while revalidating that network.
 	return s.cfg.Network, s.cfg.ProxyURL, nil
 }
 

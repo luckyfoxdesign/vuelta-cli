@@ -112,6 +112,26 @@ class PipToolsScanTest(unittest.TestCase):
             with self.assertRaises(scanner.ScanError):
                 scanner.scan(path)
 
+    def test_accepts_common_registry_metadata_larger_than_one_mibibyte(self):
+        path = self.write_requirements("matplotlib==3.8.0\n")
+        response = FakeResponse(
+            {
+                "info": {"name": "matplotlib", "version": "3.11.1"},
+                "releases": {"padding": "x" * ((1 << 20) + 1)},
+            }
+        )
+        with mock.patch.object(scanner.urllib.request, "urlopen", return_value=response):
+            self.assertEqual(
+                scanner.scan(path),
+                [
+                    {
+                        "name": "matplotlib",
+                        "current": "3.8.0",
+                        "latest_version": "3.11.1",
+                    }
+                ],
+            )
+
     def test_bounds_registry_failures(self):
         path = self.write_requirements("requests==2.31.0\n")
         failures = [

@@ -276,6 +276,33 @@ func TestLifecycleLockSerializesConcurrentInvocations(t *testing.T) {
 	}
 }
 
+func TestPersistentSessionKeepsLifecycleLockUntilClose(t *testing.T) {
+	docker := &lifecycleDocker{
+		networkExists: true, networkAttachments: []string{"vuelta-egress-proxy"},
+		containerExists: true, containerContract: assetContract(), running: true, healthy: true,
+	}
+	cfg := testEgressConfig()
+	cfg.Persistent = true
+	session := NewSession(cfg, docker)
+	if _, _, err := session.Resolve(context.Background()); err != nil {
+		t.Fatalf("persistent resolve: %v", err)
+	}
+	if session.lock == nil {
+		t.Fatal("persistent session released its lifecycle lock before Close")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireLifecycleLock(ctx, cfg.Network); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("concurrent lock error = %v, want deadline", err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("close persistent session: %v", err)
+	}
+	if session.lock != nil {
+		t.Fatal("persistent session retained its lifecycle lock after Close")
+	}
+}
+
 func TestSessionCleanupTargetsOnlyResourcesItCreated(t *testing.T) {
 	docker := &lifecycleDocker{networkExists: true, containerExists: true, running: true, healthy: true}
 	session := &Session{cfg: testEgressConfig(), docker: docker, networkCreated: true, containerCreated: true, ensured: true}

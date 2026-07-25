@@ -11,11 +11,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 )
 
 // Project is one detected root-only manifest/lock-file pair.
 type Project struct {
 	Root        string
+	Stack       string
 	Manager     string
 	Manifest    string
 	Lock        string
@@ -41,25 +45,36 @@ func Detect(path string) (Project, error) {
 		return Project{}, errors.New("adhoc project path must be a directory")
 	}
 
-	type definition struct {
-		manager, manifest, lock string
-		configs                 []string
-	}
-	definitions := []definition{
-		{"npm", "package.json", "package-lock.json", []string{".npmrc"}},
-		{"pnpm", "package.json", "pnpm-lock.yaml", []string{".npmrc", "pnpm-workspace.yaml"}},
-		{"bun", "package.json", "bun.lock", []string{".npmrc", "bunfig.toml"}},
-		{"poetry", "pyproject.toml", "poetry.lock", []string{"poetry.toml"}},
-		{"uv", "pyproject.toml", "uv.lock", []string{}},
-		{"pip-tools", "requirements.in", "requirements.txt", []string{"pip.conf"}},
+	adapters, err := catalog.Discover(root)
+	if err != nil {
+		return Project{}, fmt.Errorf("detect adhoc ecosystem: %w", err)
 	}
 	var matches []Project
-	for _, definition := range definitions {
-		if regularFile(root, definition.manifest) && regularFile(root, definition.lock) {
-			matches = append(matches, Project{
-				Root: root, Manager: definition.manager, Manifest: definition.manifest,
-				Lock: definition.lock, ConfigFiles: definition.configs,
-			})
+	for _, adapter := range adapters {
+		provider, ok := adapter.(ecosystem.InputProvider)
+		if !ok {
+			continue
+		}
+		contract := provider.PackageInput(true)
+		project := Project{Root: root, Stack: adapter.Key().Stack, Manager: adapter.Key().PackageManager}
+		requiredPresent := true
+		for _, file := range contract.Files {
+			if !file.Optional && !regularFile(root, file.Path) {
+				requiredPresent = false
+			}
+			switch file.Category {
+			case ecosystem.InputCategoryManifest:
+				project.Manifest = file.Path
+			case ecosystem.InputCategoryLock:
+				project.Lock = file.Path
+			case ecosystem.InputCategoryManagerConfig:
+				project.ConfigFiles = append(project.ConfigFiles, file.Path)
+			}
+		}
+		// A one-file dependency input is intentionally not treated as an
+		// updateable adhoc manifest/lock pair.
+		if requiredPresent && project.Manifest != "" && project.Lock != "" {
+			matches = append(matches, project)
 		}
 	}
 	if len(matches) == 0 {

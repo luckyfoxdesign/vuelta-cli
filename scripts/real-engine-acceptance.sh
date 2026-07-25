@@ -28,7 +28,7 @@ cleanup() {
   rmdir "$acceptance_root" 2>/dev/null || true
 }
 trap cleanup EXIT
-docker compose --profile acceptance run --rm \
+docker compose --profile acceptance run --rm --build \
   --volume "$socket:/var/run/docker.sock" \
   --volume "$acceptance_root:$acceptance_root" \
   --volume "$matrix:$matrix:ro" \

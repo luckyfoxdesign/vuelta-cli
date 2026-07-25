@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
@@ -82,29 +84,12 @@ func Detect(selectedRoot string) (Discovery, error) {
 		return Discovery{}, fmt.Errorf("project path %s is not a directory", root)
 	}
 	d := Discovery{Root: root, PackageManagers: make(map[string][]string), Services: make(map[string][]string)}
-	if regular(root, "pyproject.toml") {
-		if regular(root, "poetry.lock") {
-			d.addManager(config.StackPython, "poetry")
-		}
-		if regular(root, "uv.lock") {
-			d.addManager(config.StackPython, "uv")
-		}
+	detectedAdapters, err := catalog.Discover(root)
+	if err != nil {
+		return Discovery{}, err
 	}
-	if regular(root, "requirements.in") {
-		d.addManager(config.StackPython, "pip-tools")
-	} else if regular(root, "requirements.txt") && len(d.PackageManagers[config.StackPython]) == 0 {
-		d.addManager(config.StackPython, "requirements")
-	}
-	if regular(root, "package.json") {
-		if regular(root, "package-lock.json") {
-			d.addManager(config.StackNode, "npm")
-		}
-		if regular(root, "pnpm-lock.yaml") {
-			d.addManager(config.StackNode, "pnpm")
-		}
-		if regular(root, "bun.lock") {
-			d.addManager(config.StackNode, "bun")
-		}
+	for _, adapter := range detectedAdapters {
+		d.addManager(adapter.Key().Stack, adapter.Key().PackageManager)
 	}
 	for _, name := range dockerNames {
 		if regular(root, name) {
@@ -236,10 +221,15 @@ func verificationCandidates(root string, discovery Discovery) ([]config.Verifica
 					continue
 				}
 				for _, manager := range discovery.PackageManagers[config.StackNode] {
-					command := []string{manager, "run", factory}
-					if factory == "test" && manager == "npm" {
-						command = []string{"npm", "test"}
+					registry, err := catalog.New()
+					if err != nil {
+						return nil, err
 					}
+					adapter, err := registry.Lookup(config.StackNode, manager)
+					if err != nil {
+						return nil, err
+					}
+					command := adapter.(ecosystem.VerificationProvider).VerificationCommand(factory)
 					candidates = append(candidates, newVerificationCandidate(factory, composeFile, service, command))
 				}
 			}
@@ -408,7 +398,7 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 			return config.Workspace{}, err
 		}
 	}
-	verification, err := d.buildVerification(input, manager)
+	verification, err := d.buildVerification(input, stack, manager)
 	if err != nil {
 		return config.Workspace{}, err
 	}
@@ -468,10 +458,10 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 	return ws, nil
 }
 
-func (d Discovery) buildVerification(input Input, manager string) (config.VerificationProfile, error) {
-	if manager == "requirements" {
+func (d Discovery) buildVerification(input Input, stack, manager string) (config.VerificationProfile, error) {
+	if adapterScanOnly(stack, manager) {
 		if len(input.VerificationNames) != 0 {
-			return config.VerificationProfile{}, errors.New("python/requirements has no safe mutation contract and cannot use --verification; register it as scan-only")
+			return config.VerificationProfile{}, fmt.Errorf("%s/%s has no safe mutation contract and cannot use --verification; register it as scan-only", stack, manager)
 		}
 		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
 	}
@@ -481,7 +471,7 @@ func (d Discovery) buildVerification(input Input, manager string) (config.Verifi
 		}
 		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
 	}
-	candidates := d.verificationCandidatesForManager(manager)
+	candidates := d.verificationCandidatesForManager(stack, manager)
 	names := append([]string(nil), input.VerificationNames...)
 	if len(names) == 0 {
 		switch len(candidates) {
@@ -519,15 +509,32 @@ func (d Discovery) buildVerification(input Input, manager string) (config.Verifi
 	return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: selected}, nil
 }
 
-func (d Discovery) verificationCandidatesForManager(manager string) []config.VerificationStep {
+func (d Discovery) verificationCandidatesForManager(stack, manager string) []config.VerificationStep {
 	candidates := make([]config.VerificationStep, 0, len(d.VerificationCandidates))
 	for _, candidate := range d.VerificationCandidates {
-		if len(candidate.Command) > 0 && (candidate.Command[0] == "npm" || candidate.Command[0] == "pnpm" || candidate.Command[0] == "bun") && candidate.Command[0] != manager {
-			continue
+		if len(candidate.Command) > 0 {
+			if registry, err := catalog.New(); err == nil {
+				if _, lookupErr := registry.Lookup(stack, candidate.Command[0]); lookupErr == nil && candidate.Command[0] != manager {
+					continue
+				}
+			}
 		}
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+func adapterScanOnly(stack, manager string) bool {
+	registry, err := catalog.New()
+	if err != nil {
+		return false
+	}
+	adapter, err := registry.Lookup(stack, manager)
+	if err != nil {
+		return false
+	}
+	_, mutable := adapter.(ecosystem.MutationProvider)
+	return !mutable && adapter.Metadata().UnsupportedReason == ""
 }
 
 func choose(flag, supplied string, options []string) (string, error) {
@@ -555,24 +562,22 @@ func chooseOptional(flag, supplied string, options []string) (string, error) {
 }
 
 func defaultAllowedPaths(stack, manager string, dockerFiles []string) []string {
-	switch stack {
-	case config.StackPython:
-		switch manager {
-		case "poetry":
-			return []string{"pyproject.toml", "poetry.lock"}
-		case "uv":
-			return []string{"pyproject.toml", "uv.lock"}
-		case "pip-tools":
-			return []string{"requirements.in", "requirements.txt"}
-		case "requirements":
-			return []string{"requirements.txt"}
-		}
-	case config.StackNode:
-		return []string{"package.json", map[string]string{"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "bun": "bun.lock"}[manager]}
-	case config.StackDocker:
+	if stack == config.StackDocker {
 		return dockerFiles
 	}
-	return nil
+	registry, err := catalog.New()
+	if err != nil {
+		return nil
+	}
+	adapter, err := registry.Lookup(stack, manager)
+	if err != nil {
+		return nil
+	}
+	policy, ok := adapter.(ecosystem.ChangePolicy)
+	if !ok {
+		return nil
+	}
+	return policy.AllowedChangedPaths()
 }
 
 func uniqueSorted(values []string) []string {

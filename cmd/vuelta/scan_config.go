@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
@@ -19,6 +20,7 @@ type scanConfigSelection struct {
 	MachineConfig     string   `json:"machine_config,omitempty"`
 	OnboardingChanged bool     `json:"onboarding_changed,omitempty"`
 	ChangedFiles      []string `json:"changed_files,omitempty"`
+	DriftWarning      string   `json:"drift_warning,omitempty"`
 }
 
 // resolveAmbiguousWorkspace retries BuildWorkspace, resolving each
@@ -54,7 +56,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 			}
 		}
 		if projectFile {
-			return loadSelectedProjectConfig(parsedConfigPath, "reused", allowMigrationPrompt)
+			return loadSelectedProjectConfig(parsedConfigPath, "reused", allowMigrationPrompt, options.stack)
 		}
 		cfg, err := loadMachineConfig(parsedConfigPath, allowMigrationPrompt)
 		if err != nil {
@@ -79,7 +81,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	_, statErr := os.Lstat(localPath)
 	switch {
 	case statErr == nil:
-		return loadSelectedProjectConfig(localPath, "reused", allowMigrationPrompt)
+		return loadSelectedProjectConfig(localPath, "reused", allowMigrationPrompt, options.stack)
 	case !errors.Is(statErr, os.ErrNotExist):
 		return nil, scanConfigSelection{}, fmt.Errorf("inspect project config %s: %w", localPath, statErr)
 	}
@@ -97,9 +99,9 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	if len(discovery.Stacks) == 0 {
 		return nil, scanConfigSelection{}, unsupportedProjectError(root)
 	}
-	workspace, err := resolveAmbiguousWorkspace(discovery, configinit.Input{ScanOnly: true}, allowMigrationPrompt, promptChoice)
+	workspace, err := resolveAmbiguousWorkspace(discovery, configinit.Input{Stack: options.stack, ScanOnly: true}, allowMigrationPrompt, promptChoice)
 	if err != nil {
-		return nil, scanConfigSelection{}, fmt.Errorf("project detection is ambiguous: %w", err)
+		return nil, scanConfigSelection{}, ambiguousStackError(err, root)
 	}
 	workspace.Path = "."
 	project := &config.ProjectConfig{SchemaVersion: config.CurrentSchemaVersion, Workspace: workspace}
@@ -127,7 +129,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	return cfg, selection, nil
 }
 
-func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
+func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, explicitStack string) (*config.Config, scanConfigSelection, error) {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
@@ -137,6 +139,16 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool) (
 		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
 	}
 	root, err := canonicalDirectory(filepath.Dir(absolute))
+	if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	if explicitStack != "" && explicitStack != project.Workspace.Stack {
+		return nil, scanConfigSelection{}, fmt.Errorf(
+			"project at %s is already configured with workspace.stack %q; --stack only resolves first-run ambiguity\n\nTo change it: remove %s and re-run vuelta scan --stack %s, or edit workspace.stack directly in %s",
+			root, project.Workspace.Stack, projectConfigName, explicitStack, path,
+		)
+	}
+	driftWarning, err := detectStackDrift(project.Workspace, root, allowMigrationPrompt)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
@@ -155,7 +167,50 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool) (
 	if ignorePlan.Changed {
 		selection.ChangedFiles = []string{".gitignore"}
 	}
+	selection.DriftWarning = driftWarning
 	return cfg, selection, nil
+}
+
+// detectStackDrift re-detects stack signals in root and compares them against
+// the persisted workspace.Stack. Any disagreement — the persisted stack no
+// longer detected, or a newly ambiguous set of candidate stacks — is reported:
+// as a non-fatal warning when interactive, or as a fail-closed error otherwise.
+func detectStackDrift(workspace config.Workspace, root string, interactive bool) (string, error) {
+	discovery, err := configinit.Detect(root)
+	if err != nil {
+		return "", fmt.Errorf("re-detect project stack signals for drift check: %w", err)
+	}
+	if len(discovery.Stacks) == 1 && discovery.Stacks[0] == workspace.Stack {
+		return "", nil
+	}
+	detected := "none"
+	if len(discovery.Stacks) > 0 {
+		detected = strings.Join(discovery.Stacks, ", ")
+	}
+	message := fmt.Sprintf(
+		"persisted workspace.stack %q no longer matches freshly detected project signals (detected: %s)",
+		workspace.Stack, detected,
+	)
+	if !interactive {
+		return "", fmt.Errorf(
+			"%s\n\nResolve: remove %s and re-run vuelta scan --stack <value>, or edit workspace.stack directly in %s",
+			message, projectConfigName, root,
+		)
+	}
+	return message + "; remove " + projectConfigName + " and re-run vuelta scan --stack <value>, or edit workspace.stack directly to update", nil
+}
+
+// ambiguousStackError names the concrete non-interactive fix for a --stack
+// ambiguity so a failed first-run onboarding never merely lists options.
+func ambiguousStackError(err error, root string) error {
+	var missing *configinit.MissingValueError
+	if errors.As(err, &missing) && missing.Flag == "--stack" {
+		return fmt.Errorf(
+			"%s\n\nResolve non-interactively:\n  vuelta scan --directory %s --stack <value>\n\nThe choice is persisted to workspace.stack in %s on first run",
+			missing.Error(), root, projectConfigName,
+		)
+	}
+	return fmt.Errorf("project detection is ambiguous: %w", err)
 }
 
 func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {

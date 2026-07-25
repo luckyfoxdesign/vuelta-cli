@@ -487,11 +487,11 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 		return fmt.Errorf("%w: verification profile changed", ErrStale)
 	}
 	if snapshot.Toolchain.ProfileID != "" {
-		_, actual, _, resolveErr := toolchain.Resolve(ws, cfg)
+		profile, actual, _, resolveErr := toolchain.Resolve(ws, cfg)
 		if resolveErr != nil {
 			return fmt.Errorf("%w: toolchain profile is no longer compatible: %v", ErrStale, resolveErr)
 		}
-		if !reflect.DeepEqual(snapshot.Toolchain, actual) {
+		if !toolchain.MatchesResolvedIdentity(snapshot.Toolchain, profile, actual) {
 			return fmt.Errorf("%w: toolchain profile changed", ErrStale)
 		}
 	} else if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
@@ -737,6 +737,12 @@ func validateToolchainIdentity(identity toolchain.Identity) error {
 		identity.PackageManager == "" || identity.PackageManagerVersion == "" || identity.Scanner == "" || identity.ScannerVersion == "" ||
 		identity.Image == "" || identity.ImageID == "" || identity.Platform == "" || identity.User == "" || len(identity.LockFormats) == 0 || !identity.Capabilities.ReadOnlyDiscovery {
 		return fmt.Errorf("%w: incomplete toolchain identity", ErrInvalid)
+	}
+	if (identity.AdapterID == "") != (identity.AdapterVersion == "") {
+		return fmt.Errorf("%w: partial adapter identity", ErrInvalid)
+	}
+	if identity.AdapterID != "" && (!strings.Contains(identity.AdapterID, "/") || !toolchainIDPattern.MatchString(identity.AdapterVersion)) {
+		return fmt.Errorf("%w: malformed adapter identity", ErrInvalid)
 	}
 	return nil
 }

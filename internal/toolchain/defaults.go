@@ -1,13 +1,14 @@
 package toolchain
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 )
 
 const (
@@ -15,15 +16,6 @@ const (
 	SourceDefault = "default"
 	// SourceOverride identifies an operator-supplied config profile.
 	SourceOverride = "override"
-)
-
-const (
-	defaultNCUVersion      = "22.2.9"
-	defaultPoetryVersion   = "2.1.1"
-	defaultUVVersion       = "0.6.14"
-	defaultPipVersion      = "25.0.1"
-	defaultPipToolsVersion = "7.5.0"
-	defaultPipScanner      = "1.1.0"
 )
 
 var exactVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?$`)
@@ -99,102 +91,51 @@ func selectOverride(ws config.Workspace, profiles []config.ToolchainProfile, con
 }
 
 func defaultProfile(constraints Constraints) (config.ToolchainProfile, buildSpec, error) {
-	runtimeVersion, err := defaultRuntime(constraints.Stack, constraints.Runtime)
+	registry, err := catalog.New()
+	if err != nil {
+		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	adapter, err := registry.Lookup(constraints.Stack, constraints.PackageManager)
 	if err != nil {
 		return config.ToolchainProfile{}, buildSpec{}, err
 	}
-	managerVersion := constraints.PackageManagerVersion
+	provider, ok := adapter.(ecosystem.ToolchainProvider)
+	if !ok {
+		return config.ToolchainProfile{}, buildSpec{}, &ecosystem.CapabilityError{
+			Key: adapter.Key(), Capability: "default-toolchain",
+			Reason: adapter.Metadata().UnsupportedReason,
+		}
+	}
+	spec, err := provider.DefaultToolchain(ecosystem.Constraints{
+		Key: adapter.Key(), Runtime: constraints.Runtime,
+		PackageManagerVersion: constraints.PackageManagerVersion,
+		LockFormat:            constraints.LockFormat, Platform: constraints.Platform,
+	})
+	if err != nil {
+		return config.ToolchainProfile{}, buildSpec{}, err
+	}
+	if spec.Key != adapter.Key() {
+		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("adapter %s returned toolchain for %s", adapter.Key().String(), spec.Key.String())
+	}
+	if !exactVersionPattern.MatchString(spec.PackageManagerVersion) {
+		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("detected package manager version %q is not an exact supported version; declare family@exact-version or add an override", spec.PackageManagerVersion)
+	}
 	profile := config.ToolchainProfile{
-		Version: config.ToolchainProfileVersion, Stack: constraints.Stack,
-		PackageManager: constraints.PackageManager, Runtime: runtimeVersion,
-		Platform: constraints.Platform, User: "10001:10001",
-		Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true},
+		Version: config.ToolchainProfileVersion, ID: spec.ID, Stack: spec.Key.Stack,
+		PackageManager: spec.Key.PackageManager, Runtime: spec.Runtime,
+		PackageManagerVersion: spec.PackageManagerVersion,
+		Scanner:               spec.Scanner, ScannerVersion: spec.ScannerVersion,
+		Platform: spec.Platform, User: spec.User,
+		LockFormats: append([]string(nil), spec.LockFormats...),
+		Capabilities: config.ToolchainCapabilities{
+			ReadOnlyDiscovery: spec.Capabilities.ReadOnlyDiscovery,
+			ReleaseAge:        spec.Capabilities.ReleaseAge,
+			ProjectConfig:     spec.Capabilities.ProjectConfig,
+		},
 	}
-	build := buildSpec{Args: map[string]string{}}
-	switch constraints.Stack + "/" + constraints.PackageManager {
-	case "node/npm":
-		if managerVersion == "" {
-			managerVersion = map[string]string{"20": "10.9.2", "22": "10.9.2", "24": "11.4.2"}[runtimeVersion]
-		}
-		profile.ID = "default-node" + runtimeVersion + "-npm"
-		profile.Scanner, profile.ScannerVersion = "ncu", defaultNCUVersion
-		profile.LockFormats = []string{"npm-v2", "npm-v3"}
-		profile.Capabilities.ReleaseAge = true
-		build.Dockerfile = "node-ncu.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "node:" + runtimeVersion + "-bookworm-slim", "NPM_VERSION": managerVersion, "NCU_VERSION": defaultNCUVersion}
-	case "node/pnpm":
-		if managerVersion == "" {
-			managerVersion = map[string]string{"pnpm-v6": "8.15.9", "pnpm-v9": "9.15.0"}[constraints.LockFormat]
-		}
-		profile.ID = "default-node" + runtimeVersion + "-pnpm"
-		profile.Scanner, profile.ScannerVersion = "pnpm", managerVersion
-		profile.LockFormats = []string{"pnpm-v6", "pnpm-v9"}
-		profile.Capabilities.ReleaseAge = true
-		build.Dockerfile = "node-pnpm.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "node:" + runtimeVersion + "-bookworm-slim", "PNPM_VERSION": managerVersion}
-	case "python/poetry":
-		managerVersion = defaultIfEmpty(managerVersion, defaultPoetryVersion)
-		profile.ID = "default-python" + strings.ReplaceAll(runtimeVersion, ".", "") + "-poetry"
-		profile.Scanner, profile.ScannerVersion = "poetry", managerVersion
-		profile.LockFormats = []string{"poetry-v2"}
-		build.Dockerfile = "python-poetry.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "POETRY_VERSION": managerVersion}
-	case "python/uv":
-		managerVersion = defaultIfEmpty(managerVersion, defaultUVVersion)
-		profile.ID = "default-python" + strings.ReplaceAll(runtimeVersion, ".", "") + "-uv"
-		profile.Scanner, profile.ScannerVersion = "uv", managerVersion
-		profile.LockFormats = []string{"uv-v1"}
-		build.Dockerfile = "python-uv.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "UV_IMAGE": "ghcr.io/astral-sh/uv:" + managerVersion, "UV_VERSION": managerVersion}
-	case "python/pip-tools":
-		managerVersion = defaultIfEmpty(managerVersion, defaultPipToolsVersion)
-		profile.ID = "default-python" + strings.ReplaceAll(runtimeVersion, ".", "") + "-pip-tools"
-		profile.Scanner, profile.ScannerVersion = "vuelta-pip-tools-scan", defaultPipScanner
-		profile.LockFormats = []string{"requirements"}
-		build.Dockerfile = "python-pip-tools.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "PIP_VERSION": defaultPipVersion, "PIP_TOOLS_VERSION": managerVersion, "SCANNER_VERSION": defaultPipScanner}
-	case "python/requirements":
-		managerVersion = defaultPipVersion
-		profile.ID = "default-python" + strings.ReplaceAll(runtimeVersion, ".", "") + "-requirements"
-		profile.Scanner, profile.ScannerVersion = "vuelta-pip-tools-scan", defaultPipScanner
-		profile.LockFormats = []string{"requirements-direct"}
-		build.Dockerfile = "python-pip-tools.Dockerfile"
-		build.Args = map[string]string{"BASE_IMAGE": "python:" + runtimeVersion + "-slim-bookworm", "PIP_VERSION": defaultPipVersion, "PIP_TOOLS_VERSION": defaultPipToolsVersion, "SCANNER_VERSION": defaultPipScanner}
-	default:
-		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("no embedded default toolchain for %s/%s; add a compatible update.toolchain_profiles override", constraints.Stack, constraints.PackageManager)
+	build := buildSpec{Dockerfile: spec.Dockerfile, Args: make(map[string]string, len(spec.BuildArgs))}
+	for key, value := range spec.BuildArgs {
+		build.Args[key] = value
 	}
-	if !exactVersionPattern.MatchString(managerVersion) {
-		return config.ToolchainProfile{}, buildSpec{}, fmt.Errorf("detected package manager version %q is not an exact supported version; declare family@exact-version or add an override", managerVersion)
-	}
-	profile.PackageManagerVersion = managerVersion
 	return profile, build, nil
-}
-
-func defaultRuntime(stack, constraint string) (string, error) {
-	var fallback string
-	var supported []string
-	switch stack {
-	case config.StackNode:
-		fallback, supported = "22", []string{"22", "24", "20"}
-	case config.StackPython:
-		fallback, supported = "3.12", []string{"3.12", "3.13", "3.11"}
-	default:
-		return "", errors.New("embedded defaults are available only for node and python")
-	}
-	if strings.TrimSpace(constraint) == "" {
-		return fallback, nil
-	}
-	for _, candidate := range supported {
-		if versionMatches(candidate, constraint) {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("runtime constraint %q is unsupported; supported %s runtimes are %s; add an update.toolchain_profiles override for an exception", constraint, stack, strings.Join(supported, ", "))
-}
-
-func defaultIfEmpty(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }

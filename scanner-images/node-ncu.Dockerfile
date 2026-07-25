@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 
 ARG NPM_VERSION
 ARG NCU_VERSION
+ENV NO_UPDATE_NOTIFIER=1
 RUN test -n "${NPM_VERSION}" \
     && test -n "${NCU_VERSION}" \
     && npm install --global --ignore-scripts --no-audit --no-fund "npm@${NPM_VERSION}" "npm-check-updates@${NCU_VERSION}" \

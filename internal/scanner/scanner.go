@@ -286,27 +286,20 @@ func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 	return string(out), nil
 }
 
-// stackManifests maps each supported stack/package_manager pair to the
-// manifest files that must be present at the workspace root. The docker
-// stack has no manifest of its own here: it is validated via
-// docker_images.files by config.Validate.
-var stackManifests = map[string][]string{
-	"python/poetry":       {"pyproject.toml", "poetry.lock"},
-	"python/uv":           {"pyproject.toml", "uv.lock"},
-	"python/pip-tools":    {"requirements.in"},
-	"python/requirements": {"requirements.txt"},
-	"node/npm":            {"package.json", "package-lock.json"},
-	"node/pnpm":           {"package.json", "pnpm-lock.yaml"},
-	"node/bun":            {"package.json", "bun.lock"},
-}
-
 func stackFilesPresent(path string, ws config.Workspace) bool {
 	if ws.Stack == config.StackDocker {
 		return true
 	}
-	key := ws.Stack + "/" + ws.PackageManager
-	for _, f := range stackManifests[key] {
-		if _, err := os.Stat(filepath.Join(path, f)); err != nil {
+	contract, err := scaninput.PackageContract(ws, false)
+	if err != nil {
+		return false
+	}
+	for _, file := range contract.Files {
+		if file.Optional {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(path, file.Path))
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return false
 		}
 	}

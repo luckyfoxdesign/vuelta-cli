@@ -16,6 +16,8 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
@@ -359,12 +361,15 @@ func buildUpdatePlan(snapshot updatesnapshot.Snapshot, workspace *config.Workspa
 }
 
 func intendedWorkspaceFiles(snapshot updatesnapshot.Snapshot, workspace config.Workspace) []string {
-	filesByManager := map[string][]string{
-		"npm": {"package.json", "package-lock.json"}, "pnpm": {"package.json", "pnpm-lock.yaml"},
-		"bun": {"package.json", "bun.lock"}, "poetry": {"pyproject.toml", "poetry.lock"},
-		"uv": {"pyproject.toml", "uv.lock"}, "pip-tools": {"requirements.in", "requirements.txt"},
+	var files []string
+	registry, err := catalog.New()
+	if err == nil && workspace.PackageManager != "" {
+		if adapter, lookupErr := registry.Lookup(workspace.Stack, workspace.PackageManager); lookupErr == nil {
+			if policy, ok := adapter.(ecosystem.ChangePolicy); ok {
+				files = policy.AllowedChangedPaths()
+			}
+		}
 	}
-	files := append([]string(nil), filesByManager[workspace.PackageManager]...)
 	for _, candidate := range snapshot.Candidates {
 		if candidate.File != "" {
 			files = append(files, candidate.File)

@@ -16,6 +16,8 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	scannerimages "github.com/luckyfoxdesign/vuelta/scanner-images"
 )
 
@@ -268,20 +270,37 @@ func validateBuiltDefault(ctx context.Context, docker dockerexec.Runner, profile
 		}
 		return fmt.Errorf("validate hardened scanner startup failed (%s, exit %d)", category, exitCode)
 	}
-	if !matchesScannerVersion(profile.Scanner, profile.ScannerVersion, strings.TrimSpace(string(smoke.Combined))) {
+	if !matchesScannerVersion(profile, strings.TrimSpace(string(smoke.Combined))) {
 		return fmt.Errorf("scanner %q did not report expected version %q", profile.Scanner, profile.ScannerVersion)
 	}
 	return nil
 }
 
-func matchesScannerVersion(scanner, version, output string) bool {
-	switch scanner {
-	case "ncu", "pnpm", "vuelta-pip-tools-scan":
-		return output == version
-	case "poetry":
-		return strings.Contains(output, "version "+version)
-	case "uv":
-		return strings.HasPrefix(output, "uv "+version) && (len(output) == len("uv "+version) || output[len("uv "+version)] == ' ')
+func matchesScannerVersion(profile config.ToolchainProfile, output string) bool {
+	registry, err := catalog.New()
+	if err != nil {
+		return false
+	}
+	adapter, err := registry.Lookup(profile.Stack, profile.PackageManager)
+	if err != nil {
+		return false
+	}
+	provider, ok := adapter.(ecosystem.ProfilePolicyProvider)
+	if !ok {
+		return false
+	}
+	policy := provider.ProfilePolicy()
+	if policy.ExpectedScanner != profile.Scanner {
+		return false
+	}
+	switch policy.VersionOutputStyle {
+	case "exact":
+		return output == profile.ScannerVersion
+	case "contains-version":
+		return strings.Contains(output, "version "+profile.ScannerVersion)
+	case "prefix-name-version":
+		prefix := profile.Scanner + " " + profile.ScannerVersion
+		return strings.HasPrefix(output, prefix) && (len(output) == len(prefix) || output[len(prefix)] == ' ')
 	default:
 		return false
 	}

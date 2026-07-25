@@ -19,6 +19,8 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
@@ -133,6 +135,7 @@ type scanOptions struct {
 	project            string
 	directory          string
 	all                bool
+	stack              string
 	only               string
 	policyPath         string
 	minReleaseAge      string
@@ -162,6 +165,9 @@ func executeScan(args []string) error {
 		options.updateConfigPath = selection.MachineConfig
 	}
 	warnings := configWarnings(cfg)
+	if selection.DriftWarning != "" {
+		warnings = appendUniqueStrings(warnings, selection.DriftWarning)
+	}
 	if selection.Scope == "project" && (cfg.Docker == nil || cfg.Docker.Developer == nil) {
 		warnings = append(warnings, fmt.Sprintf(
 			"machine Docker trust is not configured; run %s",
@@ -277,6 +283,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.directory, "directory", "", "scan an explicit directory")
 	fs.StringVar(&options.directory, "d", "", "scan an explicit directory")
 	fs.BoolVar(&options.all, "all", false, "scan every configured project")
+	fs.StringVar(&options.stack, "stack", "", "resolve first-run ambiguous stack detection: python, node, or docker")
 	fs.StringVar(&options.only, "only", "", "scan only vulnerabilities or packages")
 	fs.StringVar(&options.policyPath, "policy", "", "standalone package policy")
 	fs.StringVar(&options.minReleaseAge, "min-release-age", "", "minimum release age")
@@ -642,11 +649,12 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		}
 		identityWorkspace = detectedWorkspace
 	}
-	if isStandaloneRequirementsWorkspace(identityWorkspace) {
-		identityWorkspace.PackageManager = "requirements"
+	if scanOnlyAdapter, ok := scanOnlyWorkspaceAdapter(identityWorkspace); ok {
+		identityWorkspace.Stack = scanOnlyAdapter.Key().Stack
+		identityWorkspace.PackageManager = scanOnlyAdapter.Key().PackageManager
 		result.Status = config.VerificationScanOnly
 		result.PackageUpdates = &packageUpdateAvailability{Status: config.VerificationScanOnly, Reason: "manifest_has_no_safe_mutation_contract"}
-		result.Warnings = appendUniqueStrings(result.Warnings, "requirements.txt candidates are scan-only; the manifest does not prove dependency ownership and no update snapshot will be created")
+		result.Warnings = appendUniqueStrings(result.Warnings, fmt.Sprintf("%s candidates are scan-only; the manifest does not prove dependency ownership and no update snapshot will be created", scanOnlyAdapter.Key().String()))
 	}
 	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
 	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
@@ -749,18 +757,18 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
 	case unverified && len(result.Candidates) > 0:
 		warning := "release age could not be verified for one or more candidates; update must fail closed unless explicitly authorized"
-		if identityWorkspace.PackageManager == "requirements" {
-			warning = "release age could not be verified for one or more requirements.txt candidates; they remain scan-only and cannot be updated"
+		if workspaceScanOnly(identityWorkspace) {
+			warning = "release age could not be verified for one or more scan-only candidates; they cannot be updated"
 		}
 		result.Warnings = append(result.Warnings, warning)
 		result = addStage(result, stageReleaseAge, stageUnverified, "release age could not be verified for one or more candidates")
 	default:
 		result = addStage(result, stageReleaseAge, stageVerified, "")
 	}
-	if options.allowProjectConfig && identityWorkspace.PackageManager != "requirements" {
+	if options.allowProjectConfig && !workspaceScanOnly(identityWorkspace) {
 		result.Warnings = append(result.Warnings, "reviewed project package-manager configuration was allowed during scan")
 	}
-	if identityWorkspace.PackageManager == "requirements" {
+	if workspaceScanOnly(identityWorkspace) {
 		result = addStage(result, stageSnapshot, stageSkipped, "manifest has no safe mutation contract")
 		return finalizeStageOutcomes(result)
 	}
@@ -984,8 +992,9 @@ func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) 
 func scanWorkspace(target scanTarget) (config.Workspace, error) {
 	if target.workspace != nil {
 		workspace := *target.workspace
-		if isStandaloneRequirementsWorkspace(workspace) {
-			workspace.PackageManager = "requirements"
+		if adapter, ok := scanOnlyWorkspaceAdapter(workspace); ok {
+			workspace.Stack = adapter.Key().Stack
+			workspace.PackageManager = adapter.Key().PackageManager
 		}
 		return workspace, nil
 	}
@@ -993,14 +1002,37 @@ func scanWorkspace(target scanTarget) (config.Workspace, error) {
 	if err == nil {
 		return workspaceForAdhoc(project), nil
 	}
-	if _, requirementsErr := os.Lstat(filepath.Join(target.path, "requirements.txt")); requirementsErr == nil {
-		return config.Workspace{Path: target.path, Stack: config.StackPython, PackageManager: "requirements"}, nil
+	if adapters, discoverErr := catalog.Discover(target.path); discoverErr == nil {
+		for _, adapter := range adapters {
+			if _, mutable := adapter.(ecosystem.MutationProvider); !mutable && adapter.Metadata().UnsupportedReason == "" {
+				return config.Workspace{
+					Path: target.path, Stack: adapter.Key().Stack, PackageManager: adapter.Key().PackageManager,
+				}, nil
+			}
+		}
 	}
 	return config.Workspace{}, err
 }
 
-func isStandaloneRequirementsWorkspace(workspace config.Workspace) bool {
-	return workspace.Stack == config.StackPython && (workspace.PackageManager == "" || workspace.PackageManager == "requirements")
+func scanOnlyWorkspaceAdapter(workspace config.Workspace) (ecosystem.Adapter, bool) {
+	if workspace.PackageManager != "" {
+		registry, err := catalog.New()
+		if err != nil {
+			return nil, false
+		}
+		adapter, err := registry.Lookup(workspace.Stack, workspace.PackageManager)
+		if err != nil {
+			return nil, false
+		}
+		_, mutable := adapter.(ecosystem.MutationProvider)
+		return adapter, !mutable && adapter.Metadata().UnsupportedReason == ""
+	}
+	adapters, err := catalog.Discover(workspace.Path)
+	if err != nil || len(adapters) != 1 {
+		return nil, false
+	}
+	_, mutable := adapters[0].(ecosystem.MutationProvider)
+	return adapters[0], !mutable && adapters[0].Metadata().UnsupportedReason == ""
 }
 
 func findingRefs(findings []vulnscan.Finding) []string {
@@ -1051,19 +1083,19 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		}
 		return report.Candidates, packageToolName(workspace), workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 	}
-	if workspace, detectErr := scanWorkspace(target); detectErr == nil && workspace.PackageManager == "requirements" {
+	if workspace, detectErr := scanWorkspace(target); detectErr == nil && workspaceScanOnly(workspace) {
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
 		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
 		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{RequireTracked: false, ToolchainProfile: options.toolchainProfile})
 		if err != nil {
-			return nil, "requirements", false, err
+			return nil, packageToolName(workspace), false, err
 		}
 		report, err := updater.ScanCandidateReport(ctx, candidateScanner, target.path)
 		if options.packageDiagnostics != nil {
 			*options.packageDiagnostics = append(*options.packageDiagnostics, report.Diagnostics...)
 		}
-		return report.Candidates, "requirements", workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
+		return report.Candidates, packageToolName(workspace), workspaceReleaseAgeVerified(workspace, cfg, minAge, options.toolchainIdentity), err
 	}
 	project, err := adhoc.Detect(target.path)
 	if err != nil {
@@ -1084,11 +1116,23 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 }
 
 func workspaceForAdhoc(project adhoc.Project) config.Workspace {
-	stack := config.StackNode
-	if project.Manager == "poetry" || project.Manager == "uv" || project.Manager == "pip-tools" {
-		stack = config.StackPython
+	return config.Workspace{Path: project.Root, Stack: project.Stack, PackageManager: project.Manager}
+}
+
+func workspaceScanOnly(workspace config.Workspace) bool {
+	if workspace.PackageManager == "" {
+		return false
 	}
-	return config.Workspace{Path: project.Root, Stack: stack, PackageManager: project.Manager}
+	registry, err := catalog.New()
+	if err != nil {
+		return false
+	}
+	adapter, err := registry.Lookup(workspace.Stack, workspace.PackageManager)
+	if err != nil {
+		return false
+	}
+	_, mutable := adapter.(ecosystem.MutationProvider)
+	return !mutable && adapter.Metadata().UnsupportedReason == ""
 }
 
 func packageToolName(workspace config.Workspace) string {
@@ -1111,7 +1155,27 @@ func workspaceReleaseAgeVerified(workspace config.Workspace, cfg config.Config, 
 	if _, identity, err := updater.ResolveToolchainProfile(workspace, cfg); err == nil && identity != nil {
 		return identity.Capabilities.ReleaseAge
 	}
-	return workspace.Stack == config.StackNode
+	registry, err := catalog.New()
+	if err != nil {
+		return false
+	}
+	adapter, err := registry.Lookup(workspace.Stack, workspace.PackageManager)
+	if err != nil {
+		return false
+	}
+	provider, ok := adapter.(ecosystem.ScannerProvider)
+	if !ok {
+		return false
+	}
+	policy, ok := adapter.(ecosystem.ProfilePolicyProvider)
+	if !ok {
+		return false
+	}
+	spec, err := provider.Scanner(ecosystem.ScannerRequest{
+		ProfileScanner:    policy.ProfilePolicy().ExpectedScanner,
+		MinReleaseAgeDays: int(minAge / (24 * time.Hour)),
+	})
+	return err == nil && spec.ReleaseAge
 }
 
 func failOpenUnsupportedReleaseAge(cfg *config.Config, workspace config.Workspace, identity *toolchain.Identity) {

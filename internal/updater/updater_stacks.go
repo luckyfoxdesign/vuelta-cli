@@ -3,10 +3,14 @@ package updater
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
+
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 )
 
 var ncuVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
@@ -34,158 +38,50 @@ func lockDigest(projectPath, lockFile string) (string, error) {
 	return fmt.Sprintf("%x", sum), nil
 }
 
-// PoetryUpdater runs `poetry update` for a python/poetry workspace.
-type PoetryUpdater struct {
+// SpecUpdater executes only the reviewed argv and lock-file policy returned by
+// a built-in adapter. Docker, egress, mounts, user, platform, and output limits
+// remain owned by the core runner.
+type SpecUpdater struct {
 	Image string
+	Spec  ecosystem.MutationSpec
 	Run   DockerRunner
 }
 
-func (u PoetryUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	before, err := lockDigest(projectPath, "poetry.lock")
-	if err != nil {
-		return false, err
+// NewSpecUpdater validates adapter output before any container can run.
+func NewSpecUpdater(image string, spec ecosystem.MutationSpec, run DockerRunner) (SpecUpdater, error) {
+	if image == "" || run == nil {
+		return SpecUpdater{}, errors.New("ecosystem updater requires an image and core runner")
 	}
-	if _, err := u.Run(ctx, u.Image, []string{"poetry", "update"}, projectPath); err != nil {
-		return false, err
+	if spec.LockFile == "" || filepath.Base(spec.LockFile) != spec.LockFile || strings.ContainsAny(spec.LockFile, `/\`+"\x00") {
+		return SpecUpdater{}, fmt.Errorf("ecosystem mutation lock file %q is not a root file", spec.LockFile)
 	}
-	after, err := lockDigest(projectPath, "poetry.lock")
-	if err != nil {
-		return false, err
+	if len(spec.Commands) == 0 {
+		return SpecUpdater{}, errors.New("ecosystem mutation has no commands")
 	}
-	return before != after, nil
-}
-
-// UVUpdater runs `uv lock --upgrade` for a python/uv workspace.
-type UVUpdater struct {
-	Image string
-	Run   DockerRunner
-}
-
-func (u UVUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	before, err := lockDigest(projectPath, "uv.lock")
-	if err != nil {
-		return false, err
-	}
-	if _, err := u.Run(ctx, u.Image, []string{"uv", "lock", "--upgrade"}, projectPath); err != nil {
-		return false, err
-	}
-	after, err := lockDigest(projectPath, "uv.lock")
-	if err != nil {
-		return false, err
-	}
-	return before != after, nil
-}
-
-// PipToolsUpdater runs `pip-compile --upgrade requirements.in` for a
-// python/pip-tools workspace.
-type PipToolsUpdater struct {
-	Image string
-	Run   DockerRunner
-}
-
-func (u PipToolsUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	before, err := lockDigest(projectPath, "requirements.txt")
-	if err != nil {
-		return false, err
-	}
-	if _, err := u.Run(ctx, u.Image, []string{"pip-compile", "--upgrade", "requirements.in"}, projectPath); err != nil {
-		return false, err
-	}
-	after, err := lockDigest(projectPath, "requirements.txt")
-	if err != nil {
-		return false, err
-	}
-	return before != after, nil
-}
-
-// NPMUpdater runs a pinned npm-check-updates version followed by
-// `npm install` for a node/npm workspace, per part A §6.
-type NPMUpdater struct {
-	Image      string
-	NCUVersion string
-	DirectNCU  bool
-	Run        DockerRunner
-}
-
-func (u NPMUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	if !u.DirectNCU {
-		if err := validateNCUVersion(u.NCUVersion); err != nil {
-			return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+	for commandIndex, command := range spec.Commands {
+		if len(command) == 0 {
+			return SpecUpdater{}, fmt.Errorf("ecosystem mutation command %d is empty", commandIndex)
+		}
+		for argumentIndex, argument := range command {
+			if argument == "" || strings.ContainsRune(argument, '\x00') {
+				return SpecUpdater{}, fmt.Errorf("ecosystem mutation command %d argument %d is invalid", commandIndex, argumentIndex)
+			}
 		}
 	}
-	before, err := lockDigest(projectPath, "package-lock.json")
+	return SpecUpdater{Image: image, Spec: spec, Run: run}, nil
+}
+
+func (u SpecUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
+	before, err := lockDigest(projectPath, u.Spec.LockFile)
 	if err != nil {
 		return false, err
 	}
-	command := []string{"npx", "npm-check-updates@" + u.NCUVersion, "-u"}
-	if u.DirectNCU {
-		command = []string{"ncu", "-u"}
-	}
-	if _, err := u.Run(ctx, u.Image, command, projectPath); err != nil {
-		return false, err
-	}
-	if _, err := u.Run(ctx, u.Image, []string{"npm", "install"}, projectPath); err != nil {
-		return false, err
-	}
-	after, err := lockDigest(projectPath, "package-lock.json")
-	if err != nil {
-		return false, err
-	}
-	return before != after, nil
-}
-
-// BunUpdater runs a pinned npm-check-updates version followed by `bun install`
-// for a node/bun workspace. The commands are separate argv lists so neither
-// the configured version nor package metadata is interpreted by a shell.
-type BunUpdater struct {
-	Image      string
-	NCUVersion string
-	DirectNCU  bool
-	Run        DockerRunner
-}
-
-func (u BunUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	if !u.DirectNCU {
-		if err := validateNCUVersion(u.NCUVersion); err != nil {
-			return false, fmt.Errorf("validate npm-check-updates version: %w", err)
+	for _, command := range u.Spec.Commands {
+		if _, err := u.Run(ctx, u.Image, append([]string(nil), command...), projectPath); err != nil {
+			return false, err
 		}
 	}
-	before, err := lockDigest(projectPath, "bun.lock")
-	if err != nil {
-		return false, err
-	}
-	command := []string{"bunx", "npm-check-updates@" + u.NCUVersion, "-u"}
-	if u.DirectNCU {
-		command = []string{"ncu", "-u"}
-	}
-	if _, err := u.Run(ctx, u.Image, command, projectPath); err != nil {
-		return false, err
-	}
-	if _, err := u.Run(ctx, u.Image, []string{"bun", "install"}, projectPath); err != nil {
-		return false, err
-	}
-	after, err := lockDigest(projectPath, "bun.lock")
-	if err != nil {
-		return false, err
-	}
-	return before != after, nil
-}
-
-// PNPMUpdater runs `pnpm up --latest` for a node/pnpm workspace.
-type PNPMUpdater struct {
-	Image string
-	Run   DockerRunner
-}
-
-func (u PNPMUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	before, err := lockDigest(projectPath, "pnpm-lock.yaml")
-	if err != nil {
-		return false, err
-	}
-	if _, err := u.Run(ctx, u.Image, []string{"pnpm", "up", "--latest"}, projectPath); err != nil {
-		return false, err
-	}
-	after, err := lockDigest(projectPath, "pnpm-lock.yaml")
+	after, err := lockDigest(projectPath, u.Spec.LockFile)
 	if err != nil {
 		return false, err
 	}

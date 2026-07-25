@@ -7,6 +7,8 @@ import (
 	"sort"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 )
 
 // Stage identifies one consumer of repository input.
@@ -45,71 +47,27 @@ type Contract struct {
 	Files []File
 }
 
-var packageFiles = map[string][]File{
-	"python/poetry": {
-		{Path: "pyproject.toml", Category: CategoryManifest},
-		{Path: "poetry.lock", Category: CategoryLock},
-	},
-	"python/uv": {
-		{Path: "pyproject.toml", Category: CategoryManifest},
-		{Path: "uv.lock", Category: CategoryLock},
-	},
-	"python/pip-tools": {
-		{Path: "requirements.in", Category: CategoryManifest},
-		{Path: "requirements.txt", Category: CategoryLock},
-	},
-	"python/requirements": {
-		{Path: "requirements.txt", Category: CategoryDependency},
-	},
-	"node/npm": {
-		{Path: "package.json", Category: CategoryManifest},
-		{Path: "package-lock.json", Category: CategoryLock},
-	},
-	"node/pnpm": {
-		{Path: "package.json", Category: CategoryManifest},
-		{Path: "pnpm-lock.yaml", Category: CategoryLock},
-	},
-	"node/bun": {
-		{Path: "package.json", Category: CategoryManifest},
-		{Path: "bun.lock", Category: CategoryLock},
-	},
-}
-
-var managerConfigs = map[string][]string{
-	"npm":          {".npmrc"},
-	"pnpm":         {".npmrc", "pnpm-workspace.yaml"},
-	"bun":          {".npmrc", "bunfig.toml"},
-	"poetry":       {"poetry.toml"},
-	"uv":           {},
-	"pip-tools":    {"pip.conf"},
-	"requirements": {},
-}
-
 // PackageContract returns the manifest/lock inputs for candidate discovery.
 // Manager configuration is optional and appears only after the explicit gate.
 func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, error) {
-	files, ok := packageFiles[ws.Stack+"/"+ws.PackageManager]
+	if ws.Stack == config.StackDocker && ws.PackageManager == "" {
+		return Contract{Stage: StagePackageCandidates}, nil
+	}
+	adapter, err := adapterFor(ws.Stack, ws.PackageManager)
+	if err != nil {
+		return Contract{}, fmt.Errorf("unsupported package input contract for stack=%q package_manager=%q: %w", ws.Stack, ws.PackageManager, err)
+	}
+	provider, ok := adapter.(ecosystem.InputProvider)
 	if !ok {
-		if ws.Stack == config.StackDocker && ws.PackageManager == "" {
-			return Contract{Stage: StagePackageCandidates}, nil
-		}
-		return Contract{}, fmt.Errorf("unsupported package input contract for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
+		return Contract{}, &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "scan-input"}
 	}
-	contract := Contract{Stage: StagePackageCandidates, Files: append([]File(nil), files...)}
-	if allowManagerConfig {
-		for _, path := range managerConfigs[ws.PackageManager] {
-			contract.Files = append(contract.Files, File{
-				Path: path, Category: CategoryManagerConfig, Optional: true, ReviewedManagerConfig: true,
-			})
-		}
-	}
-	return contract, nil
+	return fromEcosystemContract(provider.PackageInput(allowManagerConfig)), nil
 }
 
 // DependencyContract excludes manager configuration because CVE scanners need
 // only recognized manifests and lockfiles.
 func DependencyContract(ws config.Workspace) (Contract, error) {
-	if ws.Stack == config.StackPython && (ws.PackageManager == "" || ws.PackageManager == "requirements") {
+	if ws.Stack == config.StackPython && ws.PackageManager == "" {
 		return PythonRequirementsContract(), nil
 	}
 	contract, err := PackageContract(ws, false)
@@ -124,9 +82,34 @@ func DependencyContract(ws config.Workspace) (Contract, error) {
 // input accepted by CVE scanners. A requirements.txt file alone does not
 // imply that pip-tools owns it and never enables package updates.
 func PythonRequirementsContract() Contract {
-	return Contract{Stage: StageDependencyCVE, Files: []File{{
-		Path: "requirements.txt", Category: CategoryDependency,
-	}}}
+	adapter, err := adapterFor(config.StackPython, "requirements")
+	if err != nil {
+		return Contract{Stage: StageDependencyCVE}
+	}
+	provider, ok := adapter.(ecosystem.InputProvider)
+	if !ok {
+		return Contract{Stage: StageDependencyCVE}
+	}
+	return fromEcosystemContract(provider.DependencyInput())
+}
+
+func adapterFor(stack, packageManager string) (ecosystem.Adapter, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return nil, err
+	}
+	return registry.Lookup(stack, packageManager)
+}
+
+func fromEcosystemContract(source ecosystem.InputContract) Contract {
+	contract := Contract{Stage: Stage(source.Stage), Files: make([]File, len(source.Files))}
+	for index, file := range source.Files {
+		contract.Files[index] = File{
+			Path: file.Path, Category: Category(file.Category), Optional: file.Optional,
+			ReviewedManagerConfig: file.ReviewedManagerConfig,
+		}
+	}
+	return contract
 }
 
 // DockerContract returns only explicitly configured Docker manifest files.
