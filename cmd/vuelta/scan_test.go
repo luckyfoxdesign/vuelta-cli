@@ -335,6 +335,38 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	}
 }
 
+func TestScanOneTargetWithNonTTYProgressStaysPlain(t *testing.T) {
+	root := t.TempDir()
+	workspace := config.Workspace{Name: "example", Path: root, Stack: config.StackNode, PackageManager: "npm"}
+	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
+	policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+			return nil, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0"}}, "npm", true, nil
+		},
+	}
+	cfg := config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy"}}
+	_, stderr := captureScanOutput(t, func() {
+		scanOneTargetWith(context.Background(), cfg, target, scanOptions{}, config.LocalPackagePolicy{}, policyIdentity, 0, runners)
+	})
+	for _, wanted := range []string{"Scanning for vulnerabilities...\n", "Scanning packages for updates...\n"} {
+		if !strings.Contains(stderr, wanted) {
+			t.Fatalf("non-tty progress output missing %q: %q", wanted, stderr)
+		}
+	}
+	for _, forbidden := range []string{"\r", "\x1b"} {
+		if strings.Contains(stderr, forbidden) {
+			t.Fatalf("non-tty progress output contains animation control characters: %q", stderr)
+		}
+	}
+}
+
 func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {

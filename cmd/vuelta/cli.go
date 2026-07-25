@@ -252,6 +252,9 @@ func (c *cli) run(args []string) error {
 	if globals.noInput && definition.handler == "scan" {
 		normalized = append([]string{"--internal-no-input"}, normalized...)
 	}
+	if globals.noColor && definition.handler == "scan" {
+		normalized = append([]string{"--internal-no-color"}, normalized...)
+	}
 	if globals.config != "" && definition.handler == "update" {
 		normalized = append([]string{"--internal-config", globals.config}, normalized...)
 	}

@@ -152,6 +152,7 @@ type scanOptions struct {
 	packageDiagnostics *[]updater.ScanDiagnostic
 	explicitConfig     bool
 	nonInteractive     bool
+	noColor            bool
 	updateConfigPath   string
 }
 
@@ -296,6 +297,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.BoolVar(&options.verbose, "verbose", false, "show technical stages, inputs, warnings, and error details")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
 	fs.BoolVar(&options.nonInteractive, "internal-no-input", false, "disable prompts")
+	fs.BoolVar(&options.noColor, "internal-no-color", false, "disable color and progress animation")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
 	}
@@ -576,13 +578,16 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 		alerts:          scanAlertsStage,
 		packages:        scanPackages,
 		prepareToolchain: func(ctx context.Context, cfg config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
-			return toolchain.Prepare(ctx, workspace, cfg, dockerexec.Default(), func(message string) {
+			progress := newScanProgress(scanProgressEligible(options), os.Stderr)
+			prepared, err := toolchain.Prepare(ctx, workspace, cfg, dockerexec.Default(), func(message string) {
 				if options.verbose {
-					fmt.Fprintln(os.Stderr, "Toolchain:", message)
+					progress.start(fmt.Sprintf("Toolchain: %s", message))
 				} else {
-					fmt.Fprintln(os.Stderr, "Preparing scanner for the first run...")
+					progress.start("Preparing scanner for the first run...")
 				}
 			})
+			progress.stop()
+			return prepared, err
 		},
 	})
 }
@@ -666,6 +671,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result.InputCategories = inputCategories
 	}
 	result = addStage(result, stagePreflight, stageSucceeded, "")
+	progress := newScanProgress(scanProgressEligible(options), os.Stderr)
 
 	if options.only == "packages" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "vulnerabilities", Status: "skipped", Reason: "not requested"})
@@ -679,7 +685,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		if target.dockerErr != nil && vulnerabilityStageUsesDocker(cfg, identityWorkspace) {
 			scanErr = target.dockerErr
 		} else {
+			progress.start("Scanning for vulnerabilities...")
 			findings, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
+			progress.stop()
 		}
 		if !requested {
 			result = addStage(result, stageVulnerability, stageNotRequested, "")
@@ -692,7 +700,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result = addStage(result, stageVulnerability, stageSucceeded, "")
 		}
 
+		progress.start("Checking GitHub security alerts...")
 		alertFindings, requested, alertErr := runners.alerts(ctx, cfg, target)
+		progress.stop()
 		if !requested {
 			result = addStage(result, stageAlerts, stageNotRequested, "")
 		} else if alertErr != nil {
@@ -742,7 +752,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	if target.dockerErr != nil {
 		err = target.dockerErr
 	} else {
+		progress.start("Scanning packages for updates...")
 		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
+		progress.stop()
 	}
 	result.Diagnostics = append(result.Diagnostics, packageDiagnostics...)
 	if err != nil {
