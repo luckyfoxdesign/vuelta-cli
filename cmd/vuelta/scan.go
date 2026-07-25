@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -38,6 +39,8 @@ const (
 	exitFindings = 5
 	exitPartial  = 6
 )
+
+const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
 
 type scanTarget struct {
 	workspace         *config.Workspace
@@ -97,26 +100,27 @@ type packageUpdateAvailability struct {
 }
 
 type scanResult struct {
-	Project         string                     `json:"project,omitempty"`
-	Directory       string                     `json:"directory"`
-	Origin          string                     `json:"origin"`
-	Execution       string                     `json:"execution"`
-	Status          string                     `json:"status"`
-	SnapshotID      string                     `json:"snapshot_id,omitempty"`
-	SnapshotCreated *time.Time                 `json:"snapshot_created_at,omitempty"`
-	SnapshotExpires *time.Time                 `json:"snapshot_expires_at,omitempty"`
-	Candidates      []updatesnapshot.Candidate `json:"candidates"`
-	Vulnerabilities []string                   `json:"vulnerabilities"`
-	Tools           []scanToolResult           `json:"tools"`
-	Stages          []scanStageResult          `json:"stages"`
-	InputCategories []string                   `json:"input_categories"`
-	Warnings        []string                   `json:"warnings"`
-	Verification    []string                   `json:"verification"`
-	Toolchain       *toolchain.Identity        `json:"toolchain,omitempty"`
-	PackageUpdates  *packageUpdateAvailability `json:"package_updates,omitempty"`
-	Diagnostics     []updater.ScanDiagnostic   `json:"diagnostics"`
-	Capabilities    []scanCapability           `json:"capabilities"`
-	Error           *jsonCommandError          `json:"error,omitempty"`
+	Project               string                     `json:"project,omitempty"`
+	Directory             string                     `json:"directory"`
+	Origin                string                     `json:"origin"`
+	Execution             string                     `json:"execution"`
+	Status                string                     `json:"status"`
+	SnapshotID            string                     `json:"snapshot_id,omitempty"`
+	SnapshotCreated       *time.Time                 `json:"snapshot_created_at,omitempty"`
+	SnapshotExpires       *time.Time                 `json:"snapshot_expires_at,omitempty"`
+	Candidates            []updatesnapshot.Candidate `json:"candidates"`
+	Vulnerabilities       []string                   `json:"vulnerabilities"`
+	VulnerabilityFindings []vulnscan.Finding         `json:"-"`
+	Tools                 []scanToolResult           `json:"tools"`
+	Stages                []scanStageResult          `json:"stages"`
+	InputCategories       []string                   `json:"input_categories"`
+	Warnings              []string                   `json:"warnings"`
+	Verification          []string                   `json:"verification"`
+	Toolchain             *toolchain.Identity        `json:"toolchain,omitempty"`
+	PackageUpdates        *packageUpdateAvailability `json:"package_updates,omitempty"`
+	Diagnostics           []updater.ScanDiagnostic   `json:"diagnostics"`
+	Capabilities          []scanCapability           `json:"capabilities"`
+	Error                 *jsonCommandError          `json:"error,omitempty"`
 }
 
 type scanSummary struct {
@@ -186,7 +190,7 @@ func executeScan(args []string) error {
 	}
 	for _, target := range targets {
 		if target.onboardingChanged {
-			warnings = appendUniqueStrings(warnings, "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating")
+			warnings = appendUniqueStrings(warnings, onboardingChangedWarning)
 			break
 		}
 	}
@@ -256,7 +260,7 @@ func executeScan(args []string) error {
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, "warning:", warning)
 		}
-		writeHumanScanResults(results, options.updateConfigPath, options.verbose)
+		writeHumanScanResults(results, options.updateConfigPath, options.verbose, warnings)
 	}
 	return scanResultError(summary, options.failOn)
 }
@@ -584,8 +588,8 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 type scanStageRunners struct {
-	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]string, string, bool, error)
-	alerts           func(context.Context, config.Config, scanTarget) ([]string, bool, error)
+	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error)
+	alerts           func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
 }
@@ -593,7 +597,7 @@ type scanStageRunners struct {
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{},
+		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{},
 	}
 	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
 	if stateErr == nil {
@@ -605,7 +609,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result.Warnings = appendUniqueStrings(result.Warnings, "project-local snapshot cleanup unavailable: "+stateErr.Error())
 	}
 	if target.onboardingChanged {
-		result.Warnings = appendUniqueStrings(result.Warnings, "project onboarding changed .vuelta.yaml or .gitignore; review and commit those versioned files, then repeat the scan before updating")
+		result.Warnings = appendUniqueStrings(result.Warnings, onboardingChangedWarning)
 	}
 	if target.err != nil {
 		result = recordScanStageFailure(result, stagePreflight, "target_unavailable", target.err, "Fix the configured workspace path, then run scan again")
@@ -668,7 +672,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageVulnerability, stageNotRequested, "")
 		result = addStage(result, stageAlerts, stageNotRequested, "")
 	} else {
-		var findings []string
+		var findings []vulnscan.Finding
 		tool := cfg.VulnScan.DependencySource
 		requested := true
 		var scanErr error
@@ -683,7 +687,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "failed", Reason: scanErr.Error()})
 			result = recordScanStageFailure(result, stageVulnerability, "vulnerability_scan_failed", scanErr, "Make the configured scanner available and run scan again")
 		} else {
-			result.Vulnerabilities = appendUniqueStrings(result.Vulnerabilities, findings...)
+			result.VulnerabilityFindings = appendUniqueFindings(result.VulnerabilityFindings, findings...)
 			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "used"})
 			result = addStage(result, stageVulnerability, stageSucceeded, "")
 		}
@@ -695,10 +699,14 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Tools = append(result.Tools, scanToolResult{Name: "github-dependabot", Status: "failed", Reason: alertErr.Error()})
 			result = recordScanStageFailure(result, stageAlerts, "alerts_scan_failed", alertErr, "Check the GitHub remote, token configuration, and API availability")
 		} else {
-			result.Vulnerabilities = appendUniqueStrings(result.Vulnerabilities, alertFindings...)
+			result.VulnerabilityFindings = appendUniqueFindings(result.VulnerabilityFindings, alertFindings...)
 			result.Tools = append(result.Tools, scanToolResult{Name: "github-dependabot", Status: "used"})
 			result = addStage(result, stageAlerts, stageSucceeded, "")
 		}
+		sort.SliceStable(result.VulnerabilityFindings, func(i, j int) bool {
+			return result.VulnerabilityFindings[i].ID < result.VulnerabilityFindings[j].ID
+		})
+		result.Vulnerabilities = findingRefs(result.VulnerabilityFindings)
 	}
 	if options.only == "vulnerabilities" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "not requested"})
@@ -953,7 +961,7 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]string, string, bool, error) {
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]vulnscan.Finding, string, bool, error) {
 	workspace, err := scanWorkspace(target)
 	if err != nil {
 		return nil, cfg.VulnScan.DependencySource, true, err
@@ -964,10 +972,10 @@ func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanT
 			return nil, "trivy-images", false, nil
 		}
 		report, scanErr := scanner.ScanImages(ctx, target.path, workspace, cfg)
-		return findingRefs(report.Findings), cfg.VulnScan.ImageScan.Tool, true, scanErr
+		return report.Findings, cfg.VulnScan.ImageScan.Tool, true, scanErr
 	}
 	report, scanErr := scanner.Scan(ctx, target.path, workspace, cfg)
-	return findingRefs(report.Findings), cfg.VulnScan.DependencySource, true, scanErr
+	return report.Findings, cfg.VulnScan.DependencySource, true, scanErr
 }
 
 func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace) bool {
@@ -977,7 +985,7 @@ func vulnerabilityStageUsesDocker(cfg config.Config, workspace config.Workspace)
 	return true
 }
 
-func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) ([]string, bool, error) {
+func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) ([]vulnscan.Finding, bool, error) {
 	if cfg.VulnScan.DependencySource != "github-dependabot" {
 		return nil, false, nil
 	}
@@ -986,7 +994,7 @@ func scanAlertsStage(ctx context.Context, cfg config.Config, target scanTarget) 
 		return nil, true, err
 	}
 	findings, err := (githubalerts.Client{}).Scan(ctx, workspace, cfg.GithubAdvisories)
-	return findingRefs(findings), true, err
+	return findings, true, err
 }
 
 func scanWorkspace(target scanTarget) (config.Workspace, error) {
@@ -1042,6 +1050,20 @@ func findingRefs(findings []vulnscan.Finding) []string {
 	}
 	sort.Strings(refs)
 	return refs
+}
+
+func appendUniqueFindings(values []vulnscan.Finding, additions ...vulnscan.Finding) []vulnscan.Finding {
+	seen := make(map[string]bool, len(values)+len(additions))
+	for _, value := range values {
+		seen[value.Ref()] = true
+	}
+	for _, value := range additions {
+		if !seen[value.Ref()] {
+			values = append(values, value)
+			seen[value.Ref()] = true
+		}
+	}
+	return values
 }
 
 func appendUniqueStrings(values []string, additions ...string) []string {
@@ -1395,7 +1417,11 @@ func summarizeScan(results []scanResult) scanSummary {
 	return summary
 }
 
-func writeHumanScanResults(results []scanResult, machineConfig string, verbose bool) {
+func writeHumanScanResults(results []scanResult, machineConfig string, verbose bool, alreadyWarned []string) {
+	warned := make(map[string]bool, len(alreadyWarned))
+	for _, warning := range alreadyWarned {
+		warned[warning] = true
+	}
 	for resultIndex, result := range results {
 		if resultIndex > 0 {
 			fmt.Println()
@@ -1405,10 +1431,12 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 			label = result.Directory
 		}
 		fmt.Printf("Scan: %s\n", label)
+		fmt.Println()
 		writePackageCandidateTable(result)
 		fmt.Printf("Result: %s\n", conciseScanSummary(result))
-		for _, finding := range result.Vulnerabilities {
-			fmt.Printf("Vulnerability: %s\n", finding)
+		if len(result.VulnerabilityFindings) > 0 {
+			fmt.Println()
+			writeVulnerabilityTable(result)
 		}
 		if result.PackageUpdates != nil && result.PackageUpdates.Reason == "manifest_has_no_safe_mutation_contract" {
 			fmt.Println("Note: requirements.txt is read-only; automatic updates are unavailable.")
@@ -1422,41 +1450,27 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 			fmt.Fprintf(os.Stderr, "Issue: %s:%d [%s] %s\n", diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)
 		}
 		if verbose {
-			fmt.Printf("Details:\n  status: %s\n", result.Status)
-		}
-		if verbose && len(result.Stages) > 0 {
-			stages := make([]string, 0, len(result.Stages))
-			for _, stage := range result.Stages {
-				stages = append(stages, fmt.Sprintf("%s=%s", stage.Name, stage.Status))
-			}
-			fmt.Printf("  stages: %s\n", strings.Join(stages, ", "))
-		}
-		if verbose && len(result.InputCategories) > 0 {
-			fmt.Printf("  inputs: %s\n", strings.Join(result.InputCategories, ", "))
+			fmt.Println()
+			fmt.Println("Details:")
+			writeScanDetails(result)
 		}
 		if verbose {
-			for _, step := range result.Verification {
-				fmt.Printf("  verification: %s\n", step)
+			pending := make([]string, 0, len(result.Warnings))
+			for _, warning := range result.Warnings {
+				if !warned[warning] {
+					pending = append(pending, warning)
+				}
 			}
-		}
-		if verbose && result.PackageUpdates != nil {
-			fmt.Printf("  package updates: %s (%s)\n", result.PackageUpdates.Status, result.PackageUpdates.Reason)
-		}
-		if verbose {
-			for _, capability := range result.Capabilities {
-				if capability.Reason == "" {
-					fmt.Printf("  capability %s: %s\n", capability.Name, capability.Status)
-				} else {
-					fmt.Printf("  capability %s: %s (%s)\n", capability.Name, capability.Status, capability.Reason)
+			if len(pending) > 0 {
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, "Warnings:")
+				for _, warning := range pending {
+					fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 				}
 			}
 		}
-		if verbose {
-			for _, warning := range result.Warnings {
-				fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
-			}
-		}
 		if result.Error != nil {
+			fmt.Fprintln(os.Stderr)
 			fmt.Fprintf(os.Stderr, "Error: %s\n", result.Error.Message)
 			if result.Error.Hint != "" {
 				fmt.Fprintf(os.Stderr, "Hint: %s\n", result.Error.Hint)
@@ -1631,21 +1645,79 @@ func markdownValueLimit(value string, maximum int) string {
 
 var reportUserinfoURL = regexp.MustCompile(`(?i)https?://[^/\s@]+@`)
 
+func writeTable(w io.Writer, headers []string, rows [][]string) {
+	if len(rows) == 0 {
+		return
+	}
+	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(table, strings.Join(headers, "\t"))
+	for _, row := range rows {
+		_, _ = fmt.Fprintln(table, strings.Join(row, "\t"))
+	}
+	_ = table.Flush()
+}
+
 func writePackageCandidateTable(result scanResult) {
 	if len(result.Candidates) == 0 {
 		return
 	}
-	table := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(table, "MANAGER\tPACKAGE\tCURRENT\tLATEST\tSTATUS")
+	fmt.Println("Packages:")
+	rows := make([][]string, 0, len(result.Candidates))
 	for _, candidate := range result.Candidates {
 		current := candidate.Current
 		if current == "" {
 			current = "unknown"
 		}
-		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n",
-			candidate.Kind, candidate.Name, current, candidate.Target, packageCandidateStatus(result, candidate))
+		rows = append(rows, []string{
+			candidate.Kind, candidate.Name, current, candidate.Target, packageCandidateStatus(result, candidate),
+		})
 	}
-	_ = table.Flush()
+	writeTable(os.Stdout, []string{"MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS"}, rows)
+}
+
+func writeVulnerabilityTable(result scanResult) {
+	if len(result.VulnerabilityFindings) == 0 {
+		return
+	}
+	fmt.Println("Vulnerabilities:")
+	rows := make([][]string, 0, len(result.VulnerabilityFindings))
+	for _, finding := range result.VulnerabilityFindings {
+		pkg := finding.Package
+		if pkg == "" {
+			pkg = "unknown"
+		}
+		severity := finding.Severity
+		if severity == "" {
+			severity = "unknown"
+		}
+		rows = append(rows, []string{finding.ID, pkg, severity})
+	}
+	writeTable(os.Stdout, []string{"CVE", "PACKAGE", "SEVERITY"}, rows)
+}
+
+func writeScanDetails(result scanResult) {
+	details := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintf(details, "  status:\t%s\n", result.Status)
+	for _, stage := range result.Stages {
+		_, _ = fmt.Fprintf(details, "  stage %s:\t%s\n", stage.Name, stage.Status)
+	}
+	if len(result.InputCategories) > 0 {
+		_, _ = fmt.Fprintf(details, "  inputs:\t%s\n", strings.Join(result.InputCategories, ", "))
+	}
+	for _, step := range result.Verification {
+		_, _ = fmt.Fprintf(details, "  verification:\t%s\n", step)
+	}
+	if result.PackageUpdates != nil {
+		_, _ = fmt.Fprintf(details, "  package updates:\t%s (%s)\n", result.PackageUpdates.Status, result.PackageUpdates.Reason)
+	}
+	for _, capability := range result.Capabilities {
+		if capability.Reason == "" {
+			_, _ = fmt.Fprintf(details, "  capability %s:\t%s\n", capability.Name, capability.Status)
+		} else {
+			_, _ = fmt.Fprintf(details, "  capability %s:\t%s (%s)\n", capability.Name, capability.Status, capability.Reason)
+		}
+	}
+	_ = details.Flush()
 }
 
 func packageCandidateStatus(result scanResult, candidate updatesnapshot.Candidate) string {

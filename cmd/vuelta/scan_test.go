@@ -18,6 +18,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
+	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
 func TestResolveScanTargetsDoesNotWalkToContainingRegisteredProject(t *testing.T) {
@@ -207,10 +208,12 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 					return nil, "trivy", false, nil
 				},
-				alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+					return nil, false, nil
+				},
 				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 					if testCase.err != nil {
 						return nil, "npm", false, testCase.err
@@ -295,17 +298,17 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 					if test.dependencySource == "github-dependabot" {
 						return nil, "trivy-images", false, nil
 					}
-					return []string{"CVE-1"}, "trivy", true, test.vulnerabilityErr
+					return []vulnscan.Finding{{ID: "CVE-1"}}, "trivy", true, test.vulnerabilityErr
 				},
-				alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 					if test.dependencySource != "github-dependabot" {
 						return nil, false, nil
 					}
-					return []string{"GHSA-1"}, true, test.alertErr
+					return []vulnscan.Finding{{ID: "GHSA-1"}}, true, test.alertErr
 				},
 				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 					if test.packageErr != nil {
@@ -340,11 +343,13 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
 	vulnerabilityCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			vulnerabilityCalled = true
-			return []string{"CVE-2026-0001"}, "trivy", true, nil
+			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, "trivy", true, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			t.Fatal("package scanner was called for --only vulnerabilities")
 			return nil, "", false, nil
@@ -367,10 +372,12 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
-			return []string{"CVE-2026-0001"}, "trivy", true, nil
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
+			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, "trivy", true, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
 		packages: func(_ context.Context, _ config.Config, _ scanTarget, options scanOptions, _ config.LocalPackagePolicy, _ time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			if options.packageDiagnostics != nil {
 				*options.packageDiagnostics = append(*options.packageDiagnostics, updater.ScanDiagnostic{File: "requirements.txt", Line: 2, Code: "exact_pin_required", Message: "expected one exact pin"})
@@ -404,11 +411,11 @@ func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			t.Fatal("vulnerability scanner was called for --only packages")
 			return nil, "", false, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			t.Fatal("alerts scanner was called for --only packages")
 			return nil, false, nil
 		},
@@ -438,11 +445,13 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	}
 	called := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			called = true
 			return nil, "trivy", true, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			t.Fatal("package scanner was called")
 			return nil, "", false, nil
@@ -488,12 +497,12 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	}
 	alertsCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			return nil, "trivy-images", false, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			alertsCalled = true
-			return []string{"GHSA-1"}, true, nil
+			return []vulnscan.Finding{{ID: "GHSA-1"}}, true, nil
 		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			t.Fatal("Docker-backed package runner was called")
@@ -511,10 +520,12 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	workspace := config.Workspace{Name: "supported", Path: root, Stack: config.StackNode, PackageManager: "npm"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			return nil, "trivy", true, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			t.Fatal("package stage was not requested")
 			return nil, "", false, nil
@@ -547,10 +558,10 @@ func TestGitlessWorkspaceKeepsCandidatesAndReportsCapability(t *testing.T) {
 		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			return nil, "trivy", false, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) {
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 			return nil, false, nil
 		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
@@ -586,10 +597,12 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	brokenWorkspace := config.Workspace{Name: "broken", Path: brokenRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	supportedWorkspace := config.Workspace{Name: "supported", Path: supportedRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]string, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, string, bool, error) {
 			return nil, "trivy", false, nil
 		},
-		alerts: func(context.Context, config.Config, scanTarget) ([]string, bool, error) { return nil, false, nil },
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
 		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			return nil, "npm", true, nil
 		},
@@ -665,7 +678,10 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 		Candidates: []updatesnapshot.Candidate{{
 			Kind: "npm", Name: "lodash", Current: "4.17.20", Target: "4.17.23", ReleaseAgeVerified: true,
 		}},
-		Vulnerabilities: []string{},
+		Vulnerabilities: []string{"CVE-2024-1"},
+		VulnerabilityFindings: []vulnscan.Finding{
+			{ID: "CVE-2024-1", Package: "lodash", Severity: "HIGH"},
+		},
 		Stages: []scanStageResult{
 			{Name: stageCandidate, Status: string(stageSucceeded)},
 			{Name: stageVulnerability, Status: string(stageNotRequested)},
@@ -675,34 +691,51 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 	}
 
 	stdout, stderr := captureScanOutput(t, func() {
-		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false)
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false, nil)
 	})
 	for _, wanted := range []string{
-		"Scan: api", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
+		"Scan: api", "Packages:", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
 		"npm", "lodash", "4.17.20", "4.17.23", "available",
-		"Result: 1 package update available.",
+		"Result: 1 package update available; 1 vulnerability found.",
+		"Vulnerabilities:", "CVE", "SEVERITY", "CVE-2024-1", "HIGH",
 		"Next: vuelta update --directory /tmp/project --config /tmp/config.yaml",
 	} {
 		if !strings.Contains(stdout, wanted) {
 			t.Fatalf("compact output %q does not contain %q", stdout, wanted)
 		}
 	}
-	for _, hidden := range []string{"Details:", "stages:", "inputs:", "built a local scanner image"} {
+	for _, hidden := range []string{"Details:", "stage ", "inputs:", "built a local scanner image"} {
 		if strings.Contains(stdout, hidden) || strings.Contains(stderr, hidden) {
 			t.Fatalf("compact output exposed %q: stdout=%q stderr=%q", hidden, stdout, stderr)
 		}
 	}
 
 	stdout, stderr = captureScanOutput(t, func() {
-		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", true)
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", true, nil)
 	})
-	for _, wanted := range []string{"Details:", "stages:", "inputs:"} {
+	for _, wanted := range []string{"Details:", "stage candidate:", "inputs:"} {
 		if !strings.Contains(stdout, wanted) {
 			t.Fatalf("verbose stdout %q does not contain %q", stdout, wanted)
 		}
 	}
-	if !strings.Contains(stderr, "Warning: built a local scanner image") {
+	if !strings.Contains(stderr, "Warnings:") || !strings.Contains(stderr, "Warning: built a local scanner image") {
 		t.Fatalf("verbose stderr = %q", stderr)
+	}
+}
+
+func TestHumanScanOutputSkipsWarningsAlreadyShownAtCommandLevel(t *testing.T) {
+	result := scanResult{
+		Directory: "/tmp/project", Status: "clean",
+		Warnings: []string{onboardingChangedWarning, "only shown per-project"},
+	}
+	_, stderr := captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "", true, []string{onboardingChangedWarning})
+	})
+	if strings.Contains(stderr, "Warning: "+onboardingChangedWarning) {
+		t.Fatalf("warning already shown at command level was printed again: %q", stderr)
+	}
+	if !strings.Contains(stderr, "Warning: only shown per-project") {
+		t.Fatalf("unique per-project warning is missing: %q", stderr)
 	}
 }
 
@@ -716,7 +749,7 @@ func TestHumanScanOutputExplainsRequirementsReadOnly(t *testing.T) {
 		},
 	}
 	stdout, _ := captureScanOutput(t, func() {
-		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false)
+		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false, nil)
 	})
 	for _, wanted := range []string{
 		"requirements", "flask", "0.5", "3.1.3", "read-only",
