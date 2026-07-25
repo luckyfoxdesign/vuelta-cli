@@ -219,6 +219,21 @@ func TestSelectScanConfigurationAmbiguousStackNamesWorkingFix(t *testing.T) {
 	}
 }
 
+func TestSelectScanConfigurationMissingRuntimeDigestSurfacesValidationNotAmbiguity(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "Dockerfile", "FROM node:20-alpine\n")
+	writeScanProjectFile(t, project, "compose.yml", "services:\n  app:\n    build: .\n")
+
+	_, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err == nil || !strings.Contains(err.Error(), "docker_images.runtime_images") {
+		t.Fatalf("err = %v, want validation failure naming docker_images.runtime_images", err)
+	}
+	if strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("err = %v, a resolved single stack must not be reported as ambiguous", err)
+	}
+}
+
 func TestSelectScanConfigurationExplicitStackConflictsWithPersistedValue(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))

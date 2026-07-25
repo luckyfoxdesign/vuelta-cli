@@ -201,10 +201,17 @@ func detectStackDrift(workspace config.Workspace, root string, interactive bool)
 }
 
 // ambiguousStackError names the concrete non-interactive fix for a --stack
-// ambiguity so a failed first-run onboarding never merely lists options.
+// ambiguity so a failed first-run onboarding never merely lists options. Only
+// a *configinit.MissingValueError reflects an actual detection ambiguity;
+// any other error (e.g. a cfg.Validate() failure after the stack was already
+// resolved) is returned unwrapped so it surfaces under its own wording
+// instead of being misattributed to detection.
 func ambiguousStackError(err error, root string) error {
 	var missing *configinit.MissingValueError
-	if errors.As(err, &missing) && missing.Flag == "--stack" {
+	if !errors.As(err, &missing) {
+		return err
+	}
+	if missing.Flag == "--stack" {
 		return fmt.Errorf(
 			"%s\n\nResolve non-interactively:\n  vuelta scan --directory %s --stack <value>\n\nThe choice is persisted to workspace.stack in %s on first run",
 			missing.Error(), root, projectConfigName,
