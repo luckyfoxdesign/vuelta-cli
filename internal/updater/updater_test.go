@@ -3,6 +3,7 @@ package updater
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -262,12 +263,12 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	combined, ok := resolved.(combinedScanner)
-	if !ok || len(combined) != 1 {
+	if !ok || len(combined.scanners) != 1 {
 		t.Fatalf("scanner = %T %#v", resolved, resolved)
 	}
-	packageScan, ok := combined[0].(packageScanner)
+	packageScan, ok := combined.scanners[0].(packageScanner)
 	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"ncu", "--jsonUpgraded", "--removeRange", "--cooldown", "168"}) {
-		t.Fatalf("profile scanner = %#v", combined[0])
+		t.Fatalf("profile scanner = %#v", combined.scanners[0])
 	}
 	spec, err := resolvePlannedMutationSpec(ws, cfg, &profile, []updatesnapshot.Candidate{{Kind: "npm", Name: "example", Target: "2.0.0"}}, false)
 	if err != nil || len(spec.Mutations) != 1 || !reflect.DeepEqual(spec.Mutations[0].Commands, [][]string{{"ncu", "--filter", "example", "--cooldown", "168", "-u"}}) {
@@ -293,12 +294,12 @@ func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	combined, ok := resolved.(combinedScanner)
-	if !ok || len(combined) != 1 {
+	if !ok || len(combined.scanners) != 1 {
 		t.Fatalf("scanner = %T %#v", resolved, resolved)
 	}
-	dockerScan, ok := combined[0].(dockerCandidateScanner)
+	dockerScan, ok := combined.scanners[0].(dockerCandidateScanner)
 	if !ok {
-		t.Fatalf("scanner[0] = %T, want dockerCandidateScanner", combined[0])
+		t.Fatalf("scanner[0] = %T, want dockerCandidateScanner", combined.scanners[0])
 	}
 	dockerScan.Resolve = func(_ context.Context, ref string) (string, error) {
 		if ref != "node:20-alpine" {
@@ -306,7 +307,7 @@ func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {
 		}
 		return newDigest, nil
 	}
-	combined[0] = dockerScan
+	combined.scanners[0] = dockerScan
 
 	candidates, err := combined.Scan(context.Background(), root)
 	if err != nil {
@@ -330,12 +331,51 @@ func TestResolveCandidateScannerDockerOnlyWithoutImagesIsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	combined, ok := resolved.(combinedScanner)
-	if !ok || len(combined) != 0 {
+	if !ok || len(combined.scanners) != 0 {
 		t.Fatalf("scanner = %T %#v, want empty combinedScanner", resolved, resolved)
 	}
 	candidates, err := combined.Scan(context.Background(), t.TempDir())
 	if err != nil || len(candidates) != 0 {
 		t.Fatalf("Scan() = %#v, %v; want no candidates", candidates, err)
+	}
+}
+
+func TestCombinedScannerReportsSubScannerProgress(t *testing.T) {
+	tests := []struct {
+		name     string
+		scanners []CandidateScanner
+		want     []string
+	}{
+		{
+			name: "multiple",
+			scanners: []CandidateScanner{
+				progressCandidateScanner{kind: "npm"},
+				progressCandidateScanner{kind: "docker"},
+			},
+			want: []string{"1/2 npm", "2/2 docker"},
+		},
+		{
+			name:     "single",
+			scanners: []CandidateScanner{progressCandidateScanner{kind: "npm"}},
+			want:     []string{"1/1 npm"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var got []string
+			scanner := combinedScanner{
+				scanners: test.scanners,
+				progress: func(detail string, done, total int) {
+					got = append(got, fmt.Sprintf("%d/%d %s", done, total, detail))
+				},
+			}
+			if _, err := scanner.Scan(context.Background(), t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("progress = %#v, want %#v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -416,12 +456,12 @@ func TestProfilePipToolsScannerUsesProjectPinMetadataCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	combined, ok := resolved.(combinedScanner)
-	if !ok || len(combined) != 1 {
+	if !ok || len(combined.scanners) != 1 {
 		t.Fatalf("scanner = %T %#v", resolved, resolved)
 	}
-	packageScan, ok := combined[0].(packageScanner)
+	packageScan, ok := combined.scanners[0].(packageScanner)
 	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"vuelta-pip-tools-scan"}) {
-		t.Fatalf("profile scanner = %#v", combined[0])
+		t.Fatalf("profile scanner = %#v", combined.scanners[0])
 	}
 }
 
@@ -450,7 +490,7 @@ func TestProfileRequirementsScannerSelectsReviewedRequirementsFile(t *testing.T)
 		t.Fatal(err)
 	}
 	combined := resolved.(combinedScanner)
-	packageScan := combined[0].(packageScanner)
+	packageScan := combined.scanners[0].(packageScanner)
 	want := []string{"vuelta-pip-tools-scan", "--requirements", "requirements.txt", "--report"}
 	if packageScan.Kind != "requirements" || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, want) {
 		t.Fatalf("profile scanner = %#v", packageScan)
@@ -534,6 +574,16 @@ type staticCandidateScanner struct{ candidates []updatesnapshot.Candidate }
 
 func (s staticCandidateScanner) Scan(context.Context, string) ([]updatesnapshot.Candidate, error) {
 	return append([]updatesnapshot.Candidate(nil), s.candidates...), nil
+}
+
+type progressCandidateScanner struct{ kind string }
+
+func (progressCandidateScanner) Scan(context.Context, string) ([]updatesnapshot.Candidate, error) {
+	return nil, nil
+}
+
+func (s progressCandidateScanner) candidateScannerKind() string {
+	return s.kind
 }
 
 func slicesContain(values []string, want string) bool {

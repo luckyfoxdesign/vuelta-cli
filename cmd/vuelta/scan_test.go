@@ -209,7 +209,7 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 					return nil, nil, nil, "trivy", false, nil
 				},
 				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -340,7 +340,7 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 					if test.dependencySource == "github-dependabot" {
 						return nil, nil, nil, "trivy-images", false, nil
 					}
@@ -383,7 +383,7 @@ func TestScanOneTargetWithNonTTYProgressStaysPlain(t *testing.T) {
 	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
 	policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -517,6 +517,24 @@ func TestScanPhaseMessagePrefixesAllTargets(t *testing.T) {
 	}
 }
 
+func TestScanStepProgressFormatsCountsAndPreservesProjectPrefix(t *testing.T) {
+	var output strings.Builder
+	progress := newScanProgress(false, &output)
+	options := scanOptions{all: true, progressIndex: 2, progressTotal: 5}
+	target := scanTarget{name: "landing", path: "/projects/landing"}
+	update := scanStepProgress(progress, options, target, "Images")
+
+	update("Preparing scan input", 0, 0)
+	update("python:3.12 (linux/amd64)", 2, 3)
+
+	want := "" +
+		"[2/5 landing] Images: Preparing scan input\n" +
+		"[2/5 landing] Images 2/3: python:3.12 (linux/amd64)\n"
+	if output.String() != want {
+		t.Fatalf("step progress = %q, want %q", output.String(), want)
+	}
+}
+
 func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
@@ -525,7 +543,7 @@ func TestStandaloneRequirementsVulnerabilityOnlyRunsScanner(t *testing.T) {
 	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
 	vulnerabilityCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			vulnerabilityCalled = true
 			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, nil, nil, "trivy", true, nil
 		},
@@ -554,7 +572,7 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return []vulnscan.Finding{{ID: "CVE-2026-0001"}}, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -593,7 +611,7 @@ func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			t.Fatal("vulnerability scanner was called for --only packages")
 			return nil, nil, nil, "", false, nil
 		},
@@ -627,7 +645,7 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	}
 	called := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			called = true
 			return nil, nil, nil, "trivy", true, nil
 		},
@@ -663,7 +681,7 @@ func TestDockerOnlyCandidateStageUsesDockerRegistry(t *testing.T) {
 		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -739,7 +757,7 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	}
 	alertsCalled := false
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy-images", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -762,7 +780,7 @@ func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	workspace := config.Workspace{Name: "supported", Path: root, Stack: config.StackNode, PackageManager: "npm"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy", true, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -800,7 +818,7 @@ func TestGitlessWorkspaceKeepsCandidatesAndReportsCapability(t *testing.T) {
 		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
 	}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
@@ -839,7 +857,7 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	brokenWorkspace := config.Workspace{Name: "broken", Path: brokenRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	supportedWorkspace := config.Workspace{Name: "supported", Path: supportedRoot, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
 	runners := scanStageRunners{
-		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 			return nil, nil, nil, "trivy", false, nil
 		},
 		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {

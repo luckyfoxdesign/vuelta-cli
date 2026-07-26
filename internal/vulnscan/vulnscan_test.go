@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +166,94 @@ func TestScanImagesUsesOSPackagesOnlyWithoutDependencyScan(t *testing.T) {
 	}
 }
 
+func TestScanReportsDependencyToolProgress(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	var progress []struct {
+		detail      string
+		done, total int
+	}
+	scanner := NewAdhocScanner(
+		func(context.Context, string, string, ...string) ([]byte, error) {
+			return []byte(trivyJSON(now.Format(time.RFC3339))), nil
+		},
+		WithDependencyProgress(func(detail string, done, total int) {
+			progress = append(progress, struct {
+				detail      string
+				done, total int
+			}{detail: detail, done: done, total: total})
+		}),
+	)
+	scanner.Now = func() time.Time { return now }
+	root, workspace := adhocNPMWorkspace(t)
+	if _, err := scanner.Scan(context.Background(), root, workspace, config.Config{
+		VulnScan: config.VulnScanConfig{DependencySource: "trivy", DatabaseMaxAgeHours: 24},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		detail      string
+		done, total int
+	}{{detail: "trivy fs", done: 1, total: 1}}
+	if !reflect.DeepEqual(progress, want) {
+		t.Fatalf("progress = %#v, want %#v", progress, want)
+	}
+}
+
+func TestScanImagesReportsIntentPlatformProgressInCommandOrder(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM alpine:3.20\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var commands int
+	var progress []struct {
+		detail      string
+		done, total int
+	}
+	scanner := NewAdhocScanner(
+		func(context.Context, string, string, ...string) ([]byte, error) {
+			commands++
+			return []byte(trivyImageJSON(now.Format(time.RFC3339), "example@sha256:"+strings.Repeat("a", 64))), nil
+		},
+		WithImageProgress(func(detail string, done, total int) {
+			progress = append(progress, struct {
+				detail      string
+				done, total int
+			}{detail: detail, done: done, total: total})
+		}),
+	)
+	scanner.Now = func() time.Time { return now }
+	_, err := scanner.ScanImages(context.Background(), root, config.Workspace{
+		Path: root,
+		DockerImages: &config.DockerImagesSpec{
+			Files:         []string{"Dockerfile"},
+			RuntimeImages: []string{"registry.example/app:latest"},
+			Platforms:     []string{"linux/amd64", "linux/arm64"},
+		},
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DatabaseMaxAgeHours: 24,
+		ImageScan: config.ImageScanConfig{
+			Enabled: true, Tool: "trivy", Image: "scanner@sha256:" + strings.Repeat("b", 64),
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		detail      string
+		done, total int
+	}{
+		{detail: "Preparing scan input"},
+		{detail: "alpine:3.20 (linux/amd64)", done: 1, total: 4},
+		{detail: "alpine:3.20 (linux/arm64)", done: 2, total: 4},
+		{detail: "registry.example/app:latest (linux/amd64)", done: 3, total: 4},
+		{detail: "registry.example/app:latest (linux/arm64)", done: 4, total: 4},
+	}
+	if commands != 4 || !reflect.DeepEqual(progress, want) {
+		t.Fatalf("commands = %d, progress = %#v, want %#v", commands, progress, want)
+	}
+}
+
 func TestScanImagesResolvesBareTagAsBaseImageProxyAndRecordsDigest(t *testing.T) {
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	root := t.TempDir()
@@ -241,10 +330,18 @@ func TestScanImagesNoImageReferenceIsStructuredSkip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
-		t.Fatal("trivy must not be invoked when nothing is resolvable")
-		return nil, nil
-	})
+	var stepCalls int
+	scanner := NewAdhocScanner(
+		func(context.Context, string, string, ...string) ([]byte, error) {
+			t.Fatal("trivy must not be invoked when nothing is resolvable")
+			return nil, nil
+		},
+		WithImageProgress(func(_ string, done, _ int) {
+			if done > 0 {
+				stepCalls++
+			}
+		}),
+	)
 	report, err := scanner.ScanImages(context.Background(), root, config.Workspace{
 		Path: root, DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}},
 	}, config.Config{VulnScan: config.VulnScanConfig{
@@ -256,6 +353,9 @@ func TestScanImagesNoImageReferenceIsStructuredSkip(t *testing.T) {
 	}
 	if len(report.ImageSkips) != 1 {
 		t.Fatalf("skips = %#v", report.ImageSkips)
+	}
+	if stepCalls != 0 {
+		t.Fatalf("image step callback called %d times without image intents", stepCalls)
 	}
 }
 

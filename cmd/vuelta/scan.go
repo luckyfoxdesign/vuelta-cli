@@ -178,6 +178,9 @@ type scanOptions struct {
 	toolchainProfile   *config.ToolchainProfile
 	toolchainIdentity  *toolchain.Identity
 	packageDiagnostics *[]updater.ScanDiagnostic
+	dependencyProgress vulnscan.ProgressFunc
+	imageProgress      vulnscan.ProgressFunc
+	packageProgress    updater.ProgressFunc
 	explicitConfig     bool
 	nonInteractive     bool
 	noColor            bool
@@ -655,7 +658,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 type scanStageRunners struct {
-	vulnerabilities  func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
+	vulnerabilities  func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
 	alerts           func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
@@ -734,6 +737,11 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 	result = addStage(result, stagePreflight, stageSucceeded, "")
 	progress := newScanProgress(scanProgressEligible(options), os.Stderr)
+	if !options.jsonOutput {
+		options.dependencyProgress = scanStepProgress(progress, options, target, "Dependencies")
+		options.imageProgress = scanStepProgress(progress, options, target, "Images")
+		options.packageProgress = scanStepProgress(progress, options, target, "Packages")
+	}
 
 	if options.only == "packages" {
 		result.Tools = append(result.Tools, scanToolResult{Name: "vulnerabilities", Status: "skipped", Reason: "not requested"})
@@ -750,7 +758,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			scanErr = target.dockerErr
 		} else {
 			progress.start(scanPhaseMessage(options, target, vulnerabilityProgressMessage(tool)))
-			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
+			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options)
 			progress.stop()
 		}
 		if !requested {
@@ -997,6 +1005,16 @@ func scanPhaseMessage(options scanOptions, target scanTarget, message string) st
 	return fmt.Sprintf("[%d/%d %s] %s", options.progressIndex, options.progressTotal, name, message)
 }
 
+func scanStepProgress(progress *scanProgress, options scanOptions, target scanTarget, stage string) func(string, int, int) {
+	return func(detail string, done, total int) {
+		message := stage + ": " + detail
+		if done > 0 && total > 0 {
+			message = fmt.Sprintf("%s %d/%d: %s", stage, done, total, detail)
+		}
+		progress.update(scanPhaseMessage(options, target, message))
+	}
+}
+
 func addUnavailableReleaseAgeStage(result scanResult, minAge time.Duration, reason string) scanResult {
 	if minAge > 0 {
 		return addStage(result, stageReleaseAge, stageFailed, reason)
@@ -1065,12 +1083,15 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
 	workspace, err := scanWorkspace(target)
 	if err != nil {
 		return nil, nil, nil, cfg.VulnScan.DependencySource, true, err
 	}
-	scanner := vulnscan.NewReadOnlyScanner()
+	scanner := vulnscan.NewReadOnlyScanner(
+		vulnscan.WithDependencyProgress(options.dependencyProgress),
+		vulnscan.WithImageProgress(options.imageProgress),
+	)
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
 			return nil, nil, nil, "trivy-images", false, nil
@@ -1264,6 +1285,7 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
 		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
 			AllowProjectConfig: options.allowProjectConfig, RequireTracked: false, ToolchainProfile: options.toolchainProfile,
+			Progress: options.packageProgress,
 		})
 		if err != nil {
 			return nil, workspace.PackageManager, false, err
@@ -1278,7 +1300,9 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 		scanConfig := cfg
 		scanConfig.Update.MinReleaseAgeDays = minDays
 		failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
-		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{RequireTracked: false, ToolchainProfile: options.toolchainProfile})
+		candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
+			RequireTracked: false, ToolchainProfile: options.toolchainProfile, Progress: options.packageProgress,
+		})
 		if err != nil {
 			return nil, packageToolName(workspace), false, err
 		}
@@ -1298,6 +1322,7 @@ func scanPackages(ctx context.Context, cfg config.Config, target scanTarget, opt
 	failOpenUnsupportedReleaseAge(&scanConfig, workspace, options.toolchainIdentity)
 	candidateScanner, err := updater.ResolveCandidateScannerWithOptions(workspace, scanConfig, updater.CandidateScannerOptions{
 		AllowProjectConfig: options.allowProjectConfig, RequireTracked: false, ToolchainProfile: options.toolchainProfile,
+		Progress: options.packageProgress,
 	})
 	if err != nil {
 		return nil, project.Manager, false, err

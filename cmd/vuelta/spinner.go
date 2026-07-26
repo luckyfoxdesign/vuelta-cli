@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,8 @@ type scanProgress struct {
 	stderr   io.Writer
 	cancel   chan struct{}
 	finished chan struct{}
+	message  string
+	mu       sync.RWMutex
 }
 
 func newScanProgress(animated bool, stderr io.Writer) *scanProgress {
@@ -57,24 +60,47 @@ func (p *scanProgress) start(message string) {
 	finished := make(chan struct{})
 	p.cancel = cancel
 	p.finished = finished
+	p.setMessage(message)
 	stderr := p.stderr
+	started := time.Now()
+	_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[0], message, 0))
 	go func() {
 		defer close(finished)
 		ticker := time.NewTicker(spinnerInterval)
 		defer ticker.Stop()
-		started := time.Now()
 		frame := 0
-		_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[frame], message, 0))
 		for {
 			select {
 			case <-cancel:
 				return
 			case <-ticker.C:
 				frame = (frame + 1) % len(spinnerFrames)
-				_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[frame], message, time.Since(started)))
+				_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[frame], p.currentMessage(), time.Since(started)))
 			}
 		}
 	}()
+}
+
+// update changes the active phase label without restarting its spinner.
+// Non-animated progress remains line-oriented and prints every update.
+func (p *scanProgress) update(message string) {
+	if !p.animated {
+		_, _ = fmt.Fprintln(p.stderr, message)
+		return
+	}
+	p.setMessage(message)
+}
+
+func (p *scanProgress) setMessage(message string) {
+	p.mu.Lock()
+	p.message = message
+	p.mu.Unlock()
+}
+
+func (p *scanProgress) currentMessage() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.message
 }
 
 func scanProgressFrame(frame, message string, elapsed time.Duration) string {
@@ -84,7 +110,7 @@ func scanProgressFrame(frame, message string, elapsed time.Duration) string {
 	if elapsed >= scanElapsedThreshold {
 		suffix = fmt.Sprintf(" — %ds", int64(elapsed/time.Second))
 	}
-	return fmt.Sprintf("\r%s %s%s", frame, message, suffix)
+	return fmt.Sprintf("\r\x1b[2K%s %s%s", frame, message, suffix)
 }
 
 // stop ends the current animated phase, if any, and clears its line. It is

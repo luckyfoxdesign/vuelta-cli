@@ -84,12 +84,12 @@ const (
 // to, and the tier that resolution claim rests on.
 type ImageResolution struct {
 	Reference           string
-	ResolvedDigest       string
-	Platform             string
-	Tier                 ImageTier
-	Dockerfile           string
-	OSPackagesInstalled  bool
-	ResolvedAt           time.Time
+	ResolvedDigest      string
+	Platform            string
+	Tier                ImageTier
+	Dockerfile          string
+	OSPackagesInstalled bool
+	ResolvedAt          time.Time
 }
 
 // ImageSkip is a structured tier-4 capability outcome: an image intent that
@@ -105,27 +105,59 @@ type ImageSkip struct {
 // gate behavior can be tested without a daemon or a network connection.
 type Command func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
 
+// ProgressFunc synchronously reports one observable scanner step. Callers
+// must return quickly; a nil callback disables progress entirely.
+type ProgressFunc func(detail string, done, total int)
+
+// ScannerOption configures optional scanner observability without changing
+// the Scan or ScanImages library contracts.
+type ScannerOption func(*Scanner)
+
+// WithDependencyProgress reports dependency input/scanner steps.
+func WithDependencyProgress(progress ProgressFunc) ScannerOption {
+	return func(scanner *Scanner) {
+		scanner.dependencyProgress = progress
+	}
+}
+
+// WithImageProgress reports image input and per-reference/platform steps.
+func WithImageProgress(progress ProgressFunc) ScannerOption {
+	return func(scanner *Scanner) {
+		scanner.imageProgress = progress
+	}
+}
+
 // Scanner invokes Trivy/OSV and validates their structured output.
 type Scanner struct {
 	Command              Command
 	Docker               dockerexec.Runner
 	Now                  func() time.Time
 	allowUntrackedInputs bool
+	dependencyProgress   ProgressFunc
+	imageProgress        ProgressFunc
 }
 
 // NewAdhocScanner returns the narrow scanner used only for an explicit
 // unregistered directory. Registered pipeline callers use the zero-value
 // Scanner, which always requires tracked inputs.
-func NewAdhocScanner(command Command) Scanner {
-	return Scanner{Command: command, allowUntrackedInputs: true}
+func NewAdhocScanner(command Command, options ...ScannerOption) Scanner {
+	scanner := Scanner{Command: command, allowUntrackedInputs: true}
+	for _, option := range options {
+		option(&scanner)
+	}
+	return scanner
 }
 
 // NewReadOnlyScanner returns the container scanner used by the read-only scan
 // command. Scan inputs remain allowlisted and secret-like names are rejected,
 // but Git tracking is deferred to snapshot creation so a dirty honest project
 // can still receive vulnerability findings.
-func NewReadOnlyScanner() Scanner {
-	return Scanner{allowUntrackedInputs: true}
+func NewReadOnlyScanner(options ...ScannerOption) Scanner {
+	scanner := Scanner{allowUntrackedInputs: true}
+	for _, option := range options {
+		option(&scanner)
+	}
+	return scanner
 }
 
 func (s Scanner) command(ctx context.Context, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
@@ -253,6 +285,9 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Wo
 	defer bundle.Destroy()
 	switch scanConfig.DependencySource {
 	case "trivy":
+		if s.dependencyProgress != nil {
+			s.dependencyProgress("trivy fs", 1, 1)
+		}
 		out, err := s.command(ctx, bundle, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
 		if err != nil {
 			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
@@ -266,6 +301,9 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Wo
 		}
 		return parsed, nil
 	case "osv-scanner":
+		if s.dependencyProgress != nil {
+			s.dependencyProgress("osv-scanner", 1, 1)
+		}
 		out, err := s.command(ctx, bundle, scanConfig.Image, cfg.Update.Egress, "osv-scanner", "--format", "json", "--lockfile", "/project")
 		if err != nil {
 			return nil, fmt.Errorf("osv-scanner filesystem scan: %w", err)
@@ -295,6 +333,9 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	if repositoryRoot == "" {
 		repositoryRoot = root
 	}
+	if s.imageProgress != nil {
+		s.imageProgress("Preparing scan input", 0, 0)
+	}
 	bundle, err := scaninput.Build(ctx, root, repositoryRoot, scaninput.Options{RequireTracked: !s.allowUntrackedInputs}, scaninput.DockerContract(ws))
 	if err != nil {
 		return nil, nil, nil, err
@@ -312,12 +353,19 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	var findings []Finding
 	var resolutions []ImageResolution
 	var skips []ImageSkip
+	platforms := imagePlatforms(ws, scanConfig)
+	total := len(intents) * len(platforms)
+	step := 0
 	for _, intent := range intents {
 		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--format", "json"}
 		if scanConfig.ImageScan.VEX == "auto" {
 			args = append(args, "--vex", "repo")
 		}
-		for _, platform := range imagePlatforms(ws, scanConfig) {
+		for _, platform := range platforms {
+			step++
+			if s.imageProgress != nil {
+				s.imageProgress(intent.Reference+" ("+platform+")", step, total)
+			}
 			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, intent.Reference)
 			out, cmdErr := s.command(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
 			if cmdErr != nil {

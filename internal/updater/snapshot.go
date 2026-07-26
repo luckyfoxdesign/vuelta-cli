@@ -26,6 +26,10 @@ type CandidateScanner interface {
 	Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error)
 }
 
+// ProgressFunc synchronously reports the current candidate sub-scanner.
+// Callers must return quickly; a nil callback disables progress entirely.
+type ProgressFunc func(detail string, done, total int)
+
 // ScanDiagnostic is one bounded, path-safe problem with an individual
 // dependency record. Diagnostics never become update-plan input.
 type ScanDiagnostic struct {
@@ -68,6 +72,7 @@ func ResolveCandidateScanner(ws config.Workspace, cfg config.Config) (CandidateS
 type CandidateScannerOptions struct {
 	AllowProjectConfig bool
 	RequireTracked     bool
+	Progress           ProgressFunc
 	// ToolchainProfile is a scan-prepared embedded default or override. Update
 	// callers leave it nil and retain the existing fail-closed resolution path.
 	ToolchainProfile *config.ToolchainProfile
@@ -144,7 +149,7 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 			Contract: scaninput.DockerContract(ws), RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
 		})
 	}
-	return combinedScanner(scanners), nil
+	return combinedScanner{scanners: scanners, progress: options.Progress}, nil
 }
 
 // ResolveToolchainProfile returns the exact profile used by production scan
@@ -205,7 +210,10 @@ func candidateScannerProvider(ws config.Workspace) (ecosystem.Adapter, ecosystem
 	return adapter, provider, nil
 }
 
-type combinedScanner []CandidateScanner
+type combinedScanner struct {
+	scanners []CandidateScanner
+	progress ProgressFunc
+}
 
 func (s combinedScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
 	report, err := s.ScanReport(ctx, projectPath)
@@ -215,7 +223,10 @@ func (s combinedScanner) Scan(ctx context.Context, projectPath string) ([]update
 func (s combinedScanner) ScanReport(ctx context.Context, projectPath string) (CandidateReport, error) {
 	var candidates []updatesnapshot.Candidate
 	var diagnostics []ScanDiagnostic
-	for _, scanner := range s {
+	for index, scanner := range s.scanners {
+		if s.progress != nil {
+			s.progress(candidateScannerKind(scanner), index+1, len(s.scanners))
+		}
 		report, err := ScanCandidateReport(ctx, scanner, projectPath)
 		if err != nil {
 			return CandidateReport{}, err
@@ -238,6 +249,17 @@ func (s combinedScanner) ScanReport(ctx context.Context, projectPath string) (Ca
 	return CandidateReport{Candidates: candidates, Diagnostics: diagnostics}, nil
 }
 
+type kindedCandidateScanner interface {
+	candidateScannerKind() string
+}
+
+func candidateScannerKind(scanner CandidateScanner) string {
+	if kinded, ok := scanner.(kindedCandidateScanner); ok {
+		return kinded.candidateScannerKind()
+	}
+	return "packages"
+}
+
 type packageScanner struct {
 	Kind, Image       string
 	Args              []string
@@ -247,6 +269,10 @@ type packageScanner struct {
 	Contract          scaninput.Contract
 	RepositoryRoot    string
 	RequireTracked    bool
+}
+
+func (s packageScanner) candidateScannerKind() string {
+	return s.Kind
 }
 
 func (s packageScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
@@ -406,6 +432,10 @@ type dockerCandidateScanner struct {
 	Contract       scaninput.Contract
 	RepositoryRoot string
 	RequireTracked bool
+}
+
+func (dockerCandidateScanner) candidateScannerKind() string {
+	return "docker"
 }
 
 func (s dockerCandidateScanner) Scan(ctx context.Context, projectPath string) ([]updatesnapshot.Candidate, error) {
