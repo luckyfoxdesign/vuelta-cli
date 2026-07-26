@@ -77,8 +77,10 @@ type CandidateScannerOptions struct {
 // contracts. Snapshot/update callers require tracked inputs; the read-only
 // scan command may defer that integrity check until snapshot creation.
 func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, options CandidateScannerOptions) (CandidateScanner, error) {
-	if err := toolchain.ValidateManagerSupport(ws.Stack, ws.PackageManager); err != nil {
-		return nil, err
+	if ws.PackageManager != "" {
+		if err := toolchain.ValidateManagerSupport(ws.Stack, ws.PackageManager); err != nil {
+			return nil, err
+		}
 	}
 	var scanners []CandidateScanner
 	packageContract, err := scaninput.PackageContract(ws, options.AllowProjectConfig)

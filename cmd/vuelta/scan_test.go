@@ -649,6 +649,66 @@ func TestRegisteredScanOnlyRequirementsWorkspaceUsesDependencyContract(t *testin
 	}
 }
 
+func TestDockerOnlyCandidateStageUsesDockerRegistry(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := config.Workspace{
+		Name: "docker-only", Path: root, Stack: config.StackDocker,
+		DockerImages: &config.DockerImagesSpec{
+			Files:         []string{"Dockerfile"},
+			RuntimeImages: []string{"scratch"},
+		},
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", false, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
+		packages: scanPackages,
+	}
+	result := scanOneTargetWith(
+		context.Background(),
+		config.Config{},
+		scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace},
+		scanOptions{},
+		config.LocalPackagePolicy{},
+		updatesnapshot.PolicyIdentity{},
+		0,
+		runners,
+	)
+	if result.Error != nil || result.Status == "partial" || result.Status == "failed" {
+		t.Fatalf("docker-only result = %#v", result)
+	}
+	candidateSucceeded := false
+	for _, stage := range result.Stages {
+		if stage.Name == stageCandidate && stage.Status == string(stageSucceeded) {
+			candidateSucceeded = true
+		}
+	}
+	if !candidateSucceeded {
+		t.Fatalf("candidate stage did not succeed: %#v", result.Stages)
+	}
+	dockerRegistryUsed := false
+	for _, tool := range result.Tools {
+		if tool.Name == "docker-registry" && tool.Status == "used" {
+			dockerRegistryUsed = true
+		}
+	}
+	if !dockerRegistryUsed {
+		t.Fatalf("docker-registry tool was not used: %#v", result.Tools)
+	}
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "unsupported ecosystem: docker/") {
+			t.Fatalf("unsupported docker ecosystem warning leaked: %q", warning)
+		}
+	}
+}
+
 func containsSubstring(values []string, want string) bool {
 	for _, value := range values {
 		if strings.Contains(value, want) {

@@ -275,6 +275,79 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 	}
 }
 
+func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {
+	root := t.TempDir()
+	oldDigest := "sha256:" + strings.Repeat("a", 64)
+	newDigest := "sha256:" + strings.Repeat("b", 64)
+	writeFile(t, root, "Dockerfile", "FROM node:20-alpine@"+oldDigest+"\n")
+	ws := config.Workspace{
+		Path: root, Stack: config.StackDocker,
+		DockerImages: &config.DockerImagesSpec{
+			Files:         []string{"Dockerfile"},
+			RuntimeImages: []string{"node:20-alpine"},
+		},
+	}
+
+	resolved, err := ResolveCandidateScannerWithOptions(ws, config.Config{}, CandidateScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, ok := resolved.(combinedScanner)
+	if !ok || len(combined) != 1 {
+		t.Fatalf("scanner = %T %#v", resolved, resolved)
+	}
+	dockerScan, ok := combined[0].(dockerCandidateScanner)
+	if !ok {
+		t.Fatalf("scanner[0] = %T, want dockerCandidateScanner", combined[0])
+	}
+	dockerScan.Resolve = func(_ context.Context, ref string) (string, error) {
+		if ref != "node:20-alpine" {
+			t.Fatalf("digest reference = %q, want node:20-alpine", ref)
+		}
+		return newDigest, nil
+	}
+	combined[0] = dockerScan
+
+	candidates, err := combined.Scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []updatesnapshot.Candidate{{
+		Kind: "docker", Name: "node:20-alpine", Current: oldDigest, Target: newDigest, File: "Dockerfile",
+	}}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("candidates = %#v, want %#v", candidates, want)
+	}
+}
+
+func TestResolveCandidateScannerDockerOnlyWithoutImagesIsEmpty(t *testing.T) {
+	resolved, err := ResolveCandidateScannerWithOptions(
+		config.Workspace{Stack: config.StackDocker},
+		config.Config{},
+		CandidateScannerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, ok := resolved.(combinedScanner)
+	if !ok || len(combined) != 0 {
+		t.Fatalf("scanner = %T %#v, want empty combinedScanner", resolved, resolved)
+	}
+	candidates, err := combined.Scan(context.Background(), t.TempDir())
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("Scan() = %#v, %v; want no candidates", candidates, err)
+	}
+}
+
+func TestResolveCandidateScannerStillRejectsUnknownManager(t *testing.T) {
+	ws := config.Workspace{Stack: "elixir", PackageManager: "mix"}
+	_, err := ResolveCandidateScannerWithOptions(ws, config.Config{}, CandidateScannerOptions{})
+	var unsupported *ecosystem.UnsupportedError
+	if !errors.Is(err, ecosystem.ErrUnsupported) || !errors.As(err, &unsupported) {
+		t.Fatalf("unknown manager error = %v, want UnsupportedError", err)
+	}
+}
+
 func TestPlannedNPMUpdateAppliesOnlyReviewedTargetAndKeepsDependenciesForVerification(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "package.json", `{"dependencies":{"example":"^1.0.0"}}`)
@@ -355,8 +428,9 @@ func TestProfilePipToolsScannerUsesProjectPinMetadataCommand(t *testing.T) {
 func TestLegacyBunScannerFailsBeforeDockerResolution(t *testing.T) {
 	ws := config.Workspace{Stack: config.StackNode, PackageManager: "bun"}
 	_, err := ResolveCandidateScannerWithOptions(ws, config.Config{}, CandidateScannerOptions{})
-	if err == nil || !strings.Contains(err.Error(), "mandatory egress proxy") {
-		t.Fatalf("bun scanner error = %v", err)
+	var capability *ecosystem.CapabilityError
+	if !errors.As(err, &capability) || capability.Capability != "candidate-scanner" || !strings.Contains(err.Error(), "mandatory egress proxy") {
+		t.Fatalf("bun scanner error = %v, want candidate-scanner CapabilityError", err)
 	}
 }
 
