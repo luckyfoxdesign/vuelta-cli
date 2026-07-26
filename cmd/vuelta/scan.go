@@ -35,10 +35,10 @@ import (
 )
 
 const (
-	exitEnv                = 4
-	exitFindings           = 5
-	exitPartial            = 6
-	exitImageScanRequired  = 7
+	exitEnv               = 4
+	exitFindings          = 5
+	exitPartial           = 6
+	exitImageScanRequired = 7
 )
 
 const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
@@ -182,6 +182,8 @@ type scanOptions struct {
 	nonInteractive     bool
 	noColor            bool
 	updateConfigPath   string
+	progressIndex      int
+	progressTotal      int
 }
 
 func executeScan(args []string) error {
@@ -217,6 +219,7 @@ func executeScan(args []string) error {
 	if selection.OnboardingChanged && len(targets) == 1 {
 		targets[0].onboardingChanged = true
 	}
+	writeScanPreflight(os.Stderr, options, *cfg, selection, targets)
 	for _, target := range targets {
 		if target.onboardingChanged {
 			warnings = appendUniqueStrings(warnings, onboardingChangedWarning)
@@ -250,8 +253,13 @@ func executeScan(args []string) error {
 		ctx = egress.WithSession(ctx, egressSession)
 	}
 	results := make([]scanResult, 0, len(targets))
-	for _, target := range targets {
-		results = append(results, scanOneTarget(ctx, *cfg, target, options, policy, policyIdentity, minAge))
+	for index, target := range targets {
+		targetOptions := options
+		if options.all {
+			targetOptions.progressIndex = index + 1
+			targetOptions.progressTotal = len(targets)
+		}
+		results = append(results, scanOneTarget(ctx, *cfg, target, targetOptions, policy, policyIdentity, minAge))
 	}
 	if egressSession != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -278,20 +286,42 @@ func executeScan(args []string) error {
 			return err
 		}
 	} else {
-		if selection.Scope == "project" {
-			if selection.Status == "created" {
-				fmt.Printf("Created project config: %s\n", selection.Path)
-			} else {
-				fmt.Printf("Using project config: %s\n", selection.Path)
-			}
-			fmt.Printf("Scanning %s...\n", cfg.Workspaces[0].Path)
-		}
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, "warning:", warning)
 		}
 		writeHumanScanResults(results, options.updateConfigPath, options.verbose, warnings)
 	}
 	return scanResultError(summary, options.failOn, options.requireImageScan)
+}
+
+func writeScanPreflight(writer io.Writer, options scanOptions, cfg config.Config, selection scanConfigSelection, targets []scanTarget) {
+	if options.jsonOutput || selection.Scope != "project" || len(cfg.Workspaces) == 0 || len(targets) != 1 {
+		return
+	}
+	target := targets[0]
+	workspace := cfg.Workspaces[0]
+	projectName := target.name
+	if projectName == "" {
+		projectName = config.WorkspaceName(workspace)
+	}
+	detected := "none"
+	if len(selection.DetectedStacks) > 0 {
+		detected = strings.Join(selection.DetectedStacks, ", ")
+	}
+	selected := workspace.Stack
+	if workspace.PackageManager != "" {
+		selected += "/" + workspace.PackageManager
+	}
+	_, _ = fmt.Fprintf(
+		writer,
+		"Project:  %s (%s)\nConfig:   %s (%s)\nDetected: %s\nSelected: %s\n",
+		projectName,
+		target.path,
+		filepath.Base(selection.Path),
+		selection.Status,
+		detected,
+		selected,
+	)
 }
 
 func scanResultError(summary scanSummary, failOn string, requireImageScan bool) error {
@@ -613,9 +643,9 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 			progress := newScanProgress(scanProgressEligible(options), os.Stderr)
 			prepared, err := toolchain.Prepare(ctx, workspace, cfg, dockerexec.Default(), func(message string) {
 				if options.verbose {
-					progress.start(fmt.Sprintf("Toolchain: %s", message))
+					progress.start(scanPhaseMessage(options, target, fmt.Sprintf("Toolchain: %s", message)))
 				} else {
-					progress.start("Preparing scanner for the first run...")
+					progress.start(scanPhaseMessage(options, target, "Preparing scanner for the first run..."))
 				}
 			})
 			progress.stop()
@@ -719,7 +749,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		if target.dockerErr != nil && vulnerabilityStageUsesDocker(cfg, identityWorkspace) {
 			scanErr = target.dockerErr
 		} else {
-			progress.start("Scanning for vulnerabilities...")
+			progress.start(scanPhaseMessage(options, target, vulnerabilityProgressMessage(tool)))
 			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target)
 			progress.stop()
 		}
@@ -737,7 +767,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Warnings = appendUniqueStrings(result.Warnings, driftWarnings...)
 		}
 
-		progress.start("Checking GitHub security alerts...")
+		progress.start(scanPhaseMessage(options, target, "Checking GitHub security alerts..."))
 		alertFindings, requested, alertErr := runners.alerts(ctx, cfg, target)
 		progress.stop()
 		if !requested {
@@ -789,7 +819,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	if target.dockerErr != nil {
 		err = target.dockerErr
 	} else {
-		progress.start("Scanning packages for updates...")
+		progress.start(scanPhaseMessage(options, target, packageProgressMessage(identityWorkspace.PackageManager)))
 		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
 		progress.stop()
 	}
@@ -940,6 +970,31 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result.Status = "ready"
 	result = addStage(result, stageSnapshot, stageSucceeded, "")
 	return result
+}
+
+func vulnerabilityProgressMessage(tool string) string {
+	if tool == "" {
+		return "Scanning dependencies for vulnerabilities..."
+	}
+	return fmt.Sprintf("Scanning dependencies with %s...", tool)
+}
+
+func packageProgressMessage(manager string) string {
+	if manager == "" {
+		return "Scanning packages for updates..."
+	}
+	return fmt.Sprintf("Scanning %s packages for updates...", manager)
+}
+
+func scanPhaseMessage(options scanOptions, target scanTarget, message string) string {
+	if !options.all || options.progressIndex < 1 || options.progressTotal < 1 {
+		return message
+	}
+	name := target.name
+	if name == "" {
+		name = filepath.Base(target.path)
+	}
+	return fmt.Sprintf("[%d/%d %s] %s", options.progressIndex, options.progressTotal, name, message)
 }
 
 func addUnavailableReleaseAgeStage(result scanResult, minAge time.Duration, reason string) scanResult {

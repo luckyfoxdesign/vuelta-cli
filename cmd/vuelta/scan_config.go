@@ -21,6 +21,7 @@ type scanConfigSelection struct {
 	OnboardingChanged bool     `json:"onboarding_changed,omitempty"`
 	ChangedFiles      []string `json:"changed_files,omitempty"`
 	DriftWarning      string   `json:"drift_warning,omitempty"`
+	DetectedStacks    []string `json:"detected_stacks,omitempty"`
 }
 
 // resolveAmbiguousWorkspace retries BuildWorkspace, resolving each
@@ -126,6 +127,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	if ignorePlan.Changed {
 		selection.ChangedFiles = append(selection.ChangedFiles, ".gitignore")
 	}
+	selection.DetectedStacks = append([]string(nil), discovery.Stacks...)
 	return cfg, selection, nil
 }
 
@@ -148,7 +150,7 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 			root, project.Workspace.Stack, projectConfigName, explicitStack, path,
 		)
 	}
-	driftWarning, err := detectStackDrift(project.Workspace, root, allowMigrationPrompt)
+	driftWarning, detectedStacks, err := detectStackDrift(project.Workspace, root, allowMigrationPrompt)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
@@ -168,6 +170,7 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 		selection.ChangedFiles = []string{".gitignore"}
 	}
 	selection.DriftWarning = driftWarning
+	selection.DetectedStacks = detectedStacks
 	return cfg, selection, nil
 }
 
@@ -175,13 +178,14 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 // the persisted workspace.Stack. Any disagreement — the persisted stack no
 // longer detected, or a newly ambiguous set of candidate stacks — is reported:
 // as a non-fatal warning when interactive, or as a fail-closed error otherwise.
-func detectStackDrift(workspace config.Workspace, root string, interactive bool) (string, error) {
+func detectStackDrift(workspace config.Workspace, root string, interactive bool) (string, []string, error) {
 	discovery, err := configinit.Detect(root)
 	if err != nil {
-		return "", fmt.Errorf("re-detect project stack signals for drift check: %w", err)
+		return "", nil, fmt.Errorf("re-detect project stack signals for drift check: %w", err)
 	}
+	detectedStacks := append([]string(nil), discovery.Stacks...)
 	if len(discovery.Stacks) == 1 && discovery.Stacks[0] == workspace.Stack {
-		return "", nil
+		return "", detectedStacks, nil
 	}
 	detected := "none"
 	if len(discovery.Stacks) > 0 {
@@ -192,12 +196,12 @@ func detectStackDrift(workspace config.Workspace, root string, interactive bool)
 		workspace.Stack, detected,
 	)
 	if !interactive {
-		return "", fmt.Errorf(
+		return "", nil, fmt.Errorf(
 			"%s\n\nResolve: remove %s and re-run vuelta scan --stack <value>, or edit workspace.stack directly in %s",
 			message, projectConfigName, root,
 		)
 	}
-	return message + "; remove " + projectConfigName + " and re-run vuelta scan --stack <value>, or edit workspace.stack directly to update", nil
+	return message + "; remove " + projectConfigName + " and re-run vuelta scan --stack <value>, or edit workspace.stack directly to update", detectedStacks, nil
 }
 
 // ambiguousStackError names the concrete non-interactive fix for a --stack

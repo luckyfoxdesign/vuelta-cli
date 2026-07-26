@@ -397,7 +397,11 @@ func TestScanOneTargetWithNonTTYProgressStaysPlain(t *testing.T) {
 	_, stderr := captureScanOutput(t, func() {
 		scanOneTargetWith(context.Background(), cfg, target, scanOptions{}, config.LocalPackagePolicy{}, policyIdentity, 0, runners)
 	})
-	for _, wanted := range []string{"Scanning for vulnerabilities...\n", "Scanning packages for updates...\n"} {
+	for _, wanted := range []string{
+		"Scanning dependencies with trivy...\n",
+		"Checking GitHub security alerts...\n",
+		"Scanning npm packages for updates...\n",
+	} {
 		if !strings.Contains(stderr, wanted) {
 			t.Fatalf("non-tty progress output missing %q: %q", wanted, stderr)
 		}
@@ -406,6 +410,110 @@ func TestScanOneTargetWithNonTTYProgressStaysPlain(t *testing.T) {
 		if strings.Contains(stderr, forbidden) {
 			t.Fatalf("non-tty progress output contains animation control characters: %q", stderr)
 		}
+	}
+}
+
+func TestWriteScanPreflightShowsSingleAndMultipleDetectedStacks(t *testing.T) {
+	tests := []struct {
+		name     string
+		detected []string
+		want     string
+	}{
+		{name: "single", detected: []string{"node"}, want: "Detected: node\n"},
+		{name: "multiple", detected: []string{"docker", "node"}, want: "Detected: docker, node\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := config.Workspace{Name: "landing", Path: "/projects/landing", Stack: config.StackNode, PackageManager: "npm"}
+			var output strings.Builder
+			writeScanPreflight(
+				&output,
+				scanOptions{},
+				config.Config{Workspaces: []config.Workspace{workspace}},
+				scanConfigSelection{
+					Path:           "/projects/landing/.vuelta.yaml",
+					Scope:          "project",
+					Status:         "reused",
+					DriftWarning:   "persisted stack drift detail",
+					DetectedStacks: test.detected,
+				},
+				[]scanTarget{{workspace: &workspace, name: "landing", path: "/projects/landing"}},
+			)
+			text := output.String()
+			for _, wanted := range []string{
+				"Project:  landing (/projects/landing)\n",
+				"Config:   .vuelta.yaml (reused)\n",
+				test.want,
+				"Selected: node/npm\n",
+			} {
+				if !strings.Contains(text, wanted) {
+					t.Fatalf("preflight output %q does not contain %q", text, wanted)
+				}
+			}
+			if strings.Contains(text, "persisted stack drift detail") || strings.ContainsAny(text, "\x1b\r") {
+				t.Fatalf("preflight duplicated drift warning or emitted terminal controls: %q", text)
+			}
+		})
+	}
+}
+
+func TestWriteScanPreflightKeepsJSONOutputClean(t *testing.T) {
+	workspace := config.Workspace{Name: "landing", Path: "/projects/landing", Stack: config.StackNode, PackageManager: "npm"}
+	var output strings.Builder
+	writeScanPreflight(
+		&output,
+		scanOptions{jsonOutput: true},
+		config.Config{Workspaces: []config.Workspace{workspace}},
+		scanConfigSelection{Path: "/projects/landing/.vuelta.yaml", Scope: "project", Status: "reused", DetectedStacks: []string{"node"}},
+		[]scanTarget{{workspace: &workspace, name: "landing", path: "/projects/landing"}},
+	)
+	if output.Len() != 0 {
+		t.Fatalf("--json preflight output = %q, want empty", output.String())
+	}
+}
+
+func TestExecuteScanWritesPlainPreflightBeforeFirstPhase(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	if err := os.WriteFile(filepath.Join(project, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "package-lock.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr := captureScanOutput(t, func() {
+		_ = executeScan([]string{"--directory", project, "--internal-no-color", "--internal-no-input"})
+	})
+	for _, wanted := range []string{
+		"Project:  " + filepath.Base(project) + " (" + project + ")\n",
+		"Config:   .vuelta.yaml (created)\n",
+		"Detected: node\n",
+		"Selected: node/npm\n",
+	} {
+		if !strings.Contains(stderr, wanted) {
+			t.Fatalf("scan stderr %q does not contain preflight line %q", stderr, wanted)
+		}
+	}
+	headerIndex := strings.Index(stderr, "Project:")
+	phaseIndex := strings.Index(stderr, "Checking GitHub security alerts...")
+	if headerIndex < 0 || phaseIndex < 0 || headerIndex >= phaseIndex {
+		t.Fatalf("preflight must precede the first scan phase: %q", stderr)
+	}
+	if strings.ContainsAny(stderr, "\x1b\r") {
+		t.Fatalf("non-tty scan output contains terminal controls: %q", stderr)
+	}
+}
+
+func TestScanPhaseMessagePrefixesAllTargets(t *testing.T) {
+	got := scanPhaseMessage(
+		scanOptions{all: true, progressIndex: 2, progressTotal: 5},
+		scanTarget{name: "landing", path: "/projects/landing"},
+		"Scanning npm packages for updates...",
+	)
+	want := "[2/5 landing] Scanning npm packages for updates..."
+	if got != want {
+		t.Fatalf("phase message = %q, want %q", got, want)
 	}
 }
 

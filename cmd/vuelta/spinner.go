@@ -10,6 +10,7 @@ import (
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 const spinnerInterval = 100 * time.Millisecond
+const scanElapsedThreshold = 3 * time.Second
 
 // scanProgress reports phase labels for long-running scan stages (Docker
 // pull/build, container-based scans). When animated it draws an
@@ -49,6 +50,9 @@ func (p *scanProgress) start(message string) {
 		_, _ = fmt.Fprintln(p.stderr, message)
 		return
 	}
+	if p.cancel != nil {
+		p.stop()
+	}
 	cancel := make(chan struct{})
 	finished := make(chan struct{})
 	p.cancel = cancel
@@ -58,18 +62,29 @@ func (p *scanProgress) start(message string) {
 		defer close(finished)
 		ticker := time.NewTicker(spinnerInterval)
 		defer ticker.Stop()
+		started := time.Now()
 		frame := 0
-		_, _ = fmt.Fprintf(stderr, "\r%s %s", spinnerFrames[frame], message)
+		_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[frame], message, 0))
 		for {
 			select {
 			case <-cancel:
 				return
 			case <-ticker.C:
 				frame = (frame + 1) % len(spinnerFrames)
-				_, _ = fmt.Fprintf(stderr, "\r%s %s", spinnerFrames[frame], message)
+				_, _ = fmt.Fprint(stderr, scanProgressFrame(spinnerFrames[frame], message, time.Since(started)))
 			}
 		}
 	}()
+}
+
+func scanProgressFrame(frame, message string, elapsed time.Duration) string {
+	// Reserve the initial elapsed suffix width so the line does not jump when
+	// the timer first appears. The spaces remain invisible for short phases.
+	suffix := "     "
+	if elapsed >= scanElapsedThreshold {
+		suffix = fmt.Sprintf(" — %ds", int64(elapsed/time.Second))
+	}
+	return fmt.Sprintf("\r%s %s%s", frame, message, suffix)
 }
 
 // stop ends the current animated phase, if any, and clears its line. It is

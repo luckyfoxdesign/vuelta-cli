@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -24,6 +25,9 @@ func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
 	}
 	if selection.Status != "created" || selection.Scope != "project" || !selection.OnboardingChanged || len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Path != project {
 		t.Fatalf("selection/config = %#v %#v", selection, cfg)
+	}
+	if strings.Join(selection.DetectedStacks, ",") != config.StackNode {
+		t.Fatalf("created detected stacks = %#v, want [%s]", selection.DetectedStacks, config.StackNode)
 	}
 	before, err := os.ReadFile(selection.Path)
 	if err != nil {
@@ -50,6 +54,9 @@ func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
 	}
 	if reused.Status != "reused" || reused.OnboardingChanged || !bytes.Equal(before, after) {
 		t.Fatal("second selection rewrote the project config")
+	}
+	if strings.Join(reused.DetectedStacks, ",") != config.StackNode {
+		t.Fatalf("reused detected stacks = %#v, want [%s]", reused.DetectedStacks, config.StackNode)
 	}
 }
 
@@ -203,6 +210,9 @@ func TestSelectScanConfigurationStackFlagResolvesAmbiguity(t *testing.T) {
 	if selection.Status != "created" || cfg.Workspaces[0].Stack != config.StackDocker {
 		t.Fatalf("selection/config = %#v %#v", selection, cfg)
 	}
+	if strings.Join(selection.DetectedStacks, ",") != "docker,python" {
+		t.Fatalf("detected stacks = %#v, want [docker python]", selection.DetectedStacks)
+	}
 }
 
 func TestSelectScanConfigurationAmbiguousStackNamesWorkingFix(t *testing.T) {
@@ -289,15 +299,18 @@ func TestDetectStackDriftWarnsWhenInteractiveFailsClosedOtherwise(t *testing.T) 
 	writeScanProjectFile(t, root, "requirements.txt", "requests==2.0.0\n")
 	workspace := config.Workspace{Stack: config.StackNode}
 
-	warning, err := detectStackDrift(workspace, root, true)
+	warning, detected, err := detectStackDrift(workspace, root, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(warning, "no longer matches freshly detected") {
 		t.Fatalf("warning = %q", warning)
 	}
+	if strings.Join(detected, ",") != config.StackPython {
+		t.Fatalf("detected stacks = %#v, want [%s]", detected, config.StackPython)
+	}
 
-	if _, err := detectStackDrift(workspace, root, false); err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
+	if _, _, err := detectStackDrift(workspace, root, false); err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
 		t.Fatalf("non-interactive drift error = %v", err)
 	}
 }
@@ -308,9 +321,30 @@ func TestDetectStackDriftNoDisagreement(t *testing.T) {
 	writeScanProjectFile(t, root, "package-lock.json", "{}\n")
 	workspace := config.Workspace{Stack: config.StackNode}
 
-	warning, err := detectStackDrift(workspace, root, false)
-	if err != nil || warning != "" {
-		t.Fatalf("warning = %q, err = %v", warning, err)
+	warning, detected, err := detectStackDrift(workspace, root, false)
+	if err != nil || warning != "" || strings.Join(detected, ",") != config.StackNode {
+		t.Fatalf("warning = %q, detected = %#v, err = %v", warning, detected, err)
+	}
+}
+
+func TestScanConfigSelectionJSONAddsDetectedStacksWithoutChangingExistingFields(t *testing.T) {
+	selection := scanConfigSelection{
+		Path:              "/project/.vuelta.yaml",
+		Scope:             "project",
+		Status:            "reused",
+		MachineConfig:     "/machine/config.yaml",
+		OnboardingChanged: true,
+		ChangedFiles:      []string{".gitignore"},
+		DriftWarning:      "drift",
+		DetectedStacks:    []string{"docker", "node"},
+	}
+	data, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"path":"/project/.vuelta.yaml","scope":"project","status":"reused","machine_config":"/machine/config.yaml","onboarding_changed":true,"changed_files":[".gitignore"],"drift_warning":"drift","detected_stacks":["docker","node"]}`
+	if string(data) != want {
+		t.Fatalf("selection JSON = %s, want %s", data, want)
 	}
 }
 

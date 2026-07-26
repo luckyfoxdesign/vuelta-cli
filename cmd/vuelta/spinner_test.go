@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanProgressEligibleRespectsNoColorAndJSON(t *testing.T) {
@@ -51,4 +52,19 @@ func TestScanProgressAnimatedStartAndStopIsBoundedAndClears(t *testing.T) {
 	}
 	// stop must be idempotent and safe once the phase already ended.
 	progress.stop()
+}
+
+func TestScanProgressFrameShowsElapsedOnlyAfterThreshold(t *testing.T) {
+	before := scanProgressFrame("⠋", "Scanning dependencies with trivy...", scanElapsedThreshold-time.Millisecond)
+	if strings.Contains(before, " — ") {
+		t.Fatalf("elapsed appeared before threshold: %q", before)
+	}
+	atThreshold := scanProgressFrame("⠙", "Scanning dependencies with trivy...", scanElapsedThreshold)
+	if !strings.HasSuffix(atThreshold, " — 3s") {
+		t.Fatalf("elapsed frame = %q, want 3s suffix", atThreshold)
+	}
+	later := scanProgressFrame("⠹", "Scanning dependencies with trivy...", 47*time.Second)
+	if !strings.HasSuffix(later, " — 47s") {
+		t.Fatalf("elapsed frame = %q, want 47s suffix", later)
+	}
 }
