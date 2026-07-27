@@ -130,22 +130,23 @@ type ObservedCapability struct {
 
 // ObservedToolchain is the bounded, non-secret identity selected by Vuelta.
 type ObservedToolchain struct {
-	AdapterID             string   `json:"adapter_id,omitempty"`
-	AdapterVersion        string   `json:"adapter_version,omitempty"`
-	Source                string   `json:"source,omitempty"`
-	ProfileID             string   `json:"profile_id,omitempty"`
-	Hash                  string   `json:"hash,omitempty"`
-	RuntimeConstraint     string   `json:"runtime_constraint,omitempty"`
-	Runtime               string   `json:"runtime,omitempty"`
-	PackageManager        string   `json:"package_manager,omitempty"`
-	PackageManagerVersion string   `json:"package_manager_version,omitempty"`
-	Scanner               string   `json:"scanner,omitempty"`
-	ScannerVersion        string   `json:"scanner_version,omitempty"`
-	Image                 string   `json:"image,omitempty"`
-	ImageID               string   `json:"image_id,omitempty"`
-	Platform              string   `json:"platform,omitempty"`
-	User                  string   `json:"user,omitempty"`
-	LockFormats           []string `json:"lock_formats"`
+	AdapterID               string   `json:"adapter_id,omitempty"`
+	AdapterVersion          string   `json:"adapter_version,omitempty"`
+	Source                  string   `json:"source,omitempty"`
+	ProfileID               string   `json:"profile_id,omitempty"`
+	Hash                    string   `json:"hash,omitempty"`
+	RuntimeConstraint       string   `json:"runtime_constraint,omitempty"`
+	RuntimeConstraintSource string   `json:"runtime_constraint_source,omitempty"`
+	Runtime                 string   `json:"runtime,omitempty"`
+	PackageManager          string   `json:"package_manager,omitempty"`
+	PackageManagerVersion   string   `json:"package_manager_version,omitempty"`
+	Scanner                 string   `json:"scanner,omitempty"`
+	ScannerVersion          string   `json:"scanner_version,omitempty"`
+	Image                   string   `json:"image,omitempty"`
+	ImageID                 string   `json:"image_id,omitempty"`
+	Platform                string   `json:"platform,omitempty"`
+	User                    string   `json:"user,omitempty"`
+	LockFormats             []string `json:"lock_formats"`
 }
 
 // Comparison summarizes changes against the newest previous completed run.
@@ -195,22 +196,23 @@ type rawDiagnostic struct {
 }
 
 type rawToolchain struct {
-	AdapterID             string   `json:"adapter_id"`
-	AdapterVersion        string   `json:"adapter_version"`
-	Source                string   `json:"source"`
-	ProfileID             string   `json:"profile_id"`
-	Hash                  string   `json:"hash"`
-	RuntimeConstraint     string   `json:"runtime_constraint"`
-	Runtime               string   `json:"runtime"`
-	PackageManager        string   `json:"package_manager"`
-	PackageManagerVersion string   `json:"package_manager_version"`
-	Scanner               string   `json:"scanner"`
-	ScannerVersion        string   `json:"scanner_version"`
-	Image                 string   `json:"image"`
-	ImageID               string   `json:"image_id"`
-	Platform              string   `json:"platform"`
-	User                  string   `json:"user"`
-	LockFormats           []string `json:"lock_formats"`
+	AdapterID               string   `json:"adapter_id"`
+	AdapterVersion          string   `json:"adapter_version"`
+	Source                  string   `json:"source"`
+	ProfileID               string   `json:"profile_id"`
+	Hash                    string   `json:"hash"`
+	RuntimeConstraint       string   `json:"runtime_constraint"`
+	RuntimeConstraintSource string   `json:"runtime_constraint_source"`
+	Runtime                 string   `json:"runtime"`
+	PackageManager          string   `json:"package_manager"`
+	PackageManagerVersion   string   `json:"package_manager_version"`
+	Scanner                 string   `json:"scanner"`
+	ScannerVersion          string   `json:"scanner_version"`
+	Image                   string   `json:"image"`
+	ImageID                 string   `json:"image_id"`
+	Platform                string   `json:"platform"`
+	User                    string   `json:"user"`
+	LockFormats             []string `json:"lock_formats"`
 }
 
 // ParseObservedEnvelope rejects malformed or trailing JSON and retains only
@@ -352,22 +354,23 @@ func managerImpliesStack(managers []string, stack string) bool {
 
 func sanitizeObservedToolchain(value rawToolchain) ObservedToolchain {
 	return ObservedToolchain{
-		AdapterID:             SanitizeMessage(value.AdapterID),
-		AdapterVersion:        SanitizeMessage(value.AdapterVersion),
-		Source:                SanitizeMessage(value.Source),
-		ProfileID:             SanitizeMessage(value.ProfileID),
-		Hash:                  SanitizeMessage(value.Hash),
-		RuntimeConstraint:     SanitizeMessage(value.RuntimeConstraint),
-		Runtime:               SanitizeMessage(value.Runtime),
-		PackageManager:        SanitizeMessage(value.PackageManager),
-		PackageManagerVersion: SanitizeMessage(value.PackageManagerVersion),
-		Scanner:               SanitizeMessage(value.Scanner),
-		ScannerVersion:        SanitizeMessage(value.ScannerVersion),
-		Image:                 SanitizeMessage(value.Image),
-		ImageID:               SanitizeMessage(value.ImageID),
-		Platform:              SanitizeMessage(value.Platform),
-		User:                  SanitizeMessage(value.User),
-		LockFormats:           sanitizeList(value.LockFormats, 16),
+		AdapterID:               SanitizeMessage(value.AdapterID),
+		AdapterVersion:          SanitizeMessage(value.AdapterVersion),
+		Source:                  SanitizeMessage(value.Source),
+		ProfileID:               SanitizeMessage(value.ProfileID),
+		Hash:                    SanitizeMessage(value.Hash),
+		RuntimeConstraint:       SanitizeMessage(value.RuntimeConstraint),
+		RuntimeConstraintSource: SanitizeMessage(value.RuntimeConstraintSource),
+		Runtime:                 SanitizeMessage(value.Runtime),
+		PackageManager:          SanitizeMessage(value.PackageManager),
+		PackageManagerVersion:   SanitizeMessage(value.PackageManagerVersion),
+		Scanner:                 SanitizeMessage(value.Scanner),
+		ScannerVersion:          SanitizeMessage(value.ScannerVersion),
+		Image:                   SanitizeMessage(value.Image),
+		ImageID:                 SanitizeMessage(value.ImageID),
+		Platform:                SanitizeMessage(value.Platform),
+		User:                    SanitizeMessage(value.User),
+		LockFormats:             sanitizeList(value.LockFormats, 16),
 	}
 }
 

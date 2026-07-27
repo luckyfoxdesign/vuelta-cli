@@ -184,6 +184,10 @@ type npmAdapter struct {
 	mutableAdapter
 }
 
+type pipToolsAdapter struct {
+	mutableAdapter
+}
+
 type unsupportedAdapter struct {
 	baseAdapter
 	inputCapability
@@ -386,7 +390,7 @@ func UV() ecosystem.Adapter {
 // PipTools returns the python/pip-tools built-in adapter.
 func PipTools() ecosystem.Adapter {
 	key := ecosystem.Key{Stack: "python", PackageManager: "pip-tools"}
-	return mutablePythonAdapter(key, "pip-tools", "requirements.txt", "requirements",
+	adapter := mutablePythonAdapter(key, "pip-tools", "requirements.txt", "requirements",
 		"vuelta-pip-tools-scan", defaultPipScanner, "python-pip-tools.Dockerfile", []string{"pip.conf"},
 		func(runtime, manager string) map[string]string {
 			return map[string]string{
@@ -396,9 +400,14 @@ func PipTools() ecosystem.Adapter {
 				"SCANNER_VERSION":   defaultPipScanner,
 			}
 		},
-		[]string{"vuelta-pip-tools-scan"},
+		[]string{"vuelta-pip-tools-scan", "--requirements", "requirements.in", "--report"},
 		[][]string{{"pip-compile", "--upgrade", "requirements.in"}},
 	)
+	adapter.files = append(adapter.files, ecosystem.InputFile{
+		Path: "pyproject.toml", Category: ecosystem.InputCategoryManifest, Optional: true,
+	})
+	adapter.detect = detectPipToolsConstraints
+	return pipToolsAdapter{mutableAdapter: adapter}
 }
 
 // Requirements returns the scan-only python/requirements built-in adapter.
@@ -476,7 +485,7 @@ func mutablePythonAdapter(
 	buildArgs func(runtime, manager string) map[string]string,
 	scannerArgs []string,
 	mutationCommands [][]string,
-) ecosystem.Adapter {
+) mutableAdapter {
 	manifest := "pyproject.toml"
 	detectionFiles := []string{manifest, lockFile}
 	if key.PackageManager == "pip-tools" {
@@ -621,7 +630,11 @@ func detectNodeConstraints(root string, key ecosystem.Key, platform string) (eco
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return ecosystem.Constraints{}, fmt.Errorf("parse package.json toolchain metadata: %w", err)
 	}
-	constraints := ecosystem.Constraints{Key: key, Platform: platform, Runtime: strings.TrimSpace(manifest.Engines["node"])}
+	runtimeConstraint := strings.TrimSpace(manifest.Engines["node"])
+	constraints := ecosystem.Constraints{
+		Key: key, Platform: platform, Runtime: runtimeConstraint,
+		RuntimeConstraintSource: runtimeConstraintSource(runtimeConstraint),
+	}
 	if manifest.PackageManager != "" {
 		family, version, ok := strings.Cut(manifest.PackageManager, "@")
 		if !ok || family == "" || version == "" {
@@ -693,6 +706,7 @@ func detectPythonConstraints(root string, key ecosystem.Key, platform string) (e
 	} else if match := poetryPythonPattern.FindSubmatch(data); match != nil {
 		constraints.Runtime = string(match[1])
 	}
+	constraints.RuntimeConstraintSource = runtimeConstraintSource(constraints.Runtime)
 	lock := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock", "pip-tools": "requirements.txt"}[key.PackageManager]
 	if _, err := ecosystem.ReadRootFile(root, lock, ecosystem.DefaultManifestLimit); err != nil {
 		return ecosystem.Constraints{}, err
@@ -707,7 +721,17 @@ func detectRequirementsConstraints(root string, key ecosystem.Key, platform stri
 	if _, err := ecosystem.ReadRootFile(root, "requirements.txt", ecosystem.DefaultManifestLimit); err != nil {
 		return ecosystem.Constraints{}, err
 	}
-	return ecosystem.Constraints{Key: key, Platform: platform, LockFormat: "requirements-direct"}, nil
+	return ecosystem.Constraints{
+		Key: key, Platform: platform, LockFormat: "requirements-direct",
+		RuntimeConstraintSource: ecosystem.RuntimeConstraintSourceDefault,
+	}, nil
+}
+
+func runtimeConstraintSource(runtime string) string {
+	if strings.TrimSpace(runtime) == "" {
+		return ecosystem.RuntimeConstraintSourceDefault
+	}
+	return ecosystem.RuntimeConstraintSourceProject
 }
 
 func defaultIfEmpty(value, fallback string) string {

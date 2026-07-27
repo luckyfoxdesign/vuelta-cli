@@ -59,12 +59,22 @@ type VerificationProvider interface {
 
 // Constraints contains normalized, allowlisted project metadata.
 type Constraints struct {
-	Key                   Key
-	Runtime               string
-	PackageManagerVersion string
-	LockFormat            string
-	Platform              string
+	Key                     Key
+	Runtime                 string
+	RuntimeConstraintSource string
+	PackageManagerVersion   string
+	LockFormat              string
+	Platform                string
 }
+
+const (
+	// RuntimeConstraintSourceDefault means no project runtime constraint was
+	// declared and the embedded runtime policy selected the default.
+	RuntimeConstraintSourceDefault = "default"
+	// RuntimeConstraintSourceProject means allowlisted project metadata
+	// declared the runtime constraint.
+	RuntimeConstraintSourceProject = "project"
+)
 
 // ConstraintDetector parses only adapter-owned root inputs.
 type ConstraintDetector interface {

@@ -979,6 +979,7 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	}
 	if supported.Toolchain == nil || supported.Toolchain.Runtime != "22" ||
 		supported.Toolchain.Source != toolchain.SourceDefault ||
+		supported.Toolchain.RuntimeConstraintSource != ecosystem.RuntimeConstraintSourceProject ||
 		supported.Toolchain.RuntimeConstraint != ">=22.0.0 <23.0.0" {
 		t.Fatalf("supported toolchain result = %#v", supported.Toolchain)
 	}
@@ -988,9 +989,10 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	}
 	var decoded struct {
 		Toolchain *struct {
-			RuntimeConstraint string `json:"runtime_constraint"`
-			Runtime           string `json:"runtime"`
-			Source            string `json:"source"`
+			RuntimeConstraint       string `json:"runtime_constraint"`
+			RuntimeConstraintSource string `json:"runtime_constraint_source"`
+			Runtime                 string `json:"runtime"`
+			Source                  string `json:"source"`
 		} `json:"toolchain"`
 	}
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
@@ -998,6 +1000,7 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	}
 	if decoded.Toolchain == nil ||
 		decoded.Toolchain.RuntimeConstraint != ">=22.0.0 <23.0.0" ||
+		decoded.Toolchain.RuntimeConstraintSource != "project" ||
 		decoded.Toolchain.Runtime != "22" ||
 		decoded.Toolchain.Source != toolchain.SourceDefault {
 		t.Fatalf("structured scan toolchain = %#v", decoded.Toolchain)

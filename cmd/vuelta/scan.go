@@ -63,7 +63,8 @@ type scanToolResult struct {
 // without changing the snapshot identity contract.
 type scanToolchainResult struct {
 	toolchain.Identity
-	RuntimeConstraint string `json:"runtime_constraint,omitempty"`
+	RuntimeConstraint       string `json:"runtime_constraint,omitempty"`
+	RuntimeConstraintSource string `json:"runtime_constraint_source"`
 }
 
 type scanCapability struct {
@@ -174,31 +175,32 @@ type scanSummary struct {
 }
 
 type scanOptions struct {
-	project             string
-	directory           string
-	all                 bool
-	stack               string
-	only                string
-	policyPath          string
-	minReleaseAge       string
-	allowProjectConfig  bool
-	failOn              string
-	requireImageScan    bool
-	verbose             bool
-	jsonOutput          bool
-	toolchainProfile    *config.ToolchainProfile
-	toolchainIdentity   *toolchain.Identity
-	toolchainConstraint string
-	packageDiagnostics  *[]updater.ScanDiagnostic
-	dependencyProgress  vulnscan.ProgressFunc
-	imageProgress       vulnscan.ProgressFunc
-	packageProgress     updater.ProgressFunc
-	explicitConfig      bool
-	nonInteractive      bool
-	noColor             bool
-	updateConfigPath    string
-	progressIndex       int
-	progressTotal       int
+	project                   string
+	directory                 string
+	all                       bool
+	stack                     string
+	only                      string
+	policyPath                string
+	minReleaseAge             string
+	allowProjectConfig        bool
+	failOn                    string
+	requireImageScan          bool
+	verbose                   bool
+	jsonOutput                bool
+	toolchainProfile          *config.ToolchainProfile
+	toolchainIdentity         *toolchain.Identity
+	toolchainConstraint       string
+	toolchainConstraintSource string
+	packageDiagnostics        *[]updater.ScanDiagnostic
+	dependencyProgress        vulnscan.ProgressFunc
+	imageProgress             vulnscan.ProgressFunc
+	packageProgress           updater.ProgressFunc
+	explicitConfig            bool
+	nonInteractive            bool
+	noColor                   bool
+	updateConfigPath          string
+	progressIndex             int
+	progressTotal             int
 }
 
 func executeScan(args []string) error {
@@ -853,7 +855,12 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		options.toolchainProfile = &prepared.Profile
 		options.toolchainIdentity = &prepared.Identity
 		options.toolchainConstraint = prepared.RuntimeConstraint
-		result.Toolchain = resolvedScanToolchain(prepared.Identity, prepared.RuntimeConstraint)
+		options.toolchainConstraintSource = prepared.Constraints.RuntimeConstraintSource
+		result.Toolchain = resolvedScanToolchain(
+			prepared.Identity,
+			prepared.RuntimeConstraint,
+			prepared.Constraints.RuntimeConstraintSource,
+		)
 		if prepared.Built {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("built default toolchain %s locally; cache key %s will be reused by later scans", prepared.Profile.ID, prepared.CacheKey[:12]))
 		}
@@ -942,7 +949,11 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	var selectedToolchain toolchain.Identity
 	if options.toolchainIdentity != nil {
 		selectedToolchain = *options.toolchainIdentity
-		result.Toolchain = resolvedScanToolchain(selectedToolchain, options.toolchainConstraint)
+		result.Toolchain = resolvedScanToolchain(
+			selectedToolchain,
+			options.toolchainConstraint,
+			options.toolchainConstraintSource,
+		)
 	} else if identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		_, identity, constraints, resolveErr := toolchain.Resolve(identityWorkspace, cfg)
 		if resolveErr != nil {
@@ -955,7 +966,11 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			return finalizeStageOutcomes(result)
 		}
 		selectedToolchain = identity
-		result.Toolchain = resolvedScanToolchain(identity, runtimeConstraint.Canonical())
+		result.Toolchain = resolvedScanToolchain(
+			identity,
+			runtimeConstraint.Canonical(),
+			constraints.RuntimeConstraintSource,
+		)
 	}
 	configHash := "adhoc"
 	verificationHash := ""
@@ -1664,8 +1679,15 @@ func scanFailureContract(code, hint string, err error) (string, string) {
 	return code, hint
 }
 
-func resolvedScanToolchain(identity toolchain.Identity, constraint string) *scanToolchainResult {
-	return &scanToolchainResult{Identity: identity, RuntimeConstraint: constraint}
+func resolvedScanToolchain(
+	identity toolchain.Identity,
+	constraint string,
+	constraintSource string,
+) *scanToolchainResult {
+	return &scanToolchainResult{
+		Identity: identity, RuntimeConstraint: constraint,
+		RuntimeConstraintSource: constraintSource,
+	}
 }
 
 // classifySubprocessError extracts a safe category, exit code, and bounded

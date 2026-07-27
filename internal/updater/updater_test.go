@@ -460,7 +460,9 @@ func TestProfilePipToolsScannerUsesProjectPinMetadataCommand(t *testing.T) {
 		t.Fatalf("scanner = %T %#v", resolved, resolved)
 	}
 	packageScan, ok := combined.scanners[0].(packageScanner)
-	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{"vuelta-pip-tools-scan"}) {
+	if !ok || packageScan.Image != image || !reflect.DeepEqual(packageScan.Args, []string{
+		"vuelta-pip-tools-scan", "--requirements", "requirements.in", "--report",
+	}) {
 		t.Fatalf("profile scanner = %#v", combined.scanners[0])
 	}
 }

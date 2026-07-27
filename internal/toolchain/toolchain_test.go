@@ -278,6 +278,47 @@ func TestSelectRequirementsOnlyEmbeddedScanner(t *testing.T) {
 	}
 }
 
+func TestSelectPipToolsDefaultsWithoutPyprojectMetadata(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "requirements.in", "requests\n")
+	write(t, root, "requirements.txt", "requests==2.31.0\n")
+	selection, err := Select(config.Workspace{
+		Path: root, Stack: config.StackPython, PackageManager: "pip-tools",
+		Platform: "linux/amd64",
+	}, config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Source != SourceDefault ||
+		selection.Constraints.RuntimeConstraintSource != ecosystem.RuntimeConstraintSourceDefault ||
+		selection.RuntimeConstraint != "" ||
+		selection.Profile.Runtime != "3.12" ||
+		selection.Profile.ID != "default-python312-pip-tools" {
+		t.Fatalf("selection = %#v", selection)
+	}
+}
+
+func TestSelectPipToolsHonorsPresentRuntimeMetadata(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "requirements.in", "requests\n")
+	write(t, root, "requirements.txt", "requests==2.31.0\n")
+	write(t, root, "pyproject.toml", "[project]\nrequires-python = \">=3.11,<3.12\"\n")
+	selection, err := Select(config.Workspace{
+		Path: root, Stack: config.StackPython, PackageManager: "pip-tools",
+		Platform: "linux/amd64",
+	}, config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Constraints.RuntimeConstraintSource != ecosystem.RuntimeConstraintSourceProject ||
+		selection.RuntimeConstraint != ">=3.11.0 <3.12.0" ||
+		selection.Profile.Runtime != "3.11" {
+		t.Fatalf("selection = %#v", selection)
+	}
+}
+
 func profile(id, manager, runtime, managerVersion, lock string) config.ToolchainProfile {
 	return config.ToolchainProfile{
 		Version: config.ToolchainProfileVersion, ID: id, Stack: config.StackNode, PackageManager: manager,

@@ -42,6 +42,24 @@ func ReadRootFile(root, name string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
+// IsSecretLikePath reports repository-relative names that no dependency graph
+// may select as ordinary scanner input. Reviewed manager configuration remains
+// an explicit, separate capability.
+func IsSecretLikePath(name string) bool {
+	for _, component := range strings.Split(strings.ToLower(filepath.ToSlash(name)), "/") {
+		if strings.HasPrefix(component, ".env") || strings.HasPrefix(component, ".git") ||
+			component == ".vuelta" || component == ".npmrc" || component == ".netrc" ||
+			component == "pip.conf" || component == "auth.json" || component == "id_rsa" ||
+			component == "id_ed25519" || strings.HasSuffix(component, ".pem") ||
+			strings.HasSuffix(component, ".key") || strings.Contains(component, "credential") ||
+			strings.Contains(component, "password") || strings.Contains(component, "secret") ||
+			strings.Contains(component, "token") {
+			return true
+		}
+	}
+	return false
+}
+
 func rootFilePath(root, name string) (string, error) {
 	if root == "" || name == "" || filepath.IsAbs(name) || filepath.Clean(name) != name ||
 		name == "." || strings.Contains(name, "/") || strings.Contains(name, `\`) {

@@ -213,6 +213,95 @@ func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) 
 	}
 }
 
+func TestPipToolsContractArchivesOnlyTheExplicitRequirementsGraph(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "requirements.in", "-r requirements/base.in\n-c constraints.txt\ndemo\n")
+	write(t, root, "requirements.txt", "demo==1.0.0 \\\n    --hash=sha256:abc\n")
+	write(t, root, "requirements/base.in", "base\n")
+	write(t, root, "constraints.txt", "shared==2.0.0\n")
+	write(t, root, "pyproject.toml", "[project]\nrequires-python = \">=3.11\"\n")
+	write(t, root, "src/unrelated.py", "sentinel\n")
+
+	contract, err := PackageContract(config.Workspace{
+		Path: root, Stack: config.StackPython, PackageManager: "pip-tools",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := Build(context.Background(), root, root, Options{}, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := archiveFiles(t, bundle.Archive)
+	want := map[string]string{
+		"project/requirements.in":      "-r requirements/base.in\n-c constraints.txt\ndemo\n",
+		"project/requirements.txt":     "demo==1.0.0 \\\n    --hash=sha256:abc\n",
+		"project/requirements/base.in": "base\n",
+		"project/constraints.txt":      "shared==2.0.0\n",
+		"project/pyproject.toml":       "[project]\nrequires-python = \">=3.11\"\n",
+	}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("archive files = %v, want %v", sortedKeys(files), sortedKeys(want))
+	}
+}
+
+func TestPipToolsCorpusLayoutsResolveWithoutPyproject(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		source   string
+		compiled string
+		extra    map[string]string
+	}{
+		{
+			name:     "gcpdiag hashes",
+			source:   "google-cloud-core\n",
+			compiled: "google-cloud-core==2.4.1 \\\n    --hash=sha256:abc\n",
+		},
+		{
+			name:     "AWS CDK constraint",
+			source:   "-c constraints.txt\naws-cdk-lib\n",
+			compiled: "aws-cdk-lib==2.100.0\n",
+			extra:    map[string]string{"constraints.txt": "constructs==10.3.0\n"},
+		},
+		{
+			name:     "Dallinger nested source",
+			source:   "-r requirements/base.in\ndallinger\n",
+			compiled: "dallinger==11.0.0\n",
+			extra:    map[string]string{"requirements/base.in": "requests\n"},
+		},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			write(t, root, "requirements.in", testCase.source)
+			write(t, root, "requirements.txt", testCase.compiled)
+			for name, contents := range testCase.extra {
+				write(t, root, name, contents)
+			}
+			contract, err := PackageContract(config.Workspace{
+				Path: root, Stack: config.StackPython, PackageManager: "pip-tools",
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle, err := Build(context.Background(), root, root, Options{}, contract)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := bundle.Content("pyproject.toml"); ok {
+				t.Fatal("absent optional pyproject.toml was synthesized")
+			}
+			if len(bundle.Manifest.Entries) != 2+len(testCase.extra) {
+				t.Fatalf("manifest entries = %#v", bundle.Manifest.Entries)
+			}
+		})
+	}
+}
+
 func TestPythonRequirementsContractRejectsUnsafeInputs(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -15,12 +15,13 @@ import (
 
 // Constraints is the allowlisted project metadata used during resolution.
 type Constraints struct {
-	Stack                 string `json:"stack"`
-	PackageManager        string `json:"package_manager"`
-	Runtime               string `json:"runtime,omitempty"`
-	PackageManagerVersion string `json:"package_manager_version,omitempty"`
-	LockFormat            string `json:"lock_format"`
-	Platform              string `json:"platform"`
+	Stack                   string `json:"stack"`
+	PackageManager          string `json:"package_manager"`
+	Runtime                 string `json:"runtime,omitempty"`
+	RuntimeConstraintSource string `json:"runtime_constraint_source"`
+	PackageManagerVersion   string `json:"package_manager_version,omitempty"`
+	LockFormat              string `json:"lock_format"`
+	Platform                string `json:"platform"`
 }
 
 // Identity is persisted in snapshots so update cannot silently switch image,
@@ -170,8 +171,9 @@ func Detect(ws config.Workspace) (Constraints, error) {
 	}
 	return Constraints{
 		Stack: detected.Key.Stack, PackageManager: detected.Key.PackageManager,
-		Runtime: detected.Runtime, PackageManagerVersion: detected.PackageManagerVersion,
-		LockFormat: detected.LockFormat, Platform: detected.Platform,
+		Runtime: detected.Runtime, RuntimeConstraintSource: detected.RuntimeConstraintSource,
+		PackageManagerVersion: detected.PackageManagerVersion,
+		LockFormat:            detected.LockFormat, Platform: detected.Platform,
 	}, nil
 }
 

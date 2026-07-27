@@ -42,7 +42,7 @@ func TestBuiltInAdapterContracts(t *testing.T) {
 			"pyproject.toml":   "[project]\nrequires-python = \">=3.12,<3.13\"\n",
 			"requirements.in":  "demo==1.0.0\n",
 			"requirements.txt": "demo==1.0.0\n",
-		}, output: `[{"name":"demo","current":"1.0.0","latest_version":"2.0.0"}]`},
+		}, output: `{"candidates":[{"name":"demo","current":"1.0.0","latest_version":"2.0.0"}],"diagnostics":[]}`},
 		{key: "python/requirements", scannable: true, files: map[string]string{
 			"requirements.txt": "demo==1.0.0\n",
 		}, output: `{"candidates":[{"name":"demo","current":"1.0.0","latest_version":"2.0.0"}],"diagnostics":[]}`},

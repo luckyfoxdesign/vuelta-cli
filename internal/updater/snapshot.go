@@ -372,7 +372,8 @@ func parsePackageReport(kind string, data []byte) (CandidateReport, error) {
 		}
 		if provider, ok := adapter.(ecosystem.InputProvider); ok {
 			for _, file := range provider.PackageInput(false).Files {
-				if file.Category == ecosystem.InputCategoryLock {
+				if file.Category == ecosystem.InputCategoryLock ||
+					kind == "requirements" || kind == "pip-tools" {
 					inputs[file.Path] = []byte("{}")
 				}
 			}

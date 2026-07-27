@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode"
@@ -17,7 +18,7 @@ type decoderCapability struct {
 }
 
 func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]byte) (ecosystem.CandidateReport, error) {
-	report, err := decodePackageReport(c.kind, output)
+	report, err := decodePackageReport(c.kind, output, inputs)
 	if err != nil {
 		return ecosystem.CandidateReport{}, err
 	}
@@ -42,7 +43,7 @@ func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]b
 	return report, nil
 }
 
-func decodePackageReport(kind string, data []byte) (ecosystem.CandidateReport, error) {
+func decodePackageReport(kind string, data []byte, inputs map[string][]byte) (ecosystem.CandidateReport, error) {
 	start := bytes.IndexAny(data, "{[")
 	if start < 0 {
 		return ecosystem.CandidateReport{}, errors.New("scanner output contains no JSON value")
@@ -52,12 +53,12 @@ func decodePackageReport(kind string, data []byte) (ecosystem.CandidateReport, e
 		return ecosystem.CandidateReport{}, err
 	}
 	diagnostics := []ecosystem.Diagnostic{}
-	if kind == "requirements" {
+	if kind == "requirements" || kind == "pip-tools" {
 		root, ok := value.(map[string]any)
 		if !ok {
 			return ecosystem.CandidateReport{}, errors.New("requirements scanner report must be an object")
 		}
-		if err := decodeRequirementsDiagnostics(root["diagnostics"], &diagnostics); err != nil {
+		if err := decodeRequirementsDiagnostics(root["diagnostics"], inputs, &diagnostics); err != nil {
 			return ecosystem.CandidateReport{}, err
 		}
 		value = root["candidates"]
@@ -74,7 +75,8 @@ func decodePackageReport(kind string, data []byte) (ecosystem.CandidateReport, e
 		if !validDecodedCandidate(candidate) {
 			return ecosystem.CandidateReport{}, fmt.Errorf("invalid candidate %q", candidate.Name)
 		}
-		if kind == "requirements" && !requirementsNamePattern.MatchString(candidate.Name) {
+		if (kind == "requirements" || kind == "pip-tools") &&
+			!requirementsNamePattern.MatchString(candidate.Name) {
 			return ecosystem.CandidateReport{}, fmt.Errorf("requirements candidate name %q is not canonical", candidate.Name)
 		}
 	}
@@ -87,7 +89,11 @@ var (
 	candidatePartPattern    = regexp.MustCompile(`^[A-Za-z0-9@._+!/-]+$`)
 )
 
-func decodeRequirementsDiagnostics(value any, diagnostics *[]ecosystem.Diagnostic) error {
+func decodeRequirementsDiagnostics(
+	value any,
+	inputs map[string][]byte,
+	diagnostics *[]ecosystem.Diagnostic,
+) error {
 	items, ok := value.([]any)
 	if !ok {
 		return errors.New("requirements scanner diagnostics must be an array")
@@ -105,7 +111,8 @@ func decodeRequirementsDiagnostics(value any, diagnostics *[]ecosystem.Diagnosti
 		severity, _ := record["severity"].(string)
 		message, _ := record["message"].(string)
 		line, lineOK := record["line"].(float64)
-		if file != "requirements.txt" || !diagnosticCodePattern.MatchString(code) ||
+		if !requirementsDiagnosticFileAllowed(file, inputs) ||
+			!diagnosticCodePattern.MatchString(code) ||
 			(severity != "info" && severity != "error") || message == "" || len(message) > 512 ||
 			strings.IndexFunc(message, unicode.IsControl) >= 0 || !lineOK || line < 1 || line > 1_000_000 || line != float64(int(line)) {
 			return errors.New("requirements scanner diagnostic is invalid")
@@ -115,6 +122,18 @@ func decodeRequirementsDiagnostics(value any, diagnostics *[]ecosystem.Diagnosti
 		})
 	}
 	return nil
+}
+
+func requirementsDiagnosticFileAllowed(file string, inputs map[string][]byte) bool {
+	if file == "" || filepath.Base(file) != file {
+		return false
+	}
+	for name := range inputs {
+		if filepath.Base(filepath.FromSlash(name)) == file {
+			return true
+		}
+	}
+	return false
 }
 
 func collectCandidates(kind string, value any, candidates *[]ecosystem.Candidate) {
