@@ -80,18 +80,19 @@ type Result struct {
 // ObservedEnvelope is the bounded subset of Vuelta's JSON contract retained
 // in reports. Raw project output is never copied into a report.
 type ObservedEnvelope struct {
-	Format          int                  `json:"format,omitempty"`
-	Command         string               `json:"command,omitempty"`
-	DetectedStacks  []string             `json:"detected_stacks"`
-	PackageManagers []string             `json:"package_managers"`
-	LockFormats     []string             `json:"lock_formats"`
-	Statuses        []string             `json:"statuses"`
-	Stages          []ObservedStage      `json:"stages"`
-	Diagnostics     []string             `json:"diagnostics"`
-	Warnings        []string             `json:"warnings"`
-	Errors          []ObservedError      `json:"errors"`
-	Capabilities    []ObservedCapability `json:"capabilities"`
-	Toolchains      []ObservedToolchain  `json:"toolchains"`
+	Format            int                  `json:"format,omitempty"`
+	Command           string               `json:"command,omitempty"`
+	DetectedStacks    []string             `json:"detected_stacks"`
+	PackageManagers   []string             `json:"package_managers"`
+	LockFormats       []string             `json:"lock_formats"`
+	Statuses          []string             `json:"statuses"`
+	Stages            []ObservedStage      `json:"stages"`
+	Diagnostics       []string             `json:"diagnostics"`
+	DiagnosticDetails []ObservedDiagnostic `json:"diagnostic_details,omitempty"`
+	Warnings          []string             `json:"warnings"`
+	Errors            []ObservedError      `json:"errors"`
+	Capabilities      []ObservedCapability `json:"capabilities"`
+	Toolchains        []ObservedToolchain  `json:"toolchains"`
 }
 
 // ObservedStage is one extracted scan stage.
@@ -99,6 +100,17 @@ type ObservedStage struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// ObservedDiagnostic retains the typed disposition needed for verdicts while
+// Diagnostics preserves the schema-1 human-readable list for older reports.
+type ObservedDiagnostic struct {
+	File     string `json:"file,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Severity string `json:"severity"`
+	Category string `json:"category,omitempty"`
+	Message  string `json:"message"`
 }
 
 // ObservedError is one extracted top-level or result error.
@@ -171,6 +183,10 @@ type rawScanResult struct {
 
 type rawDiagnostic struct {
 	Category string `json:"category"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
 	Message  string `json:"message"`
 	Reason   string `json:"reason"`
 }
@@ -212,7 +228,8 @@ func ParseObservedEnvelope(data []byte) (ObservedEnvelope, error) {
 		Format: raw.Format, Command: raw.Command,
 		DetectedStacks: []string{}, PackageManagers: []string{}, LockFormats: []string{},
 		Statuses: []string{}, Stages: []ObservedStage{}, Diagnostics: []string{},
-		Warnings: []string{}, Errors: []ObservedError{}, Capabilities: []ObservedCapability{},
+		DiagnosticDetails: []ObservedDiagnostic{},
+		Warnings:          []string{}, Errors: []ObservedError{}, Capabilities: []ObservedCapability{},
 		Toolchains: []ObservedToolchain{},
 	}
 	if raw.Config != nil {
@@ -238,6 +255,11 @@ func ParseObservedEnvelope(data []byte) (ObservedEnvelope, error) {
 				message = diagnostic.Category + ": " + message
 			}
 			observed.Diagnostics = appendBounded(observed.Diagnostics, 64, SanitizeMessage(message))
+			observed.DiagnosticDetails = appendBounded(observed.DiagnosticDetails, 64, ObservedDiagnostic{
+				File: SanitizeMessage(diagnostic.File), Line: diagnostic.Line,
+				Code: SanitizeMessage(diagnostic.Code), Severity: SanitizeMessage(diagnostic.Severity),
+				Category: SanitizeMessage(diagnostic.Category), Message: SanitizeMessage(message),
+			})
 		}
 		observed.Warnings = appendBounded(observed.Warnings, 64, sanitizeList(result.Warnings, 64)...)
 		if result.Error != nil {
@@ -393,17 +415,20 @@ func classifyObserved(exitCode int, envelope ObservedEnvelope, expectation Expec
 		}
 		return "process-error", SanitizeMessage(runErr.Error()), false
 	}
+	if expectation.AllowPartial && (exitCode == 6 || slicesContains(envelope.Statuses, scanStatusPartial)) {
+		if reason, ok := matchesPartialExpectation(exitCode, envelope, expectation); ok {
+			if diagnostic, fatal := firstFatalDiagnostic(envelope); fatal {
+				return "diagnostic", diagnostic, false
+			}
+			return "expected-partial", reason, true
+		}
+		return "partial", "partial scan did not match the complete expected contract", false
+	}
 	if len(expectation.AllowedExits) > 0 && !slicesContainInt(expectation.AllowedExits, exitCode) {
 		return exitCategory(exitCode), fmt.Sprintf("Vuelta exit code %d did not match the expected contract", exitCode), false
 	}
 	if len(expectation.AllowedExits) == 0 && exitCode != 0 && exitCode != 5 {
-		if exitCode == 6 {
-			if !expectation.AllowPartial || !matchesExpectation(envelope, expectation) {
-				return "partial", "unexpected partial scan result", false
-			}
-		} else {
-			return exitCategory(exitCode), fmt.Sprintf("unexpected Vuelta exit code %d", exitCode), false
-		}
+		return exitCategory(exitCode), fmt.Sprintf("unexpected Vuelta exit code %d", exitCode), false
 	}
 	for _, stage := range envelope.Stages {
 		if stage.Status == "failed" {
@@ -417,18 +442,15 @@ func classifyObserved(exitCode int, envelope ObservedEnvelope, expectation Expec
 		return "status-mismatch", "Vuelta scan result omitted status", false
 	}
 	for _, status := range envelope.Statuses {
-		switch status {
-		case "clean", "ready", "findings", "scan-only":
-		case "partial":
-			if !expectation.AllowPartial || !matchesExpectation(envelope, expectation) {
-				return "partial", "unexpected partial scan result", false
-			}
-		default:
+		if !slicesContains(canonicalScanStatuses, status) {
 			return "status-mismatch", "Vuelta reported an unexpected scan status", false
 		}
 	}
-	if len(envelope.Diagnostics) > 0 {
-		return "diagnostic", envelope.Diagnostics[0], false
+	if reason, valid := validatePackageUpdatesCapability(envelope); !valid {
+		return "capability-mismatch", reason, false
+	}
+	if diagnostic, fatal := firstFatalDiagnostic(envelope); fatal {
+		return "diagnostic", diagnostic, false
 	}
 	if len(expectation.AllowedStatuses) > 0 {
 		for _, status := range envelope.Statuses {
@@ -443,10 +465,47 @@ func classifyObserved(exitCode int, envelope ObservedEnvelope, expectation Expec
 	if exitCode == 5 {
 		return "findings", "scan completed with vulnerability findings", true
 	}
-	if exitCode == 6 {
-		return "expected-partial", "scan matched the explicit fail-open capability contract", true
-	}
 	return "success", "scan contract passed", true
+}
+
+func matchesPartialExpectation(exitCode int, envelope ObservedEnvelope, expectation Expectation) (string, bool) {
+	if !expectation.AllowPartial || !slicesContainInt(expectation.AllowedExits, exitCode) ||
+		len(envelope.Statuses) == 0 || !matchesExpectation(envelope, expectation) {
+		return "", false
+	}
+	for _, status := range envelope.Statuses {
+		if !slicesContains(canonicalScanStatuses, status) ||
+			!slicesContains(expectation.AllowedStatuses, status) {
+			return "", false
+		}
+	}
+	observedFailures := make(map[string]string)
+	for _, stage := range envelope.Stages {
+		if stage.Status == "failed" {
+			observedFailures[stage.Name] = ""
+		}
+	}
+	for _, observed := range envelope.Errors {
+		if observed.Stage == "" || observed.Code == "" {
+			return "", false
+		}
+		if _, failed := observedFailures[observed.Stage]; !failed {
+			return "", false
+		}
+		if observedFailures[observed.Stage] != "" {
+			return "", false
+		}
+		observedFailures[observed.Stage] = observed.Code
+	}
+	if len(observedFailures) != len(expectation.FailedStages) {
+		return "", false
+	}
+	for _, expected := range expectation.FailedStages {
+		if observedFailures[expected.Stage] != expected.ReasonCode {
+			return "", false
+		}
+	}
+	return "scan matched the explicit partial capability and failed-stage contract", true
 }
 
 func exitCategory(code int) string {
@@ -462,19 +521,64 @@ func exitCategory(code int) string {
 
 func matchesExpectation(envelope ObservedEnvelope, expectation Expectation) bool {
 	for _, expected := range expectation.Capabilities {
-		found := false
+		matches := 0
 		for _, observed := range envelope.Capabilities {
 			if observed.Name == expected.Name && observed.Status == expected.Status &&
+				(expected.ReasonCode == "" || observed.Reason == expected.ReasonCode) &&
 				(expected.ReasonContains == "" || strings.Contains(observed.Reason, expected.ReasonContains)) {
-				found = true
-				break
+				matches++
 			}
 		}
-		if !found {
+		if matches != 1 {
 			return false
 		}
 	}
 	return len(expectation.Capabilities) > 0
+}
+
+func validatePackageUpdatesCapability(envelope ObservedEnvelope) (string, bool) {
+	var capability ObservedCapability
+	count := 0
+	for _, observed := range envelope.Capabilities {
+		if observed.Name == "package_updates" {
+			capability = observed
+			count++
+		}
+	}
+	if count != 1 {
+		return "scan must report exactly one package_updates capability", false
+	}
+	scanOnly := slicesContains(envelope.Statuses, scanStatusScanOnly)
+	switch capability.Status {
+	case "available":
+		if scanOnly {
+			return "scan_only result reported package updates as available", false
+		}
+	case scanStatusScanOnly:
+		if !scanOnly || capability.Reason == "" {
+			return "package_updates scan_only capability did not match the result status", false
+		}
+	case "unavailable":
+		return "package_updates became unavailable outside an explicit partial contract", false
+	default:
+		return "package_updates reported an unexpected capability status", false
+	}
+	return "", true
+}
+
+func firstFatalDiagnostic(envelope ObservedEnvelope) (string, bool) {
+	if len(envelope.DiagnosticDetails) == 0 {
+		if len(envelope.Diagnostics) > 0 {
+			return envelope.Diagnostics[0], true
+		}
+		return "", false
+	}
+	for _, diagnostic := range envelope.DiagnosticDetails {
+		if diagnostic.Severity != "info" {
+			return nonEmpty(diagnostic.Message, "Vuelta reported a fatal diagnostic"), true
+		}
+	}
+	return "", false
 }
 
 func slicesContainInt(values []int, want int) bool {
@@ -571,6 +675,49 @@ func stableResultMap(results []Result) map[string]Result {
 
 func resultKey(result Result) string {
 	return fmt.Sprintf("%s/%s/%d", result.Name, result.Scenario, result.Pass)
+}
+
+// ComparisonIneligibility explains why a report cannot participate in stable
+// regression or performance comparison.
+func ComparisonIneligibility(report Report, stable []Case, manifestHash string) string {
+	if report.SchemaVersion != ReportSchemaVersion {
+		return "report schema does not match the current corpus schema"
+	}
+	if report.ManifestHash == "" || report.ManifestHash != manifestHash {
+		return "manifest hash does not match the current stable manifest"
+	}
+	expected := make(map[string]bool)
+	for _, corpusCase := range stable {
+		for _, scenario := range corpusCase.Scenarios {
+			for pass := 1; pass <= scenario.EffectiveRepeat(); pass++ {
+				expected[fmt.Sprintf("%s/%s/%d", corpusCase.Name, scenario.Name, pass)] = true
+			}
+		}
+	}
+	if len(expected) == 0 {
+		return "stable selection is empty"
+	}
+	observed := make(map[string]bool)
+	for _, result := range report.Results {
+		if result.Source != "stable" {
+			continue
+		}
+		if result.Name == "preflight" {
+			return "report contains only an infrastructure preflight failure"
+		}
+		key := resultKey(result)
+		if !expected[key] {
+			return "stable result set is incompatible with the current manifest"
+		}
+		if observed[key] {
+			return "stable result set contains duplicate scenario passes"
+		}
+		observed[key] = true
+	}
+	if len(observed) != len(expected) {
+		return "stable result set is incomplete"
+	}
+	return ""
 }
 
 // RenderMarkdown creates a bounded, escaped human report.

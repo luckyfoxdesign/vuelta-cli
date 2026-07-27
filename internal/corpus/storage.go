@@ -199,3 +199,45 @@ func PreviousReport(root, currentRunID string) (Report, bool, error) {
 	}
 	return Report{}, false, nil
 }
+
+// PreviousComparableReport returns the newest complete stable report produced
+// from the same manifest, plus explicit warnings for newer excluded runs.
+func PreviousComparableReport(
+	root, currentRunID string,
+	stable []Case,
+	manifestHash string,
+) (Report, bool, []string, error) {
+	entries, err := os.ReadDir(filepath.Join(root, "runs"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Report{}, false, nil, nil
+		}
+		return Report{}, false, nil, err
+	}
+	var ids []string
+	for _, entry := range entries {
+		if entry.IsDir() && entry.Name() < currentRunID {
+			ids = append(ids, entry.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	var warnings []string
+	for _, id := range ids {
+		report, loadErr := LoadReport(filepath.Join(root, "runs", id, "report.json"))
+		if loadErr != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"previous report %s excluded from comparison: %s",
+				id, SanitizeMessage(loadErr.Error()),
+			))
+			continue
+		}
+		if reason := ComparisonIneligibility(report, stable, manifestHash); reason != "" {
+			warnings = append(warnings, fmt.Sprintf(
+				"previous report %s excluded from comparison: %s", id, reason,
+			))
+			continue
+		}
+		return report, true, warnings, nil
+	}
+	return Report{}, false, warnings, nil
+}

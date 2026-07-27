@@ -174,7 +174,7 @@ func runScan(ctx context.Context, options scanOptions) (int, error) {
 	if !options.stableOnly && options.caseName == "" && options.onlyFailed == "" {
 		discovery, warnings = (corpus.GitHubClient{}).Discover(ctx)
 	}
-	return executeHarness(ctx, sourceRoot, options.root, manifestBytes, stable, discovery, warnings)
+	return executeHarness(ctx, sourceRoot, options.root, manifestBytes, stable, manifest.Cases, discovery, warnings)
 }
 
 func runRefresh(ctx context.Context, options scanOptions) (int, error) {
@@ -197,7 +197,9 @@ func runRefresh(ctx context.Context, options scanOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	exit, reportDir, err := executeHarnessWithDir(ctx, sourceRoot, options.root, manifestBytes, refreshed, nil, nil)
+	exit, reportDir, err := executeHarnessWithDir(
+		ctx, sourceRoot, options.root, manifestBytes, refreshed, refreshed, nil, nil,
+	)
 	if err != nil {
 		return exit, err
 	}
@@ -216,10 +218,12 @@ func executeHarness(
 	ctx context.Context,
 	sourceRoot, root string,
 	manifest []byte,
-	stable, discovery []corpus.Case,
+	stable, expectedStable, discovery []corpus.Case,
 	warnings []string,
 ) (int, error) {
-	exit, _, err := executeHarnessWithDir(ctx, sourceRoot, root, manifest, stable, discovery, warnings)
+	exit, _, err := executeHarnessWithDir(
+		ctx, sourceRoot, root, manifest, stable, expectedStable, discovery, warnings,
+	)
 	return exit, err
 }
 
@@ -227,7 +231,7 @@ func executeHarnessWithDir(
 	ctx context.Context,
 	sourceRoot, root string,
 	manifest []byte,
-	stable, discovery []corpus.Case,
+	stable, expectedStable, discovery []corpus.Case,
 	warnings []string,
 ) (int, string, error) {
 	socket := os.Getenv("VUELTA_CORPUS_DOCKER_SOCKET")
@@ -238,7 +242,8 @@ func executeHarnessWithDir(
 	report, reportDir, exit, err := (corpus.Harness{
 		Sources: corpus.SourceStore{}, Scanner: scanner,
 	}).Execute(ctx, corpus.HarnessInput{
-		Root: root, ManifestBytes: manifest, Stable: stable, Discovery: discovery,
+		Root: root, ManifestBytes: manifest, Stable: stable, ExpectedStable: expectedStable,
+		Discovery:   discovery,
 		AppRevision: corpus.SourceRevision(ctx, sourceRoot), Now: time.Now(), Warnings: warnings,
 	})
 	if err != nil {

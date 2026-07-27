@@ -274,8 +274,9 @@ func discoveryCase(repository githubRepository, commit string, slot discoverySlo
 		expectation = Expectation{
 			AllowedStatuses: []string{"partial"}, AllowedExits: []int{6}, AllowPartial: true,
 			Capabilities: []ExpectedCapability{{
-				Name: "package_updates", Status: "unavailable", ReasonContains: "scanner",
+				Name: "package_updates", Status: "unavailable", ReasonCode: "toolchain_incompatible",
 			}},
+			FailedStages: []ExpectedFailure{{Stage: "candidate", ReasonCode: "toolchain_incompatible"}},
 		}
 	}
 	return Case{

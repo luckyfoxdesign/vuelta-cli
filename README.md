@@ -381,6 +381,10 @@ Gitless projects remain scannable and report
 their findings and candidates remain visible while Git-bound snapshots and
 updates are disabled. Use `--project NAME` or `--all` for global configured
 workspaces, or `--directory PATH` to select an exact local root.
+Every per-project JSON result includes `package_updates` with status
+`available`, `scan_only`, or `unavailable`. Non-available states include a
+stable machine-readable reason code; corpus and automation contracts match
+that code exactly rather than parsing human diagnostics.
 `update` resolves exactly the current directory, or `--directory PATH`, before
 opening state. Without `--snapshot`, it bounded-enumerates only that project's
 snapshot directory and deterministically selects the newest validated

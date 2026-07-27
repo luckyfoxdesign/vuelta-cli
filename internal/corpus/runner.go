@@ -15,13 +15,14 @@ import (
 
 // HarnessInput contains already validated stable and discovery cases.
 type HarnessInput struct {
-	Root          string
-	ManifestBytes []byte
-	Stable        []Case
-	Discovery     []Case
-	AppRevision   string
-	Now           time.Time
-	Warnings      []string
+	Root           string
+	ManifestBytes  []byte
+	Stable         []Case
+	ExpectedStable []Case
+	Discovery      []Case
+	AppRevision    string
+	Now            time.Time
+	Warnings       []string
 }
 
 // Harness executes cases sequentially and never turns discovery findings into
@@ -78,17 +79,29 @@ func (h Harness) Execute(ctx context.Context, input HarnessInput) (Report, strin
 	}
 	report.Warnings = uniqueSorted(report.Warnings)
 	report.Summary = summarize(report.Results)
-	if previous, ok, previousErr := PreviousReport(input.Root, storage.RunID); previousErr != nil {
+	expectedStable := input.ExpectedStable
+	if expectedStable == nil {
+		expectedStable = input.Stable
+	}
+	if reason := ComparisonIneligibility(report, expectedStable, report.ManifestHash); reason != "" {
+		report.Warnings = append(report.Warnings, "current report excluded from comparison: "+reason)
+	} else if previous, ok, comparisonWarnings, previousErr := PreviousComparableReport(
+		input.Root, storage.RunID, expectedStable, report.ManifestHash,
+	); previousErr != nil {
 		report.Warnings = append(report.Warnings, "previous report comparison failed: "+SanitizeMessage(previousErr.Error()))
-	} else if ok {
-		report.Comparison = BuildComparison(report, previous)
-		applyDurationComparison(report.Results, previous.Results)
+	} else {
+		report.Warnings = append(report.Warnings, comparisonWarnings...)
+		if ok {
+			report.Comparison = BuildComparison(report, previous)
+			applyDurationComparison(report.Results, previous.Results)
+		}
 	}
 	report.FinishedAt = time.Now()
 	if cleanupErr := storage.CleanupTemp(); cleanupErr != nil {
 		report.Warnings = append(report.Warnings, "temporary work cleanup failed: "+SanitizeMessage(cleanupErr.Error()))
 		report.Summary.StableFailed++
 	}
+	report.Warnings = uniqueSorted(report.Warnings)
 	if err := storage.WriteReport(report); err != nil {
 		return report, storage.RunDir, 1, err
 	}
@@ -244,7 +257,8 @@ func emptyEnvelope() ObservedEnvelope {
 	return ObservedEnvelope{
 		DetectedStacks: []string{}, PackageManagers: []string{}, LockFormats: []string{},
 		Statuses: []string{}, Stages: []ObservedStage{}, Diagnostics: []string{},
-		Warnings: []string{}, Errors: []ObservedError{}, Capabilities: []ObservedCapability{},
+		DiagnosticDetails: []ObservedDiagnostic{},
+		Warnings:          []string{}, Errors: []ObservedError{}, Capabilities: []ObservedCapability{},
 		Toolchains: []ObservedToolchain{},
 	}
 }

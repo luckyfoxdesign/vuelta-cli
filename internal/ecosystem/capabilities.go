@@ -135,10 +135,11 @@ type ScannerProvider interface {
 // Diagnostic is a bounded, path-safe parser issue that never becomes update
 // plan input.
 type Diagnostic struct {
-	File    string
-	Line    int
-	Code    string
-	Message string
+	File     string
+	Line     int
+	Code     string
+	Severity string
+	Message  string
 }
 
 // CandidateReport is normalized scanner output.

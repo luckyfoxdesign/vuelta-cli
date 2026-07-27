@@ -18,16 +18,26 @@ import (
 const (
 	ManifestSchemaVersion = 1
 	maxManifestBytes      = 1 << 20
+
+	scanStatusClean    = "clean"
+	scanStatusReady    = "ready"
+	scanStatusFindings = "findings"
+	scanStatusScanOnly = "scan_only"
+	scanStatusPartial  = "partial"
 )
 
 var (
 	slugPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$`)
+	stableCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	githubPartPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$`)
 	fullCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
 var allowedManagers = []string{"npm", "pnpm", "poetry", "uv", "pip-tools", "requirements", "bun"}
 var allowedLicenses = []string{"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"}
+var canonicalScanStatuses = []string{
+	scanStatusClean, scanStatusReady, scanStatusFindings, scanStatusScanOnly, scanStatusPartial,
+}
 
 // Manifest is the strict, versioned stable or candidate corpus definition.
 type Manifest struct {
@@ -65,15 +75,24 @@ type Expectation struct {
 	AllowedExits    []int                `yaml:"allowed_exit_codes,omitempty" json:"allowed_exit_codes,omitempty"`
 	AllowPartial    bool                 `yaml:"allow_partial,omitempty" json:"allow_partial,omitempty"`
 	Capabilities    []ExpectedCapability `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	FailedStages    []ExpectedFailure    `yaml:"failed_stages,omitempty" json:"failed_stages,omitempty"`
 }
 
-// ExpectedCapability is an exact structured capability assertion. Reason
-// matching is bounded to a stable substring because human wording may include
-// version identities.
+// ExpectedCapability is an exact structured capability assertion. ReasonCode
+// is the stable contract; ReasonContains remains readable for older manifests
+// but is not sufficient for a reviewed partial contract.
 type ExpectedCapability struct {
 	Name           string `yaml:"name" json:"name"`
 	Status         string `yaml:"status" json:"status"`
+	ReasonCode     string `yaml:"reason_code,omitempty" json:"reason_code,omitempty"`
 	ReasonContains string `yaml:"reason_contains,omitempty" json:"reason_contains,omitempty"`
+}
+
+// ExpectedFailure is one explicitly permitted failed stage and its stable
+// structured error code.
+type ExpectedFailure struct {
+	Stage      string `yaml:"stage" json:"stage"`
+	ReasonCode string `yaml:"reason_code" json:"reason_code"`
 }
 
 // LoadManifest reads a regular, non-symlink manifest under a fixed size bound.
@@ -249,7 +268,8 @@ func (m Manifest) ValidateStableCoverage() error {
 		}
 		if corpusCase.ExpectedPackageManager == "bun" {
 			if !slices.Contains(corpusCase.Features, "bun-capability") ||
-				!hasExpectedCapabilityContract(corpusCase, 6, "package_updates", "unavailable", "scanner") {
+				!hasExpectedCapabilityContract(corpusCase, 6, "package_updates", "unavailable", "toolchain_incompatible") ||
+				!hasExpectedFailedStage(corpusCase, "candidate", "toolchain_incompatible") {
 				return fmt.Errorf("stable Bun case %q must define the exact scanner capability contract", corpusCase.Name)
 			}
 		}
@@ -295,7 +315,18 @@ func hasExpectedCapabilityContract(corpusCase Case, exit int, name, status, reas
 		}
 		for _, capability := range scenario.Expect.Capabilities {
 			if capability.Name == name && capability.Status == status &&
-				strings.Contains(capability.ReasonContains, reason) {
+				capability.ReasonCode == reason {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasExpectedFailedStage(corpusCase Case, stage, reasonCode string) bool {
+	for _, scenario := range corpusCase.Scenarios {
+		for _, failure := range scenario.Expect.FailedStages {
+			if failure.Stage == stage && failure.ReasonCode == reasonCode {
 				return true
 			}
 		}
@@ -334,7 +365,7 @@ func (s Scenario) validate() error {
 
 func (e Expectation) validate() error {
 	for _, status := range e.AllowedStatuses {
-		if !slices.Contains([]string{"clean", "ready", "findings", "scan-only", "partial"}, status) {
+		if !slices.Contains(canonicalScanStatuses, status) {
 			return fmt.Errorf("expect.allowed_statuses contains unsupported value %q", status)
 		}
 	}
@@ -345,15 +376,46 @@ func (e Expectation) validate() error {
 	}
 	for _, capability := range e.Capabilities {
 		if capability.Name == "" || capability.Status == "" ||
-			strings.ContainsAny(capability.Name+capability.Status+capability.ReasonContains, "\x00\r\n") {
+			strings.ContainsAny(capability.Name+capability.Status+capability.ReasonCode+capability.ReasonContains, "\x00\r\n") {
 			return errors.New("expected capability fields must be bounded single-line values")
 		}
-		if len(capability.Name) > 64 || len(capability.Status) > 64 || len(capability.ReasonContains) > 256 {
+		if len(capability.Name) > 64 || len(capability.Status) > 64 ||
+			len(capability.ReasonCode) > 64 || len(capability.ReasonContains) > 256 {
 			return errors.New("expected capability fields exceed their limits")
 		}
+		if capability.ReasonCode != "" && !stableCodePattern.MatchString(capability.ReasonCode) {
+			return errors.New("expected capability reason_code must be a lowercase stable code")
+		}
+		if capability.ReasonCode != "" && capability.ReasonContains != "" {
+			return errors.New("expected capability cannot combine reason_code and reason_contains")
+		}
+	}
+	seenStages := make(map[string]bool, len(e.FailedStages))
+	for _, failure := range e.FailedStages {
+		if !stableCodePattern.MatchString(failure.Stage) ||
+			!stableCodePattern.MatchString(failure.ReasonCode) {
+			return errors.New("expected failed stage and reason_code must be lowercase stable codes")
+		}
+		if seenStages[failure.Stage] {
+			return fmt.Errorf("expected failed stage %q is duplicated", failure.Stage)
+		}
+		seenStages[failure.Stage] = true
 	}
 	if (e.AllowPartial || len(e.AllowedExits) > 0 || len(e.AllowedStatuses) > 0) && len(e.Capabilities) == 0 {
 		return errors.New("non-default expectations require an exact capability contract")
+	}
+	if e.AllowPartial {
+		if !slices.Contains(e.AllowedStatuses, scanStatusPartial) ||
+			!slices.Contains(e.AllowedExits, 6) || len(e.FailedStages) == 0 {
+			return errors.New("partial expectations require partial status, exit 6, and explicit failed stages")
+		}
+		for _, capability := range e.Capabilities {
+			if capability.ReasonCode == "" {
+				return errors.New("partial capability expectations require exact reason_code values")
+			}
+		}
+	} else if len(e.FailedStages) > 0 {
+		return errors.New("expected failed stages require allow_partial")
 	}
 	return nil
 }

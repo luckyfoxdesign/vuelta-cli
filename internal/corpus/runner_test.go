@@ -70,7 +70,7 @@ func (f *fakeScanner) Scan(_ context.Context, request ScanRequest) (ProcessObser
 	}, result.err
 }
 
-const cleanEnvelope = `{"format":1,"command":"scan","config":{"detected_stacks":["node"]},"results":[{"status":"clean","stages":[],"diagnostics":[],"warnings":[],"capabilities":[],"toolchain":{"package_manager":"npm","lock_formats":["npm-v3"]}}],"warnings":[],"errors":[]}`
+const cleanEnvelope = `{"format":1,"command":"scan","config":{"detected_stacks":["node"]},"results":[{"status":"clean","stages":[],"diagnostics":[],"warnings":[],"capabilities":[],"package_updates":{"status":"available"},"toolchain":{"package_manager":"npm","lock_formats":["npm-v3"]}}],"warnings":[],"errors":[]}`
 
 func testCase(name string) Case {
 	return Case{
@@ -162,6 +162,72 @@ func TestHarnessRejectsUnexpectedSourceMutation(t *testing.T) {
 	}
 	if exit != 1 || report.Results[0].ObservedCategory != "unexpected-filesystem-change" {
 		t.Fatalf("exit/result = %d/%#v", exit, report.Results[0])
+	}
+}
+
+func TestHarnessRequirementsAndBunContractsWithoutNetwork(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	requirements := testCase("requirements-contract")
+	requirements.ExpectedStack = "python"
+	requirements.ExpectedPackageManager = "requirements"
+	requirements.ExpectedLockFormat = "requirements-direct"
+	bun := testCase("bun-contract")
+	bun.ExpectedPackageManager = "bun"
+	bun.ExpectedLockFormat = "bun-text"
+	bun.Scenarios[0].Expect = Expectation{
+		AllowedStatuses: []string{"partial"}, AllowedExits: []int{6}, AllowPartial: true,
+		Capabilities: []ExpectedCapability{{
+			Name: "package_updates", Status: "unavailable", ReasonCode: "toolchain_incompatible",
+		}},
+		FailedStages: []ExpectedFailure{{
+			Stage: "candidate", ReasonCode: "toolchain_incompatible",
+		}},
+	}
+	scanner := &fakeScanner{results: []fakeScanResult{
+		{output: `{"format":1,"command":"scan","config":{"detected_stacks":["python"]},"results":[{"status":"scan_only","stages":[{"name":"candidate","status":"succeeded"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","severity":"info","message":"expected one exact pin"}],"warnings":[],"package_updates":{"status":"scan_only","reason":"manifest_has_no_safe_mutation_contract"},"toolchain":{"package_manager":"requirements","lock_formats":["requirements-direct"]}}],"warnings":[],"errors":[]}`},
+		{exit: 6, output: `{"format":1,"command":"scan","config":{"detected_stacks":["node"]},"results":[{"status":"partial","stages":[{"name":"candidate","status":"failed","reason":"scanner unavailable"}],"diagnostics":[],"warnings":[],"error":{"code":"toolchain_incompatible","message":"scanner unavailable","stage":"candidate"},"package_updates":{"status":"unavailable","reason":"toolchain_incompatible"},"toolchain":{"package_manager":"bun","lock_formats":["bun-text"]}}],"warnings":[],"errors":[]}`},
+	}}
+	report, _, exit, err := (Harness{Sources: &fakeSources{}, Scanner: scanner}).Execute(
+		context.Background(),
+		HarnessInput{
+			Root: root, ManifestBytes: []byte("manifest"),
+			Stable: []Case{requirements, bun},
+			Now:    time.Date(2026, 7, 27, 4, 0, 0, 0, time.UTC),
+		},
+	)
+	if err != nil || exit != 0 {
+		t.Fatalf("Execute() = exit %d, err %v", exit, err)
+	}
+	if report.Summary.StablePassed != 2 || report.Summary.StableFailed != 0 {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+	if report.Results[0].Verdict != "pass" || report.Results[1].ObservedCategory != "expected-partial" {
+		t.Fatalf("results = %#v", report.Results)
+	}
+}
+
+func TestHarnessWarnsWhenStableSelectionIsNotComparable(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	selected := testCase("selected")
+	report, _, exit, err := (Harness{
+		Sources: &fakeSources{},
+		Scanner: &fakeScanner{results: []fakeScanResult{{output: cleanEnvelope}}},
+	}).Execute(context.Background(), HarnessInput{
+		Root: root, ManifestBytes: []byte("manifest"),
+		Stable:         []Case{selected},
+		ExpectedStable: []Case{selected, testCase("not-selected")},
+		Now:            time.Date(2026, 7, 27, 5, 0, 0, 0, time.UTC),
+	})
+	if err != nil || exit != 0 {
+		t.Fatalf("Execute() = exit %d, err %v", exit, err)
+	}
+	if !slicesContains(report.Warnings, "current report excluded from comparison: stable result set is incomplete") {
+		t.Fatalf("warnings = %#v", report.Warnings)
+	}
+	if report.Comparison.PreviousRunID != "" {
+		t.Fatalf("comparison = %#v", report.Comparison)
 	}
 }
 

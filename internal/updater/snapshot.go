@@ -33,10 +33,11 @@ type ProgressFunc func(detail string, done, total int)
 // ScanDiagnostic is one bounded, path-safe problem with an individual
 // dependency record. Diagnostics never become update-plan input.
 type ScanDiagnostic struct {
-	File    string `json:"file"`
-	Line    int    `json:"line"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
 }
 
 // CandidateReport keeps valid candidates independent from unsupported input
@@ -319,7 +320,8 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 	}
 	for index, diagnostic := range decoded.Diagnostics {
 		report.Diagnostics[index] = ScanDiagnostic{
-			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code, Message: diagnostic.Message,
+			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code,
+			Severity: diagnostic.Severity, Message: diagnostic.Message,
 		}
 	}
 	return report, nil
@@ -392,7 +394,8 @@ func parsePackageReport(kind string, data []byte) (CandidateReport, error) {
 	}
 	for index, diagnostic := range decoded.Diagnostics {
 		report.Diagnostics[index] = ScanDiagnostic{
-			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code, Message: diagnostic.Message,
+			File: diagnostic.File, Line: diagnostic.Line, Code: diagnostic.Code,
+			Severity: diagnostic.Severity, Message: diagnostic.Message,
 		}
 	}
 	return report, nil

@@ -17,7 +17,7 @@ from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
 from pip._vendor.packaging.version import InvalidVersion, Version
 
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 MAX_REQUIREMENTS_BYTES = 1 << 20
 # Popular projects with long release histories (for example matplotlib) can
 # legitimately exceed 1 MiB because PyPI's project endpoint includes every
@@ -48,7 +48,13 @@ def normalized_name(value: str) -> str:
 
 
 def diagnostic(path: Path, line: int, code: str, message: str) -> dict[str, object]:
-    return {"file": path.name, "line": line, "code": code, "message": message}
+    return {
+        "file": path.name,
+        "line": line,
+        "code": code,
+        "severity": "info",
+        "message": message,
+    }
 
 
 def _record_diagnostic(

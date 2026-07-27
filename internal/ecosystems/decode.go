@@ -93,13 +93,17 @@ func decodeRequirementsDiagnostics(value any, diagnostics *[]ecosystem.Diagnosti
 		}
 		file, _ := record["file"].(string)
 		code, _ := record["code"].(string)
+		severity, _ := record["severity"].(string)
 		message, _ := record["message"].(string)
 		line, lineOK := record["line"].(float64)
-		if file != "requirements.txt" || !diagnosticCodePattern.MatchString(code) || message == "" || len(message) > 512 ||
+		if file != "requirements.txt" || !diagnosticCodePattern.MatchString(code) ||
+			(severity != "info" && severity != "error") || message == "" || len(message) > 512 ||
 			strings.IndexFunc(message, unicode.IsControl) >= 0 || !lineOK || line < 1 || line > 1_000_000 || line != float64(int(line)) {
 			return errors.New("requirements scanner diagnostic is invalid")
 		}
-		*diagnostics = append(*diagnostics, ecosystem.Diagnostic{File: file, Line: int(line), Code: code, Message: message})
+		*diagnostics = append(*diagnostics, ecosystem.Diagnostic{
+			File: file, Line: int(line), Code: code, Severity: severity, Message: message,
+		})
 	}
 	return nil
 }

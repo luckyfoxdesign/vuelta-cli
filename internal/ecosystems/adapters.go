@@ -21,7 +21,7 @@ const (
 	defaultUVVersion       = "0.11.29"
 	defaultPipVersion      = "25.0.1"
 	defaultPipToolsVersion = "7.5.0"
-	defaultPipScanner      = "1.1.1"
+	defaultPipScanner      = "1.2.0"
 )
 
 type baseAdapter struct {

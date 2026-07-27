@@ -23,7 +23,10 @@ cases:
           capabilities:
             - name: package_updates
               status: unavailable
-              reason_contains: lockfile
+              reason_code: package_scan_failed
+          failed_stages:
+            - stage: candidate
+              reason_code: package_scan_failed
 
   - name: axios-npm-v3
     url: https://github.com/axios/axios
@@ -321,7 +324,10 @@ cases:
           capabilities:
             - name: package_updates
               status: unavailable
-              reason_contains: scanner
+              reason_code: toolchain_incompatible
+          failed_stages:
+            - stage: candidate
+              reason_code: toolchain_incompatible
 
   - name: t3-env-bun-capability
     url: https://github.com/t3-oss/t3-env
@@ -347,4 +353,7 @@ cases:
           capabilities:
             - name: package_updates
               status: unavailable
-              reason_contains: scanner
+              reason_code: toolchain_incompatible
+          failed_stages:
+            - stage: candidate
+              reason_code: toolchain_incompatible

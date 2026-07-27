@@ -121,7 +121,7 @@ type scanStageResult struct {
 
 type packageUpdateAvailability struct {
 	Status string `json:"status"`
-	Reason string `json:"reason"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type scanResult struct {
@@ -668,6 +668,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
 		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{}, ImageScans: []imageScanRecord{},
+		PackageUpdates: &packageUpdateAvailability{Status: "available"},
 	}
 	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
 	if stateErr == nil {
@@ -694,6 +695,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result.Verification = config.VerificationPlan(*target.workspace)
 		if target.workspace.Verification.State == config.VerificationScanOnly {
 			result.Status = config.VerificationScanOnly
+			result.PackageUpdates = &packageUpdateAvailability{
+				Status: config.VerificationScanOnly, Reason: "verification_profile_scan_only",
+			}
 			result.Warnings = append(result.Warnings, "updates and update --dry-run are disabled until a ready verification profile is configured")
 		}
 	}
@@ -1517,6 +1521,9 @@ func failedScanResult(result scanResult, stage, code string, err error, hint str
 func recordScanStageFailure(result scanResult, stage, code string, err error, hint string) scanResult {
 	code, hint = scanFailureContract(code, hint, err)
 	result = addStage(result, stage, stageFailed, safeStageReason(err))
+	if stage == stageCandidate || stage == stagePreflight {
+		result.PackageUpdates = &packageUpdateAvailability{Status: "unavailable", Reason: code}
+	}
 	category, exitCode, detail := classifySubprocessError(err)
 	failure := &jsonCommandError{
 		Code: code, Message: err.Error(), Hint: hint,

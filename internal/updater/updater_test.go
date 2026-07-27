@@ -174,7 +174,7 @@ func TestParsePackageCandidates(t *testing.T) {
 }
 
 func TestParseRequirementsReportKeepsCandidatesAndDiagnostics(t *testing.T) {
-	report, err := parsePackageReport("requirements", []byte(`{"candidates":[{"name":"demo-pkg","current":"1.0","latest_version":"2.0"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","message":"expected one exact pin"}]}`))
+	report, err := parsePackageReport("requirements", []byte(`{"candidates":[{"name":"demo-pkg","current":"1.0","latest_version":"2.0"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","severity":"info","message":"expected one exact pin"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

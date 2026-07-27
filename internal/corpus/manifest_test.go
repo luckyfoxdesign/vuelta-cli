@@ -52,17 +52,26 @@ cases:
 	}
 }
 
-func TestExpectationRequiresCapabilityContract(t *testing.T) {
+func TestExpectationRequiresCompletePartialContract(t *testing.T) {
 	t.Parallel()
-	expectation := Expectation{AllowPartial: true, AllowedExits: []int{6}}
+	expectation := Expectation{
+		AllowPartial: true, AllowedExits: []int{6}, AllowedStatuses: []string{"partial"},
+	}
 	if err := expectation.validate(); err == nil {
 		t.Fatal("partial expectation without capability contract was accepted")
 	}
 	expectation.Capabilities = []ExpectedCapability{{
-		Name: "package_updates", Status: "unavailable", ReasonContains: "scanner",
+		Name: "package_updates", Status: "unavailable", ReasonCode: "toolchain_incompatible",
+	}}
+	expectation.FailedStages = []ExpectedFailure{{
+		Stage: "candidate", ReasonCode: "toolchain_incompatible",
 	}}
 	if err := expectation.validate(); err != nil {
 		t.Fatalf("valid capability expectation rejected: %v", err)
+	}
+	expectation.AllowedStatuses = []string{"scan-only"}
+	if err := expectation.validate(); err == nil {
+		t.Fatal("hyphenated scan-only status was accepted")
 	}
 }
 
@@ -101,7 +110,10 @@ func TestValidateStableCoverage(t *testing.T) {
 				AllowedExits:    []int{6},
 				AllowPartial:    true,
 				Capabilities: []ExpectedCapability{{
-					Name: "package_updates", Status: "unavailable", ReasonContains: "scanner",
+					Name: "package_updates", Status: "unavailable", ReasonCode: "toolchain_incompatible",
+				}},
+				FailedStages: []ExpectedFailure{{
+					Stage: "candidate", ReasonCode: "toolchain_incompatible",
 				}},
 			}
 		}

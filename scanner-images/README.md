@@ -24,7 +24,7 @@ through the mandatory egress proxy and never invokes pip, follows includes,
 or installs project dependencies. Exact pins survive alongside bounded
 per-line diagnostics for ranges, URLs, editable installs, hashes, includes,
 malformed records, and ambiguous duplicate pins. Pass
-`SCANNER_VERSION=1.1.1` when building that image; the Docker build runs the
+`SCANNER_VERSION=1.2.0` when building that image; the Docker build runs the
 helper's hermetic parser and response tests and verifies the version.
 
 `node/bun` is intentionally not a supported profile. `npm-check-updates`

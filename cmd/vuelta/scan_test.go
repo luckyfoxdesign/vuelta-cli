@@ -580,7 +580,10 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 		},
 		packages: func(_ context.Context, _ config.Config, _ scanTarget, options scanOptions, _ config.LocalPackagePolicy, _ time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
 			if options.packageDiagnostics != nil {
-				*options.packageDiagnostics = append(*options.packageDiagnostics, updater.ScanDiagnostic{File: "requirements.txt", Line: 2, Code: "exact_pin_required", Message: "expected one exact pin"})
+				*options.packageDiagnostics = append(*options.packageDiagnostics, updater.ScanDiagnostic{
+					File: "requirements.txt", Line: 2, Code: "exact_pin_required",
+					Severity: "info", Message: "expected one exact pin",
+				})
 			}
 			return []updatesnapshot.Candidate{{Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2"}}, "requirements", false, nil
 		},
@@ -593,6 +596,9 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 	}
 	if len(result.Vulnerabilities) != 1 || len(result.Candidates) != 1 || len(result.Diagnostics) != 1 || result.SnapshotID != "" || hasFailedStage(result, stageCandidate) {
 		t.Fatalf("vulnerability/snapshot result = %#v", result)
+	}
+	if result.Diagnostics[0].Severity != "info" {
+		t.Fatalf("diagnostic severity = %q, want info", result.Diagnostics[0].Severity)
 	}
 	if !containsSubstring(result.Warnings, "no update snapshot") {
 		t.Fatalf("warnings = %#v", result.Warnings)
@@ -774,6 +780,10 @@ func TestDockerUnavailableStillRunsIndependentAlerts(t *testing.T) {
 	if !alertsCalled || result.Status != "partial" || len(result.Vulnerabilities) != 1 || !hasFailedStage(result, stageCandidate) {
 		t.Fatalf("result = %#v", result)
 	}
+	if result.PackageUpdates == nil || result.PackageUpdates.Status != "unavailable" ||
+		result.PackageUpdates.Reason != "package_scan_failed" {
+		t.Fatalf("package update capability = %#v", result.PackageUpdates)
+	}
 }
 
 func TestFailedWorkspaceDoesNotStopSupportedWorkspace(t *testing.T) {
@@ -885,8 +895,15 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	if broken.Status != "partial" || broken.Error == nil || broken.Error.Code != "toolchain_incompatible" || !strings.Contains(broken.Error.Hint, "override") {
 		t.Fatalf("broken result = %#v", broken)
 	}
+	if broken.PackageUpdates == nil || broken.PackageUpdates.Status != "unavailable" ||
+		broken.PackageUpdates.Reason != "toolchain_incompatible" {
+		t.Fatalf("broken package update capability = %#v", broken.PackageUpdates)
+	}
 	if supported.Status != "clean" || hasFailedStage(supported, stageCandidate) {
 		t.Fatalf("supported result = %#v", supported)
+	}
+	if supported.PackageUpdates == nil || supported.PackageUpdates.Status != "available" {
+		t.Fatalf("supported package update capability = %#v", supported.PackageUpdates)
 	}
 }
 

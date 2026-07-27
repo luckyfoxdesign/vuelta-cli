@@ -92,6 +92,7 @@ class PipToolsScanTest(unittest.TestCase):
                 "malformed_requirement",
             ],
         )
+        self.assertEqual({item["severity"] for item in diagnostics}, {"info"})
 
     def test_duplicate_normalized_names_are_all_ambiguous(self):
         path = self.write_requirements("demo_pkg==1.0\ndemo-pkg==2.0\nvalid==1.0\n")
