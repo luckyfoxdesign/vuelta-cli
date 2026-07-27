@@ -25,6 +25,7 @@ import (
 // deterministic truncation marker.
 const (
 	discoveryOutputMaxBytes = 8 << 20
+	discoveryErrorBytes     = 16 << 10
 	applyOutputTailBytes    = 128 << 10
 )
 
@@ -38,9 +39,16 @@ type Updater interface {
 // daemon.
 type DockerRunner func(ctx context.Context, image string, args []string, workDir string) (output string, err error)
 
+// ReadOnlyScanOutput keeps machine-readable stdout isolated from bounded
+// stderr diagnostics.
+type ReadOnlyScanOutput struct {
+	Stdout string
+	Stderr string
+}
+
 // ReadOnlyDockerRunner executes discovery against an in-memory minimal input
 // archive rather than a host directory mount.
-type ReadOnlyDockerRunner func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (output string, err error)
+type ReadOnlyDockerRunner func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error)
 
 // ErrEgressPolicyUnavailable is returned when the registry allowlist policy
 // required for an update container has not been configured. The runner must
@@ -122,29 +130,32 @@ func NewReadOnlyDockerRunnerForProfile(egressConfig config.EgressConfig, user, p
 // NewReadOnlyDockerRunnerWithProfile returns a discovery runner with explicit
 // profile execution constraints.
 func NewReadOnlyDockerRunnerWithProfile(docker dockerexec.Runner, egressConfig config.EgressConfig, user, platform string) ReadOnlyDockerRunner {
-	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (string, error) {
+	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error) {
 		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
-			return "", err
+			return ReadOnlyScanOutput{}, err
 		}
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return ReadOnlyScanOutput{}, err
 		}
 		result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
 			Image: image, Platform: platform, User: user, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL,
-			Memory: "1g", Tmpfs: "64m", Combined: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
+			Memory: "1g", Tmpfs: "64m",
+			Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
+			Stderr: dockerexec.Capture{Mode: dockerexec.Excerpt, Bytes: discoveryErrorBytes},
 		})
+		output := ReadOnlyScanOutput{Stdout: string(result.Stdout), Stderr: string(result.Stderr)}
 		var limitErr *dockerexec.OutputLimitError
-		if errors.As(err, &limitErr) && limitErr.Stream == "output" && len(result.Combined) > 0 {
-			return "", fmt.Errorf("docker read-only scan %s %s: output exceeded %d bytes", image, strings.Join(args, " "), discoveryOutputMaxBytes)
+		if errors.As(err, &limitErr) && limitErr.Stream == "stdout" {
+			return output, fmt.Errorf("docker read-only scan output exceeded %d bytes", discoveryOutputMaxBytes)
 		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return string(result.Combined), ctxErr
+				return output, ctxErr
 			}
-			return string(result.Combined), fmt.Errorf("docker read-only scan %s %s: %w", image, strings.Join(args, " "), err)
+			return output, fmt.Errorf("docker read-only scan failed: %w", err)
 		}
-		return string(result.Combined), nil
+		return output, nil
 	}
 }
 

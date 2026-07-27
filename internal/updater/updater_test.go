@@ -194,7 +194,7 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	}
 	scanner := packageScanner{
 		Kind: "npm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
-		Run: func(_ context.Context, _ string, _ []string, bundle scaninput.Bundle) (string, error) {
+		Run: func(_ context.Context, _ string, _ []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error) {
 			if _, ok := bundle.Content("package.json"); !ok {
 				t.Fatal("package manifest missing from minimal bundle")
 			}
@@ -204,7 +204,7 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 			if _, ok := bundle.Content("unrelated-source.js"); ok {
 				t.Fatal("unrelated source visible to package scanner")
 			}
-			return `{"example":"2.0.0"}`, nil
+			return ReadOnlyScanOutput{Stdout: `{"example":"2.0.0"}`}, nil
 		},
 	}
 	candidates, err := scanner.Scan(context.Background(), root)
@@ -229,19 +229,53 @@ func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
 	scanner := packageScanner{
 		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
 		AcceptedExitCodes: []int{1},
-		Run: func(context.Context, string, []string, scaninput.Bundle) (string, error) {
-			return `{"lodash":{"latest":"4.18.1","wanted":"4.17.20","dependencyType":"dependencies"}}`, fakeExitCode(1)
+		Run: func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+			return ReadOnlyScanOutput{
+				Stdout: `{"lodash":{"latest":"4.18.1","wanted":"4.17.20","dependencyType":"dependencies"}}`,
+				Stderr: "pnpm notice: update available",
+			}, fakeExitCode(1)
 		},
 	}
 	candidates, err := scanner.Scan(context.Background(), root)
 	if err != nil || len(candidates) != 1 || candidates[0].Name != "lodash" || candidates[0].Target != "4.18.1" {
 		t.Fatalf("Scan() = %#v, %v", candidates, err)
 	}
-	scanner.Run = func(context.Context, string, []string, scaninput.Bundle) (string, error) {
-		return `not-json`, fakeExitCode(1)
+	scanner.Run = func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+		return ReadOnlyScanOutput{Stdout: `not-json`}, fakeExitCode(1)
 	}
 	if _, err := scanner.Scan(context.Background(), root); err == nil || !strings.Contains(err.Error(), "parse pnpm") {
 		t.Fatalf("malformed exit-one output error = %v", err)
+	}
+}
+
+func TestPNPMScannerReturnsBoundedTypedManagerFailure(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"packageManager":"pnpm@10.14.0"}`)
+	writeFile(t, root, "pnpm-lock.yaml", `lockfileVersion: '9.0'`)
+	contract, err := scaninput.PackageContract(config.Workspace{Stack: config.StackNode, PackageManager: "pnpm"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := packageScanner{
+		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
+		AcceptedExitCodes: []int{1},
+		Run: func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+			return ReadOnlyScanOutput{
+				Stdout: "arbitrary project output is not diagnostic input",
+				Stderr: "FIRST token=fixture-value " + strings.Repeat("x", 2048) + " LAST",
+			}, fakeExitCode(2)
+		},
+	}
+	_, err = scanner.Scan(context.Background(), root)
+	var candidateErr *ecosystem.CandidateError
+	if !errors.As(err, &candidateErr) ||
+		candidateErr.Kind != ecosystem.CandidateFailureManager ||
+		candidateErr.ExitCode != 2 ||
+		len(candidateErr.Detail) > 1024 ||
+		strings.Contains(candidateErr.Detail, "fixture-value") ||
+		!strings.Contains(candidateErr.Detail, "FIRST") ||
+		!strings.Contains(candidateErr.Detail, "LAST") {
+		t.Fatalf("manager failure = %#v, %v", candidateErr, err)
 	}
 }
 

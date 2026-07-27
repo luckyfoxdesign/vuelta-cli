@@ -1136,6 +1136,10 @@ func isPartialCapabilityFailure(failure *jsonCommandError) bool {
 	}
 	switch failure.Code {
 	case "toolchain_incompatible", reasonLockfileMissing,
+		string(toolchain.BuildFailureVersionUnavailable),
+		string(toolchain.BuildFailureRegistry),
+		string(toolchain.BuildFailureDocker),
+		string(toolchain.BuildFailureCancelled),
 		ecosystem.RuntimeConstraintInvalid,
 		ecosystem.RuntimeConstraintUnsupportedSyntax,
 		ecosystem.RuntimeConstraintNoCompatible:
@@ -1656,6 +1660,36 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 }
 
 func scanFailureContract(code, hint string, err error) (string, string) {
+	var candidateErr *ecosystem.CandidateError
+	if errors.As(err, &candidateErr) {
+		switch candidateErr.Kind {
+		case ecosystem.CandidateFailureManager:
+			return "package_manager_failure", "Review the bounded package-manager stderr diagnostic and registry availability"
+		case ecosystem.CandidateFailureNonJSON:
+			return "package_output_non_json", "The selected pnpm version wrote non-JSON data to stdout; keep notices on stderr and rerun"
+		case ecosystem.CandidateFailureTruncatedJSON:
+			return "package_output_truncated_json", "Retry the scan; if it repeats, review the pnpm structured-output regression"
+		case ecosystem.CandidateFailureSchemaMismatch:
+			return "package_output_schema_mismatch", "Use a pnpm version from the supported output matrix or report the schema regression"
+		}
+	}
+	var versionErr *ecosystem.ToolchainVersionError
+	if errors.As(err, &versionErr) {
+		return string(toolchain.BuildFailureVersionUnavailable), "Use pnpm 8 with a v6 lockfile, pnpm 9-11 with a v9 lockfile, or add a reviewed immutable toolchain override"
+	}
+	var buildErr *toolchain.BuildError
+	if errors.As(err, &buildErr) {
+		switch buildErr.Kind {
+		case toolchain.BuildFailureVersionUnavailable:
+			return string(buildErr.Kind), "Correct the declared pnpm version or add a reviewed immutable toolchain override"
+		case toolchain.BuildFailureRegistry:
+			return string(buildErr.Kind), "Retry after registry and approved egress availability are restored"
+		case toolchain.BuildFailureCancelled:
+			return string(buildErr.Kind), "Retry the scan after the cancellation source is resolved"
+		default:
+			return string(buildErr.Kind), "Review the bounded scanner build diagnostic and Docker builder health"
+		}
+	}
 	var constraintErr *ecosystem.RuntimeConstraintError
 	if errors.As(err, &constraintErr) {
 		return constraintErr.ReasonCode, constraintErr.Hint()

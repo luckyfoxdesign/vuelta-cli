@@ -47,6 +47,24 @@ func Tail(data []byte, max int) string {
 	return text[len(text)-max:]
 }
 
+// Excerpt returns redacted first and last context under max bytes. The source
+// must already have been bounded by the process boundary.
+func Excerpt(data []byte, max int) string {
+	text := Redact(strings.TrimSpace(string(data)))
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	const marker = "\n[vuelta: excerpt]\n"
+	if max <= len(marker)+2 {
+		head := max / 2
+		return text[:head] + text[len(text)-(max-head):]
+	}
+	retained := max - len(marker)
+	head := retained / 2
+	tail := retained - head
+	return text[:head] + marker + text[len(text)-tail:]
+}
+
 // ClassifyDetail derives a stable, safe category from already-redacted
 // diagnostic text using conservative substring heuristics. It returns
 // CategoryUnknown when the text gives no reliable signal.

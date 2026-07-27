@@ -9,6 +9,9 @@ RUN test -n "${PNPM_VERSION}" \
     && groupadd --gid 10001 vuelta \
     && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin vuelta
 
+ENV npm_config_ignore_scripts=true \
+    PNPM_CONFIG_IGNORE_SCRIPTS=true
+
 ENTRYPOINT []
 CMD ["pnpm", "--version"]
 USER 10001:10001

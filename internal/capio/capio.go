@@ -1,7 +1,7 @@
 // Package capio provides bounded collectors for untrusted subprocess output.
 // Limits are enforced while the child is still streaming, so host memory
-// stays bounded regardless of how much a process writes: Tail soft-truncates
-// diagnostic output to a marked tail, Limit hard-stops structured output that
+// stays bounded regardless of how much a process writes: Tail and Excerpt
+// soft-truncate diagnostics, while Limit hard-stops structured output that
 // must be parsed in full.
 package capio
 
@@ -78,8 +78,79 @@ func (t *Tail) String() string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "[vuelta: output truncated, kept last %d of %d bytes]\n", t.limit, t.total)
-	b.Write(t.buf[t.next:])
-	b.Write(t.buf[:t.next])
+	b.Write(t.bytesLocked())
+	return b.String()
+}
+
+func (t *Tail) bytesLocked() []byte {
+	if t.total <= int64(t.limit) {
+		return append([]byte(nil), t.buf...)
+	}
+	result := make([]byte, 0, len(t.buf))
+	result = append(result, t.buf[t.next:]...)
+	result = append(result, t.buf[:t.next]...)
+	return result
+}
+
+// Excerpt retains deterministic first and last context under one fixed byte
+// budget. It is intended for diagnostics where an initial error code and a
+// final cause are both useful.
+type Excerpt struct {
+	mu        sync.Mutex
+	limit     int
+	headLimit int
+	head      []byte
+	tail      *Tail
+	total     int64
+}
+
+// NewExcerpt returns an Excerpt retaining at most limit input bytes.
+func NewExcerpt(limit int) *Excerpt {
+	if limit <= 1 {
+		panic("capio: excerpt limit must be greater than one")
+	}
+	headLimit := limit / 2
+	return &Excerpt{
+		limit: limit, headLimit: headLimit,
+		tail: NewTail(limit - headLimit),
+	}
+}
+
+// Write never fails and never retains more than the configured byte budget.
+func (e *Excerpt) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	written := len(p)
+	e.total += int64(written)
+	if len(e.head) < e.headLimit {
+		keep := e.headLimit - len(e.head)
+		if keep > len(p) {
+			keep = len(p)
+		}
+		e.head = append(e.head, p[:keep]...)
+		p = p[keep:]
+	}
+	if len(p) > 0 {
+		_, _ = e.tail.Write(p)
+	}
+	return written, nil
+}
+
+// String returns the complete small output or a marked first/last excerpt.
+func (e *Excerpt) String() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tail.mu.Lock()
+	defer e.tail.mu.Unlock()
+	tail := e.tail.bytesLocked()
+	if e.total <= int64(e.limit) {
+		return string(append(append([]byte(nil), e.head...), tail...))
+	}
+	var b strings.Builder
+	b.Write(e.head)
+	fmt.Fprintf(&b, "\n[vuelta: output truncated, kept first %d and last %d of %d bytes]\n",
+		e.headLimit, e.limit-e.headLimit, e.total)
+	b.Write(tail)
 	return b.String()
 }
 

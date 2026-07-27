@@ -14,6 +14,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
@@ -287,9 +288,17 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 		return CandidateReport{}, err
 	}
 	defer bundle.Destroy()
-	out, err := s.Run(ctx, s.Image, s.Args, bundle)
+	output, err := s.Run(ctx, s.Image, s.Args, bundle)
 	if err != nil && !acceptedDiscoveryExit(s.AcceptedExitCodes, err) {
-		return CandidateReport{}, err
+		exitCode := -1
+		var exit exitCoder
+		if errors.As(err, &exit) {
+			exitCode = exit.ExitCode()
+		}
+		return CandidateReport{}, &ecosystem.CandidateError{
+			Kind: ecosystem.CandidateFailureManager, Manager: s.Kind,
+			ExitCode: exitCode, Detail: safeerr.Excerpt([]byte(output.Stderr), 1024), Err: err,
+		}
 	}
 	decoder := s.Decode
 	if decoder == nil {
@@ -304,7 +313,7 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 			inputs[file.Path] = content
 		}
 	}
-	decoded, err := decoder.DecodeCandidates([]byte(out), inputs)
+	decoded, err := decoder.DecodeCandidates([]byte(output.Stdout), inputs)
 	if err != nil {
 		return CandidateReport{}, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
 	}

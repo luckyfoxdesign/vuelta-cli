@@ -950,7 +950,10 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 		},
 		prepareToolchain: func(_ context.Context, _ config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
 			if workspace.Name == "broken" {
-				return toolchain.Prepared{}, errors.New("embedded scanner build failed")
+				return toolchain.Prepared{}, &toolchain.BuildError{
+					Kind:    toolchain.BuildFailureVersionUnavailable,
+					Manager: "npm", Version: "99.0.0", ExitCode: 1,
+				}
 			}
 			selection, err := toolchain.Select(workspace, config.Config{})
 			if err != nil {
@@ -964,11 +967,13 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	options := scanOptions{only: "packages"}
 	broken := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &brokenWorkspace, name: "broken", path: brokenRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
 	supported := scanOneTargetWith(context.Background(), config.Config{}, scanTarget{workspace: &supportedWorkspace, name: "supported", path: supportedRoot, origin: updatesnapshot.OriginWorkspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
-	if broken.Status != "partial" || broken.Error == nil || broken.Error.Code != "toolchain_incompatible" || !strings.Contains(broken.Error.Hint, "override") {
+	if broken.Status != "partial" || broken.Error == nil ||
+		broken.Error.Code != string(toolchain.BuildFailureVersionUnavailable) ||
+		!strings.Contains(broken.Error.Hint, "override") {
 		t.Fatalf("broken result = %#v", broken)
 	}
 	if broken.PackageUpdates == nil || broken.PackageUpdates.Status != "unavailable" ||
-		broken.PackageUpdates.Reason != "toolchain_incompatible" {
+		broken.PackageUpdates.Reason != string(toolchain.BuildFailureVersionUnavailable) {
 		t.Fatalf("broken package update capability = %#v", broken.PackageUpdates)
 	}
 	if supported.Status != "clean" || hasFailedStage(supported, stageCandidate) {
@@ -1004,6 +1009,57 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 		decoded.Toolchain.Runtime != "22" ||
 		decoded.Toolchain.Source != toolchain.SourceDefault {
 		t.Fatalf("structured scan toolchain = %#v", decoded.Toolchain)
+	}
+}
+
+func TestPNPMOutputFailuresHaveDistinctStableContracts(t *testing.T) {
+	tests := []struct {
+		name string
+		kind ecosystem.CandidateFailureKind
+		code string
+	}{
+		{"manager", ecosystem.CandidateFailureManager, "package_manager_failure"},
+		{"non-json", ecosystem.CandidateFailureNonJSON, "package_output_non_json"},
+		{"truncated", ecosystem.CandidateFailureTruncatedJSON, "package_output_truncated_json"},
+		{"schema", ecosystem.CandidateFailureSchemaMismatch, "package_output_schema_mismatch"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"packageManager":"pnpm@10.14.0"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			workspace := config.Workspace{
+				Name: "pnpm-output", Path: root, Stack: config.StackNode,
+				PackageManager: "pnpm", Platform: "linux/amd64",
+			}
+			runners := scanStageRunners{
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+					return nil, nil, nil, "trivy", false, nil
+				},
+				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+					return nil, false, nil
+				},
+				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+					return nil, "pnpm", false, &ecosystem.CandidateError{
+						Kind: testCase.kind, Manager: "pnpm", ExitCode: 2,
+					}
+				},
+			}
+			result := scanOneTargetWith(
+				context.Background(), config.Config{},
+				scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace},
+				scanOptions{only: "packages"}, config.LocalPackagePolicy{},
+				updatesnapshot.PolicyIdentity{}, 0, runners,
+			)
+			if result.Status != "failed" || result.Error == nil || result.Error.Code != testCase.code ||
+				result.PackageUpdates == nil || result.PackageUpdates.Reason != testCase.code {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 }
 

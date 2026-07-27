@@ -18,6 +18,9 @@ type decoderCapability struct {
 }
 
 func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]byte) (ecosystem.CandidateReport, error) {
+	if c.kind == "pnpm" {
+		return decodePNPMReport(output, inputs)
+	}
 	report, err := decodePackageReport(c.kind, output, inputs)
 	if err != nil {
 		return ecosystem.CandidateReport{}, err

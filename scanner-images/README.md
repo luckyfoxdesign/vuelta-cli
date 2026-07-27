@@ -32,6 +32,22 @@ cannot use the mandatory proxy when executed by Bun, while `bun outdated`
 does not provide a stable structured output contract. Keep the Dockerfile as
 an upstream compatibility fixture, not as a catalog release input.
 
+## pnpm candidate contract
+
+Embedded pnpm scanning accepts exact pnpm 8, 9, 10, and 11 declarations.
+pnpm 8 is paired with lockfile v6; pnpm 9–11 are paired with lockfile v9.
+Corepack's `+sha512...` integrity annotation is validated but removed from the
+registry version passed to `npm install`; the semantic version is not
+substituted. Other families require a reviewed immutable toolchain override.
+
+All supported families run `pnpm outdated --format json`. Stdout is a
+hard-bounded JSON-only object keyed by package name. Records require `latest`
+and may contain `current`, `wanted`, `isDeprecated`, and `dependencyType`.
+Stderr is collected separately as a bounded, redacted first/last diagnostic
+excerpt. Non-JSON stdout, truncated JSON, schema drift, manager exit failures,
+unavailable versions, registry failures, and Docker build failures retain
+distinct stable classifications.
+
 Each image has an empty entrypoint and a known passwd user. Profile metadata
 must declare `10001:10001`, except `bun-ncu`, which uses the base image's known
 `1000:1000` Bun user. Vuelta still runs the final container with a read-only

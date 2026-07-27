@@ -83,6 +83,7 @@ cases:
     scenarios:
       - name: default
         args: []
+        repeat: 2
 
   - name: gperdomor-oss-pnpm-workspace
     url: https://github.com/gperdomor/oss
@@ -98,6 +99,7 @@ cases:
     scenarios:
       - name: default
         args: []
+        repeat: 2
 
   - name: tsx-pnpm-workspace
     url: https://github.com/privatenumber/tsx

@@ -41,6 +41,14 @@ func TestTailBoundsAndRedacts(t *testing.T) {
 	}
 }
 
+func TestExcerptBoundsSourceAndKeepsBothContexts(t *testing.T) {
+	data := []byte("FIRST token=abc123secret " + string(make([]byte, 80)) + " LAST")
+	got := Excerpt(data, 64)
+	if len(got) > 64 || contains(got, "abc123secret") || !contains(got, "FIRST") || !contains(got, "LAST") {
+		t.Fatalf("Excerpt() = %q", got)
+	}
+}
+
 func TestClassifyDetailHeuristics(t *testing.T) {
 	cases := []struct {
 		detail string

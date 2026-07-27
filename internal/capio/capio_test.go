@@ -89,6 +89,26 @@ func TestTailConcurrentWritersStayBounded(t *testing.T) {
 	}
 }
 
+func TestExcerptKeepsFirstAndLastContext(t *testing.T) {
+	excerpt := NewExcerpt(10)
+	if _, err := excerpt.Write([]byte("0123456789abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	got := excerpt.String()
+	if !strings.Contains(got, "01234") || !strings.HasSuffix(got, "bcdef") ||
+		!strings.Contains(got, "kept first 5 and last 5 of 16 bytes") {
+		t.Fatalf("excerpt = %q", got)
+	}
+}
+
+func TestExcerptKeepsSmallOutputVerbatim(t *testing.T) {
+	excerpt := NewExcerpt(10)
+	_, _ = excerpt.Write([]byte("small"))
+	if got := excerpt.String(); got != "small" {
+		t.Fatalf("excerpt = %q", got)
+	}
+}
+
 func TestLimitKeepsSmallOutputAndDoesNotFire(t *testing.T) {
 	fired := 0
 	lim := NewLimit(32, func() { fired++ })

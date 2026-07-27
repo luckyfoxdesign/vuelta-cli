@@ -251,6 +251,29 @@ func TestSelectEmbeddedDefaultMatrixWithoutConfigProfiles(t *testing.T) {
 	}
 }
 
+func TestSelectPNPMNormalizesCorepackIntegrityAndPreflightsFamily(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+	write(t, root, "package.json", `{"packageManager":"pnpm@10.14.0+sha512.AbCdEf0123+/="}`)
+	workspace := config.Workspace{
+		Path: root, Stack: config.StackNode, PackageManager: "pnpm",
+		Platform: "linux/amd64",
+	}
+	selection, err := Select(workspace, config.Config{})
+	if err != nil || selection.Profile.PackageManagerVersion != "10.14.0" ||
+		selection.Profile.ScannerVersion != "10.14.0" ||
+		selection.build.Args["PNPM_VERSION"] != "10.14.0" {
+		t.Fatalf("Select() = %#v, %v", selection, err)
+	}
+
+	write(t, root, "package.json", `{"packageManager":"pnpm@12.0.0"}`)
+	_, err = Select(workspace, config.Config{})
+	var versionErr *ecosystem.ToolchainVersionError
+	if !errors.As(err, &versionErr) || versionErr.Version != "12.0.0" {
+		t.Fatalf("unsupported version error = %#v, %v", versionErr, err)
+	}
+}
+
 func TestDetectRejectsManagerConflictAndMalformedLock(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "package.json", `{"packageManager":"pnpm@10.0.0"}`)

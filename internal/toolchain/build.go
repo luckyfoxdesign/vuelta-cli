@@ -12,12 +12,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	scannerimages "github.com/luckyfoxdesign/vuelta/scanner-images"
 )
 
@@ -29,6 +31,8 @@ const (
 )
 
 var localImageIDPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+var scannerBuildLocks sync.Map
 
 type buildSpec struct {
 	Dockerfile string
@@ -64,6 +68,20 @@ func Prepare(ctx context.Context, ws config.Workspace, cfg config.Config, docker
 		return Prepared{}, err
 	}
 	tag := "vuelta-scanner-cache:" + cacheKey
+	if imageID, inspectErr := InspectImageID(ctx, docker, tag); inspectErr == nil {
+		selection.Profile.Image = imageID
+		identity, identityErr := IdentityForResolvedProfile(selection.Profile, selection.Source, imageID)
+		if identityErr != nil {
+			return Prepared{}, identityErr
+		}
+		return Prepared{Selection: selection, Identity: identity, CacheKey: cacheKey, Cached: true}, nil
+	}
+	lockValue, _ := scannerBuildLocks.LoadOrStore(cacheKey, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	// A concurrent workspace may have completed the same content-addressed
+	// build while this caller was waiting.
 	if imageID, inspectErr := InspectImageID(ctx, docker, tag); inspectErr == nil {
 		selection.Profile.Image = imageID
 		identity, identityErr := IdentityForResolvedProfile(selection.Profile, selection.Source, imageID)
@@ -174,7 +192,7 @@ func buildDefault(ctx context.Context, docker dockerexec.Runner, selection Selec
 		}
 	}
 	iidPath := filepath.Join(root, "image.id")
-	args := []string{"build", "--pull", "--platform", selection.Profile.Platform, "--file", filepath.Join("scanner-images", selection.build.Dockerfile), "--iidfile", iidPath}
+	args := []string{"build", "--pull", "--progress", "plain", "--platform", selection.Profile.Platform, "--file", filepath.Join("scanner-images", selection.build.Dockerfile), "--iidfile", iidPath}
 	argNames := make([]string, 0, len(selection.build.Args))
 	for name := range selection.build.Args {
 		argNames = append(argNames, name)
@@ -186,17 +204,13 @@ func buildDefault(ctx context.Context, docker dockerexec.Runner, selection Selec
 	args = append(args, ".")
 	buildCtx, cancel := context.WithTimeout(ctx, scannerBuildTimeout)
 	defer cancel()
-	_, err = docker.Run(buildCtx, dockerexec.Request{
+	result, err := docker.Run(buildCtx, dockerexec.Request{
 		Args: args, Dir: root,
-		Stdout: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
-		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 16 << 10},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Excerpt, Bytes: 8 << 10},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Excerpt, Bytes: 16 << 10},
 	})
 	if err != nil {
-		category, exitCode, detail := dockerexec.Classify(err)
-		if detail != "" {
-			return fmt.Errorf("build embedded scanner image failed (%s, exit %d): %s", category, exitCode, detail)
-		}
-		return fmt.Errorf("build embedded scanner image failed (%s, exit %d)", category, exitCode)
+		return classifyBuildError(selection.Profile, result, err)
 	}
 	iid, err := os.ReadFile(iidPath)
 	if err != nil {
@@ -216,6 +230,40 @@ func buildDefault(ctx context.Context, docker dockerexec.Runner, selection Selec
 		return fmt.Errorf("publish validated scanner cache tag: %w", err)
 	}
 	return nil
+}
+
+func classifyBuildError(profile config.ToolchainProfile, result dockerexec.Result, err error) error {
+	category, exitCode, classifiedDetail := dockerexec.Classify(err)
+	detailBytes := append([]byte(nil), result.Stderr...)
+	if len(result.Stdout) > 0 {
+		if len(detailBytes) > 0 {
+			detailBytes = append(detailBytes, "\n[vuelta: build stdout]\n"...)
+		}
+		detailBytes = append(detailBytes, result.Stdout...)
+	}
+	detail := safeerr.Excerpt(detailBytes, 1024)
+	if detail == "" {
+		detail = classifiedDetail
+	}
+	lower := strings.ToLower(detail)
+	kind := BuildFailureDocker
+	switch {
+	case errors.Is(err, context.Canceled) || category == safeerr.CategoryCancelled:
+		kind = BuildFailureCancelled
+	case strings.Contains(lower, "etarget") || strings.Contains(lower, "notarget") ||
+		strings.Contains(lower, "no matching version found") ||
+		strings.Contains(lower, "version not found"):
+		kind = BuildFailureVersionUnavailable
+	case category == safeerr.CategoryEndpoint || category == safeerr.CategoryEgress ||
+		strings.Contains(lower, "eai_again") || strings.Contains(lower, "enotfound") ||
+		strings.Contains(lower, "econnreset") || strings.Contains(lower, "network request") ||
+		strings.Contains(lower, "fetch failed") || strings.Contains(lower, "registry unavailable"):
+		kind = BuildFailureRegistry
+	}
+	return &BuildError{
+		Kind: kind, Manager: profile.PackageManager, Version: profile.PackageManagerVersion,
+		Category: category, ExitCode: exitCode, Detail: detail, Unwrapped: err,
+	}
 }
 
 type builtImageMetadata struct {

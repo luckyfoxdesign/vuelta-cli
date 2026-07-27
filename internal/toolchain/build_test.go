@@ -6,17 +6,24 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	scannerimages "github.com/luckyfoxdesign/vuelta/scanner-images"
 )
 
 type cacheDocker struct {
+	mu             sync.Mutex
 	images         map[string]string
 	builds         int
+	buildDirs      []string
 	smokes         int
 	fail           bool
+	failDetail     string
+	failStdout     string
+	failErr        error
 	platform       string
 	metadataUser   string
 	scannerVersion string
@@ -25,6 +32,8 @@ type cacheDocker struct {
 func (d *cacheDocker) Path() (string, error) { return "/usr/bin/docker", nil }
 
 func (d *cacheDocker) Run(_ context.Context, request dockerexec.Request) (dockerexec.Result, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if len(request.Args) >= 3 && request.Args[0] == "image" && request.Args[1] == "inspect" {
 		imageID, ok := d.images[request.Args[len(request.Args)-1]]
 		if !ok {
@@ -38,8 +47,15 @@ func (d *cacheDocker) Run(_ context.Context, request dockerexec.Request) (docker
 		return dockerexec.Result{Stdout: []byte(imageID + "\n")}, nil
 	}
 	if len(request.Args) > 0 && request.Args[0] == "build" {
+		d.buildDirs = append(d.buildDirs, request.Dir)
 		if d.fail {
-			return dockerexec.Result{}, errors.New("build failed")
+			err := d.failErr
+			if err == nil {
+				err = errors.New("build failed")
+			}
+			return dockerexec.Result{
+				Stdout: []byte(d.failStdout), Stderr: []byte(d.failDetail),
+			}, err
 		}
 		d.builds++
 		for index, argument := range request.Args {
@@ -111,8 +127,87 @@ func TestPrepareReportsBuildFailure(t *testing.T) {
 	write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
 	workspace := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/arm64"}
 	_, err := Prepare(context.Background(), workspace, config.Config{}, &cacheDocker{images: map[string]string{}, metadataUser: "10001:10001", fail: true}, nil)
-	if err == nil || !strings.Contains(err.Error(), "build embedded scanner image") {
+	var buildErr *BuildError
+	if !errors.As(err, &buildErr) || buildErr.Kind != BuildFailureDocker {
 		t.Fatalf("Prepare error = %v", err)
+	}
+}
+
+func TestPrepareClassifiesPNPMBuildFailures(t *testing.T) {
+	tests := []struct {
+		name, detail, stdout string
+		err                  error
+		want                 BuildFailureKind
+	}{
+		{"missing version", "npm error code ETARGET\nNo matching version found for pnpm@10.999.0", "", errors.New("build failed"), BuildFailureVersionUnavailable},
+		{"registry network", "npm error network request to registry failed with EAI_AGAIN", "", errors.New("build failed"), BuildFailureRegistry},
+		{"buildkit stdout", "", "#9 ERROR: process did not complete successfully", errors.New("build failed"), BuildFailureDocker},
+		{"cancelled", "", "", context.Canceled, BuildFailureCancelled},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			write(t, root, "package.json", `{"engines":{"node":"22.x"},"packageManager":"pnpm@10.14.0"}`)
+			write(t, root, "pnpm-lock.yaml", `lockfileVersion: '9.0'`)
+			workspace := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "pnpm", Platform: "linux/amd64"}
+			docker := &cacheDocker{
+				images: map[string]string{}, metadataUser: "10001:10001",
+				fail: true, failDetail: testCase.detail,
+				failStdout: testCase.stdout, failErr: testCase.err,
+			}
+			_, err := Prepare(context.Background(), workspace, config.Config{}, docker, nil)
+			var buildErr *BuildError
+			if !errors.As(err, &buildErr) || buildErr.Kind != testCase.want ||
+				buildErr.Manager != "pnpm" || buildErr.Version != "10.14.0" ||
+				len(buildErr.Detail) > 1024 {
+				t.Fatalf("Prepare error = %#v, %v", buildErr, err)
+			}
+			if len(docker.buildDirs) != 1 {
+				t.Fatalf("build directories = %q", docker.buildDirs)
+			}
+			if _, statErr := os.Stat(docker.buildDirs[0]); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("temporary build directory remains after failure: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestPrepareCoalescesConcurrentContentAddressedBuilds(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "package.json", `{"engines":{"node":"24.x"},"packageManager":"npm@11.4.2"}`)
+	write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	workspace := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
+	docker := &cacheDocker{images: map[string]string{}, metadataUser: "10001:10001"}
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := Prepare(context.Background(), workspace, config.Config{}, docker, nil)
+			results <- err
+		}()
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if docker.builds != 1 || docker.smokes != 1 {
+		t.Fatalf("builds=%d smokes=%d, want one validated build", docker.builds, docker.smokes)
+	}
+}
+
+func TestPNPMScannerImageDisablesLifecycleScriptsAndRunsNonRoot(t *testing.T) {
+	data, err := scannerimages.Files.ReadFile("node-pnpm.Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, required := range []string{
+		"--ignore-scripts", "npm_config_ignore_scripts=true",
+		"PNPM_CONFIG_IGNORE_SCRIPTS=true", "USER 10001:10001",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("node-pnpm.Dockerfile missing %q", required)
+		}
 	}
 }
 

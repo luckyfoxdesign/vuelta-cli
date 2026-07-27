@@ -42,6 +42,8 @@ const (
 	Tail
 	// Limit retains a bounded prefix and cancels the command on overflow.
 	Limit
+	// Excerpt retains bounded first and last diagnostic context.
+	Excerpt
 )
 
 // Capture configures bounded collection for one child stream.
@@ -552,7 +554,9 @@ func validateRequest(request Request) error {
 		return errors.New("combined Docker capture cannot be mixed with stdout/stderr capture")
 	}
 	for _, capture := range []Capture{request.Stdout, request.Stderr, request.Combined} {
-		if capture.Mode > Limit || (capture.Mode != Discard && capture.Bytes <= 0) {
+		if capture.Mode > Excerpt ||
+			(capture.Mode != Discard && capture.Bytes <= 0) ||
+			(capture.Mode == Excerpt && capture.Bytes <= 1) {
 			return errors.New("invalid Docker output capture policy")
 		}
 	}
@@ -584,8 +588,8 @@ func (e *CommandError) Unwrap() error { return e.err }
 // completion (for example, the executable could not be started).
 func (e *CommandError) ExitCode() int { return e.exitCode }
 
-// SafeDetail returns a bounded, redacted diagnostic tail safe for display.
-func (e *CommandError) SafeDetail() string { return safeerr.Tail(e.detail, 512) }
+// SafeDetail returns a bounded, redacted diagnostic excerpt safe for display.
+func (e *CommandError) SafeDetail() string { return safeerr.Excerpt(e.detail, 1024) }
 
 // Category derives a stable, safe failure classification from the bounded
 // diagnostic tail already captured by the caller.
@@ -623,10 +627,11 @@ func Classify(err error) (safeerr.Category, int, string) {
 }
 
 type collector struct {
-	mode  CaptureMode
-	limit int
-	tail  *capio.Tail
-	hard  *capio.Limit
+	mode    CaptureMode
+	limit   int
+	tail    *capio.Tail
+	excerpt *capio.Excerpt
+	hard    *capio.Limit
 }
 
 func newCollector(capture Capture, cancel context.CancelFunc) *collector {
@@ -636,6 +641,8 @@ func newCollector(capture Capture, cancel context.CancelFunc) *collector {
 		c.tail = capio.NewTail(capture.Bytes)
 	case Limit:
 		c.hard = capio.NewLimit(capture.Bytes, cancel)
+	case Excerpt:
+		c.excerpt = capio.NewExcerpt(capture.Bytes)
 	}
 	return c
 }
@@ -647,6 +654,9 @@ func (c *collector) writer() io.Writer {
 	if c.hard != nil {
 		return c.hard
 	}
+	if c.excerpt != nil {
+		return c.excerpt
+	}
 	return nil
 }
 
@@ -656,6 +666,9 @@ func (c *collector) bytes() []byte {
 	}
 	if c.hard != nil {
 		return c.hard.Bytes()
+	}
+	if c.excerpt != nil {
+		return []byte(c.excerpt.String())
 	}
 	return nil
 }

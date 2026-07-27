@@ -298,6 +298,11 @@ func PNPM() ecosystem.Adapter {
 				expectedScanner: "pnpm", lockFormats: []string{"pnpm-v6", "pnpm-v9"}, versionStyle: "exact",
 			},
 			scannerCapability: scannerCapability{expectedScanner: "pnpm", resolve: func(request ecosystem.ScannerRequest) (ecosystem.ScannerSpec, error) {
+				if request.ScannerVersion != "" {
+					if _, _, err := normalizePNPMVersion(request.ScannerVersion); err != nil {
+						return ecosystem.ScannerSpec{}, err
+					}
+				}
 				args := []string{"pnpm", "outdated", "--format", "json"}
 				if !request.InstalledTool || request.MinReleaseAgeDays > 0 {
 					minimumAge := request.MinReleaseAgeDays
@@ -572,6 +577,10 @@ func nodeToolchain(key ecosystem.Key, scanner, scannerVersion string, lockFormat
 		case "pnpm":
 			if managerVersion == "" {
 				managerVersion = map[string]string{"pnpm-v6": "8.15.9", "pnpm-v9": "9.15.0"}[constraints.LockFormat]
+			}
+			managerVersion, _, err = approvedPNPMVersion(managerVersion, constraints.LockFormat)
+			if err != nil {
+				return ecosystem.ToolchainSpec{}, err
 			}
 			scannerVersion = managerVersion
 			dockerfile = "node-pnpm.Dockerfile"
