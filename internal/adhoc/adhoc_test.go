@@ -28,8 +28,37 @@ func TestDetectRejectsManifestSymlink(t *testing.T) {
 	if err := os.Symlink("package-lock.json", filepath.Join(root, "package.json")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Detect(root); err == nil || !strings.Contains(err.Error(), "exactly one") {
+	if _, err := Detect(root); err == nil || !strings.Contains(err.Error(), "must be a regular file") {
 		t.Fatalf("Detect error = %v, want rejected symlink", err)
+	}
+}
+
+func TestDetectScanAcceptsManifestOnlyButUpdateDetectionDoesNot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"name":"demo"}`)
+	project, err := DetectScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.Stack != "node" || project.Manager != "npm" || project.Manifest != "package.json" || project.Lock != "" {
+		t.Fatalf("DetectScan() = %#v", project)
+	}
+	if _, err := Detect(root); err == nil || !strings.Contains(err.Error(), "manifest/lock pair") {
+		t.Fatalf("Detect() error = %v", err)
+	}
+}
+
+func TestDetectAcceptsNPMShrinkwrapAndRejectsAmbiguousLocks(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"name":"demo"}`)
+	writeFile(t, root, "npm-shrinkwrap.json", `{"lockfileVersion":3}`)
+	project, err := Detect(root)
+	if err != nil || project.Lock != "npm-shrinkwrap.json" {
+		t.Fatalf("Detect() = %#v, %v", project, err)
+	}
+	writeFile(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	if _, err := DetectScan(root); err == nil || !strings.Contains(err.Error(), "both package-lock.json") {
+		t.Fatalf("DetectScan() ambiguous error = %v", err)
 	}
 }
 

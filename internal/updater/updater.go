@@ -286,7 +286,7 @@ func ResolveWithDocker(ws config.Workspace, cfg config.Config, docker dockerexec
 				Reason: adapter.Metadata().UnsupportedReason,
 			}
 		}
-		request := ecosystem.MutationRequest{}
+		request := ecosystem.MutationRequest{Root: ws.Path}
 		if profile != nil {
 			request.ProfileScanner = profile.Scanner
 			request.ScannerVersion = profile.ScannerVersion

@@ -170,6 +170,8 @@ type rawEnvelope struct {
 
 type rawScanResult struct {
 	Status         string               `json:"status"`
+	Stack          string               `json:"stack"`
+	PackageManager string               `json:"package_manager"`
 	Stages         []ObservedStage      `json:"stages"`
 	Diagnostics    []rawDiagnostic      `json:"diagnostics"`
 	Warnings       []string             `json:"warnings"`
@@ -243,6 +245,12 @@ func ParseObservedEnvelope(data []byte) (ObservedEnvelope, error) {
 	}
 	for _, result := range raw.Results {
 		observed.Statuses = appendBounded(observed.Statuses, 64, SanitizeMessage(result.Status))
+		if stack := SanitizeMessage(result.Stack); stack != "" {
+			observed.DetectedStacks = appendBounded(observed.DetectedStacks, 8, stack)
+		}
+		if manager := SanitizeMessage(result.PackageManager); manager != "" {
+			observed.PackageManagers = appendBounded(observed.PackageManagers, 8, manager)
+		}
 		for _, stage := range result.Stages {
 			observed.Stages = appendBounded(observed.Stages, 64, ObservedStage{
 				Name: SanitizeMessage(stage.Name), Status: SanitizeMessage(stage.Status), Reason: SanitizeMessage(stage.Reason),

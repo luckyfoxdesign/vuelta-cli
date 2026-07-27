@@ -188,7 +188,7 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	writeFile(t, root, "package.json", `{"dependencies":{"example":"1.0.0"}}`)
 	writeFile(t, root, "package-lock.json", `{"lockfileVersion":3,"packages":{"node_modules/example":{"version":"1.0.0"}}}`)
 	writeFile(t, root, "unrelated-source.js", "sentinel")
-	contract, err := scaninput.PackageContract(config.Workspace{Stack: config.StackNode, PackageManager: "npm"}, false)
+	contract, err := scaninput.PackageContract(config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

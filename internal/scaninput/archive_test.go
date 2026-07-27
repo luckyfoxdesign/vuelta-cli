@@ -114,6 +114,67 @@ func TestBuildArchivesOnlyAllowlistedTrackedInputs(t *testing.T) {
 	}
 }
 
+func TestNPMManifestOnlyArchiveIsMinimalAndLockSelectionIsExact(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, lock string
+	}{
+		{name: "manifest only"},
+		{name: "package lock", lock: "package-lock.json"},
+		{name: "shrinkwrap", lock: "npm-shrinkwrap.json"},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			write(t, root, "package.json", `{"name":"demo"}`)
+			write(t, root, "unrelated-source.js", "sentinel")
+			if testCase.lock != "" {
+				write(t, root, testCase.lock, `{"lockfileVersion":3}`)
+			}
+			contract, err := PackageContract(npmWorkspace(root), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle, err := Build(context.Background(), root, root, Options{}, contract)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := archiveFiles(t, bundle.Archive)
+			if _, ok := files["project/package.json"]; !ok {
+				t.Fatalf("archive = %#v", files)
+			}
+			if _, ok := files["project/unrelated-source.js"]; ok || len(files) != 1+boolInt(testCase.lock != "") {
+				t.Fatalf("archive = %#v", files)
+			}
+			if testCase.lock != "" {
+				if _, ok := files["project/"+testCase.lock]; !ok {
+					t.Fatalf("archive omitted %s: %#v", testCase.lock, files)
+				}
+			}
+		})
+	}
+}
+
+func TestNPMContractRejectsAmbiguousLocks(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "package.json", `{"name":"demo"}`)
+	write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	write(t, root, "npm-shrinkwrap.json", `{"lockfileVersion":3}`)
+	if _, err := PackageContract(npmWorkspace(root), false); err == nil || !strings.Contains(err.Error(), "both package-lock.json") {
+		t.Fatalf("PackageContract() error = %v", err)
+	}
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "requirements.txt", "flask==0.5\n")

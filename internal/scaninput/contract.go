@@ -61,6 +61,13 @@ func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, er
 	if !ok {
 		return Contract{}, &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "scan-input"}
 	}
+	if resolver, ok := adapter.(ecosystem.RootInputProvider); ok {
+		contract, resolveErr := resolver.PackageInputForRoot(ws.Path, allowManagerConfig)
+		if resolveErr != nil {
+			return Contract{}, resolveErr
+		}
+		return fromEcosystemContract(contract), nil
+	}
 	return fromEcosystemContract(provider.PackageInput(allowManagerConfig)), nil
 }
 
@@ -69,6 +76,16 @@ func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, er
 func DependencyContract(ws config.Workspace) (Contract, error) {
 	if ws.Stack == config.StackPython && ws.PackageManager == "" {
 		return PythonRequirementsContract(), nil
+	}
+	adapter, err := adapterFor(ws.Stack, ws.PackageManager)
+	if err == nil {
+		if resolver, ok := adapter.(ecosystem.RootInputProvider); ok {
+			contract, resolveErr := resolver.DependencyInputForRoot(ws.Path)
+			if resolveErr != nil {
+				return Contract{}, resolveErr
+			}
+			return fromEcosystemContract(contract), nil
+		}
 	}
 	contract, err := PackageContract(ws, false)
 	if err != nil {

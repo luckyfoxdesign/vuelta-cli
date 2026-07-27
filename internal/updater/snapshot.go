@@ -636,7 +636,7 @@ func resolvePlannedMutationSpec(
 		}
 	}
 	request := ecosystem.PlannedMutationRequest{
-		Candidates:   make([]ecosystem.Candidate, len(candidates)),
+		Root: workspace.Path, Candidates: make([]ecosystem.Candidate, len(candidates)),
 		AllowScripts: allowScripts, MinReleaseAgeDays: cfg.Update.MinReleaseAgeDays,
 	}
 	for index, candidate := range candidates {

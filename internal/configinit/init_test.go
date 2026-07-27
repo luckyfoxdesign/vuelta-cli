@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/luckyfoxdesign/vuelta/internal/config"
 )
 
 func TestDetectOnlyInspectsSelectedProjectRoot(t *testing.T) {
@@ -62,7 +64,7 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if got := strings.Join(cfg.Workspaces[0].AllowedChangedPaths, ","); got != "package-lock.json,package.json" {
+	if got := strings.Join(cfg.Workspaces[0].AllowedChangedPaths, ","); got != "npm-shrinkwrap.json,package-lock.json,package.json" {
 		t.Fatalf("default root-only allowed paths = %q", got)
 	}
 	if len(cfg.Update.Images) != 0 || len(cfg.Update.Tools) != 0 || len(cfg.Update.ToolchainProfiles) != 0 {
@@ -85,6 +87,39 @@ func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	if err := Write(cfg, path, true); err != nil {
 		t.Fatalf("Write with replace: %v", err)
 	}
+}
+
+func TestDetectManifestOnlyNPMAndRejectsAmbiguousOrMalformedInputs(t *testing.T) {
+	t.Parallel()
+	t.Run("manifest only", func(t *testing.T) {
+		root := t.TempDir()
+		writeProjectFile(t, root, "package.json", `{"name":"demo"}`)
+		discovery, err := Detect(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(discovery.Stacks) != 1 || discovery.Stacks[0] != config.StackNode ||
+			len(discovery.PackageManagers[config.StackNode]) != 1 ||
+			discovery.PackageManagers[config.StackNode][0] != "npm" {
+			t.Fatalf("discovery = %#v", discovery)
+		}
+	})
+	t.Run("ambiguous npm locks", func(t *testing.T) {
+		root := t.TempDir()
+		writeProjectFile(t, root, "package.json", `{"name":"demo"}`)
+		writeProjectFile(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+		writeProjectFile(t, root, "npm-shrinkwrap.json", `{"lockfileVersion":3}`)
+		if _, err := Detect(root); err == nil || !strings.Contains(err.Error(), "both package-lock.json") {
+			t.Fatalf("Detect() error = %v", err)
+		}
+	})
+	t.Run("malformed manifest", func(t *testing.T) {
+		root := t.TempDir()
+		writeProjectFile(t, root, "package.json", `{`)
+		if _, err := Detect(root); err == nil || !strings.Contains(err.Error(), "parse package.json") {
+			t.Fatalf("Detect() error = %v", err)
+		}
+	})
 }
 
 func TestDetectRequirementsOnlyProjectAsScanOnly(t *testing.T) {

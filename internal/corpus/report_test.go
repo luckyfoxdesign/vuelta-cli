@@ -248,6 +248,21 @@ func TestParseRequirementsEnvelopePreservesInformationalDiagnostics(t *testing.T
 	}
 }
 
+func TestManifestOnlyEnvelopePreservesDetectedManagerWithoutToolchain(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"format":1,"command":"scan","results":[{"stack":"node","package_manager":"npm","status":"partial","stages":[{"name":"vulnerability","status":"succeeded"},{"name":"candidate","status":"failed","reason":"npm project has no supported lockfile"}],"diagnostics":[],"warnings":[],"capabilities":[],"package_updates":{"status":"unavailable","reason":"lockfile_missing"},"error":{"code":"lockfile_missing","message":"npm project has no supported lockfile","stage":"candidate"}}],"warnings":[],"errors":[]}`)
+	observed, err := ParseObservedEnvelope(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpusCase := Case{
+		ExpectedStack: "node", ExpectedPackageManager: "npm", ExpectedLockFormat: "absent",
+	}
+	if err := ValidateObservedContract(corpusCase, observed); err != nil {
+		t.Fatalf("ValidateObservedContract() error = %v; observed=%#v", err, observed)
+	}
+}
+
 func TestSanitizeAndRenderMarkdown(t *testing.T) {
 	t.Parallel()
 	value := SanitizeMessage("bad\x00\n| `value`")

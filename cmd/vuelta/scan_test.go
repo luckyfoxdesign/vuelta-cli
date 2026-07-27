@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -375,6 +376,76 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 				t.Fatalf("vulnerability result was lost: %#v", result.Vulnerabilities)
 			}
 		})
+	}
+}
+
+func TestManifestOnlyNPMScanPreservesReadOnlyFindingsAndNeverRunsMutationStages(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"demo"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := scanTarget{path: root, origin: updatesnapshot.OriginAdhoc}
+	vulnerabilityCalls := 0
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			vulnerabilityCalls++
+			return []vulnscan.Finding{{ID: "CVE-READ-ONLY"}}, nil, nil, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			t.Fatal("manifest-only npm invoked package candidate scanning")
+			return nil, "", false, nil
+		},
+		prepareToolchain: func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error) {
+			t.Fatal("manifest-only npm prepared a lock-dependent toolchain")
+			return toolchain.Prepared{}, nil
+		},
+	}
+	var first scanResult
+	for run := 0; run < 2; run++ {
+		result := scanOneTargetWith(
+			context.Background(),
+			config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy"}},
+			target,
+			scanOptions{},
+			config.LocalPackagePolicy{},
+			updatesnapshot.PolicyIdentity{},
+			0,
+			runners,
+		)
+		if result.Status != "partial" || result.Error == nil || result.Error.Code != reasonLockfileMissing {
+			t.Fatalf("run %d result = %#v", run+1, result)
+		}
+		if result.Stack != config.StackNode || result.PackageManager != "npm" {
+			t.Fatalf("run %d detected ecosystem = %s/%s", run+1, result.Stack, result.PackageManager)
+		}
+		if len(result.Vulnerabilities) != 1 || result.Vulnerabilities[0] != "CVE-READ-ONLY" {
+			t.Fatalf("run %d findings = %#v", run+1, result.Vulnerabilities)
+		}
+		if result.PackageUpdates == nil || result.PackageUpdates.Status != "unavailable" ||
+			result.PackageUpdates.Reason != reasonLockfileMissing {
+			t.Fatalf("run %d package updates = %#v", run+1, result.PackageUpdates)
+		}
+		if result.SnapshotID != "" || !hasFailedStage(result, stageCandidate) {
+			t.Fatalf("run %d snapshot/stages = %q %#v", run+1, result.SnapshotID, result.Stages)
+		}
+		if run == 0 {
+			first = result
+		} else if !reflect.DeepEqual(first.Warnings, result.Warnings) {
+			t.Fatalf("repeat warnings changed: %#v != %#v", first.Warnings, result.Warnings)
+		}
+	}
+	if vulnerabilityCalls != 2 {
+		t.Fatalf("vulnerability calls = %d", vulnerabilityCalls)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "package.json" {
+		t.Fatalf("manifest-only scans changed the project: %#v", entries)
 	}
 }
 
@@ -1300,6 +1371,9 @@ func TestFailedScanResultSurfacesSafeCategoryExitCodeAndBoundedDetailForDockerFa
 
 func TestProjectConfigIsIgnoredUnlessExplicitlyAllowed(t *testing.T) {
 	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(directory, ".npmrc"), []byte("registry=https://example.invalid\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

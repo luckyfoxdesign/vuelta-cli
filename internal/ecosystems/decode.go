@@ -22,11 +22,20 @@ func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]b
 		return ecosystem.CandidateReport{}, err
 	}
 	if c.kind == "npm" {
-		lock, ok := inputs["package-lock.json"]
-		if !ok {
-			return ecosystem.CandidateReport{}, errors.New("npm candidate scan input omitted package-lock.json")
+		var lock []byte
+		var lockName string
+		for _, name := range []string{npmPackageLock, npmShrinkwrapLock} {
+			if data, ok := inputs[name]; ok {
+				if lock != nil {
+					return ecosystem.CandidateReport{}, errors.New("npm candidate scan input contains multiple lockfiles")
+				}
+				lock, lockName = data, name
+			}
 		}
-		if err := addNPMCurrentVersions(report.Candidates, lock); err != nil {
+		if lock == nil {
+			return ecosystem.CandidateReport{}, errors.New("npm candidate scan input omitted a supported lockfile")
+		}
+		if err := addNPMCurrentVersions(report.Candidates, lockName, lock); err != nil {
 			return ecosystem.CandidateReport{}, err
 		}
 	}
@@ -174,7 +183,7 @@ func firstString(record map[string]any, keys ...string) (string, bool) {
 	return "", false
 }
 
-func addNPMCurrentVersions(candidates []ecosystem.Candidate, lockData []byte) error {
+func addNPMCurrentVersions(candidates []ecosystem.Candidate, lockName string, lockData []byte) error {
 	var lock struct {
 		Packages map[string]struct {
 			Version string `json:"version"`
@@ -184,7 +193,7 @@ func addNPMCurrentVersions(candidates []ecosystem.Candidate, lockData []byte) er
 		} `json:"dependencies"`
 	}
 	if err := json.Unmarshal(lockData, &lock); err != nil {
-		return fmt.Errorf("parse package-lock.json for current candidate versions: %w", err)
+		return fmt.Errorf("parse %s for current candidate versions: %w", lockName, err)
 	}
 	for index := range candidates {
 		if candidates[index].Current != "" {

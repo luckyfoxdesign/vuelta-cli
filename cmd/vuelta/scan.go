@@ -118,6 +118,8 @@ const (
 	stageReport        = "report"
 )
 
+const reasonLockfileMissing = "lockfile_missing"
+
 // scanStageResult reports one independent scan stage so a failure in one
 // stage never hides the outcome of another.
 type scanStageResult struct {
@@ -136,6 +138,8 @@ type scanResult struct {
 	Directory             string                     `json:"directory"`
 	Origin                string                     `json:"origin"`
 	Execution             string                     `json:"execution"`
+	Stack                 string                     `json:"stack,omitempty"`
+	PackageManager        string                     `json:"package_manager,omitempty"`
 	Status                string                     `json:"status"`
 	SnapshotID            string                     `json:"snapshot_id,omitempty"`
 	SnapshotCreated       *time.Time                 `json:"snapshot_created_at,omitempty"`
@@ -735,6 +739,8 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		}
 		identityWorkspace = detectedWorkspace
 	}
+	result.Stack = identityWorkspace.Stack
+	result.PackageManager = identityWorkspace.PackageManager
 	if scanOnlyAdapter, ok := scanOnlyWorkspaceAdapter(identityWorkspace); ok {
 		identityWorkspace.Stack = scanOnlyAdapter.Key().Stack
 		identityWorkspace.PackageManager = scanOnlyAdapter.Key().PackageManager
@@ -746,6 +752,13 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
 	if initialInputErr == nil {
 		result.InputCategories = inputCategories
+	}
+	lockfileMissing := false
+	if initialInputErr == nil {
+		lockfileMissing, initialInputErr = mutationLockfileMissing(identityWorkspace)
+	}
+	if lockfileMissing {
+		result.PackageUpdates = &packageUpdateAvailability{Status: "unavailable", Reason: reasonLockfileMissing}
 	}
 	result = addStage(result, stagePreflight, stageSucceeded, "")
 	progress := newScanProgress(scanProgressEligible(options), os.Stderr)
@@ -810,6 +823,21 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageCandidate, stageNotRequested, "")
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
 		result = addStage(result, stageSnapshot, stageNotRequested, "")
+		return finalizeStageOutcomes(result)
+	}
+
+	if lockfileMissing {
+		manager := packageToolName(identityWorkspace)
+		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "skipped", Reason: reasonLockfileMissing})
+		result = recordScanStageFailure(
+			result,
+			stageCandidate,
+			reasonLockfileMissing,
+			fmt.Errorf("%s project has no supported lockfile", manager),
+			"Generate package-lock.json or npm-shrinkwrap.json to enable package candidates, snapshots, and updates",
+		)
+		result = addStage(result, stageReleaseAge, stageNotRequested, "package candidates require a lockfile")
+		result = addStage(result, stageSnapshot, stageSkipped, reasonLockfileMissing)
 		return finalizeStageOutcomes(result)
 	}
 
@@ -1092,7 +1120,7 @@ func isPartialCapabilityFailure(failure *jsonCommandError) bool {
 		return false
 	}
 	switch failure.Code {
-	case "toolchain_incompatible",
+	case "toolchain_incompatible", reasonLockfileMissing,
 		ecosystem.RuntimeConstraintInvalid,
 		ecosystem.RuntimeConstraintUnsupportedSyntax,
 		ecosystem.RuntimeConstraintNoCompatible:
@@ -1233,6 +1261,10 @@ func scanWorkspace(target scanTarget) (config.Workspace, error) {
 	if err == nil {
 		return workspaceForAdhoc(project), nil
 	}
+	scanProject, scanErr := adhoc.DetectScan(target.path)
+	if scanErr == nil {
+		return workspaceForAdhoc(scanProject), nil
+	}
 	if adapters, discoverErr := catalog.Discover(target.path); discoverErr == nil {
 		for _, adapter := range adapters {
 			if _, mutable := adapter.(ecosystem.MutationProvider); !mutable && adapter.Metadata().UnsupportedReason == "" {
@@ -1241,6 +1273,9 @@ func scanWorkspace(target scanTarget) (config.Workspace, error) {
 				}, nil
 			}
 		}
+	}
+	if scanErr != nil {
+		return config.Workspace{}, scanErr
 	}
 	return config.Workspace{}, err
 }
@@ -1382,6 +1417,33 @@ func workspaceScanOnly(workspace config.Workspace) bool {
 	}
 	_, mutable := adapter.(ecosystem.MutationProvider)
 	return !mutable && adapter.Metadata().UnsupportedReason == ""
+}
+
+func mutationLockfileMissing(workspace config.Workspace) (bool, error) {
+	if workspace.PackageManager == "" {
+		return false, nil
+	}
+	registry, err := catalog.New()
+	if err != nil {
+		return false, err
+	}
+	adapter, err := registry.Lookup(workspace.Stack, workspace.PackageManager)
+	if err != nil {
+		return false, err
+	}
+	if _, mutable := adapter.(ecosystem.MutationProvider); !mutable {
+		return false, nil
+	}
+	contract, err := scaninput.PackageContract(workspace, false)
+	if err != nil {
+		return false, err
+	}
+	for _, file := range contract.Files {
+		if file.Category == scaninput.CategoryLock {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func packageToolName(workspace config.Workspace) string {

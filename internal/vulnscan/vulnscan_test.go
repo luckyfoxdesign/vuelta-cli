@@ -59,6 +59,40 @@ func TestScanParsesFreshStructuredTrivyResultWithoutIgnoreFlags(t *testing.T) {
 	}
 }
 
+func TestManifestOnlyNPMDependencyScanArchivesOnlyPackageJSON(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"demo"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unrelated-source.js"), []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewAdhocScanner(func(_ context.Context, dir, _ string, _ ...string) ([]byte, error) {
+		data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err != nil || string(data) != `{"name":"demo"}` {
+			t.Fatalf("package.json = %q, %v", data, err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "package-lock.json")); !os.IsNotExist(err) {
+			t.Fatalf("package-lock.json entered manifest-only archive: %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "unrelated-source.js")); !os.IsNotExist(err) {
+			t.Fatalf("unrelated source entered manifest-only archive: %v", err)
+		}
+		return []byte(`{"Metadata":{"DBUpdatedAt":"` + now.Add(-time.Hour).Format(time.RFC3339) + `"},"Results":[]}`), nil
+	})
+	scanner.Now = func() time.Time { return now }
+	report, err := scanner.Scan(context.Background(), root, config.Workspace{
+		Path: root, Stack: config.StackNode, PackageManager: "npm",
+	}, config.Config{VulnScan: config.VulnScanConfig{
+		DependencySource: "trivy", DatabaseMaxAgeHours: 24,
+	}})
+	if err != nil || len(report.Findings) != 0 {
+		t.Fatalf("Scan() = %#v, %v", report, err)
+	}
+}
+
 func TestStandaloneRequirementsReachesSelectedDependencyScanner(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	tests := []struct {

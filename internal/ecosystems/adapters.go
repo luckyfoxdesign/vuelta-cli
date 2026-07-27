@@ -180,6 +180,10 @@ type mutableAdapter struct {
 	plannedMutationCapability
 }
 
+type npmAdapter struct {
+	mutableAdapter
+}
+
 type unsupportedAdapter struct {
 	baseAdapter
 	inputCapability
@@ -206,11 +210,10 @@ func NPM() ecosystem.Adapter {
 			ReleaseAge: true, LegacyImageKey: "node", LegacyToolKey: "npm_check_updates",
 		}, nil
 	}}
-	return mutableAdapter{
+	return npmAdapter{mutableAdapter: mutableAdapter{
 		scanningAdapter: scanningAdapter{
 			baseAdapter:            base(key, "npm", 100, false, ""),
 			inputCapability:        inputs("package.json", "package-lock.json", []string{".npmrc"}),
-			detectionCapability:    detectionCapability{required: []string{"package.json", "package-lock.json"}},
 			verificationCapability: verificationCapability{manager: "npm"},
 			constraintCapability: constraintCapability{
 				key: key, detect: detectNodeConstraints,
@@ -221,18 +224,22 @@ func NPM() ecosystem.Adapter {
 			},
 			scannerCapability: scanner,
 			decoderCapability: decoderCapability{kind: "npm"},
-			changeCapability:  changes("package.json", "package-lock.json"),
+			changeCapability:  changes("package.json", "package-lock.json", "npm-shrinkwrap.json"),
 		},
 		mutationCapability: mutationCapability{resolve: func(request ecosystem.MutationRequest) (ecosystem.MutationSpec, error) {
 			if request.ProfileScanner != "ncu" {
 				return ecosystem.MutationSpec{}, fmt.Errorf("npm mutation requires ncu scanner, got %q", request.ProfileScanner)
+			}
+			lockFile, err := npmMutationLock(request.Root)
+			if err != nil {
+				return ecosystem.MutationSpec{}, err
 			}
 			first := []string{"ncu", "-u"}
 			if !request.InstalledTool {
 				first = []string{"npx", "npm-check-updates@" + request.ScannerVersion, "-u"}
 			}
 			return ecosystem.MutationSpec{
-				LockFile:       "package-lock.json",
+				LockFile:       lockFile,
 				Commands:       [][]string{first, {"npm", "install"}},
 				LegacyImageKey: "node", LegacyToolKey: "npm_check_updates",
 			}, nil
@@ -240,6 +247,10 @@ func NPM() ecosystem.Adapter {
 		plannedMutationCapability: plannedMutationCapability{resolve: func(request ecosystem.PlannedMutationRequest) (ecosystem.PlannedMutationSpec, error) {
 			if request.ProfileScanner != "ncu" {
 				return ecosystem.PlannedMutationSpec{}, fmt.Errorf("npm planned mutation requires ncu scanner, got %q", request.ProfileScanner)
+			}
+			lockFile, err := npmMutationLock(request.Root)
+			if err != nil {
+				return ecosystem.PlannedMutationSpec{}, err
 			}
 			mutations := make([]ecosystem.CandidateMutation, 0, len(request.Candidates))
 			for _, candidate := range request.Candidates {
@@ -259,11 +270,11 @@ func NPM() ecosystem.Adapter {
 				final = append(final, "--ignore-scripts")
 			}
 			return ecosystem.PlannedMutationSpec{
-				LockFile: "package-lock.json", LegacyImageKey: "node", LegacyToolKey: "npm_check_updates",
+				LockFile: lockFile, LegacyImageKey: "node", LegacyToolKey: "npm_check_updates",
 				Mutations: mutations, FinalCommands: [][]string{final}, Validation: "npm-exact-targets",
 			}, nil
 		}},
-	}
+	}}
 }
 
 // PNPM returns the node/pnpm built-in adapter.
@@ -623,7 +634,14 @@ func detectNodeConstraints(root string, key ecosystem.Key, platform string) (eco
 	}
 	switch key.PackageManager {
 	case "npm":
-		lock, err := ecosystem.ReadRootFile(root, "package-lock.json", ecosystem.DefaultManifestLimit)
+		project, err := inspectNPMProject(root)
+		if err != nil {
+			return ecosystem.Constraints{}, err
+		}
+		if !project.detected || project.lockFile == "" {
+			return ecosystem.Constraints{}, errors.New("npm toolchain resolution requires exactly one supported lockfile")
+		}
+		lock, err := ecosystem.ReadRootFile(root, project.lockFile, ecosystem.DefaultManifestLimit)
 		if err != nil {
 			return ecosystem.Constraints{}, err
 		}
@@ -631,7 +649,7 @@ func detectNodeConstraints(root string, key ecosystem.Key, platform string) (eco
 			LockfileVersion int `json:"lockfileVersion"`
 		}
 		if err := json.Unmarshal(lock, &metadata); err != nil || metadata.LockfileVersion == 0 {
-			return ecosystem.Constraints{}, errors.New("package-lock.json has malformed lockfileVersion")
+			return ecosystem.Constraints{}, fmt.Errorf("%s has malformed lockfileVersion", project.lockFile)
 		}
 		constraints.LockFormat = fmt.Sprintf("npm-v%d", metadata.LockfileVersion)
 	case "pnpm":

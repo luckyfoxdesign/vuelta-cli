@@ -26,9 +26,19 @@ type Project struct {
 	ConfigFiles []string
 }
 
-// Detect resolves exactly one supported manifest/lock pair in path. It never
+// Detect resolves exactly one updateable manifest/lock pair in path. It never
 // searches parent directories or follows manifest and lock-file symlinks.
 func Detect(path string) (Project, error) {
+	return detect(path, true)
+}
+
+// DetectScan resolves exactly one supported read-only project shape. Unlike
+// Detect, it permits an adapter to expose a manifest without a mutation lock.
+func DetectScan(path string) (Project, error) {
+	return detect(path, false)
+}
+
+func detect(path string, requireLock bool) (Project, error) {
 	root, err := filepath.Abs(path)
 	if err != nil {
 		return Project{}, fmt.Errorf("resolve adhoc project path: %w", err)
@@ -56,6 +66,12 @@ func Detect(path string) (Project, error) {
 			continue
 		}
 		contract := provider.PackageInput(true)
+		if resolver, ok := adapter.(ecosystem.RootInputProvider); ok {
+			contract, err = resolver.PackageInputForRoot(root, true)
+			if err != nil {
+				return Project{}, fmt.Errorf("resolve %s adhoc scan input: %w", adapter.Key().String(), err)
+			}
+		}
 		project := Project{Root: root, Stack: adapter.Key().Stack, Manager: adapter.Key().PackageManager}
 		requiredPresent := true
 		for _, file := range contract.Files {
@@ -71,16 +87,20 @@ func Detect(path string) (Project, error) {
 				project.ConfigFiles = append(project.ConfigFiles, file.Path)
 			}
 		}
-		// A one-file dependency input is intentionally not treated as an
-		// updateable adhoc manifest/lock pair.
-		if requiredPresent && project.Manifest != "" && project.Lock != "" {
+		if requiredPresent && project.Manifest != "" && (!requireLock || project.Lock != "") {
 			matches = append(matches, project)
 		}
 	}
 	if len(matches) == 0 {
+		if !requireLock {
+			return Project{}, errors.New("adhoc scan needs exactly one supported regular project manifest at its root")
+		}
 		return Project{}, errors.New("adhoc project needs exactly one supported regular manifest/lock pair at its root")
 	}
 	if len(matches) != 1 {
+		if !requireLock {
+			return Project{}, errors.New("adhoc scan has multiple supported project manifests; select the stack or package manager explicitly")
+		}
 		return Project{}, errors.New("adhoc project has multiple supported manifest/lock pairs; select a project with one pair")
 	}
 	return matches[0], nil

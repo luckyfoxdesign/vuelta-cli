@@ -23,10 +23,10 @@ cases:
           capabilities:
             - name: package_updates
               status: unavailable
-              reason_code: package_scan_failed
+              reason_code: lockfile_missing
           failed_stages:
             - stage: candidate
-              reason_code: package_scan_failed
+              reason_code: lockfile_missing
 
   - name: axios-npm-v3
     url: https://github.com/axios/axios

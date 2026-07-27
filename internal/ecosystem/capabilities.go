@@ -38,6 +38,14 @@ type InputProvider interface {
 	DependencyInput() InputContract
 }
 
+// RootInputProvider resolves adapters whose supported input filename depends
+// on the exact selected project root. Implementations inspect only
+// adapter-owned root metadata and never search parent directories.
+type RootInputProvider interface {
+	PackageInputForRoot(root string, allowManagerConfig bool) (InputContract, error)
+	DependencyInputForRoot(root string) (InputContract, error)
+}
+
 // Detector performs bounded root-only project detection.
 type Detector interface {
 	Detect(root string) (bool, error)
@@ -166,6 +174,7 @@ type MutationSpec struct {
 
 // MutationRequest contains normalized tool identity selected by core.
 type MutationRequest struct {
+	Root           string
 	ProfileScanner string
 	ScannerVersion string
 	InstalledTool  bool
@@ -188,6 +197,7 @@ type Candidate struct {
 // PlannedMutationRequest binds reviewed snapshot candidates to explicit core
 // policy before an adapter constructs argv.
 type PlannedMutationRequest struct {
+	Root              string
 	Candidates        []Candidate
 	ProfileScanner    string
 	ScannerVersion    string

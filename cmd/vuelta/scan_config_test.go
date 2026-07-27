@@ -13,11 +13,10 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 )
 
-func TestSelectScanConfigurationCreatesAndReusesProjectConfig(t *testing.T) {
+func TestSelectScanConfigurationCreatesAndReusesManifestOnlyNPMProjectConfig(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
 	writeScanProjectFile(t, project, "package.json", "{}\n")
-	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
 
 	cfg, selection, err := selectScanConfiguration(scanOptions{directory: project}, filepath.Join("unused", "config.yaml"))
 	if err != nil {
