@@ -75,7 +75,7 @@ func PackageContract(ws config.Workspace, allowManagerConfig bool) (Contract, er
 // only recognized manifests and lockfiles.
 func DependencyContract(ws config.Workspace) (Contract, error) {
 	if ws.Stack == config.StackPython && ws.PackageManager == "" {
-		return PythonRequirementsContract(), nil
+		return PythonRequirementsContractForRoot(ws.Path)
 	}
 	adapter, err := adapterFor(ws.Stack, ws.PackageManager)
 	if err == nil {
@@ -108,6 +108,24 @@ func PythonRequirementsContract() Contract {
 		return Contract{Stage: StageDependencyCVE}
 	}
 	return fromEcosystemContract(provider.DependencyInput())
+}
+
+// PythonRequirementsContractForRoot expands only the bounded include and
+// constraint graph rooted at the selected requirements.txt.
+func PythonRequirementsContractForRoot(root string) (Contract, error) {
+	adapter, err := adapterFor(config.StackPython, "requirements")
+	if err != nil {
+		return Contract{}, err
+	}
+	resolver, ok := adapter.(ecosystem.RootInputProvider)
+	if !ok {
+		return Contract{}, &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "root-scan-input"}
+	}
+	contract, err := resolver.DependencyInputForRoot(root)
+	if err != nil {
+		return Contract{}, err
+	}
+	return fromEcosystemContract(contract), nil
 }
 
 func adapterFor(stack, packageManager string) (ecosystem.Adapter, error) {

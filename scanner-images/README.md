@@ -17,15 +17,17 @@ test leaves the cache tag unpublished. Cached images are not reprobed during
 each live scan.
 
 `python-pip-tools.Dockerfile` also installs the versioned
-`vuelta-pip-tools-scan` helper. For pip-tools it reads direct exact pins from
-`requirements.in`; for the explicit `python/requirements` profile it reads
-the reviewed root `requirements.txt`. It queries bounded PyPI JSON metadata
-through the mandatory egress proxy and never invokes pip, follows includes,
-or installs project dependencies. Exact pins survive alongside bounded
-per-line diagnostics for ranges, URLs, editable installs, hashes, includes,
-malformed records, and ambiguous duplicate pins. Pass
-`SCANNER_VERSION=1.2.0` when building that image; the Docker build runs the
-helper's hermetic parser and response tests and verifies the version.
+`vuelta-pip-tools-scan` helper. For pip-tools it reads the bounded graph rooted
+at `requirements.in`; for the explicit `python/requirements` profile it reads
+the graph rooted at the reviewed `requirements.txt`. Relative requirements and
+constraint includes are followed under file/depth/byte limits with canonical
+project containment. It queries bounded PyPI JSON metadata through the
+mandatory egress proxy and never invokes pip or installs project dependencies.
+Exact pins and hashes survive alongside bounded, source-qualified diagnostics
+for constraints, ranges, URLs, editable installs, invalid records, cycles,
+duplicates, and conflicts. Pass `SCANNER_VERSION=1.3.0` when building that
+image; the Docker build runs the helper's hermetic parser and response tests
+and verifies the version.
 
 `node/bun` is intentionally not a supported profile. `npm-check-updates`
 cannot use the mandatory proxy when executed by Bun, while `bun outdated`

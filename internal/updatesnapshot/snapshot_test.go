@@ -409,6 +409,10 @@ func TestValidateCandidatesFailsClosedOneGatePerCase(t *testing.T) {
 		{"flag injection", func(snapshot *Snapshot) { snapshot.Candidates[0].Name = "--registry" }},
 		{"duplicate", func(snapshot *Snapshot) { snapshot.Candidates = append(snapshot.Candidates, snapshot.Candidates[0]) }},
 		{"unverified age", func(snapshot *Snapshot) { snapshot.Candidates[0].ReleaseAgeVerified = false }},
+		{"scan-only provenance", func(snapshot *Snapshot) {
+			snapshot.Candidates[0].Line = 1
+			snapshot.Candidates[0].Disposition = "scanned"
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

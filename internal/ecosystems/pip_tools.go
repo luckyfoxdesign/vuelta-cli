@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -22,7 +23,33 @@ const (
 	pipToolsMetadataFile  = "pyproject.toml"
 	maxRequirementsFiles  = 32
 	maxRequirementRecords = 32_768
+	maxRequirementsDepth  = 8
+	maxRequirementsBytes  = 8 << 20
 )
+
+var errRequirementsInputUnavailable = errors.New("requirements input unavailable")
+
+func (a requirementsAdapter) PackageInputForRoot(root string, _ bool) (ecosystem.InputContract, error) {
+	return a.inputForRoot(root, ecosystem.InputStagePackageCandidates)
+}
+
+func (a requirementsAdapter) DependencyInputForRoot(root string) (ecosystem.InputContract, error) {
+	return a.inputForRoot(root, ecosystem.InputStageDependencyCVE)
+}
+
+func (a requirementsAdapter) inputForRoot(root string, stage ecosystem.InputStage) (ecosystem.InputContract, error) {
+	graph, err := resolveRequirementsGraph(root, "requirements.txt")
+	if err != nil {
+		return ecosystem.InputContract{}, err
+	}
+	files := make([]ecosystem.InputFile, 0, len(graph))
+	for _, name := range graph {
+		files = append(files, ecosystem.InputFile{
+			Path: name, Category: ecosystem.InputCategoryDependency,
+		})
+	}
+	return ecosystem.InputContract{Stage: stage, Files: files}, nil
+}
 
 func (a pipToolsAdapter) PackageInputForRoot(root string, allowManagerConfig bool) (ecosystem.InputContract, error) {
 	return a.inputForRoot(root, allowManagerConfig, ecosystem.InputStagePackageCandidates)
@@ -195,43 +222,65 @@ func invalidPipToolsRuntimeMetadata(detail string) error {
 }
 
 func resolveRequirementsGraph(root string, initial ...string) ([]string, error) {
-	queue := append([]string(nil), initial...)
+	canonicalRoot, err := canonicalRequirementsRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	type pendingFile struct {
+		name  string
+		depth int
+	}
+	queue := make([]pendingFile, 0, len(initial))
+	for _, name := range initial {
+		queue = append(queue, pendingFile{name: name})
+	}
 	seen := make(map[string]bool, len(queue))
 	var resolved []string
 	records := 0
+	totalBytes := 0
 	for len(queue) > 0 {
-		name := queue[0]
+		current := queue[0]
 		queue = queue[1:]
-		if seen[name] {
+		if seen[current.name] {
 			continue
 		}
-		if len(seen) >= maxRequirementsFiles {
-			return nil, fmt.Errorf("pip-tools requirements graph exceeds %d files", maxRequirementsFiles)
+		if current.depth > maxRequirementsDepth {
+			return nil, fmt.Errorf("requirements graph exceeds maximum depth of %d", maxRequirementsDepth)
 		}
-		data, err := readRequirementsGraphFile(root, name)
+		if len(seen) >= maxRequirementsFiles {
+			return nil, fmt.Errorf("requirements graph exceeds maximum file count of %d", maxRequirementsFiles)
+		}
+		data, err := readRequirementsGraphFile(canonicalRoot, current.name)
 		if err != nil {
+			if current.depth > 0 && errors.Is(err, errRequirementsInputUnavailable) {
+				continue
+			}
 			return nil, err
 		}
-		seen[name] = true
-		resolved = append(resolved, name)
+		totalBytes += len(data)
+		if totalBytes > maxRequirementsBytes {
+			return nil, fmt.Errorf("requirements graph exceeds maximum aggregate size of %d bytes", maxRequirementsBytes)
+		}
+		seen[current.name] = true
+		resolved = append(resolved, current.name)
 		for _, line := range strings.Split(string(data), "\n") {
 			records++
 			if records > maxRequirementRecords {
-				return nil, fmt.Errorf("pip-tools requirements graph exceeds %d records", maxRequirementRecords)
+				return nil, fmt.Errorf("requirements graph exceeds maximum record count of %d", maxRequirementRecords)
 			}
 			target, selected, err := requirementDirectiveTarget(line)
 			if err != nil {
-				return nil, fmt.Errorf("parse pip-tools directive in %s: %w", name, err)
+				return nil, fmt.Errorf("parse requirements directive in %s: %w", current.name, err)
 			}
 			if !selected {
 				continue
 			}
-			next, local, err := resolveRequirementReference(name, target)
+			next, local, err := resolveRequirementReference(current.name, target)
 			if err != nil {
 				return nil, err
 			}
 			if local && !seen[next] {
-				queue = append(queue, next)
+				queue = append(queue, pendingFile{name: next, depth: current.depth + 1})
 			}
 		}
 	}
@@ -239,45 +288,88 @@ func resolveRequirementsGraph(root string, initial ...string) ([]string, error) 
 	return resolved, nil
 }
 
+func canonicalRequirementsRoot(root string) (string, error) {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve selected requirements root: %w", err)
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve selected requirements root: %w", err)
+	}
+	info, err := os.Lstat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("inspect selected requirements root: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("selected requirements root is not a canonical directory")
+	}
+	return canonical, nil
+}
+
 func readRequirementsGraphFile(root, name string) ([]byte, error) {
 	if name == "" || path.IsAbs(name) || path.Clean(name) != name || name == "." ||
 		strings.Contains(name, `\`) {
-		return nil, fmt.Errorf("pip-tools requirements path %q is not a safe project-relative path", name)
+		return nil, fmt.Errorf("requirements path %q is not a safe project-relative path", name)
 	}
 	if ecosystem.IsSecretLikePath(name) {
-		return nil, errors.New("pip-tools requirements graph selected a disallowed secret-like path")
+		return nil, errors.New("requirements graph selected a disallowed secret-like path")
 	}
-	if strings.Count(name, "/")+1 > 8 {
-		return nil, errors.New("pip-tools requirements path exceeds maximum depth")
+	if strings.Count(name, "/")+1 > maxRequirementsDepth {
+		return nil, errors.New("requirements path exceeds maximum depth")
 	}
 	current := root
 	parts := strings.Split(name, "/")
+	var selectedInfo os.FileInfo
 	for index, part := range parts {
 		current = filepath.Join(current, filepath.FromSlash(part))
 		info, err := os.Lstat(current)
 		if err != nil {
-			return nil, fmt.Errorf("inspect selected pip-tools input %s: %w", name, err)
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil, errRequirementsInputUnavailable
+			}
+			return nil, fmt.Errorf("inspect selected requirements input %s: %w", name, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("selected pip-tools input %s traverses a symbolic link", name)
+			return nil, fmt.Errorf("selected requirements input %s traverses a symbolic link", name)
 		}
 		if index < len(parts)-1 && !info.IsDir() {
-			return nil, fmt.Errorf("selected pip-tools input %s has a non-directory parent", name)
+			return nil, fmt.Errorf("selected requirements input %s has a non-directory parent", name)
 		}
 		if index == len(parts)-1 && (!info.Mode().IsRegular() || info.Size() > ecosystem.DefaultManifestLimit) {
 			return nil, fmt.Errorf(
-				"selected pip-tools input %s must be a regular file no larger than %d bytes",
+				"selected requirements input %s must be a regular file no larger than %d bytes",
 				name,
 				ecosystem.DefaultManifestLimit,
 			)
 		}
+		if index == len(parts)-1 {
+			selectedInfo = info
+		}
 	}
-	data, err := os.ReadFile(current)
+	file, err := os.Open(current)
 	if err != nil {
-		return nil, fmt.Errorf("read selected pip-tools input %s: %w", name, err)
+		return nil, fmt.Errorf("open selected requirements input %s: %w", name, err)
+	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(selectedInfo, openedInfo) {
+		_ = file.Close()
+		return nil, fmt.Errorf("selected requirements input %s changed during validation", name)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, ecosystem.DefaultManifestLimit+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, fmt.Errorf("read selected requirements input %s: %w", name, errors.Join(readErr, closeErr))
+	}
+	if int64(len(data)) > ecosystem.DefaultManifestLimit {
+		return nil, fmt.Errorf(
+			"selected requirements input %s must be a regular file no larger than %d bytes",
+			name,
+			ecosystem.DefaultManifestLimit,
+		)
 	}
 	if !utf8.Valid(data) {
-		return nil, fmt.Errorf("selected pip-tools input %s must be UTF-8", name)
+		return nil, fmt.Errorf("selected requirements input %s must be UTF-8", name)
 	}
 	return data, nil
 }
@@ -312,7 +404,7 @@ func requirementDirectiveTarget(line string) (string, bool, error) {
 		return "", false, nil
 	}
 	if value == "" {
-		return "", false, errors.New("requirements include or constraint directive has no target")
+		return "", false, nil
 	}
 	if strings.ContainsAny(value, " \t\"'") {
 		return "", false, nil
@@ -326,11 +418,11 @@ func resolveRequirementReference(parent, target string) (string, bool, error) {
 		return "", false, nil
 	}
 	if path.IsAbs(target) || strings.Contains(target, `\`) {
-		return "", false, fmt.Errorf("pip-tools directive target %q must be project-relative", target)
+		return "", false, fmt.Errorf("requirements directive target %q must be project-relative", target)
 	}
 	resolved := path.Clean(path.Join(path.Dir(parent), target))
 	if resolved == "." || resolved == ".." || strings.HasPrefix(resolved, "../") {
-		return "", false, fmt.Errorf("pip-tools directive target %q escapes the selected project", target)
+		return "", false, fmt.Errorf("requirements directive target %q escapes the selected project", target)
 	}
 	return resolved, true, nil
 }

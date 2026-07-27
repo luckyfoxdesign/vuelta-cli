@@ -177,7 +177,9 @@ func boolInt(value bool) int {
 
 func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) {
 	root := t.TempDir()
-	write(t, root, "requirements.txt", "flask==0.5\n")
+	write(t, root, "requirements.txt", "-r requirements/base.txt\n-c constraints.txt\nflask==0.5\n")
+	write(t, root, "requirements/base.txt", "requests==2.31.0\n")
+	write(t, root, "constraints.txt", "requests<3\n")
 	write(t, root, "requirements.in", "flask\n")
 	write(t, root, "pyproject.toml", "[project]\nname = \"unrelated\"\n")
 
@@ -190,12 +192,21 @@ func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) 
 		t.Fatal(err)
 	}
 	files := archiveFiles(t, bundle.Archive)
-	want := map[string]string{"project/requirements.txt": "flask==0.5\n"}
-	if !reflect.DeepEqual(files, want) {
-		t.Fatalf("archive files = %v, want only standalone requirements input", sortedKeys(files))
+	want := map[string]string{
+		"project/requirements.txt":      "-r requirements/base.txt\n-c constraints.txt\nflask==0.5\n",
+		"project/requirements/base.txt": "requests==2.31.0\n",
+		"project/constraints.txt":       "requests<3\n",
 	}
-	if len(bundle.Manifest.Entries) != 1 || bundle.Manifest.Entries[0].Category != CategoryDependency {
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("archive files = %v, want only standalone requirements graph", sortedKeys(files))
+	}
+	if len(bundle.Manifest.Entries) != len(want) {
 		t.Fatalf("manifest = %#v", bundle.Manifest)
+	}
+	for _, entry := range bundle.Manifest.Entries {
+		if entry.Category != CategoryDependency {
+			t.Fatalf("manifest entry = %#v", entry)
+		}
 	}
 	if _, err := PackageContract(config.Workspace{Path: root, Stack: config.StackPython}, false); err == nil {
 		t.Fatal("standalone requirements.txt unexpectedly enabled a package contract")
@@ -209,7 +220,7 @@ func TestPythonRequirementsContractIsManagerIndependentAndMinimal(t *testing.T) 
 		t.Fatal(err)
 	}
 	if got := archiveFiles(t, packageBundle.Archive); !reflect.DeepEqual(got, want) {
-		t.Fatalf("package archive files = %v, want only requirements.txt", sortedKeys(got))
+		t.Fatalf("package archive files = %v, want only requirements graph", sortedKeys(got))
 	}
 }
 

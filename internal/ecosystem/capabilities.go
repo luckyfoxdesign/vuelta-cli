@@ -153,11 +153,12 @@ type ScannerProvider interface {
 // Diagnostic is a bounded, path-safe parser issue that never becomes update
 // plan input.
 type Diagnostic struct {
-	File     string
-	Line     int
-	Code     string
-	Severity string
-	Message  string
+	File        string
+	Line        int
+	Code        string
+	Severity    string
+	Disposition string
+	Message     string
 }
 
 // CandidateReport is normalized scanner output.
@@ -197,11 +198,13 @@ type MutationProvider interface {
 
 // Candidate is the normalized, non-executable adapter view of an update.
 type Candidate struct {
-	Kind    string
-	Name    string
-	Current string
-	Target  string
-	File    string
+	Kind        string
+	Name        string
+	Current     string
+	Target      string
+	File        string
+	Line        int
+	Disposition string
 }
 
 // PlannedMutationRequest binds reviewed snapshot candidates to explicit core

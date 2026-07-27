@@ -654,10 +654,14 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 			if options.packageDiagnostics != nil {
 				*options.packageDiagnostics = append(*options.packageDiagnostics, updater.ScanDiagnostic{
 					File: "requirements.txt", Line: 2, Code: "exact_pin_required",
-					Severity: "info", Message: "expected one exact pin",
+					Severity: "info", Disposition: "unsupported",
+					Message: "expected one exact pin",
 				})
 			}
-			return []updatesnapshot.Candidate{{Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2"}}, "requirements", false, nil
+			return []updatesnapshot.Candidate{{
+				Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2",
+				File: "requirements.txt", Line: 1, Disposition: "scanned",
+			}}, "requirements", false, nil
 		},
 	}
 	result := scanOneTargetWith(context.Background(), config.Config{VulnScan: config.VulnScanConfig{
@@ -669,8 +673,12 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 	if len(result.Vulnerabilities) != 1 || len(result.Candidates) != 1 || len(result.Diagnostics) != 1 || result.SnapshotID != "" || hasFailedStage(result, stageCandidate) {
 		t.Fatalf("vulnerability/snapshot result = %#v", result)
 	}
-	if result.Diagnostics[0].Severity != "info" {
-		t.Fatalf("diagnostic severity = %q, want info", result.Diagnostics[0].Severity)
+	if result.Diagnostics[0].Severity != "info" || result.Diagnostics[0].Disposition != "unsupported" {
+		t.Fatalf("diagnostic = %#v", result.Diagnostics[0])
+	}
+	if result.Candidates[0].File != "requirements.txt" || result.Candidates[0].Line != 1 ||
+		result.Candidates[0].Disposition != "scanned" {
+		t.Fatalf("candidate provenance = %#v", result.Candidates[0])
 	}
 	if !containsSubstring(result.Warnings, "no update snapshot") {
 		t.Fatalf("warnings = %#v", result.Warnings)

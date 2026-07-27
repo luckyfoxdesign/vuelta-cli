@@ -78,9 +78,18 @@ func decodePackageReport(kind string, data []byte, inputs map[string][]byte) (ec
 		if !validDecodedCandidate(candidate) {
 			return ecosystem.CandidateReport{}, fmt.Errorf("invalid candidate %q", candidate.Name)
 		}
-		if (kind == "requirements" || kind == "pip-tools") &&
-			!requirementsNamePattern.MatchString(candidate.Name) {
-			return ecosystem.CandidateReport{}, fmt.Errorf("requirements candidate name %q is not canonical", candidate.Name)
+		if kind == "requirements" || kind == "pip-tools" {
+			if !requirementsNamePattern.MatchString(candidate.Name) {
+				return ecosystem.CandidateReport{}, fmt.Errorf("requirements candidate name %q is not canonical", candidate.Name)
+			}
+			if (candidate.File == "") != (candidate.Line == 0) ||
+				(candidate.File != "" && (!requirementsReportFileAllowed(candidate.File, inputs) ||
+					candidate.Line < 1 || candidate.Line > 1_000_000)) ||
+				(candidate.Disposition != "" && candidate.Disposition != "scanned" &&
+					candidate.Disposition != "constrained") ||
+				(candidate.Disposition != "" && candidate.File == "") {
+				return ecosystem.CandidateReport{}, errors.New("requirements candidate provenance is invalid")
+			}
 		}
 	}
 	return ecosystem.CandidateReport{Candidates: candidates, Diagnostics: diagnostics}, nil
@@ -112,31 +121,35 @@ func decodeRequirementsDiagnostics(
 		file, _ := record["file"].(string)
 		code, _ := record["code"].(string)
 		severity, _ := record["severity"].(string)
+		disposition, _ := record["disposition"].(string)
 		message, _ := record["message"].(string)
 		line, lineOK := record["line"].(float64)
-		if !requirementsDiagnosticFileAllowed(file, inputs) ||
+		if !requirementsReportFileAllowed(file, inputs) ||
 			!diagnosticCodePattern.MatchString(code) ||
 			(severity != "info" && severity != "error") || message == "" || len(message) > 512 ||
+			(disposition != "" && disposition != "constrained" &&
+				disposition != "unsupported" && disposition != "invalid") ||
 			strings.IndexFunc(message, unicode.IsControl) >= 0 || !lineOK || line < 1 || line > 1_000_000 || line != float64(int(line)) {
 			return errors.New("requirements scanner diagnostic is invalid")
 		}
 		*diagnostics = append(*diagnostics, ecosystem.Diagnostic{
-			File: file, Line: int(line), Code: code, Severity: severity, Message: message,
+			File: file, Line: int(line), Code: code, Severity: severity,
+			Disposition: disposition, Message: message,
 		})
 	}
 	return nil
 }
 
-func requirementsDiagnosticFileAllowed(file string, inputs map[string][]byte) bool {
-	if file == "" || filepath.Base(file) != file {
+func requirementsReportFileAllowed(file string, inputs map[string][]byte) bool {
+	if file == "" || strings.Contains(file, `\`) || filepath.IsAbs(file) {
 		return false
 	}
-	for name := range inputs {
-		if filepath.Base(filepath.FromSlash(name)) == file {
-			return true
-		}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(file)))
+	if clean != file || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return false
 	}
-	return false
+	_, ok := inputs[clean]
+	return ok
 }
 
 func collectCandidates(kind string, value any, candidates *[]ecosystem.Candidate) {
@@ -154,7 +167,36 @@ func collectCandidates(kind string, value any, candidates *[]ecosystem.Candidate
 		current, _ := firstString(value, "version", "current", "installed_version")
 		target, _ := firstString(value, "latest", "latest_version", "wanted", "target")
 		if name != "" && target != "" {
-			*candidates = append(*candidates, ecosystem.Candidate{Kind: kind, Name: name, Current: current, Target: target})
+			file := ""
+			if rawFile, present := value["file"]; present {
+				var ok bool
+				file, ok = rawFile.(string)
+				if !ok {
+					file = "\x00"
+				}
+			}
+			disposition := ""
+			if rawDisposition, present := value["disposition"]; present {
+				var ok bool
+				disposition, ok = rawDisposition.(string)
+				if !ok {
+					disposition = "\x00"
+				}
+			}
+			line := 0
+			if rawLine, present := value["line"]; present {
+				number, ok := rawLine.(float64)
+				if !ok || number < 1 || number > 1_000_000 ||
+					number != float64(int(number)) {
+					line = -1
+				} else {
+					line = int(number)
+				}
+			}
+			*candidates = append(*candidates, ecosystem.Candidate{
+				Kind: kind, Name: name, Current: current, Target: target,
+				File: file, Line: line, Disposition: disposition,
+			})
 			return
 		}
 		for key, item := range value {

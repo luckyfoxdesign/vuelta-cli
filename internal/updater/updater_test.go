@@ -174,11 +174,14 @@ func TestParsePackageCandidates(t *testing.T) {
 }
 
 func TestParseRequirementsReportKeepsCandidatesAndDiagnostics(t *testing.T) {
-	report, err := parsePackageReport("requirements", []byte(`{"candidates":[{"name":"demo-pkg","current":"1.0","latest_version":"2.0"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","severity":"info","message":"expected one exact pin"}]}`))
+	report, err := parsePackageReport("requirements", []byte(`{"candidates":[{"name":"demo-pkg","current":"1.0","latest_version":"2.0","file":"requirements.txt","line":1,"disposition":"scanned"}],"diagnostics":[{"file":"requirements.txt","line":2,"code":"exact_pin_required","severity":"info","disposition":"unsupported","message":"expected one exact pin"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Candidates) != 1 || report.Candidates[0].Kind != "requirements" || len(report.Diagnostics) != 1 || report.Diagnostics[0].Line != 2 {
+	if len(report.Candidates) != 1 || report.Candidates[0].Kind != "requirements" ||
+		report.Candidates[0].File != "requirements.txt" || report.Candidates[0].Line != 1 ||
+		report.Candidates[0].Disposition != "scanned" || len(report.Diagnostics) != 1 ||
+		report.Diagnostics[0].Line != 2 || report.Diagnostics[0].Disposition != "unsupported" {
 		t.Fatalf("report = %#v", report)
 	}
 }

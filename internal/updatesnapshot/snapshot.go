@@ -64,6 +64,8 @@ type Candidate struct {
 	Current            string `json:"current"`
 	Target             string `json:"target"`
 	File               string `json:"file,omitempty"`
+	Line               int    `json:"line,omitempty"`
+	Disposition        string `json:"disposition,omitempty"`
 	ReleaseAgeVerified bool   `json:"release_age_verified"`
 }
 
@@ -576,7 +578,8 @@ func ValidateCandidates(snapshot Snapshot, allowUnverifiedReleaseAge bool) error
 		if !allowedKinds[candidate.Kind] || !candidatePartPattern.MatchString(candidate.Name) ||
 			!candidatePartPattern.MatchString(candidate.Target) || strings.HasPrefix(candidate.Name, "-") ||
 			strings.HasPrefix(candidate.Target, "-") ||
-			(candidate.Current != "" && !candidatePartPattern.MatchString(candidate.Current)) {
+			(candidate.Current != "" && !candidatePartPattern.MatchString(candidate.Current)) ||
+			candidate.Line != 0 || candidate.Disposition != "" {
 			return fmt.Errorf("%w: inadmissible candidate %s/%s", ErrInvalid, candidate.Kind, candidate.Name)
 		}
 		if (candidate.Kind == "docker") != (candidate.File != "") {

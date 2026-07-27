@@ -21,7 +21,7 @@ const (
 	defaultUVVersion       = "0.11.29"
 	defaultPipVersion      = "25.0.1"
 	defaultPipToolsVersion = "7.5.0"
-	defaultPipScanner      = "1.2.0"
+	defaultPipScanner      = "1.3.0"
 )
 
 type baseAdapter struct {
@@ -186,6 +186,10 @@ type npmAdapter struct {
 
 type pipToolsAdapter struct {
 	mutableAdapter
+}
+
+type requirementsAdapter struct {
+	scanningAdapter
 }
 
 type unsupportedAdapter struct {
@@ -419,7 +423,7 @@ func PipTools() ecosystem.Adapter {
 func Requirements() ecosystem.Adapter {
 	key := ecosystem.Key{Stack: "python", PackageManager: "requirements"}
 	files := []ecosystem.InputFile{{Path: "requirements.txt", Category: ecosystem.InputCategoryDependency}}
-	return scanningAdapter{
+	return requirementsAdapter{scanningAdapter: scanningAdapter{
 		baseAdapter: base(key, "requirements.txt", 1000, true, ""),
 		inputCapability: inputCapability{
 			files: files,
@@ -459,7 +463,7 @@ func Requirements() ecosystem.Adapter {
 		}},
 		decoderCapability: decoderCapability{kind: "requirements"},
 		changeCapability:  changes("requirements.txt"),
-	}
+	}}
 }
 
 func base(key ecosystem.Key, displayName string, priority int, fallback bool, unsupported string) baseAdapter {
