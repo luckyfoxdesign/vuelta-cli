@@ -191,7 +191,7 @@ func packageUpdatesForStatus(status string) []ObservedCapability {
 
 func TestParseObservedEnvelopeRejectsBrokenJSON(t *testing.T) {
 	t.Parallel()
-	valid := []byte(`{"format":1,"command":"scan","config":{"detected_stacks":["node"]},"results":[{"status":"clean","stages":[],"diagnostics":[],"warnings":[],"capabilities":[],"toolchain":{"package_manager":"npm","lock_formats":["npm-v3"]}}],"warnings":[],"errors":[]}`)
+	valid := []byte(`{"format":1,"command":"scan","config":{"detected_stacks":["node"]},"results":[{"status":"clean","stages":[],"diagnostics":[],"warnings":[],"capabilities":[],"toolchain":{"source":"default","runtime_constraint":">=18.0.0","runtime":"24","package_manager":"npm","lock_formats":["npm-v3"]}}],"warnings":[],"errors":[]}`)
 	observed, err := ParseObservedEnvelope(valid)
 	if err != nil {
 		t.Fatalf("ParseObservedEnvelope() error = %v", err)
@@ -199,7 +199,10 @@ func TestParseObservedEnvelopeRejectsBrokenJSON(t *testing.T) {
 	if len(observed.Statuses) != 1 || observed.Statuses[0] != "clean" {
 		t.Fatalf("statuses = %#v", observed.Statuses)
 	}
-	if len(observed.Toolchains) != 1 || observed.Toolchains[0].PackageManager != "npm" {
+	if len(observed.Toolchains) != 1 || observed.Toolchains[0].PackageManager != "npm" ||
+		observed.Toolchains[0].RuntimeConstraint != ">=18.0.0" ||
+		observed.Toolchains[0].Runtime != "24" ||
+		observed.Toolchains[0].Source != "default" {
 		t.Fatalf("toolchains = %#v", observed.Toolchains)
 	}
 	corpusCase := testCase("contract")

@@ -24,10 +24,11 @@ var exactVersionPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-
 // an embedded build recipe; override selections use the exact configured
 // image reference.
 type Selection struct {
-	Profile     config.ToolchainProfile
-	Constraints Constraints
-	Source      string
-	build       *buildSpec
+	Profile           config.ToolchainProfile
+	Constraints       Constraints
+	RuntimeConstraint string
+	Source            string
+	build             *buildSpec
 }
 
 // Select resolves operator overrides first and otherwise derives a supported
@@ -40,21 +41,39 @@ func Select(ws config.Workspace, cfg config.Config) (Selection, error) {
 	if err := ValidateManagerSupport(constraints.Stack, constraints.PackageManager); err != nil {
 		return Selection{}, err
 	}
-	profile, found, err := selectOverride(ws, cfg.Update.ToolchainProfiles, constraints)
+	runtimeConstraint, err := ecosystem.ParseRuntimeConstraint(constraints.Stack, constraints.Runtime)
+	if err != nil {
+		return Selection{}, err
+	}
+	profile, found, err := selectOverride(ws, cfg.Update.ToolchainProfiles, constraints, runtimeConstraint)
 	if err != nil {
 		return Selection{}, err
 	}
 	if found {
-		return Selection{Profile: profile, Constraints: constraints, Source: SourceOverride}, nil
+		return Selection{
+			Profile: profile, Constraints: constraints,
+			RuntimeConstraint: runtimeConstraint.Canonical(), Source: SourceOverride,
+		}, nil
 	}
 	profile, build, err := defaultProfile(constraints)
 	if err != nil {
 		return Selection{}, err
 	}
-	return Selection{Profile: profile, Constraints: constraints, Source: SourceDefault, build: &build}, nil
+	if !runtimeConstraint.MatchesProfile(profile.Runtime) {
+		return Selection{}, fmt.Errorf("resolved embedded runtime %q does not satisfy parsed constraint %q", profile.Runtime, runtimeConstraint.Canonical())
+	}
+	return Selection{
+		Profile: profile, Constraints: constraints,
+		RuntimeConstraint: runtimeConstraint.Canonical(), Source: SourceDefault, build: &build,
+	}, nil
 }
 
-func selectOverride(ws config.Workspace, profiles []config.ToolchainProfile, constraints Constraints) (config.ToolchainProfile, bool, error) {
+func selectOverride(
+	ws config.Workspace,
+	profiles []config.ToolchainProfile,
+	constraints Constraints,
+	runtimeConstraint ecosystem.RuntimeConstraint,
+) (config.ToolchainProfile, bool, error) {
 	var matches []config.ToolchainProfile
 	var reasons []string
 	selectedIDFound := false
@@ -63,7 +82,7 @@ func selectOverride(ws config.Workspace, profiles []config.ToolchainProfile, con
 			continue
 		}
 		selectedIDFound = selectedIDFound || profile.ID == ws.ToolchainProfile
-		if reason := incompatibility(profile, constraints); reason != "" {
+		if reason := incompatibility(profile, constraints, runtimeConstraint); reason != "" {
 			reasons = append(reasons, profile.ID+": "+reason)
 			continue
 		}

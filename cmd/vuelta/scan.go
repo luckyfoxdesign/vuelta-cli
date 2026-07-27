@@ -59,6 +59,13 @@ type scanToolResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// scanToolchainResult adds resolution context to the persisted identity
+// without changing the snapshot identity contract.
+type scanToolchainResult struct {
+	toolchain.Identity
+	RuntimeConstraint string `json:"runtime_constraint,omitempty"`
+}
+
 type scanCapability struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
@@ -141,7 +148,7 @@ type scanResult struct {
 	InputCategories       []string                   `json:"input_categories"`
 	Warnings              []string                   `json:"warnings"`
 	Verification          []string                   `json:"verification"`
-	Toolchain             *toolchain.Identity        `json:"toolchain,omitempty"`
+	Toolchain             *scanToolchainResult       `json:"toolchain,omitempty"`
 	PackageUpdates        *packageUpdateAvailability `json:"package_updates,omitempty"`
 	Diagnostics           []updater.ScanDiagnostic   `json:"diagnostics"`
 	Capabilities          []scanCapability           `json:"capabilities"`
@@ -163,30 +170,31 @@ type scanSummary struct {
 }
 
 type scanOptions struct {
-	project            string
-	directory          string
-	all                bool
-	stack              string
-	only               string
-	policyPath         string
-	minReleaseAge      string
-	allowProjectConfig bool
-	failOn             string
-	requireImageScan   bool
-	verbose            bool
-	jsonOutput         bool
-	toolchainProfile   *config.ToolchainProfile
-	toolchainIdentity  *toolchain.Identity
-	packageDiagnostics *[]updater.ScanDiagnostic
-	dependencyProgress vulnscan.ProgressFunc
-	imageProgress      vulnscan.ProgressFunc
-	packageProgress    updater.ProgressFunc
-	explicitConfig     bool
-	nonInteractive     bool
-	noColor            bool
-	updateConfigPath   string
-	progressIndex      int
-	progressTotal      int
+	project             string
+	directory           string
+	all                 bool
+	stack               string
+	only                string
+	policyPath          string
+	minReleaseAge       string
+	allowProjectConfig  bool
+	failOn              string
+	requireImageScan    bool
+	verbose             bool
+	jsonOutput          bool
+	toolchainProfile    *config.ToolchainProfile
+	toolchainIdentity   *toolchain.Identity
+	toolchainConstraint string
+	packageDiagnostics  *[]updater.ScanDiagnostic
+	dependencyProgress  vulnscan.ProgressFunc
+	imageProgress       vulnscan.ProgressFunc
+	packageProgress     updater.ProgressFunc
+	explicitConfig      bool
+	nonInteractive      bool
+	noColor             bool
+	updateConfigPath    string
+	progressIndex       int
+	progressTotal       int
 }
 
 func executeScan(args []string) error {
@@ -816,7 +824,8 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		}
 		options.toolchainProfile = &prepared.Profile
 		options.toolchainIdentity = &prepared.Identity
-		result.Toolchain = &prepared.Identity
+		options.toolchainConstraint = prepared.RuntimeConstraint
+		result.Toolchain = resolvedScanToolchain(prepared.Identity, prepared.RuntimeConstraint)
 		if prepared.Built {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("built default toolchain %s locally; cache key %s will be reused by later scans", prepared.Profile.ID, prepared.CacheKey[:12]))
 		}
@@ -905,15 +914,20 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	var selectedToolchain toolchain.Identity
 	if options.toolchainIdentity != nil {
 		selectedToolchain = *options.toolchainIdentity
-		result.Toolchain = options.toolchainIdentity
+		result.Toolchain = resolvedScanToolchain(selectedToolchain, options.toolchainConstraint)
 	} else if identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
-		_, identity, resolveErr := updater.ResolveToolchainProfile(identityWorkspace, cfg)
+		_, identity, constraints, resolveErr := toolchain.Resolve(identityWorkspace, cfg)
 		if resolveErr != nil {
 			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", resolveErr, "Fix the selected toolchain profile before creating an update snapshot")
 			return finalizeStageOutcomes(result)
 		}
-		selectedToolchain = *identity
-		result.Toolchain = identity
+		runtimeConstraint, parseErr := ecosystem.ParseRuntimeConstraint(constraints.Stack, constraints.Runtime)
+		if parseErr != nil {
+			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", parseErr, "Fix the selected toolchain profile before creating an update snapshot")
+			return finalizeStageOutcomes(result)
+		}
+		selectedToolchain = identity
+		result.Toolchain = resolvedScanToolchain(identity, runtimeConstraint.Canonical())
 	}
 	configHash := "adhoc"
 	verificationHash := ""
@@ -1065,12 +1079,27 @@ func finalizeStageOutcomes(result scanResult) scanResult {
 	if !hasFailure {
 		return finalizeCleanOrFindings(result)
 	}
-	if hasSucceededDataStage(result) || (result.Error != nil && result.Error.Code == "toolchain_incompatible") {
+	if hasSucceededDataStage(result) || isPartialCapabilityFailure(result.Error) {
 		result.Status = "partial"
 	} else {
 		result.Status = "failed"
 	}
 	return result
+}
+
+func isPartialCapabilityFailure(failure *jsonCommandError) bool {
+	if failure == nil {
+		return false
+	}
+	switch failure.Code {
+	case "toolchain_incompatible",
+		ecosystem.RuntimeConstraintInvalid,
+		ecosystem.RuntimeConstraintUnsupportedSyntax,
+		ecosystem.RuntimeConstraintNoCompatible:
+		return true
+	default:
+		return false
+	}
 }
 
 // finalizeCleanOrFindings promotes the default "clean" status to "findings"
@@ -1550,6 +1579,10 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 }
 
 func scanFailureContract(code, hint string, err error) (string, string) {
+	var constraintErr *ecosystem.RuntimeConstraintError
+	if errors.As(err, &constraintErr) {
+		return constraintErr.ReasonCode, constraintErr.Hint()
+	}
 	if errors.Is(err, errDockerBootstrapRequired) {
 		return "endpoint_bootstrap_required", "Run vuelta environment bootstrap with the reviewed local Docker socket"
 	}
@@ -1567,6 +1600,10 @@ func scanFailureContract(code, hint string, err error) (string, string) {
 		return "egress_" + stage + "_failed", "Inspect only the Vuelta-owned proxy/network diagnostics and retry"
 	}
 	return code, hint
+}
+
+func resolvedScanToolchain(identity toolchain.Identity, constraint string) *scanToolchainResult {
+	return &scanToolchainResult{Identity: identity, RuntimeConstraint: constraint}
 }
 
 // classifySubprocessError extracts a safe category, exit code, and bounded

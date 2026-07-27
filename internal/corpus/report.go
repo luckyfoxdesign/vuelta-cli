@@ -135,6 +135,7 @@ type ObservedToolchain struct {
 	Source                string   `json:"source,omitempty"`
 	ProfileID             string   `json:"profile_id,omitempty"`
 	Hash                  string   `json:"hash,omitempty"`
+	RuntimeConstraint     string   `json:"runtime_constraint,omitempty"`
 	Runtime               string   `json:"runtime,omitempty"`
 	PackageManager        string   `json:"package_manager,omitempty"`
 	PackageManagerVersion string   `json:"package_manager_version,omitempty"`
@@ -197,6 +198,7 @@ type rawToolchain struct {
 	Source                string   `json:"source"`
 	ProfileID             string   `json:"profile_id"`
 	Hash                  string   `json:"hash"`
+	RuntimeConstraint     string   `json:"runtime_constraint"`
 	Runtime               string   `json:"runtime"`
 	PackageManager        string   `json:"package_manager"`
 	PackageManagerVersion string   `json:"package_manager_version"`
@@ -347,6 +349,7 @@ func sanitizeObservedToolchain(value rawToolchain) ObservedToolchain {
 		Source:                SanitizeMessage(value.Source),
 		ProfileID:             SanitizeMessage(value.ProfileID),
 		Hash:                  SanitizeMessage(value.Hash),
+		RuntimeConstraint:     SanitizeMessage(value.RuntimeConstraint),
 		Runtime:               SanitizeMessage(value.Runtime),
 		PackageManager:        SanitizeMessage(value.PackageManager),
 		PackageManagerVersion: SanitizeMessage(value.PackageManagerVersion),

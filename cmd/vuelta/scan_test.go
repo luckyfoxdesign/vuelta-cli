@@ -14,6 +14,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
@@ -904,6 +905,99 @@ func TestToolchainBuildFailureIsPerWorkspaceAndActionable(t *testing.T) {
 	}
 	if supported.PackageUpdates == nil || supported.PackageUpdates.Status != "available" {
 		t.Fatalf("supported package update capability = %#v", supported.PackageUpdates)
+	}
+	if supported.Toolchain == nil || supported.Toolchain.Runtime != "22" ||
+		supported.Toolchain.Source != toolchain.SourceDefault ||
+		supported.Toolchain.RuntimeConstraint != ">=22.0.0 <23.0.0" {
+		t.Fatalf("supported toolchain result = %#v", supported.Toolchain)
+	}
+	encoded, err := json.Marshal(supported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Toolchain *struct {
+			RuntimeConstraint string `json:"runtime_constraint"`
+			Runtime           string `json:"runtime"`
+			Source            string `json:"source"`
+		} `json:"toolchain"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Toolchain == nil ||
+		decoded.Toolchain.RuntimeConstraint != ">=22.0.0 <23.0.0" ||
+		decoded.Toolchain.Runtime != "22" ||
+		decoded.Toolchain.Source != toolchain.SourceDefault {
+		t.Fatalf("structured scan toolchain = %#v", decoded.Toolchain)
+	}
+}
+
+func TestRuntimeConstraintFailuresAreTypedPartialCapabilities(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, constraint, wantCode string
+	}{
+		{"invalid", ">=twenty", ecosystem.RuntimeConstraintInvalid},
+		{"unsupported syntax", ">=20 || >=24", ecosystem.RuntimeConstraintUnsupportedSyntax},
+		{"no compatible runtime", "25.0.0", ecosystem.RuntimeConstraintNoCompatible},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			if err := os.WriteFile(
+				filepath.Join(root, "package.json"),
+				[]byte(fmt.Sprintf(`{"engines":{"node":%q}}`, testCase.constraint)),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(root, "package-lock.json"),
+				[]byte(`{"lockfileVersion":3}`),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			workspace := config.Workspace{
+				Name: "runtime-constraint", Path: root, Stack: config.StackNode,
+				PackageManager: "npm", Platform: "linux/amd64",
+			}
+			runners := scanStageRunners{
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+					return nil, nil, nil, "trivy", false, nil
+				},
+				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+					return nil, false, nil
+				},
+				packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+					t.Fatal("package scanner ran after runtime constraint resolution failed")
+					return nil, "", false, nil
+				},
+				prepareToolchain: func(_ context.Context, cfg config.Config, workspace config.Workspace) (toolchain.Prepared, error) {
+					selection, err := toolchain.Select(workspace, cfg)
+					return toolchain.Prepared{Selection: selection}, err
+				},
+			}
+			result := scanOneTargetWith(
+				context.Background(), config.Config{},
+				scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace},
+				scanOptions{only: "packages"}, config.LocalPackagePolicy{},
+				updatesnapshot.PolicyIdentity{}, 0, runners,
+			)
+			if result.Status != "partial" || result.Error == nil ||
+				result.Error.Code != testCase.wantCode ||
+				!strings.Contains(result.Error.Hint, "override") {
+				t.Fatalf("scan result = %#v", result)
+			}
+			if result.PackageUpdates == nil ||
+				result.PackageUpdates.Status != "unavailable" ||
+				result.PackageUpdates.Reason != testCase.wantCode {
+				t.Fatalf("package update capability = %#v", result.PackageUpdates)
+			}
+		})
 	}
 }
 

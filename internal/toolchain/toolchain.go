@@ -175,7 +175,11 @@ func Detect(ws config.Workspace) (Constraints, error) {
 	}, nil
 }
 
-func incompatibility(profile config.ToolchainProfile, constraints Constraints) string {
+func incompatibility(
+	profile config.ToolchainProfile,
+	constraints Constraints,
+	runtimeConstraint ecosystem.RuntimeConstraint,
+) string {
 	if profile.Stack != constraints.Stack || profile.PackageManager != constraints.PackageManager {
 		return "stack or package manager mismatch"
 	}
@@ -188,7 +192,7 @@ func incompatibility(profile config.ToolchainProfile, constraints Constraints) s
 	if constraints.PackageManagerVersion != "" && profile.PackageManagerVersion != constraints.PackageManagerVersion {
 		return "package manager version mismatch"
 	}
-	if constraints.Runtime != "" && !ecosystem.VersionMatches(profile.Runtime, constraints.Runtime) {
+	if constraints.Runtime != "" && !runtimeConstraint.MatchesProfile(profile.Runtime) {
 		return "runtime constraint " + constraints.Runtime + " is not satisfied"
 	}
 	if !profile.Capabilities.ReadOnlyDiscovery {

@@ -1,6 +1,7 @@
 package toolchain
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +10,109 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 )
+
+func TestSelectRealWorldRuntimeConstraints(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		stack          string
+		manager        string
+		manifestName   string
+		manifest       string
+		lockName       string
+		lock           string
+		wantRuntime    string
+		wantConstraint string
+	}{
+		{
+			name: "Node exact patch", stack: config.StackNode, manager: "npm",
+			manifestName: "package.json",
+			manifest:     `{"engines":{"node":"24.7.0"},"packageManager":"npm@11.4.2"}`,
+			lockName:     "package-lock.json", lock: `{"lockfileVersion":3}`,
+			wantRuntime: "24", wantConstraint: "=24.7.0",
+		},
+		{
+			name: "Node open lower bound", stack: config.StackNode, manager: "npm",
+			manifestName: "package.json",
+			manifest:     `{"engines":{"node":">=18.0.0"},"packageManager":"npm@11.4.2"}`,
+			lockName:     "package-lock.json", lock: `{"lockfileVersion":3}`,
+			wantRuntime: "24", wantConstraint: ">=18.0.0",
+		},
+		{
+			name: "Poetry caret", stack: config.StackPython, manager: "poetry",
+			manifestName: "pyproject.toml",
+			manifest:     "[tool.poetry.dependencies]\npython = \"^3.9\"\n",
+			lockName:     "poetry.lock", lock: "package = []\n",
+			wantRuntime: "3.13", wantConstraint: ">=3.9.0 <4.0.0",
+		},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			write(t, root, testCase.manifestName, testCase.manifest)
+			write(t, root, testCase.lockName, testCase.lock)
+			selection, err := Select(config.Workspace{
+				Path: root, Stack: testCase.stack,
+				PackageManager: testCase.manager, Platform: "linux/amd64",
+			}, config.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.Profile.Runtime != testCase.wantRuntime ||
+				selection.RuntimeConstraint != testCase.wantConstraint ||
+				selection.Source != SourceDefault {
+				t.Fatalf("Select() = %#v", selection)
+			}
+		})
+	}
+}
+
+func TestSelectCompatibleOperatorOverrideRetainsPrecedence(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "package.json", `{"engines":{"node":">=18.0.0"},"packageManager":"npm@10.9.2"}`)
+	write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	override := profile("approved-node20", "npm", "20", "10.9.2", "npm-v3")
+	selection, err := Select(config.Workspace{
+		Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Platform: "linux/amd64", ToolchainProfile: override.ID,
+	}, config.Config{Update: config.UpdateConfig{ToolchainProfiles: []config.ToolchainProfile{override}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Source != SourceOverride || selection.Profile.ID != override.ID ||
+		selection.Profile.Runtime != "20" || selection.RuntimeConstraint != ">=18.0.0" {
+		t.Fatalf("Select() = %#v", selection)
+	}
+}
+
+func TestSelectReturnsTypedRuntimeConstraintFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, constraint, wantCode string
+	}{
+		{"unsupported union", ">=20 || >=24", ecosystem.RuntimeConstraintUnsupportedSyntax},
+		{"no compatible runtime", "25.0.0", ecosystem.RuntimeConstraintNoCompatible},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			write(t, root, "package.json", fmt.Sprintf(`{"engines":{"node":%q}}`, testCase.constraint))
+			write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+			_, err := Select(config.Workspace{
+				Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64",
+			}, config.Config{})
+			var constraintErr *ecosystem.RuntimeConstraintError
+			if !errors.As(err, &constraintErr) || constraintErr.ReasonCode != testCase.wantCode {
+				t.Fatalf("Select() error = %T %v", err, err)
+			}
+		})
+	}
+}
 
 func TestResolveNodeRuntimeLockAndManagerVersion(t *testing.T) {
 	root := t.TempDir()
