@@ -41,7 +41,7 @@ const (
 var allowedCommands = map[string]bool{
 	"archive": true, "branch": true, "commit-tree": true, "diff-index": true, "diff-tree": true,
 	"fetch": true, "for-each-ref": true, "hash-object": true,
-	"ls-files": true, "ls-remote": true, "ls-tree": true,
+	"init": true, "ls-files": true, "ls-remote": true, "ls-tree": true,
 	"merge-base": true, "push": true, "read-tree": true, "remote": true,
 	"rev-parse": true, "update-index": true,
 	"tag": true, "update-ref": true, "verify-tag": true, "worktree": true,

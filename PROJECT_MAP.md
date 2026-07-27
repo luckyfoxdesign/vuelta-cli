@@ -18,9 +18,10 @@ app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
+├── cmd/vuelta-corpus/   # manual real-world corpus harness
 ├── internal/            # ecosystem adapters, config, scanner, updater, toolchain,
 │                        # projectstate, updatesnapshot, vulnscan, sandbox, scheduler
-├── acceptance/          # opt-in real Docker engine scan/update matrix
+├── acceptance/          # opt-in real-engine matrix and pinned corpus manifest
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
 ├── deploy/              # launchd and systemd scheduler examples
@@ -39,6 +40,8 @@ docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
 vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint
 scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
+scripts/corpus-scan.sh ROOT [MODE] # manual pinned corpus scan and reports
+scripts/corpus-refresh.sh ROOT # validated candidate pins without manifest mutation
 make build-mac                 # Docker cross-build both binaries for darwin/arm64
 make build-linux               # Docker cross-build both binaries for linux/amd64
 make build                     # both cross-build targets
@@ -46,6 +49,7 @@ make build                     # both cross-build targets
 
 ## Entrypoints
 
+- `cmd/vuelta-corpus/main.go` — `vuelta-corpus` binary entrypoint.
 - `cmd/vuelta-scheduler/main.go` — `vuelta-scheduler` binary entrypoint.
 - `cmd/vuelta/main.go` — `vuelta` binary entrypoint.
 
@@ -55,9 +59,9 @@ make build                     # both cross-build targets
 - `config.example.yaml` — template for `~/.config/vuelta/config.yaml`.
 - `.vuelta.yaml` — generated project-local policy; `workspace.path` is always `.`.
 - `local.example.yaml` — optional standalone allowlist policy for an explicit adhoc scan.
-- `compose.yml` — Docker services: test, race, lint, tidy, build, and opt-in real-engine.
+- `compose.yml` — Docker services: test, race, lint, tidy, build, and opt-in real-engine/corpus profiles.
 - `scanner-images/` — embedded exact-version scanner build inputs.
-- `acceptance/` — environment-gated real-engine matrix and example catalog.
+- `acceptance/` — environment-gated real-engine matrix plus the pinned stable corpus manifest.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
 - `Makefile` — Docker-only cross-build targets for the CLI and scheduler.
@@ -71,6 +75,7 @@ make build                     # both cross-build targets
 - `internal/capio/` — provides bounded collectors for untrusted subprocess output. Limits are enforced while the child is still streaming, so host memory stays bounded regardless of how much a process writes: Tail soft-truncates diagnostic output to a marked tail, Limit hard-stops structured output that must be parsed in full.
 - `internal/config/` — strictly loads machine config and the narrow project-owned .vuelta.yaml schema. Project paths resolve relative to their config without granting project policy control over machine authority.  Validation never walks parent directories or discovers projects; the CLI resolver supplies an exact selected root or configured workspace.
 - `internal/configinit/` — creates protected config containers, guards unsafe roots, deterministically detects a selected project's supported files without requiring Git, and applies atomic reviewed edits. It never walks parent directories or reads unallowlisted files.
+- `internal/corpus/` — implements the offline-testable core of the manual real-world scan harness. Network access and process execution are supplied through narrow interfaces so the standard test suite never needs GitHub or Docker.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
 - `internal/ecosystem/` — defines immutable adapter identity, normalized data contracts, typed capability errors, and deterministic registry construction. It owns no command or container execution boundary.
 - `internal/ecosystems/` — contains concrete built-in stack/package-manager adapters, structured candidate decoders, and data-only mutation policies.

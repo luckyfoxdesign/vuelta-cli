@@ -1,0 +1,350 @@
+schema_version: 1
+cases:
+  - name: express-npm-manifest-only
+    url: https://github.com/expressjs/express
+    commit: ae6dd37680e3a00618d6c8a3e522f0ee4eeba1a4
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: npm
+    expected_lock_format: absent
+    license: MIT
+    features:
+      - manifest-without-lockfile
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+        expect:
+          allowed_statuses:
+            - partial
+          allowed_exit_codes:
+            - 6
+          allow_partial: true
+          capabilities:
+            - name: package_updates
+              status: unavailable
+              reason_contains: lockfile
+
+  - name: axios-npm-v3
+    url: https://github.com/axios/axios
+    commit: 509719387e4993392ca40da03a49678269cdfb90
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: npm
+    expected_lock_format: npm-v3
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - lockfile-schema-variation
+      - prerelease-or-nonstandard-constraints
+    scenarios:
+      - name: default
+        args: []
+
+  - name: node-express-mongoose-npm-v2
+    url: https://github.com/madhums/node-express-mongoose-demo
+    commit: 8a134ab5deeef553d6de51d91d4ed8ee378acace
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: npm
+    expected_lock_format: npm-v2
+    license: MIT
+    features:
+      - dockerfile
+      - lockfile-schema-variation
+      - multi-stack-node
+    scenarios:
+      - name: onboarding
+        args: []
+        repeat: 1
+      - name: select-node
+        args:
+          - --stack
+          - node
+        repeat: 1
+      - name: persisted-node
+        args: []
+        repeat: 1
+
+  - name: unhead-pnpm-workspace
+    url: https://github.com/unjs/unhead
+    commit: d9b3d2a6f9c47319369dc4a33bf2138eb3d5664e
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: pnpm
+    expected_lock_format: pnpm-v9
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - monorepo-or-workspaces
+    scenarios:
+      - name: default
+        args: []
+
+  - name: gperdomor-oss-pnpm-workspace
+    url: https://github.com/gperdomor/oss
+    commit: e0d3f3d77166289032ee9e2a322878d5f5245ae8
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: pnpm
+    expected_lock_format: pnpm-v9
+    license: MIT
+    features:
+      - monorepo-or-workspaces
+      - prerelease-or-nonstandard-constraints
+    scenarios:
+      - name: default
+        args: []
+
+  - name: tsx-pnpm-workspace
+    url: https://github.com/privatenumber/tsx
+    commit: 5828ffe328d4709e5d0d8164b87459efb305853f
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: pnpm
+    expected_lock_format: pnpm-v9
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - monorepo-or-workspaces
+    scenarios:
+      - name: default
+        args: []
+
+  - name: poetry-self
+    url: https://github.com/python-poetry/poetry
+    commit: c459f14f1d5012bd0e3b6558c77b0e42c9d452df
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: poetry
+    expected_lock_format: poetry-v2
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - prerelease-or-nonstandard-constraints
+    scenarios:
+      - name: default
+        args: []
+
+  - name: cookiecutter-poetry
+    url: https://github.com/osprey-oss/cookiecutter-poetry
+    commit: 4355a33412fbf90434af57700c007f852f108d4a
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: poetry
+    expected_lock_format: poetry-v2
+    license: MIT
+    features:
+      - lockfile-schema-variation
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: codegraph-poetry
+    url: https://github.com/xnuinside/codegraph
+    commit: effefc709e73e1eedbbfcb850146ed603ce257ec
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: poetry
+    expected_lock_format: poetry-v2
+    license: MIT
+    features:
+      - prerelease-or-nonstandard-constraints
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: locust-uv-large
+    url: https://github.com/locustio/locust
+    commit: e29e7e011ae82aeda580a856a508c73a1a3f2392
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: uv
+    expected_lock_format: uv-v1
+    license: MIT
+    features:
+      - large-project
+    scenarios:
+      - name: default
+        args: []
+
+  - name: production-ready-python-uv
+    url: https://github.com/solita/production-ready-python-template
+    commit: 6296819505df230bfe86ec4a83c931d0b8497f63
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: uv
+    expected_lock_format: uv-v1
+    license: MIT
+    features:
+      - dockerfile
+      - multi-stack-python
+    scenarios:
+      - name: onboarding
+        args: []
+        repeat: 1
+      - name: select-python
+        args:
+          - --stack
+          - python
+        repeat: 1
+      - name: persisted-python
+        args: []
+        repeat: 1
+
+  - name: pylacam-uv
+    url: https://github.com/Kei18/pylacam
+    commit: 864a158ffa03c554f76ed2e45110667ee8fc97c2
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: uv
+    expected_lock_format: uv-v1
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: gcpdiag-pip-tools
+    url: https://github.com/GoogleCloudPlatform/gcpdiag
+    commit: 3a147d784dc424bc4deb89854dd0546d5b7997e8
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: pip-tools
+    expected_lock_format: requirements
+    license: Apache-2.0
+    features:
+      - requirements-hashes
+      - prerelease-or-nonstandard-constraints
+    scenarios:
+      - name: default
+        args: []
+
+  - name: aws-cdk-structure-pip-tools-constraint
+    url: https://github.com/aws-samples/aws-cdk-project-structure-python
+    commit: f78bdc2ef678af22b42be8b21250ba5095040028
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: pip-tools
+    expected_lock_format: requirements
+    license: MIT
+    features:
+      - requirements-constraint-directive
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: dallinger-pip-tools
+    url: https://github.com/Dallinger/Dallinger
+    commit: 3108a7f164e0986577cddeac6d111fbd8d85aa19
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: pip-tools
+    expected_lock_format: requirements
+    license: MIT
+    features:
+      - dev-or-optional-dependencies
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: graphite-web-requirements-url
+    url: https://github.com/graphite-project/graphite-web
+    commit: b23b548b24a2300f55d2fb676e37ed9f4bff9c31
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: requirements
+    expected_lock_format: requirements-direct
+    license: Apache-2.0
+    features:
+      - requirements-url-dependency
+      - prerelease-or-nonstandard-constraints
+    scenarios:
+      - name: default
+        args: []
+
+  - name: pydocstringformatter-requirements-include
+    url: https://github.com/DanielNoord/pydocstringformatter
+    commit: a4c529779d4395ca4becfafa36fe368f00248a90
+    subdir: ""
+    expected_stack: python
+    expected_package_manager: requirements
+    expected_lock_format: requirements-direct
+    license: MIT
+    features:
+      - requirements-include-directive
+    scenarios:
+      - name: default
+        args: []
+
+  - name: anp-examples-nested-requirements
+    url: https://github.com/agent-network-protocol/anp-examples
+    commit: ef0ef669499acb7caf02d8d0970efc64e8cdc7cb
+    subdir: web_app/backend
+    expected_stack: python
+    expected_package_manager: requirements
+    expected_lock_format: requirements-direct
+    license: MIT
+    features:
+      - nested-root
+      - single-package
+    scenarios:
+      - name: default
+        args: []
+
+  - name: uniwind-bun-capability
+    url: https://github.com/uni-stack/uniwind
+    commit: 6cce440432086e28520f25c9b9104efd8946eab2
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: bun
+    expected_lock_format: bun-text
+    license: MIT
+    features:
+      - bun-capability
+      - monorepo-or-workspaces
+    scenarios:
+      - name: default
+        args: []
+        expect:
+          allowed_statuses:
+            - partial
+          allowed_exit_codes:
+            - 6
+          allow_partial: true
+          capabilities:
+            - name: package_updates
+              status: unavailable
+              reason_contains: scanner
+
+  - name: t3-env-bun-capability
+    url: https://github.com/t3-oss/t3-env
+    commit: 7d26a645904a8fa8712c16f31a4737a80e7066fd
+    subdir: ""
+    expected_stack: node
+    expected_package_manager: bun
+    expected_lock_format: bun-text
+    license: MIT
+    features:
+      - bun-capability
+      - dev-or-optional-dependencies
+      - monorepo-or-workspaces
+    scenarios:
+      - name: default
+        args: []
+        expect:
+          allowed_statuses:
+            - partial
+          allowed_exit_codes:
+            - 6
+          allow_partial: true
+          capabilities:
+            - name: package_updates
+              status: unavailable
+              reason_contains: scanner

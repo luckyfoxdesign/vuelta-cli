@@ -237,6 +237,62 @@ target mock accepts only well-formed immutable candidate fields and can model
 either `healthy` or `rolled_back` results. Cryptographic tag verification and
 the real deployment adapter are owned by part G.
 
+## Real-world corpus scan
+
+The manual corpus harness runs production `vuelta scan` against exactly 20
+reviewed public GitHub commits and, unless disabled, attempts up to five
+non-blocking discovery cases. Only Docker Compose runs on the host. Choose an
+existing absolute storage directory outside this repository; it retains
+immutable source caches and timestamped reports:
+
+```bash
+scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus
+scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --stable-only
+scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --case axios-npm-v3
+scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus \
+  --only-failed /absolute/path/to/vuelta-corpus/runs/RUN_ID/report.json
+```
+
+On Docker Desktop, point the wrapper at the explicit per-user socket when it
+is not available at `/var/run/docker.sock`:
+
+```bash
+VUELTA_DOCKER_SOCKET=/Users/YOU/.docker/run/docker.sock \
+  scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --stable-only
+```
+
+Each run writes `runs/RUN_ID/report.json`, `report.md`, and bounded per-pass
+logs. The Markdown report separates stable failures from discovery findings
+and compares stable scenario/pass results with the previous completed report.
+Stable source failures, contract mismatches, unexpected partials, timeouts,
+and filesystem mutations make the command fail; discovery findings do not.
+Before fetching a project, the harness performs one Docker/scanner preflight
+so a broken engine or exhausted network pool produces one infrastructure
+failure.
+
+The storage layout is append-only:
+
+```text
+vuelta-corpus/
+├── cache/          # immutable URL + commit source caches
+└── runs/
+    └── RUN_ID/
+        ├── report.json
+        ├── report.md
+        └── logs/
+```
+
+To review updated pins without changing the committed stable manifest:
+
+```bash
+scripts/corpus-refresh.sh /absolute/path/to/vuelta-corpus
+```
+
+Refresh writes a validated `candidate-manifest.yaml` and `candidate.diff`
+beside its reports. The full corpus and refresh workflows require GitHub,
+registries, and a trusted Docker endpoint, so they remain manual; ordinary
+Docker `test`, `race`, and `lint` use only offline harness fakes.
+
 ## Development
 
 ```bash

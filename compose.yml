@@ -50,5 +50,16 @@ services:
       - go-mod-cache:/go/pkg/mod
     command: ["go", "test", "-tags=realengine", "-count=1", "-timeout=45m", "./acceptance"]
 
+  corpus:
+    profiles: ["corpus"]
+    build: .
+    working_dir: /src
+    volumes:
+      - .:/src
+      - ./acceptance/corpus.example.yaml:/src/acceptance/corpus.example.yaml:ro
+      - go-mod-cache:/go/pkg/mod
+    entrypoint: ["go", "run", "./cmd/vuelta-corpus"]
+    command: []
+
 volumes:
   go-mod-cache:
