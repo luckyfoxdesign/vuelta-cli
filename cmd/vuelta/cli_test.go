@@ -47,6 +47,18 @@ func TestHelpDoesNotExecuteCommand(t *testing.T) {
 	}
 }
 
+func TestScanHelpDocumentsProjectTimeout(t *testing.T) {
+	stdout, _, command := testCLI(nil)
+	if err := command.run([]string{"help", "scan"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []string{"--timeout DURATION", "default 4m", "maximum 1h", "--project api --timeout 10m"} {
+		if !strings.Contains(stdout.String(), wanted) {
+			t.Fatalf("scan help %q does not contain %q", stdout.String(), wanted)
+		}
+	}
+}
+
 func TestUnknownCommandSuggestsWithoutExecuting(t *testing.T) {
 	_, _, command := testCLI(nil)
 	err := command.run([]string{"scna"})

@@ -43,7 +43,7 @@ var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
 		description: "find vulnerabilities and package candidates; create snapshots only for safely mutable manifests", group: "Everyday commands",
-		examples: []string{"vuelta scan", "vuelta scan --project api", "vuelta scan --directory .", "vuelta scan --all --json"},
+		examples: []string{"vuelta scan", "vuelta scan --project api --timeout 10m", "vuelta scan --directory . --timeout 10m", "vuelta scan --all --timeout 10m --json"},
 		options: []optionDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
 			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
@@ -52,6 +52,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
+			{names: []string{"--timeout"}, valueName: "DURATION", description: "maximum duration per project (default 4m; maximum 1h)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
 			{names: []string{"--require-image-scan"}, description: "return 7 when an image reference could not be resolved to any digest (tier 4)"},

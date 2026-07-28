@@ -165,6 +165,130 @@ func TestParseScanOptionsVerbose(t *testing.T) {
 	}
 }
 
+func TestParseScanOptionsTimeoutDefaultOverrideAndValidation(t *testing.T) {
+	options, _, err := parseScanOptions(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.timeout != defaultProjectScanTimeout {
+		t.Fatalf("default timeout = %s, want %s", options.timeout, defaultProjectScanTimeout)
+	}
+
+	options, _, err = parseScanOptions([]string{"--timeout", "10m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.timeout != 10*time.Minute {
+		t.Fatalf("override timeout = %s", options.timeout)
+	}
+	if options, _, err = parseScanOptions([]string{"--timeout", "1h"}); err != nil || options.timeout != maxProjectScanTimeout {
+		t.Fatalf("maximum timeout = %s, error = %v", options.timeout, err)
+	}
+
+	for _, args := range [][]string{
+		{"--timeout"},
+		{"--timeout", "invalid"},
+		{"--timeout", "0"},
+		{"--timeout", "-1s"},
+		{"--timeout", "1h1s"},
+		{"--timeout", "5m", "--timeout=10m"},
+	} {
+		if _, _, err := parseScanOptions(args); err == nil {
+			t.Fatalf("parse %v unexpectedly succeeded", args)
+		}
+	}
+}
+
+func TestRunScanTargetsUsesFreshDeadlineAndContinuesAfterProjectTimeout(t *testing.T) {
+	targets := []scanTarget{
+		{name: "slow", path: "/projects/slow"},
+		{name: "fast", path: "/projects/fast"},
+	}
+	var calls int
+	results := runScanTargets(context.Background(), targets, scanOptions{
+		all: true, timeout: 20 * time.Millisecond,
+	}, func(ctx context.Context, target scanTarget, options scanOptions) scanResult {
+		calls++
+		if target.name == "slow" {
+			options.stageTracker.set(stageCandidate)
+			<-ctx.Done()
+			return scanResult{
+				Project: target.name, Directory: target.path, Status: "ready",
+				Timeout: options.timeout.String(), SnapshotID: "new-snapshot",
+				Stages: []scanStageResult{
+					{Name: stagePreflight, Status: string(stageSucceeded)},
+					{Name: stageVulnerability, Status: string(stageSucceeded)},
+					{Name: stageAlerts, Status: string(stageSucceeded)},
+				},
+				Vulnerabilities: []string{"CVE-1"},
+			}
+		}
+		if ctx.Err() != nil {
+			t.Fatal("second project inherited the first project's expired context")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 {
+			t.Fatal("second project did not receive a fresh deadline")
+		}
+		return scanResult{
+			Project: target.name, Directory: target.path, Status: "clean",
+			Timeout: options.timeout.String(),
+		}
+	})
+	if calls != 2 || len(results) != 2 {
+		t.Fatalf("calls/results = %d/%d", calls, len(results))
+	}
+	timedOut := results[0]
+	if timedOut.Error == nil || timedOut.Error.Code != "scan_timeout" ||
+		timedOut.Error.Stage != stageCandidate || timedOut.Error.Category != "timeout" {
+		t.Fatalf("timeout error = %#v", timedOut.Error)
+	}
+	if timedOut.Timeout != "20ms" || timedOut.SnapshotID != "" ||
+		timedOut.PackageUpdates == nil || timedOut.PackageUpdates.Reason != "scan_timeout" {
+		t.Fatalf("timeout result = %#v", timedOut)
+	}
+	data, err := json.Marshal(timedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []string{`"timeout":"20ms"`, `"code":"scan_timeout"`, `"stage":"candidate"`} {
+		if !strings.Contains(string(data), wanted) {
+			t.Fatalf("timeout JSON %s does not contain %s", data, wanted)
+		}
+	}
+	statuses := make(map[string]string)
+	for _, stage := range timedOut.Stages {
+		statuses[stage.Name] = stage.Status
+	}
+	if statuses[stageVulnerability] != string(stageSucceeded) ||
+		statuses[stageCandidate] != string(stageFailed) ||
+		statuses[stageReleaseAge] != string(stageNotStarted) ||
+		statuses[stageSnapshot] != string(stageNotStarted) {
+		t.Fatalf("timeout stages = %#v", timedOut.Stages)
+	}
+	if results[1].Status != "clean" {
+		t.Fatalf("second result = %#v", results[1])
+	}
+}
+
+func TestRunScanTargetsStopsAfterInvocationCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	results := runScanTargets(ctx, []scanTarget{{name: "first"}, {name: "second"}}, scanOptions{
+		all: true, timeout: time.Minute,
+	}, func(ctx context.Context, target scanTarget, options scanOptions) scanResult {
+		calls++
+		options.stageTracker.set(stageVulnerability)
+		cancel()
+		<-ctx.Done()
+		return scanResult{Project: target.name, Status: "failed", Timeout: options.timeout.String()}
+	})
+	if calls != 1 || len(results) != 1 {
+		t.Fatalf("cancelled invocation calls/results = %d/%d", calls, len(results))
+	}
+}
+
 func TestEffectiveMinReleaseAge(t *testing.T) {
 	for _, test := range []struct {
 		value      string
@@ -1319,6 +1443,7 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 
 	result := scanResult{
 		Project: "api", Directory: "/tmp/project", Status: "ready", SnapshotID: "snapshot-id",
+		Timeout: "4m0s",
 		Candidates: []updatesnapshot.Candidate{{
 			Kind: "npm", Name: "lodash", Current: "4.17.20", Target: "4.17.23", ReleaseAgeVerified: true,
 		}},
@@ -1338,7 +1463,7 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 		writeHumanScanResults([]scanResult{result}, "/tmp/config.yaml", false, nil)
 	})
 	for _, wanted := range []string{
-		"Scan: api", "Packages:", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
+		"Scan: api", "Project timeout: 4m0s", "Packages:", "MANAGER", "PACKAGE", "CURRENT", "LATEST", "STATUS",
 		"npm", "lodash", "4.17.20", "4.17.23", "available",
 		"Result: 1 package update available; 1 vulnerability found.",
 		"Vulnerabilities:", "CVE", "SEVERITY", "CVE-2024-1", "HIGH",
@@ -1383,6 +1508,24 @@ func TestHumanScanOutputSkipsWarningsAlreadyShownAtCommandLevel(t *testing.T) {
 	}
 }
 
+func TestHumanScanTimeoutIdentifiesCodeStageAndDuration(t *testing.T) {
+	result := projectScanTimeoutResult(scanResult{
+		Project: "api", Directory: "/tmp/project", Status: "clean",
+		Stages: []scanStageResult{{Name: stagePreflight, Status: string(stageSucceeded)}},
+	}, stageVulnerability, 10*time.Minute, "")
+	stdout, stderr := captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "", false, nil)
+	})
+	if !strings.Contains(stdout, "Project timeout: 10m0s") {
+		t.Fatalf("timeout stdout = %q", stdout)
+	}
+	for _, wanted := range []string{"scan_timeout", stageVulnerability, "10m0s"} {
+		if !strings.Contains(stderr, wanted) {
+			t.Fatalf("timeout stderr %q does not contain %q", stderr, wanted)
+		}
+	}
+}
+
 func TestHumanScanOutputExplainsRequirementsReadOnly(t *testing.T) {
 	result := scanResult{
 		Directory: "/tmp/project", Status: config.VerificationScanOnly,
@@ -1411,6 +1554,7 @@ func TestProjectScanReportIsBoundedEscapedAndNamesSnapshotAuthority(t *testing.T
 	expires := created.Add(time.Hour)
 	result := scanResult{
 		Project: "api<script>", Directory: "/projects/api", Status: "ready",
+		Timeout:    "4m0s",
 		SnapshotID: "abcdefghijklmnopqrstuv", SnapshotCreated: &created, SnapshotExpires: &expires,
 		Candidates: []updatesnapshot.Candidate{{
 			Kind: "npm", Name: "bad|name", Current: "1.0.0", Target: "2.0.0", ReleaseAgeVerified: true,
@@ -1423,6 +1567,9 @@ func TestProjectScanReportIsBoundedEscapedAndNamesSnapshotAuthority(t *testing.T
 		t.Fatal(err)
 	}
 	report := string(data)
+	if !strings.Contains(report, "Project timeout: `4m0s`") {
+		t.Fatalf("report does not record the effective project timeout: %s", report)
+	}
 	for _, wanted := range []string{
 		"Status: **ready**", "bad\\|name", "&lt;script&gt;", "abcdefghijklmnopqrstuv",
 		"vuelta update --directory /projects/api", "authority is the selected JSON snapshot",

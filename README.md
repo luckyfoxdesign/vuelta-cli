@@ -379,7 +379,7 @@ Legacy scripts that intentionally use a machine-config workspace with
 silently falls back to an unrelated global workspace.
 
 ```bash
-vuelta scan --all
+vuelta scan --all --timeout 10m
 vuelta update --directory /path/to/project
 ```
 
@@ -392,6 +392,21 @@ Gitless projects remain scannable and report
 their findings and candidates remain visible while Git-bound snapshots and
 updates are disabled. Use `--project NAME` or `--all` for global configured
 workspaces, or `--directory PATH` to select an exact local root.
+Each project scan has an independent four-minute deadline by default. Use
+`--timeout DURATION` to override it up to one hour. With `scan --all`, every
+project receives a fresh deadline and a timed-out project does not prevent
+later projects from running. JSON and human output record the effective
+timeout and identify `scan_timeout` plus the active stage while retaining
+completed stage results. A timed-out project never publishes a ready update
+snapshot; its existing snapshots remain untouched and its bounded scan report
+is still written when safe.
+
+The deadline hierarchy is: stage-specific operation deadline, then project
+scan deadline, then the external corpus harness or scheduler deadline. The
+shorter stage deadlines remain in force; an intentionally smaller project
+override becomes the earlier backstop. Final result rendering and bounded
+cleanup of Vuelta-owned containers, networks, and child processes are outside
+the project deadline.
 Every per-project JSON result includes `package_updates` with status
 `available`, `scan_only`, or `unavailable`. Non-available states include a
 stable machine-readable reason code; corpus and automation contracts match

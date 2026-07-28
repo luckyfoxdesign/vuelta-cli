@@ -66,6 +66,31 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreRemoveRetractsOnlyTheSelectedSnapshot(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "snapshots")
+	store := Store{Dir: dir}
+	first := testSnapshot(t)
+	second := testSnapshot(t)
+	if err := store.Save(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Remove(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(first.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed snapshot load error = %v", err)
+	}
+	if _, err := store.Load(second.ID); err != nil {
+		t.Fatalf("unrelated snapshot was not preserved: %v", err)
+	}
+	if err := store.Remove("../outside"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("malformed removal error = %v", err)
+	}
+}
+
 func TestFormatSevenRecordsTargetSecurityAndVerificationIdentity(t *testing.T) {
 	snapshot := testSnapshot(t)
 	if snapshot.Format != 7 || snapshot.TargetRoot != "/projects/example" || snapshot.Origin != OriginWorkspace || snapshot.Project != "example" || snapshot.VerificationHash == "" {

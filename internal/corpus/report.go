@@ -434,6 +434,11 @@ func classifyObserved(exitCode int, envelope ObservedEnvelope, expectation Expec
 		}
 		return "process-error", SanitizeMessage(runErr.Error()), false
 	}
+	for _, failure := range envelope.Errors {
+		if failure.Code == "scan_timeout" {
+			return "timeout", nonEmpty(failure.Message, "project scan exceeded its configured timeout"), false
+		}
+	}
 	if expectation.AllowPartial && (exitCode == 6 || slicesContains(envelope.Statuses, scanStatusPartial)) {
 		if reason, ok := matchesPartialExpectation(exitCode, envelope, expectation); ok {
 			if diagnostic, fatal := firstFatalDiagnostic(envelope); fatal {

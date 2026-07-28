@@ -297,6 +297,23 @@ func TestClassifyTimeoutUsesEffectiveDuration(t *testing.T) {
 	}
 }
 
+func TestClassifyStructuredProjectScanTimeout(t *testing.T) {
+	t.Parallel()
+	category, verdict, reason := Classify(
+		"stable", 6, ObservedEnvelope{
+			Statuses: []string{"partial"},
+			Errors: []ObservedError{{
+				Code: "scan_timeout", Stage: "candidate",
+				Message: "project scan timed out during candidate after 4m0s",
+			}},
+		}, Expectation{}, nil,
+	)
+	if category != "timeout" || verdict != "fail" ||
+		reason != "project scan timed out during candidate after 4m0s" {
+		t.Fatalf("Classify() = %q, %q, %q", category, verdict, reason)
+	}
+}
+
 func TestBuildComparison(t *testing.T) {
 	t.Parallel()
 	previous := Report{RunID: "old", Results: []Result{

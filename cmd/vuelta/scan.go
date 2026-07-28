@@ -42,11 +42,16 @@ const (
 	exitFindings          = 5
 	exitPartial           = 6
 	exitImageScanRequired = 7
+
+	defaultProjectScanTimeout = 4 * time.Minute
+	maxProjectScanTimeout     = time.Hour
 )
 
 const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
 
 var startScanCleanupGuardian = runlease.StartGuardian
+
+var errProjectScanDeadline = errors.New("project scan deadline exceeded")
 
 type scanTarget struct {
 	workspace         *config.Workspace
@@ -112,6 +117,7 @@ const (
 	stageFailed       stageStatus = "failed"
 	stageSkipped      stageStatus = "skipped"
 	stageNotRequested stageStatus = "not_requested"
+	stageNotStarted   stageStatus = "not_started"
 	stageVerified     stageStatus = "verified"
 	stageUnverified   stageStatus = "unverified"
 )
@@ -151,6 +157,7 @@ type scanResult struct {
 	Directory             string                     `json:"directory"`
 	Origin                string                     `json:"origin"`
 	Execution             string                     `json:"execution"`
+	Timeout               string                     `json:"timeout"`
 	Stack                 string                     `json:"stack,omitempty"`
 	PackageManager        string                     `json:"package_manager,omitempty"`
 	Status                string                     `json:"status"`
@@ -210,9 +217,28 @@ type scanOptions struct {
 	explicitConfig            bool
 	nonInteractive            bool
 	noColor                   bool
+	timeout                   time.Duration
 	updateConfigPath          string
 	progressIndex             int
 	progressTotal             int
+	stageTracker              *scanStageTracker
+}
+
+type scanStageTracker struct {
+	active    string
+	completed bool
+}
+
+func (t *scanStageTracker) set(stage string) {
+	if t != nil {
+		t.active = stage
+	}
+}
+
+func (t *scanStageTracker) complete() {
+	if t != nil {
+		t.completed = true
+	}
 }
 
 func executeScan(args []string) error {
@@ -310,15 +336,9 @@ func executeScan(args []string) error {
 		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
 		ctx = egress.WithSession(ctx, egressSession)
 	}
-	results := make([]scanResult, 0, len(targets))
-	for index, target := range targets {
-		targetOptions := options
-		if options.all {
-			targetOptions.progressIndex = index + 1
-			targetOptions.progressTotal = len(targets)
-		}
-		results = append(results, scanOneTarget(ctx, *cfg, target, targetOptions, policy, policyIdentity, minAge))
-	}
+	results := runScanTargets(ctx, targets, options, func(targetCtx context.Context, target scanTarget, targetOptions scanOptions) scanResult {
+		return scanOneTarget(targetCtx, *cfg, target, targetOptions, policy, policyIdentity, minAge)
+	})
 	var egressCleanupErr error
 	if egressSession != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -360,7 +380,41 @@ func executeScan(args []string) error {
 		}
 		writeHumanScanResults(results, options.updateConfigPath, options.verbose, warnings)
 	}
+	if ctx.Err() != nil {
+		return fail(exitInterrupted, "scan interrupted")
+	}
 	return scanResultError(summary, options.failOn, options.requireImageScan)
+}
+
+type scanTargetRunner func(context.Context, scanTarget, scanOptions) scanResult
+
+func runScanTargets(ctx context.Context, targets []scanTarget, options scanOptions, runner scanTargetRunner) []scanResult {
+	timeout := options.timeout
+	if timeout <= 0 {
+		timeout = defaultProjectScanTimeout
+	}
+	results := make([]scanResult, 0, len(targets))
+	for index, target := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		targetOptions := options
+		targetOptions.timeout = timeout
+		targetOptions.stageTracker = &scanStageTracker{active: stagePreflight}
+		if options.all {
+			targetOptions.progressIndex = index + 1
+			targetOptions.progressTotal = len(targets)
+		}
+		targetCtx, cancel := context.WithTimeoutCause(ctx, timeout, errProjectScanDeadline)
+		result := runner(targetCtx, target, targetOptions)
+		cause := context.Cause(targetCtx)
+		cancel()
+		if errors.Is(cause, errProjectScanDeadline) && !targetOptions.stageTracker.completed {
+			result = projectScanTimeoutResult(result, targetOptions.stageTracker.active, timeout, options.only)
+		}
+		results = append(results, result)
+	}
+	return results
 }
 
 func writeScanPreflight(writer io.Writer, options scanOptions, cfg config.Config, selection scanConfigSelection, targets []scanTarget) {
@@ -429,6 +483,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
 	fs.BoolVar(&options.nonInteractive, "internal-no-input", false, "disable prompts")
 	fs.BoolVar(&options.noColor, "internal-no-color", false, "disable color and progress animation")
+	fs.DurationVar(&options.timeout, "timeout", defaultProjectScanTimeout, "maximum duration for each project scan")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
 	}
@@ -437,6 +492,15 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	}
 	if optionOccurrences(args, "-d", "--directory") > 1 {
 		return options, "", fail(exitConfig, "--directory may be specified only once")
+	}
+	if optionOccurrences(args, "--timeout") > 1 {
+		return options, "", fail(exitConfig, "--timeout may be specified only once")
+	}
+	if options.timeout <= 0 {
+		return options, "", fail(exitConfig, "--timeout must be greater than zero")
+	}
+	if options.timeout > maxProjectScanTimeout {
+		return options, "", fail(exitConfig, "--timeout must not exceed %s", maxProjectScanTimeout)
 	}
 	if options.only != "" && options.only != "vulnerabilities" && options.only != "packages" {
 		return options, "", fail(exitConfig, "--only must be vulnerabilities or packages")
@@ -704,6 +768,11 @@ func effectiveMinReleaseAge(value string, configuredDays, policyDays int) (time.
 }
 
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
+	defer func() {
+		if ctx.Err() == nil {
+			options.stageTracker.complete()
+		}
+	}()
 	return scanOneTargetWith(ctx, cfg, target, options, policy, policyIdentity, minAge, scanStageRunners{
 		vulnerabilities: scanVulnerabilityStage,
 		alerts:          scanAlertsStage,
@@ -732,9 +801,15 @@ type scanStageRunners struct {
 }
 
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
+	options.stageTracker.set(stagePreflight)
+	effectiveTimeout := options.timeout
+	if effectiveTimeout <= 0 {
+		effectiveTimeout = defaultProjectScanTimeout
+	}
 	result := scanResult{
 		Project: target.name, Directory: target.path, Origin: target.origin, Execution: "container",
-		Status: "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{}, ImageScans: []imageScanRecord{},
+		Timeout: effectiveTimeout.String(),
+		Status:  "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{}, ImageScans: []imageScanRecord{},
 		PackageUpdates: &packageUpdateAvailability{Status: "available"},
 	}
 	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
@@ -828,6 +903,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageVulnerability, stageNotRequested, "")
 		result = addStage(result, stageAlerts, stageNotRequested, "")
 	} else {
+		options.stageTracker.set(stageVulnerability)
 		var findings []vulnscan.Finding
 		var imageResolutions []vulnscan.ImageResolution
 		var imageSkips []vulnscan.ImageSkip
@@ -840,6 +916,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			progress.start(scanPhaseMessage(options, target, vulnerabilityProgressMessage(tool)))
 			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options)
 			progress.stop()
+		}
+		if ctx.Err() != nil {
+			return result
 		}
 		if !requested {
 			result = addStage(result, stageVulnerability, stageNotRequested, "")
@@ -855,9 +934,13 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Warnings = appendUniqueStrings(result.Warnings, driftWarnings...)
 		}
 
+		options.stageTracker.set(stageAlerts)
 		progress.start(scanPhaseMessage(options, target, "Checking GitHub security alerts..."))
 		alertFindings, requested, alertErr := runners.alerts(ctx, cfg, target)
 		progress.stop()
+		if ctx.Err() != nil {
+			return result
+		}
 		if !requested {
 			result = addStage(result, stageAlerts, stageNotRequested, "")
 		} else if alertErr != nil {
@@ -881,6 +964,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		return finalizeStageOutcomes(result)
 	}
 
+	options.stageTracker.set(stageCandidate)
 	if lockfileMissing {
 		manager := packageToolName(identityWorkspace)
 		result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "skipped", Reason: reasonLockfileMissing})
@@ -898,6 +982,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 
 	if identityWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
 		prepared, prepareErr := runners.prepareToolchain(ctx, cfg, identityWorkspace)
+		if ctx.Err() != nil {
+			return result
+		}
 		if prepareErr != nil {
 			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(identityWorkspace), Status: "failed", Reason: prepareErr.Error()})
 			result = recordScanStageFailure(result, stageCandidate, "toolchain_incompatible", prepareErr, "Adjust the detected runtime/manager constraint or add a compatible update.toolchain_profiles override")
@@ -937,6 +1024,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		candidates, manager, verified, err = runners.packages(candidateCtx, cfg, target, options, policy, minAge)
 		deadlineCause := context.Cause(candidateCtx)
 		cancelCandidate()
+		if ctx.Err() != nil {
+			progress.stop()
+			return result
+		}
 		if errors.Is(deadlineCause, errCandidateScanDeadline) {
 			if manager == "" {
 				manager = packageToolName(identityWorkspace)
@@ -964,6 +1055,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	result.Candidates = filterPolicyCandidates(candidates, policy.AllowedPackages)
 	result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "used"})
 	result = addStage(result, stageCandidate, stageSucceeded, "")
+	options.stageTracker.set(stageReleaseAge)
 	switch {
 	case minAge == 0:
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
@@ -977,6 +1069,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	default:
 		result = addStage(result, stageReleaseAge, stageVerified, "")
 	}
+	options.stageTracker.set(stageSnapshot)
 	if options.allowProjectConfig && !workspaceScanOnly(identityWorkspace) {
 		result.Warnings = append(result.Warnings, "reviewed project package-manager configuration was allowed during scan")
 	}
@@ -1013,6 +1106,9 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	if initialInputErr != nil {
 		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", initialInputErr, "Review the explicit scan inputs and their limits")
 		return finalizeStageOutcomes(result)
+	}
+	if ctx.Err() != nil {
+		return result
 	}
 
 	var selectedToolchain toolchain.Identity
@@ -1097,10 +1193,24 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", stateErr, "Review the selected project's .vuelta/snapshots directory")
 		return finalizeStageOutcomes(result)
 	}
+	if ctx.Err() != nil {
+		return result
+	}
 	if err := stateStore.Save(snapshot); err != nil {
 		result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", err, "Check the selected project's .vuelta directory permissions and file types")
 		return finalizeStageOutcomes(result)
 	}
+	if ctx.Err() != nil {
+		if err := stateStore.Remove(snapshot.ID); err != nil {
+			result.Warnings = appendUniqueStrings(result.Warnings, "cancelled scan snapshot cleanup failed: "+err.Error())
+		}
+		return result
+	}
+	// Publishing the snapshot is the final deadline-bound operation. Mark the
+	// pipeline complete before formatting its in-memory result so a deadline
+	// racing with the return cannot turn an authoritative snapshot into a
+	// timeout result.
+	options.stageTracker.complete()
 	result.SnapshotID = snapshot.ID
 	created, expires := snapshot.CreatedAt, snapshot.ExpiresAt
 	result.SnapshotCreated = &created
@@ -1178,6 +1288,68 @@ func hasFailedStage(result scanResult, name string) bool {
 		}
 	}
 	return false
+}
+
+var scanPipelineStages = []string{
+	stagePreflight,
+	stageVulnerability,
+	stageAlerts,
+	stageCandidate,
+	stageReleaseAge,
+	stageSnapshot,
+}
+
+func projectScanTimeoutResult(result scanResult, activeStage string, timeout time.Duration, only string) scanResult {
+	if activeStage == "" {
+		activeStage = stagePreflight
+	}
+	result.Timeout = timeout.String()
+	result.SnapshotID = ""
+	result.SnapshotCreated = nil
+	result.SnapshotExpires = nil
+	result.PackageUpdates = &packageUpdateAvailability{Status: "unavailable", Reason: "scan_timeout"}
+	message := fmt.Sprintf("project scan timed out during %s after %s", activeStage, timeout)
+	exitCode := -1
+	result.Error = &jsonCommandError{
+		Code: "scan_timeout", Message: message,
+		Hint:  "Increase --timeout or investigate the stage that did not complete",
+		Stage: activeStage, Category: "timeout", ExitCode: &exitCode,
+	}
+	result.Warnings = appendUniqueStrings(result.Warnings, message)
+
+	existing := make(map[string]scanStageResult, len(result.Stages))
+	for _, stage := range result.Stages {
+		existing[stage.Name] = stage
+	}
+	stages := make([]scanStageResult, 0, len(scanPipelineStages))
+	for _, name := range scanPipelineStages {
+		if name == activeStage {
+			stages = append(stages, scanStageResult{Name: name, Status: string(stageFailed), Reason: "scan_timeout"})
+			continue
+		}
+		if stage, ok := existing[name]; ok {
+			stages = append(stages, stage)
+			continue
+		}
+		status := stageNotStarted
+		if scanStageNotRequested(only, name) {
+			status = stageNotRequested
+		}
+		stages = append(stages, scanStageResult{Name: name, Status: string(status)})
+	}
+	result.Stages = stages
+	return finalizeStageOutcomes(result)
+}
+
+func scanStageNotRequested(only, stage string) bool {
+	switch only {
+	case "packages":
+		return stage == stageVulnerability || stage == stageAlerts
+	case "vulnerabilities":
+		return stage == stageCandidate || stage == stageReleaseAge || stage == stageSnapshot
+	default:
+		return false
+	}
 }
 
 func finalizeStageOutcomes(result scanResult) scanResult {
@@ -1909,6 +2081,7 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 			label = result.Directory
 		}
 		fmt.Printf("Scan: %s\n", label)
+		fmt.Printf("Project timeout: %s\n", result.Timeout)
 		fmt.Println()
 		writePackageCandidateTable(result)
 		fmt.Printf("Result: %s\n", conciseScanSummary(result))
@@ -1968,7 +2141,11 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 		}
 		if result.Error != nil {
 			fmt.Fprintln(os.Stderr)
-			fmt.Fprintf(os.Stderr, "Error: %s\n", result.Error.Message)
+			if result.Error.Code == "scan_timeout" {
+				fmt.Fprintf(os.Stderr, "Error: scan_timeout: %s\n", result.Error.Message)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: %s\n", result.Error.Message)
+			}
 			if result.Error.Hint != "" {
 				fmt.Fprintf(os.Stderr, "Hint: %s\n", result.Error.Hint)
 			}
@@ -2046,6 +2223,7 @@ func buildProjectScanReport(result scanResult, options scanOptions, completedAt 
 	fmt.Fprintf(&report, "- Completed: `%s`\n", completedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&report, "- Status: **%s**\n", markdownValue(status))
 	fmt.Fprintf(&report, "- Project: `%s`\n", markdownValue(project))
+	fmt.Fprintf(&report, "- Project timeout: `%s`\n", markdownValue(result.Timeout))
 	fmt.Fprintf(&report, "- Scan modes: `%s`\n\n", markdownValue(mode))
 	fmt.Fprintln(&report, "## Package and image candidates")
 	fmt.Fprintln(&report)

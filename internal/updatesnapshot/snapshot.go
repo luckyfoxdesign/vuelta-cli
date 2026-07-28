@@ -261,6 +261,25 @@ func (s Store) Save(snapshot Snapshot) error {
 	return nil
 }
 
+// Remove deletes one exact recognized snapshot. Callers use it only to
+// retract a snapshot they just published when their owning operation is
+// cancelled before that snapshot can become authoritative.
+func (s Store) Remove(id string) error {
+	if !idPattern.MatchString(id) {
+		return fmt.Errorf("%w: malformed snapshot ID", ErrInvalid)
+	}
+	if err := s.validateExistingDir(); err != nil {
+		return err
+	}
+	if err := os.Remove(s.path(id)); err != nil {
+		return fmt.Errorf("remove update snapshot: %w", err)
+	}
+	if err := syncDirectory(s.Dir); err != nil {
+		return fmt.Errorf("sync snapshot removal: %w", err)
+	}
+	return nil
+}
+
 func removeTemporary(path string) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return
