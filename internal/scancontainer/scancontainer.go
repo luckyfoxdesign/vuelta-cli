@@ -27,6 +27,7 @@ var (
 	exactDigest   = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 	localImageID  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	dockerName    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+	trivyDBVolume = regexp.MustCompile(`^vuelta-trivy-db-[0-9a-f]{16}$`)
 	safeSizeFlag  = regexp.MustCompile(`^[1-9][0-9]*(k|m|g)$`)
 	containerUser = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$`)
 )
@@ -41,11 +42,16 @@ type Request struct {
 	Network  string
 	Proxy    string
 	Tool     string
-	Memory   string
-	Tmpfs    string
-	Stdout   dockerexec.Capture
-	Stderr   dockerexec.Capture
-	Combined dockerexec.Capture
+	// TrivyDBVolume is a Vuelta-owned Docker volume containing only Trivy's
+	// verified vulnerability database. It is never derived from project input
+	// and is mounted below the otherwise ephemeral /tmp cache.
+	TrivyDBVolume   string
+	TrivyDBReadOnly bool
+	Memory          string
+	Tmpfs           string
+	Stdout          dockerexec.Capture
+	Stderr          dockerexec.Capture
+	Combined        dockerexec.Capture
 }
 
 // Runner owns the create/copy/start/remove lifecycle. Tests inject Docker and
@@ -109,6 +115,12 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	if request.Platform != "" {
 		loaderArgs = append(loaderArgs, "--platform", request.Platform)
 	}
+	if request.TrivyDBVolume != "" && !request.TrivyDBReadOnly {
+		loaderArgs = append(
+			loaderArgs,
+			"--mount", "type=volume,src="+request.TrivyDBVolume+",dst=/tmp/trivy/db",
+		)
+	}
 	loaderArgs = append(loaderArgs, request.Image)
 	if _, err := docker.Run(ctx, dockerexec.Request{
 		// Docker may fetch the exact digest before this stopped loader exists;
@@ -125,6 +137,18 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	}); err != nil {
 		return dockerexec.Result{}, fmt.Errorf("copy scanner input archive: %w", err)
+	}
+	if request.TrivyDBVolume != "" && !request.TrivyDBReadOnly {
+		databaseArchive, archiveErr := trivyDatabaseDirectoryArchive()
+		if archiveErr != nil {
+			return dockerexec.Result{}, archiveErr
+		}
+		if _, err := docker.Run(ctx, dockerexec.Request{
+			Args: []string{"cp", "-a", "-", loaderName + ":/"}, Stdin: bytes.NewReader(databaseArchive),
+			Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
+		}); err != nil {
+			return dockerexec.Result{}, fmt.Errorf("initialize Trivy database cache permissions: %w", err)
+		}
 	}
 	commitResult, err := docker.Run(ctx, dockerexec.Request{
 		// Pausing is Docker's default. Passing the deprecated --pause flag makes
@@ -200,6 +224,12 @@ func validateRequest(request Request) error {
 	if request.Tool != "" && request.Tool != "trivy" {
 		return errors.New("scanner tool environment is not allowlisted")
 	}
+	if request.TrivyDBVolume != "" && (request.Tool != "trivy" || !trivyDBVolume.MatchString(request.TrivyDBVolume)) {
+		return errors.New("trivy database volume is not a Vuelta-owned cache name")
+	}
+	if request.TrivyDBReadOnly && request.TrivyDBVolume == "" {
+		return errors.New("read-only Trivy database cache requires a volume")
+	}
 	if request.User != "" && !containerUser.MatchString(request.User) {
 		return errors.New("scanner user must be an explicit non-root numeric uid:gid")
 	}
@@ -257,6 +287,21 @@ func validateArchive(data []byte) error {
 	return nil
 }
 
+func trivyDatabaseDirectoryArchive() ([]byte, error) {
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	if err := writer.WriteHeader(&tar.Header{
+		Name: "tmp/trivy/db/", Typeflag: tar.TypeDir, Mode: 0o700,
+		Uid: 65532, Gid: 65532,
+	}); err != nil {
+		return nil, fmt.Errorf("build Trivy database cache initializer: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("finish Trivy database cache initializer: %w", err)
+	}
+	return buffer.Bytes(), nil
+}
+
 func createArgs(name, image string, request Request) []string {
 	proxy := request.Proxy
 	user := request.User
@@ -290,6 +335,13 @@ func createArgs(name, image string, request Request) []string {
 			"--env", "TRIVY_CACHE_DIR=/tmp/trivy",
 			"--env", "TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
 		)
+		if request.TrivyDBVolume != "" {
+			mount := "type=volume,src=" + request.TrivyDBVolume + ",dst=/tmp/trivy/db"
+			if request.TrivyDBReadOnly {
+				mount += ",readonly"
+			}
+			args = append(args, "--mount", mount)
+		}
 	}
 	args = append(args, image)
 	return append(args, request.Args...)

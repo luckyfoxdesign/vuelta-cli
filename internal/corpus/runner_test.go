@@ -207,6 +207,45 @@ func TestHarnessRequirementsAndBunContractsWithoutNetwork(t *testing.T) {
 	}
 }
 
+func TestHarnessNestedRequirementsPreservesCandidateStageWhenTrivyDatabaseIsUnavailable(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	corpusCase := testCase("anp-examples-nested-requirements")
+	corpusCase.Subdir = "examples/nested"
+	corpusCase.ExpectedStack = "python"
+	corpusCase.ExpectedPackageManager = "requirements"
+	corpusCase.ExpectedLockFormat = "requirements-direct"
+	corpusCase.Scenarios[0].Expect = Expectation{
+		AllowedStatuses: []string{"partial"},
+		AllowedExits:    []int{6},
+		AllowPartial:    true,
+		Capabilities: []ExpectedCapability{{
+			Name: "trivy_database", Status: "unavailable",
+			ReasonCode: "trivy_database_transient_transport",
+		}},
+		FailedStages: []ExpectedFailure{{
+			Stage: "vulnerability", ReasonCode: "trivy_database_transient_transport",
+		}},
+	}
+	output := `{"format":1,"command":"scan","config":{"detected_stacks":["python"]},"results":[{"status":"partial","stages":[{"name":"vulnerability","status":"failed","reason":"Trivy database acquisition failed"},{"name":"candidate","status":"succeeded"}],"diagnostics":[],"warnings":[],"capabilities":[{"name":"trivy_database","status":"unavailable","reason":"trivy_database_transient_transport"}],"error":{"code":"trivy_database_transient_transport","message":"Trivy database acquisition failed: category=transient_transport, attempts=3","stage":"vulnerability","category":"trivy_database_transient_transport"},"package_updates":{"status":"scan_only","reason":"manifest_has_no_safe_mutation_contract"},"toolchain":{"package_manager":"requirements","lock_formats":["requirements-direct"]}}],"warnings":[],"errors":[]}`
+	report, _, exit, err := (Harness{
+		Sources: &fakeSources{},
+		Scanner: &fakeScanner{results: []fakeScanResult{{output: output, exit: 6}}},
+	}).Execute(context.Background(), HarnessInput{
+		Root: root, ManifestBytes: []byte("manifest"),
+		Stable: []Case{corpusCase},
+		Now:    time.Date(2026, 7, 27, 4, 30, 0, 0, time.UTC),
+	})
+	if err != nil || exit != 0 {
+		t.Fatalf("Execute() = exit %d, err %v", exit, err)
+	}
+	if len(report.Results) != 1 ||
+		report.Results[0].Verdict != "pass" ||
+		report.Results[0].ObservedCategory != "expected-partial" {
+		t.Fatalf("nested requirements result = %#v", report.Results)
+	}
+}
+
 func TestHarnessWarnsWhenStableSelectionIsNotComparable(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

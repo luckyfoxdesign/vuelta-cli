@@ -691,6 +691,69 @@ func TestStandaloneRequirementsCombinedScanReturnsCandidatesWithoutSnapshot(t *t
 	}
 }
 
+func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	databaseErr := &vulnscan.DatabaseAcquisitionError{
+		Kind: vulnscan.FailureTransientTransport, Attempts: 3,
+		History: []string{
+			"attempt 1: transient_transport",
+			"attempt 2: transient_transport",
+			"attempt 3: transient_transport",
+		},
+		Err: errors.New("unexpected EOF"),
+	}
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return nil, nil, nil, "trivy", true, databaseErr
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{
+				Kind: "requirements", Name: "flask", Current: "0.5", Target: "3.1.2",
+				File: "requirements.txt", Line: 1, Disposition: "scanned",
+			}}, "requirements", true, nil
+		},
+	}
+	result := scanOneTargetWith(
+		context.Background(),
+		config.Config{VulnScan: config.VulnScanConfig{DependencySource: "trivy"}},
+		scanTarget{path: root, origin: updatesnapshot.OriginAdhoc},
+		scanOptions{},
+		config.LocalPackagePolicy{},
+		updatesnapshot.PolicyIdentity{},
+		0,
+		runners,
+	)
+	if result.Status != "partial" || len(result.Candidates) != 1 || !hasFailedStage(result, stageVulnerability) {
+		t.Fatalf("partial candidate result = %#v", result)
+	}
+	if result.Error == nil ||
+		result.Error.Code != "trivy_database_transient_transport" ||
+		result.Error.Category != "trivy_database_transient_transport" ||
+		!reflect.DeepEqual(result.Error.RetryHistory, databaseErr.History) {
+		t.Fatalf("structured database error = %#v", result.Error)
+	}
+	var databaseCapability *scanCapability
+	for index := range result.Capabilities {
+		if result.Capabilities[index].Name == "trivy_database" {
+			databaseCapability = &result.Capabilities[index]
+		}
+	}
+	if databaseCapability == nil ||
+		databaseCapability.Status != "unavailable" ||
+		databaseCapability.Reason != "trivy_database_transient_transport" {
+		t.Fatalf("database capability = %#v", result.Capabilities)
+	}
+	if !containsSubstring(result.Warnings, "retry_history=attempt 1: transient_transport") {
+		t.Fatalf("retry history is absent from bounded warning: %#v", result.Warnings)
+	}
+}
+
 func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {

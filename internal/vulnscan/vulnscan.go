@@ -129,19 +129,23 @@ func WithImageProgress(progress ProgressFunc) ScannerOption {
 
 // Scanner invokes Trivy/OSV and validates their structured output.
 type Scanner struct {
-	Command              Command
-	Docker               dockerexec.Runner
-	Now                  func() time.Time
+	Command Command
+	Docker  dockerexec.Runner
+	Now     func() time.Time
+	// DatabaseBackoff is a test seam for cancellation-aware Trivy database
+	// retry delays. Production callers leave it nil.
+	DatabaseBackoff      func(context.Context, time.Duration) error
 	allowUntrackedInputs bool
 	dependencyProgress   ProgressFunc
 	imageProgress        ProgressFunc
+	database             *databaseSession
 }
 
 // NewAdhocScanner returns the narrow scanner used only for an explicit
 // unregistered directory. Registered pipeline callers use the zero-value
 // Scanner, which always requires tracked inputs.
 func NewAdhocScanner(command Command, options ...ScannerOption) Scanner {
-	scanner := Scanner{Command: command, allowUntrackedInputs: true}
+	scanner := Scanner{Command: command, allowUntrackedInputs: true, database: &databaseSession{}}
 	for _, option := range options {
 		option(&scanner)
 	}
@@ -153,7 +157,7 @@ func NewAdhocScanner(command Command, options ...ScannerOption) Scanner {
 // but Git tracking is deferred to snapshot creation so a dirty honest project
 // can still receive vulnerability findings.
 func NewReadOnlyScanner(options ...ScannerOption) Scanner {
-	scanner := Scanner{allowUntrackedInputs: true}
+	scanner := Scanner{allowUntrackedInputs: true, database: &databaseSession{}}
 	for _, option := range options {
 		option(&scanner)
 	}
@@ -161,6 +165,19 @@ func NewReadOnlyScanner(options ...ScannerOption) Scanner {
 }
 
 func (s Scanner) command(ctx context.Context, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+	return s.commandWithDatabase(ctx, bundle, image, egressConfig, "", false, name, args...)
+}
+
+func (s Scanner) commandWithDatabase(
+	ctx context.Context,
+	bundle scaninput.Bundle,
+	image string,
+	egressConfig config.EgressConfig,
+	databaseVolume string,
+	databaseReadOnly bool,
+	name string,
+	args ...string,
+) ([]byte, error) {
 	if s.Command != nil {
 		private, err := scaninput.MaterializePrivate(ctx, bundle)
 		if err != nil {
@@ -173,7 +190,10 @@ func (s Scanner) command(ctx context.Context, bundle scaninput.Bundle, image str
 	if docker == nil {
 		docker = dockerexec.Default()
 	}
-	return dockerCommandWith(ctx, docker, bundle, image, egressConfig, name, args...)
+	return dockerCommandWithDatabase(
+		ctx, docker, bundle, image, egressConfig,
+		databaseVolume, databaseReadOnly, name, args...,
+	)
 }
 
 // dockerCommand runs a scanner with no host mount. The minimal input archive
@@ -183,6 +203,20 @@ func dockerCommand(ctx context.Context, bundle scaninput.Bundle, image string, e
 }
 
 func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, bundle scaninput.Bundle, image string, egressConfig config.EgressConfig, name string, args ...string) ([]byte, error) {
+	return dockerCommandWithDatabase(ctx, docker, bundle, image, egressConfig, "", false, name, args...)
+}
+
+func dockerCommandWithDatabase(
+	ctx context.Context,
+	docker dockerexec.Runner,
+	bundle scaninput.Bundle,
+	image string,
+	egressConfig config.EgressConfig,
+	databaseVolume string,
+	databaseReadOnly bool,
+	name string,
+	args ...string,
+) ([]byte, error) {
 	if !exactDigest.MatchString(image) {
 		return nil, fmt.Errorf("scanner image %q is not pinned to an exact digest", image)
 	}
@@ -196,6 +230,7 @@ func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, bundle sca
 	}
 	result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
 		Image: image, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL, Tool: toolEnvironment,
+		TrivyDBVolume: databaseVolume, TrivyDBReadOnly: databaseReadOnly,
 		Memory: "2g", Tmpfs: "2g",
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: scannerStdoutMaxBytes},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: scannerStderrTailBytes},
@@ -213,6 +248,79 @@ func dockerCommandWith(ctx context.Context, docker dockerexec.Runner, bundle sca
 	return result.Stdout, nil
 }
 
+func (s Scanner) trivyCommand(
+	ctx context.Context,
+	bundle scaninput.Bundle,
+	image string,
+	egressConfig config.EgressConfig,
+	maxAgeHours int,
+	args ...string,
+) ([]byte, error) {
+	if s.Command != nil {
+		var history []string
+		var lastErr error
+		for attempt := 1; attempt <= trivyDatabaseAttempts; attempt++ {
+			output, err := s.command(ctx, bundle, image, egressConfig, "trivy", args...)
+			if err == nil {
+				return output, nil
+			}
+			lastErr = err
+			kind := classifyDatabaseFailure(err)
+			history = append(history, fmt.Sprintf("attempt %d: %s", attempt, kind))
+			if kind != FailureTransientTransport {
+				return nil, &DatabaseAcquisitionError{Kind: kind, Attempts: attempt, History: history, Err: err}
+			}
+			if attempt == trivyDatabaseAttempts {
+				break
+			}
+			if err := s.waitForDatabaseRetry(ctx, time.Duration(attempt)*200*time.Millisecond); err != nil {
+				return nil, &DatabaseAcquisitionError{
+					Kind: FailureCancelled, Attempts: attempt,
+					History: append(history, fmt.Sprintf("backoff %d: cancelled", attempt)), Err: err,
+				}
+			}
+		}
+		return nil, &DatabaseAcquisitionError{
+			Kind: FailureTransientTransport, Attempts: trivyDatabaseAttempts,
+			History: history, Err: lastErr,
+		}
+	}
+	if s.database == nil {
+		s.database = &databaseSession{}
+	}
+	if err := s.ensureTrivyDatabase(ctx, bundle, image, egressConfig, maxAgeHours); err != nil {
+		return nil, err
+	}
+	volume := trivyDatabaseVolume(image)
+	scanArgs := make([]string, 0, len(args)+1)
+	if len(args) > 0 {
+		scanArgs = append(scanArgs, args[0], "--skip-db-update")
+		scanArgs = append(scanArgs, args[1:]...)
+	} else {
+		scanArgs = append(scanArgs, "--skip-db-update")
+	}
+	output, err := s.commandWithDatabase(
+		ctx, bundle, image, egressConfig, volume, true,
+		"trivy", scanArgs...,
+	)
+	if err != nil && isTrivyDatabaseRuntimeFailure(err) {
+		kind := classifyDatabaseFailure(err)
+		invalidateErr := s.invalidateTrivyDatabase(volume)
+		return nil, &DatabaseAcquisitionError{
+			Kind: kind, Attempts: 1, History: []string{"cached database use: " + string(kind)},
+			Err: errors.Join(err, invalidateErr),
+		}
+	}
+	return output, err
+}
+
+func isTrivyDatabaseRuntimeFailure(err error) bool {
+	_, _, detail := dockerexec.Classify(err)
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "database") || strings.Contains(lower, "metadata.json") ||
+		strings.Contains(lower, "trivy.db") || strings.Contains(lower, "sqlite")
+}
+
 func (s Scanner) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -224,6 +332,9 @@ func (s Scanner) now() time.Time {
 // Docker workspaces, every exact digest referenced by docker_images.files. No
 // scanner ignore flag is ever used: tracked policy is evaluated afterwards.
 func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+	if s.database == nil {
+		s.database = &databaseSession{}
+	}
 	scanConfig := cfg.VulnScan
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
@@ -251,6 +362,9 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 // dependencies. It lets the security gate retain image coverage when
 // github-dependabot is selected as the dependency source.
 func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+	if s.database == nil {
+		s.database = &databaseSession{}
+	}
 	if root == "" {
 		return Report{}, errors.New("scan root is required")
 	}
@@ -288,7 +402,7 @@ func (s Scanner) scanDependencies(ctx context.Context, root string, ws config.Wo
 		if s.dependencyProgress != nil {
 			s.dependencyProgress("trivy fs", 1, 1)
 		}
-		out, err := s.command(ctx, bundle, scanConfig.Image, cfg.Update.Egress, "trivy", "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
+		out, err := s.trivyCommand(ctx, bundle, scanConfig.Image, cfg.Update.Egress, scanConfig.DatabaseMaxAgeHours, "fs", "--scanners", "vuln", "--include-dev-deps", "--format", "json", "/project")
 		if err != nil {
 			return nil, fmt.Errorf("trivy filesystem scan: %w", err)
 		}
@@ -367,7 +481,7 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 				s.imageProgress(intent.Reference+" ("+platform+")", step, total)
 			}
 			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, intent.Reference)
-			out, cmdErr := s.command(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, "trivy", imageArgs...)
+			out, cmdErr := s.trivyCommand(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, scanConfig.DatabaseMaxAgeHours, imageArgs...)
 			if cmdErr != nil {
 				if intent.Tier == TierExactDigest {
 					return nil, nil, nil, fmt.Errorf("trivy image scan %s (%s): %w", intent.Reference, platform, cmdErr)

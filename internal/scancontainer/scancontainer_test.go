@@ -133,6 +133,85 @@ func TestRunUsesProfileDeclaredNonRootUser(t *testing.T) {
 	}
 }
 
+func TestRunMountsOnlyAllowlistedTrivyDatabaseVolume(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Tool = "trivy"
+	request.TrivyDBVolume = "vuelta-trivy-db-0123456789abcdef"
+	request.TrivyDBReadOnly = true
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-trivy-cache", nil }}
+	if _, err := runner.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var create string
+	for _, dockerRequest := range docker.requests {
+		args := strings.Join(dockerRequest.Args, " ")
+		if strings.HasPrefix(args, "create ") && strings.Contains(args, "--read-only") {
+			create = args
+			break
+		}
+	}
+	if create == "" {
+		t.Fatal("final read-only scanner create request is absent")
+	}
+	for _, required := range []string{
+		"TRIVY_CACHE_DIR=/tmp/trivy",
+		"TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
+		"type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db,readonly",
+	} {
+		if !strings.Contains(create, required) {
+			t.Fatalf("Trivy create args missing %q: %s", required, create)
+		}
+	}
+	if strings.Contains(create, "type=bind") {
+		t.Fatalf("Trivy database cache exposed a host path: %s", create)
+	}
+}
+
+func TestRunInitializesWritableTrivyDatabaseVolumeWithoutExecutingLoader(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Tool = "trivy"
+	request.TrivyDBVolume = "vuelta-trivy-db-0123456789abcdef"
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-trivy-acquire", nil }}
+	if _, err := runner.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	loader := strings.Join(docker.requests[0].Args, " ")
+	if !strings.Contains(loader, "--network none") ||
+		!strings.Contains(loader, "type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db") {
+		t.Fatalf("writable acquisition loader did not initialize the managed volume: %s", loader)
+	}
+	if len(docker.requests) < 3 || docker.requests[2].Stdin == nil {
+		t.Fatal("trusted database cache initializer was not copied")
+	}
+	initializer, err := io.ReadAll(docker.requests[2].Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := tar.NewReader(bytes.NewReader(initializer))
+	header, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.Name != "tmp/trivy/db/" || header.Uid != 65532 || header.Gid != 65532 || header.Mode != 0o700 {
+		t.Fatalf("database initializer header = %#v", header)
+	}
+}
+
+func TestRunRejectsForeignTrivyDatabaseVolumeBeforeDocker(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Tool = "trivy"
+	request.TrivyDBVolume = "project-controlled-cache"
+	if _, err := (Runner{Docker: docker}).Run(context.Background(), request); err == nil {
+		t.Fatal("foreign Trivy database volume was accepted")
+	}
+	if len(docker.requests) != 0 {
+		t.Fatalf("Docker was called for a foreign cache: %#v", docker.requests)
+	}
+}
+
 func TestRunUsesAllowlistedProfilePlatformForLoaderAndScanner(t *testing.T) {
 	docker := &fakeDocker{}
 	request := validRequest(t)

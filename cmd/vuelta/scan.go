@@ -1136,6 +1136,13 @@ func isPartialCapabilityFailure(failure *jsonCommandError) bool {
 	}
 	switch failure.Code {
 	case "toolchain_incompatible", reasonLockfileMissing,
+		"trivy_database_transient_transport",
+		"trivy_database_integrity",
+		"trivy_database_authorization",
+		"trivy_database_artifact_unavailable",
+		"trivy_database_policy",
+		"trivy_database_cancelled",
+		"trivy_database_invalid",
 		string(toolchain.BuildFailureVersionUnavailable),
 		string(toolchain.BuildFailureRegistry),
 		string(toolchain.BuildFailureDocker),
@@ -1634,10 +1641,20 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 	if stage == stageCandidate || stage == stagePreflight {
 		result.PackageUpdates = &packageUpdateAvailability{Status: "unavailable", Reason: code}
 	}
+	var databaseErr *vulnscan.DatabaseAcquisitionError
+	if stage == stageVulnerability && errors.As(err, &databaseErr) {
+		result.Capabilities = append(result.Capabilities, scanCapability{
+			Name: "trivy_database", Status: "unavailable", Reason: code,
+		})
+	}
 	category, exitCode, detail := classifySubprocessError(err)
 	failure := &jsonCommandError{
 		Code: code, Message: err.Error(), Hint: hint,
 		Stage: stage, Category: category, ExitCode: exitCode, StderrTail: detail,
+	}
+	if errors.As(err, &databaseErr) {
+		failure.Category = "trivy_database_" + string(databaseErr.Kind)
+		failure.RetryHistory = databaseErr.RetryHistory()
 	}
 	if result.Error == nil {
 		result.Error = failure
@@ -1652,6 +1669,9 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 	if detail != "" {
 		warning += "; detail=" + detail
 	}
+	if len(failure.RetryHistory) > 0 {
+		warning += "; retry_history=" + strings.Join(failure.RetryHistory, ", ")
+	}
 	if hint != "" {
 		warning += ". " + hint
 	}
@@ -1660,6 +1680,25 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 }
 
 func scanFailureContract(code, hint string, err error) (string, string) {
+	var databaseErr *vulnscan.DatabaseAcquisitionError
+	if errors.As(err, &databaseErr) {
+		switch databaseErr.Kind {
+		case vulnscan.FailureTransientTransport:
+			return "trivy_database_transient_transport", "Retry after approved registry connectivity is restored; Vuelta already exhausted its bounded acquisition retries"
+		case vulnscan.FailureIntegrity:
+			return "trivy_database_integrity", "Do not reuse the cache; verify the pinned scanner and approved Trivy database artifact"
+		case vulnscan.FailureAuthorization:
+			return "trivy_database_authorization", "Restore authorized anonymous access to the approved Trivy database registry"
+		case vulnscan.FailureArtifactUnavailable:
+			return "trivy_database_artifact_unavailable", "Verify the approved Trivy database artifact exists for the pinned scanner"
+		case vulnscan.FailurePolicy:
+			return "trivy_database_policy", "Restore the reviewed registry allowlist and managed egress policy; Vuelta did not bypass it"
+		case vulnscan.FailureCancelled:
+			return "trivy_database_cancelled", "Retry after the cancellation source is resolved"
+		default:
+			return "trivy_database_invalid", "Remove no resources manually; rerun so Vuelta can replace its invalid managed cache"
+		}
+	}
 	var candidateErr *ecosystem.CandidateError
 	if errors.As(err, &candidateErr) {
 		switch candidateErr.Kind {
