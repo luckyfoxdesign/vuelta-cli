@@ -87,16 +87,17 @@ func TestHarnessContinuesAfterTimeoutAndDiscoveryIsNonBlocking(t *testing.T) {
 	root := t.TempDir()
 	sources := &fakeSources{}
 	scanner := &fakeScanner{results: []fakeScanResult{
-		{err: ErrTimeout},
+		{err: &TimeoutError{Duration: 10 * time.Minute}},
 		{output: cleanEnvelope},
 		{exit: 4, output: cleanEnvelope},
 	}}
 	harness := Harness{Sources: sources, Scanner: scanner}
 	report, runDir, exit, err := harness.Execute(context.Background(), HarnessInput{
 		Root: root, ManifestBytes: []byte("manifest"),
-		Stable:    []Case{testCase("timeout-case"), testCase("next-case")},
-		Discovery: []Case{testCase("discovery-case")},
-		Now:       time.Date(2026, 7, 27, 1, 2, 3, 0, time.UTC),
+		Stable:      []Case{testCase("timeout-case"), testCase("next-case")},
+		Discovery:   []Case{testCase("discovery-case")},
+		Now:         time.Date(2026, 7, 27, 1, 2, 3, 0, time.UTC),
+		CaseTimeout: 10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -107,8 +108,39 @@ func TestHarnessContinuesAfterTimeoutAndDiscoveryIsNonBlocking(t *testing.T) {
 	if len(scanner.requests) != 3 {
 		t.Fatalf("scanner requests = %d, want 3", len(scanner.requests))
 	}
+	for index, request := range scanner.requests {
+		if request.Timeout != 10*time.Minute {
+			t.Fatalf("scanner request %d timeout = %s", index, request.Timeout)
+		}
+	}
+	if report.CaseTimeout != "10m0s" {
+		t.Fatalf("report case timeout = %q", report.CaseTimeout)
+	}
+	if report.Results[0].Reason != "scan exceeded case timeout of 10m0s" {
+		t.Fatalf("timeout reason = %q", report.Results[0].Reason)
+	}
+	if got := strings.Join(report.Results[0].ReproduceCommand, " "); !strings.HasSuffix(got, "--timeout 10m0s") {
+		t.Fatalf("reproduction command = %q", got)
+	}
 	if _, err := os.Stat(filepath.Join(runDir, "report.json")); err != nil {
 		t.Fatalf("report.json: %v", err)
+	}
+	jsonReport, err := os.ReadFile(filepath.Join(runDir, "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(jsonReport), `"case_timeout": "10m0s"`) {
+		t.Fatalf("JSON report omitted effective timeout:\n%s", jsonReport)
+	}
+	markdownReport, err := os.ReadFile(filepath.Join(runDir, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(markdownReport), "- Case timeout per pass: 10m0s") {
+		t.Fatalf("Markdown report omitted effective timeout:\n%s", markdownReport)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, ".tmp")); !os.IsNotExist(err) {
+		t.Fatalf("owned temporary resources remain after timeout: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "cache")); !os.IsNotExist(err) {
 		t.Fatal("harness unexpectedly removed or created source cache")
@@ -129,7 +161,7 @@ func TestHarnessTwoPassAndStackSequenceShareFreshCase(t *testing.T) {
 		{output: cleanEnvelope},
 		{output: cleanEnvelope},
 	}}
-	_, _, exit, err := (Harness{Sources: &fakeSources{cacheHit: true}, Scanner: scanner}).Execute(
+	report, _, exit, err := (Harness{Sources: &fakeSources{cacheHit: true}, Scanner: scanner}).Execute(
 		context.Background(),
 		HarnessInput{Root: root, ManifestBytes: []byte("manifest"), Stable: []Case{corpusCase}, Now: time.Date(2026, 7, 27, 2, 0, 0, 0, time.UTC)},
 	)
@@ -141,6 +173,12 @@ func TestHarnessTwoPassAndStackSequenceShareFreshCase(t *testing.T) {
 	}
 	if scanner.requests[0].Directory != scanner.requests[2].Directory {
 		t.Fatal("scenario sequence did not preserve one fresh case work copy")
+	}
+	if report.CaseTimeout != DefaultCaseTimeout.String() {
+		t.Fatalf("default case timeout = %q", report.CaseTimeout)
+	}
+	if strings.Contains(strings.Join(report.Results[0].ReproduceCommand, " "), "--timeout") {
+		t.Fatalf("default reproduction command includes an unnecessary override: %v", report.Results[0].ReproduceCommand)
 	}
 }
 

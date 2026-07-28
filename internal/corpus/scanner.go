@@ -20,7 +20,11 @@ import (
 )
 
 const (
-	scanTimeout       = 5 * time.Minute
+	// DefaultCaseTimeout bounds each selected corpus scenario pass by default.
+	DefaultCaseTimeout = 5 * time.Minute
+	// MaxCaseTimeout prevents an operator override from becoming effectively unbounded.
+	MaxCaseTimeout = 24 * time.Hour
+
 	scanOutputLimit   = 5 << 20
 	scanStderrLimit   = 64 << 10
 	preflightTimeout  = 2 * time.Minute
@@ -33,6 +37,7 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 type ScanRequest struct {
 	Directory string
 	Args      []string
+	Timeout   time.Duration
 }
 
 // ProcessObservation is bounded stdout/stderr plus process status.
@@ -166,10 +171,14 @@ func (s *ProductionScanner) Scan(ctx context.Context, request ScanRequest) (Proc
 	if !filepath.IsAbs(request.Directory) {
 		return ProcessObservation{}, errors.New("scan directory must be absolute")
 	}
+	caseTimeout, err := EffectiveCaseTimeout(request.Timeout)
+	if err != nil {
+		return ProcessObservation{}, err
+	}
 	args := []string{"--config", s.configPath, "--no-input", "--no-color", "scan", "--directory", request.Directory}
 	args = append(args, request.Args...)
 	args = append(args, "--json")
-	return s.run(ctx, filepath.Join(s.stateDir, "home"), scanTimeout, scanOutputLimit, args)
+	return s.run(ctx, filepath.Join(s.stateDir, "home"), caseTimeout, scanOutputLimit, args)
 }
 
 func (s *ProductionScanner) run(ctx context.Context, home string, timeout time.Duration, outputLimit int, args []string) (ProcessObservation, error) {
@@ -192,7 +201,7 @@ func (s *ProductionScanner) run(ctx context.Context, home string, timeout time.D
 		return observation, ErrOutputTooLarge
 	}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		return observation, ErrTimeout
+		return observation, &TimeoutError{Duration: timeout}
 	}
 	if err == nil {
 		return observation, nil
@@ -203,6 +212,20 @@ func (s *ProductionScanner) run(ctx context.Context, home string, timeout time.D
 		return observation, nil
 	}
 	return observation, fmt.Errorf("execute production Vuelta scan: %w", err)
+}
+
+// EffectiveCaseTimeout applies the bounded default used by the corpus harness.
+func EffectiveCaseTimeout(configured time.Duration) (time.Duration, error) {
+	if configured == 0 {
+		return DefaultCaseTimeout, nil
+	}
+	if configured < 0 {
+		return 0, errors.New("case timeout must be positive")
+	}
+	if configured > MaxCaseTimeout {
+		return 0, fmt.Errorf("case timeout must not exceed %s", MaxCaseTimeout)
+	}
+	return configured, nil
 }
 
 func minimalScannerEnvironment(home, temp string) []string {

@@ -22,6 +22,7 @@ type HarnessInput struct {
 	Discovery      []Case
 	AppRevision    string
 	Now            time.Time
+	CaseTimeout    time.Duration
 	Warnings       []string
 }
 
@@ -41,6 +42,11 @@ func (h Harness) Execute(ctx context.Context, input HarnessInput) (Report, strin
 	if input.Now.IsZero() {
 		input.Now = time.Now()
 	}
+	caseTimeout, err := EffectiveCaseTimeout(input.CaseTimeout)
+	if err != nil {
+		return Report{}, "", 2, err
+	}
+	input.CaseTimeout = caseTimeout
 	storage, err := CreateRunStorage(input.Root, input.Now)
 	if err != nil {
 		return Report{}, "", 2, err
@@ -49,6 +55,7 @@ func (h Harness) Execute(ctx context.Context, input HarnessInput) (Report, strin
 		SchemaVersion: ReportSchemaVersion, RunID: storage.RunID, StartedAt: input.Now,
 		AppRevision:  SanitizeMessage(input.AppRevision),
 		ManifestHash: fmt.Sprintf("%x", sha256.Sum256(input.ManifestBytes)),
+		CaseTimeout:  caseTimeout.String(),
 		Warnings:     uniqueSorted(input.Warnings), Results: []Result{},
 		Comparison: Comparison{NewFailures: []string{}, Fixed: []string{}, Unchanged: []string{}, Slower: []string{}},
 	}
@@ -72,7 +79,7 @@ func (h Harness) Execute(ctx context.Context, input HarnessInput) (Report, strin
 		cases  []Case
 	}{{source: "stable", cases: input.Stable}, {source: "discovery", cases: input.Discovery}} {
 		for _, corpusCase := range selected.cases {
-			results, warnings := h.runCase(ctx, storage, selected.source, corpusCase)
+			results, warnings := h.runCase(ctx, storage, selected.source, corpusCase, caseTimeout)
 			report.Results = append(report.Results, results...)
 			report.Warnings = append(report.Warnings, warnings...)
 		}
@@ -111,10 +118,18 @@ func (h Harness) Execute(ctx context.Context, input HarnessInput) (Report, strin
 	return report, storage.RunDir, 0, nil
 }
 
-func (h Harness) runCase(ctx context.Context, storage RunStorage, source string, corpusCase Case) (results []Result, warnings []string) {
+func (h Harness) runCase(
+	ctx context.Context,
+	storage RunStorage,
+	source string,
+	corpusCase Case,
+	caseTimeout time.Duration,
+) (results []Result, warnings []string) {
 	prepared, err := h.Sources.Prepare(ctx, storage.Root, storage.TempDir, corpusCase)
 	if err != nil {
-		return []Result{caseFailure(source, corpusCase, "source-failure", err)}, nil
+		return []Result{caseFailure(
+			source, corpusCase, "source-failure", err, storage.Root, caseTimeout,
+		)}, nil
 	}
 	if prepared.CacheHit {
 		warnings = append(warnings, corpusCase.Name+": immutable source cache hit")
@@ -126,11 +141,15 @@ func (h Harness) runCase(ctx context.Context, storage RunStorage, source string,
 	}()
 	initial, err := SnapshotSource(prepared.Root)
 	if err != nil {
-		return []Result{caseFailure(source, corpusCase, "source-snapshot-failure", err)}, warnings
+		return []Result{caseFailure(
+			source, corpusCase, "source-snapshot-failure", err, storage.Root, caseTimeout,
+		)}, warnings
 	}
 	for _, scenario := range corpusCase.Scenarios {
 		for pass := 1; pass <= scenario.EffectiveRepeat(); pass++ {
-			result := h.runPass(ctx, storage, source, corpusCase, prepared, initial, scenario, pass)
+			result := h.runPass(
+				ctx, storage, source, corpusCase, prepared, initial, scenario, pass, caseTimeout,
+			)
 			results = append(results, result)
 		}
 	}
@@ -146,8 +165,13 @@ func (h Harness) runPass(
 	initial SourceSnapshot,
 	scenario Scenario,
 	pass int,
+	caseTimeout time.Duration,
 ) Result {
-	request := ScanRequest{Directory: prepared.ScanRoot, Args: append([]string(nil), scenario.Args...)}
+	request := ScanRequest{
+		Directory: prepared.ScanRoot,
+		Args:      append([]string(nil), scenario.Args...),
+		Timeout:   caseTimeout,
+	}
 	observation, runErr := h.Scanner.Scan(ctx, request)
 	processCompleted := runErr == nil
 	var envelope ObservedEnvelope
@@ -222,7 +246,7 @@ func (h Harness) runPass(
 		Argv: argv, ExitCode: exitCode, DurationMS: observation.Duration.Milliseconds(),
 		ObservedCategory: category, Verdict: verdict, Reason: SanitizeMessage(reason),
 		Envelope: envelope, LogPath: logPath, ProjectURL: projectURL, CommitURL: commitURL,
-		ReproduceCommand:  []string{"scripts/corpus-scan.sh", storage.Root, "--case", corpusCase.Name},
+		ReproduceCommand:  reproduceCommand(storage.Root, corpusCase.Name, caseTimeout),
 		UnexpectedChanges: unexpected, OnboardingChanges: onboarding,
 		OutputTruncated: observation.Truncated, Contract: corpusCase,
 	}
@@ -237,7 +261,14 @@ func infrastructureFailure(err error) Result {
 	}
 }
 
-func caseFailure(source string, corpusCase Case, category string, err error) Result {
+func caseFailure(
+	source string,
+	corpusCase Case,
+	category string,
+	err error,
+	root string,
+	caseTimeout time.Duration,
+) Result {
 	verdict := "fail"
 	if source == "discovery" {
 		verdict = "finding"
@@ -248,9 +279,17 @@ func caseFailure(source string, corpusCase Case, category string, err error) Res
 		Verdict: verdict, Reason: SanitizeMessage(err.Error()), Argv: []string{},
 		Envelope: emptyEnvelope(), ProjectURL: corpusCase.URL,
 		CommitURL:         corpusCase.URL + "/commit/" + corpusCase.Commit,
-		ReproduceCommand:  []string{"scripts/corpus-scan.sh", "<ROOT>", "--case", corpusCase.Name},
+		ReproduceCommand:  reproduceCommand(root, corpusCase.Name, caseTimeout),
 		UnexpectedChanges: []string{}, OnboardingChanges: []string{}, Contract: corpusCase,
 	}
+}
+
+func reproduceCommand(root, caseName string, caseTimeout time.Duration) []string {
+	command := []string{"scripts/corpus-scan.sh", root, "--case", caseName}
+	if caseTimeout != DefaultCaseTimeout {
+		command = append(command, "--timeout", caseTimeout.String())
+	}
+	return command
 }
 
 func emptyEnvelope() ObservedEnvelope {

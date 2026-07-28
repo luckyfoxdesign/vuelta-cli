@@ -250,7 +250,10 @@ scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus
 scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --stable-only
 scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --case axios-npm-v3
 scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus \
-  --only-failed /absolute/path/to/vuelta-corpus/runs/RUN_ID/report.json
+  --case gperdomor-oss-pnpm-workspace --timeout 10m
+scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus \
+  --only-failed /absolute/path/to/vuelta-corpus/runs/RUN_ID/report.json \
+  --timeout 10m
 ```
 
 On Docker Desktop, point the wrapper at the explicit per-user socket when it
@@ -269,6 +272,14 @@ and filesystem mutations make the command fail; discovery findings do not.
 Before fetching a project, the harness performs one Docker/scanner preflight
 so a broken engine or exhausted network pool produces one infrastructure
 failure.
+
+Each selected scenario pass has a five-minute deadline by default. Use
+`--timeout DURATION` for an intentionally large diagnostic run, up to
+`24h`; zero, negative, malformed, and larger values are rejected before
+preflight. The override applies separately to every corpus pass. It does not
+bound the whole harness and does not replace stage-level deadlines inside the
+production scanner. Reports record the effective per-pass timeout, and
+reproduction commands retain non-default overrides.
 
 The storage layout is append-only:
 

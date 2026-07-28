@@ -17,11 +17,12 @@ import (
 const defaultManifestPath = "/src/acceptance/corpus.example.yaml"
 
 type scanOptions struct {
-	root       string
-	manifest   string
-	stableOnly bool
-	caseName   string
-	onlyFailed string
+	root        string
+	manifest    string
+	stableOnly  bool
+	caseName    string
+	onlyFailed  string
+	caseTimeout time.Duration
 }
 
 func main() {
@@ -34,7 +35,7 @@ func main() {
 
 func run(ctx context.Context, args []string) (int, error) {
 	if len(args) == 0 {
-		return 2, errors.New("usage: vuelta-corpus scan ROOT [--stable-only | --case NAME | --only-failed REPORT] | refresh ROOT")
+		return 2, errors.New("usage: vuelta-corpus scan ROOT [--stable-only | --case NAME | --only-failed REPORT] [--timeout DURATION] | refresh ROOT")
 	}
 	switch args[0] {
 	case "scan":
@@ -55,7 +56,10 @@ func run(ctx context.Context, args []string) (int, error) {
 }
 
 func parseScanOptions(args []string) (scanOptions, error) {
-	options := scanOptions{manifest: defaultManifestPath}
+	options := scanOptions{
+		manifest: defaultManifestPath, caseTimeout: corpus.DefaultCaseTimeout,
+	}
+	caseTimeoutSet := false
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
 		case "--stable-only":
@@ -72,6 +76,20 @@ func parseScanOptions(args []string) (scanOptions, error) {
 				return options, errors.New("--only-failed requires an absolute report path")
 			}
 			options.onlyFailed = args[index]
+		case "--timeout":
+			if caseTimeoutSet {
+				return options, errors.New("--timeout may be specified only once")
+			}
+			index++
+			if index >= len(args) || args[index] == "" {
+				return options, errors.New("--timeout requires DURATION")
+			}
+			caseTimeout, err := parseTimeout(args[index])
+			if err != nil {
+				return options, err
+			}
+			options.caseTimeout = caseTimeout
+			caseTimeoutSet = true
 		case "--manifest":
 			index++
 			if index >= len(args) || args[index] == "" {
@@ -101,6 +119,20 @@ func parseScanOptions(args []string) (scanOptions, error) {
 		return options, errors.New("--stable-only cannot be combined with a case filter")
 	}
 	return options, nil
+}
+
+func parseTimeout(value string) (time.Duration, error) {
+	caseTimeout, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("--timeout must be a valid Go duration: %w", err)
+	}
+	if caseTimeout <= 0 {
+		return 0, errors.New("--timeout must be positive")
+	}
+	if caseTimeout > corpus.MaxCaseTimeout {
+		return 0, fmt.Errorf("--timeout must not exceed %s", corpus.MaxCaseTimeout)
+	}
+	return caseTimeout, nil
 }
 
 func parseRefreshOptions(args []string) (scanOptions, error) {
@@ -174,7 +206,10 @@ func runScan(ctx context.Context, options scanOptions) (int, error) {
 	if !options.stableOnly && options.caseName == "" && options.onlyFailed == "" {
 		discovery, warnings = (corpus.GitHubClient{}).Discover(ctx)
 	}
-	return executeHarness(ctx, sourceRoot, options.root, manifestBytes, stable, manifest.Cases, discovery, warnings)
+	return executeHarness(
+		ctx, sourceRoot, options.root, manifestBytes, stable, manifest.Cases,
+		discovery, warnings, options.caseTimeout,
+	)
 }
 
 func runRefresh(ctx context.Context, options scanOptions) (int, error) {
@@ -199,6 +234,7 @@ func runRefresh(ctx context.Context, options scanOptions) (int, error) {
 	}
 	exit, reportDir, err := executeHarnessWithDir(
 		ctx, sourceRoot, options.root, manifestBytes, refreshed, refreshed, nil, nil,
+		corpus.DefaultCaseTimeout,
 	)
 	if err != nil {
 		return exit, err
@@ -220,9 +256,10 @@ func executeHarness(
 	manifest []byte,
 	stable, expectedStable, discovery []corpus.Case,
 	warnings []string,
+	caseTimeout time.Duration,
 ) (int, error) {
 	exit, _, err := executeHarnessWithDir(
-		ctx, sourceRoot, root, manifest, stable, expectedStable, discovery, warnings,
+		ctx, sourceRoot, root, manifest, stable, expectedStable, discovery, warnings, caseTimeout,
 	)
 	return exit, err
 }
@@ -233,6 +270,7 @@ func executeHarnessWithDir(
 	manifest []byte,
 	stable, expectedStable, discovery []corpus.Case,
 	warnings []string,
+	caseTimeout time.Duration,
 ) (int, string, error) {
 	socket := os.Getenv("VUELTA_CORPUS_DOCKER_SOCKET")
 	if socket == "" {
@@ -245,6 +283,7 @@ func executeHarnessWithDir(
 		Root: root, ManifestBytes: manifest, Stable: stable, ExpectedStable: expectedStable,
 		Discovery:   discovery,
 		AppRevision: corpus.SourceRevision(ctx, sourceRoot), Now: time.Now(), Warnings: warnings,
+		CaseTimeout: caseTimeout,
 	})
 	if err != nil {
 		return exit, reportDir, err

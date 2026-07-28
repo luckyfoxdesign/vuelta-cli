@@ -26,6 +26,7 @@ type Report struct {
 	FinishedAt    time.Time   `json:"finished_at"`
 	AppRevision   string      `json:"app_revision"`
 	ManifestHash  string      `json:"manifest_hash"`
+	CaseTimeout   string      `json:"case_timeout"`
 	Environment   Environment `json:"environment"`
 	Summary       Summary     `json:"summary"`
 	Warnings      []string    `json:"warnings"`
@@ -422,7 +423,11 @@ func classifyObserved(exitCode int, envelope ObservedEnvelope, expectation Expec
 			return "output-too-large", "Vuelta output exceeded 5 MiB", false
 		}
 		if errors.Is(runErr, ErrTimeout) {
-			return "timeout", "scan exceeded 5 minutes", false
+			var timeoutErr *TimeoutError
+			if errors.As(runErr, &timeoutErr) && timeoutErr.Duration > 0 {
+				return "timeout", fmt.Sprintf("scan exceeded case timeout of %s", timeoutErr.Duration), false
+			}
+			return "timeout", "scan exceeded its case timeout", false
 		}
 		if errors.Is(runErr, ErrInvalidJSON) {
 			return "invalid-json", "Vuelta returned invalid JSON", false
@@ -739,7 +744,8 @@ func RenderMarkdown(report Report) string {
 	var output strings.Builder
 	fmt.Fprintf(&output, "# Vuelta Corpus Run %s\n\n", markdown(report.RunID))
 	fmt.Fprintf(&output, "- Stable: %d passed, %d failed\n", report.Summary.StablePassed, report.Summary.StableFailed)
-	fmt.Fprintf(&output, "- Discovery: %d passed, %d findings\n\n", report.Summary.DiscoveryPassed, report.Summary.DiscoveryFindings)
+	fmt.Fprintf(&output, "- Discovery: %d passed, %d findings\n", report.Summary.DiscoveryPassed, report.Summary.DiscoveryFindings)
+	fmt.Fprintf(&output, "- Case timeout per pass: %s\n\n", reportCaseTimeout(report))
 	output.WriteString("## Warnings\n\n")
 	if len(report.Warnings) == 0 {
 		output.WriteString("None.\n")
@@ -801,6 +807,14 @@ func RenderMarkdown(report Report) string {
 		fmt.Fprintf(&output, "- More than 2× slower: %s\n", markdown(strings.Join(report.Comparison.Slower, ", ")))
 	}
 	return output.String()
+}
+
+func reportCaseTimeout(report Report) time.Duration {
+	caseTimeout, err := time.ParseDuration(report.CaseTimeout)
+	if err != nil || caseTimeout <= 0 {
+		return DefaultCaseTimeout
+	}
+	return caseTimeout
 }
 
 func writeMarkdownResult(output *strings.Builder, result Result) {

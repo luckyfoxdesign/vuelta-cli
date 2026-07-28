@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus [--stable-only | --case NAME | --only-failed /absolute/path/to/report.json]" >&2
+  echo "usage: scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus [--stable-only | --case NAME | --only-failed /absolute/path/to/report.json] [--timeout DURATION]" >&2
   exit 2
 fi
 

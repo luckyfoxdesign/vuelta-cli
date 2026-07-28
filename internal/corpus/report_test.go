@@ -271,7 +271,7 @@ func TestSanitizeAndRenderMarkdown(t *testing.T) {
 		t.Fatalf("SanitizeMessage() = %q", value)
 	}
 	report := Report{
-		RunID: "run", Results: []Result{{
+		RunID: "run", CaseTimeout: (10 * time.Minute).String(), Results: []Result{{
 			Source: "stable", Name: "a|b", Scenario: "default", Pass: 1,
 			ExitCode: intPointer(1), Verdict: "fail", Reason: "`bad`",
 		}},
@@ -279,6 +279,21 @@ func TestSanitizeAndRenderMarkdown(t *testing.T) {
 	markdown := RenderMarkdown(report)
 	if strings.Contains(markdown, "| [a|b]") || strings.Contains(markdown, "| `bad` |") {
 		t.Fatalf("RenderMarkdown() did not escape cells:\n%s", markdown)
+	}
+	if !strings.Contains(markdown, "- Case timeout per pass: 10m0s") {
+		t.Fatalf("RenderMarkdown() omitted effective timeout:\n%s", markdown)
+	}
+}
+
+func TestClassifyTimeoutUsesEffectiveDuration(t *testing.T) {
+	t.Parallel()
+	category, verdict, reason := Classify(
+		"stable", 0, ObservedEnvelope{}, Expectation{},
+		&TimeoutError{Duration: 10 * time.Minute},
+	)
+	if category != "timeout" || verdict != "fail" ||
+		reason != "scan exceeded case timeout of 10m0s" {
+		t.Fatalf("Classify() = %q, %q, %q", category, verdict, reason)
 	}
 }
 
