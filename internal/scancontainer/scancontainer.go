@@ -45,13 +45,17 @@ type Request struct {
 	// TrivyDBVolume is a Vuelta-owned Docker volume containing only Trivy's
 	// verified vulnerability database. It is never derived from project input
 	// and is mounted below the otherwise ephemeral /tmp cache.
-	TrivyDBVolume   string
-	TrivyDBReadOnly bool
-	Memory          string
-	Tmpfs           string
-	Stdout          dockerexec.Capture
-	Stderr          dockerexec.Capture
-	Combined        dockerexec.Capture
+	TrivyDBVolume string
+	// TrivyDBInitialize prepares the managed cache for the non-root scanner
+	// before a database download. Trivy needs the cache mount writable even
+	// with --skip-db-update because it opens the SQLite database with writable
+	// compatibility state.
+	TrivyDBInitialize bool
+	Memory            string
+	Tmpfs             string
+	Stdout            dockerexec.Capture
+	Stderr            dockerexec.Capture
+	Combined          dockerexec.Capture
 }
 
 // Runner owns the create/copy/start/remove lifecycle. Tests inject Docker and
@@ -78,6 +82,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 		return dockerexec.Result{}, err
 	}
 	loaderName := name + "-loader"
+	databaseInitializerName := name + "-db-init"
 	imageName := "vuelta-scan-input:" + strings.TrimPrefix(name, "vuelta-scan-")
 	loaderCreated := false
 	imageCreated := false
@@ -115,12 +120,6 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	if request.Platform != "" {
 		loaderArgs = append(loaderArgs, "--platform", request.Platform)
 	}
-	if request.TrivyDBVolume != "" && !request.TrivyDBReadOnly {
-		loaderArgs = append(
-			loaderArgs,
-			"--mount", "type=volume,src="+request.TrivyDBVolume+",dst=/tmp/trivy/db",
-		)
-	}
 	loaderArgs = append(loaderArgs, request.Image)
 	if _, err := docker.Run(ctx, dockerexec.Request{
 		// Docker may fetch the exact digest before this stopped loader exists;
@@ -132,22 +131,24 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 		return dockerexec.Result{}, fmt.Errorf("create stopped scanner input loader: %w", err)
 	}
 	loaderCreated = true
+	if request.Tool == "trivy" && exactDigest.MatchString(request.Image) {
+		cacheTag := trivyScannerCacheTag(request.Image)
+		if _, err := docker.Run(ctx, dockerexec.Request{
+			Args:   []string{"image", "tag", request.Image, cacheTag},
+			Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+		}); err != nil {
+			return dockerexec.Result{}, fmt.Errorf("retain pinned Trivy scanner image: %w", err)
+		}
+	}
 	if _, err := docker.Run(ctx, dockerexec.Request{
 		Args: []string{"cp", "-a", "-", loaderName + ":/"}, Stdin: bytes.NewReader(request.Archive),
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	}); err != nil {
 		return dockerexec.Result{}, fmt.Errorf("copy scanner input archive: %w", err)
 	}
-	if request.TrivyDBVolume != "" && !request.TrivyDBReadOnly {
-		databaseArchive, archiveErr := trivyDatabaseDirectoryArchive()
-		if archiveErr != nil {
-			return dockerexec.Result{}, archiveErr
-		}
-		if _, err := docker.Run(ctx, dockerexec.Request{
-			Args: []string{"cp", "-a", "-", loaderName + ":/"}, Stdin: bytes.NewReader(databaseArchive),
-			Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
-		}); err != nil {
-			return dockerexec.Result{}, fmt.Errorf("initialize Trivy database cache permissions: %w", err)
+	if request.TrivyDBInitialize {
+		if err := initializeTrivyDatabaseVolume(ctx, docker, databaseInitializerName, request); err != nil {
+			return dockerexec.Result{}, err
 		}
 	}
 	commitResult, err := docker.Run(ctx, dockerexec.Request{
@@ -192,6 +193,102 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	return result, nil
 }
 
+func trivyScannerCacheTag(image string) string {
+	const digestMarker = "@sha256:"
+	index := strings.LastIndex(image, digestMarker)
+	digest := image[index+len(digestMarker):]
+	return "vuelta-scanner-cache:trivy-" + digest
+}
+
+func initializeTrivyDatabaseVolume(
+	ctx context.Context,
+	docker dockerexec.Runner,
+	name string,
+	request Request,
+) error {
+	if err := runTrivyDatabaseInitializer(
+		ctx,
+		docker,
+		name,
+		request,
+		"0:0",
+		"CHOWN",
+		"/bin/chown",
+		"-R",
+		"65532:65532",
+		"/tmp/trivy/db",
+	); err != nil {
+		return fmt.Errorf("set Trivy database cache ownership: %w", err)
+	}
+	if err := runTrivyDatabaseInitializer(
+		ctx,
+		docker,
+		name,
+		request,
+		"65532:65532",
+		"",
+		"/bin/chmod",
+		"0700",
+		"/tmp/trivy/db",
+	); err != nil {
+		return fmt.Errorf("set Trivy database cache mode: %w", err)
+	}
+	return nil
+}
+
+func runTrivyDatabaseInitializer(
+	ctx context.Context,
+	docker dockerexec.Runner,
+	name string,
+	request Request,
+	user string,
+	capability string,
+	entrypoint string,
+	command ...string,
+) (err error) {
+	args := []string{
+		"create", "--name", name, "--pull", "never",
+		"--network", "none",
+		"--read-only",
+		"--security-opt", "no-new-privileges",
+		"--cap-drop", "ALL",
+		"--cpus", "0.25",
+		"--memory", "32m",
+		"--pids-limit", "16",
+		"--user", user,
+		"--mount", "type=volume,src=" + request.TrivyDBVolume + ",dst=/tmp/trivy/db",
+		"--entrypoint", entrypoint,
+	}
+	if capability != "" {
+		args = append(args, "--cap-add", capability)
+	}
+	if request.Platform != "" {
+		args = append(args, "--platform", request.Platform)
+	}
+	args = append(args, request.Image)
+	args = append(args, command...)
+	if _, err := docker.Run(ctx, dockerexec.Request{
+		Args: args, Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
+	}); err != nil {
+		return fmt.Errorf("create Trivy database cache initializer: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		if _, cleanupErr := docker.Run(cleanupCtx, dockerexec.Request{
+			Args: []string{"rm", "-f", name}, Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+		}); cleanupErr != nil {
+			err = errors.Join(err, errors.New("remove Trivy database cache initializer"))
+		}
+	}()
+	if _, err := docker.Run(ctx, dockerexec.Request{
+		Args: []string{"start", "-a", name}, Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
+	}); err != nil {
+		return fmt.Errorf("start Trivy database cache initializer: %w", err)
+	}
+	return nil
+}
+
 func (r Runner) newName() (string, error) {
 	if r.NewName != nil {
 		name, err := r.NewName()
@@ -227,8 +324,8 @@ func validateRequest(request Request) error {
 	if request.TrivyDBVolume != "" && (request.Tool != "trivy" || !trivyDBVolume.MatchString(request.TrivyDBVolume)) {
 		return errors.New("trivy database volume is not a Vuelta-owned cache name")
 	}
-	if request.TrivyDBReadOnly && request.TrivyDBVolume == "" {
-		return errors.New("read-only Trivy database cache requires a volume")
+	if request.TrivyDBInitialize && request.TrivyDBVolume == "" {
+		return errors.New("trivy database cache initialization requires a volume")
 	}
 	if request.User != "" && !containerUser.MatchString(request.User) {
 		return errors.New("scanner user must be an explicit non-root numeric uid:gid")
@@ -287,21 +384,6 @@ func validateArchive(data []byte) error {
 	return nil
 }
 
-func trivyDatabaseDirectoryArchive() ([]byte, error) {
-	var buffer bytes.Buffer
-	writer := tar.NewWriter(&buffer)
-	if err := writer.WriteHeader(&tar.Header{
-		Name: "tmp/trivy/db/", Typeflag: tar.TypeDir, Mode: 0o700,
-		Uid: 65532, Gid: 65532,
-	}); err != nil {
-		return nil, fmt.Errorf("build Trivy database cache initializer: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("finish Trivy database cache initializer: %w", err)
-	}
-	return buffer.Bytes(), nil
-}
-
 func createArgs(name, image string, request Request) []string {
 	proxy := request.Proxy
 	user := request.User
@@ -337,9 +419,6 @@ func createArgs(name, image string, request Request) []string {
 		)
 		if request.TrivyDBVolume != "" {
 			mount := "type=volume,src=" + request.TrivyDBVolume + ",dst=/tmp/trivy/db"
-			if request.TrivyDBReadOnly {
-				mount += ",readonly"
-			}
 			args = append(args, "--mount", mount)
 		}
 	}

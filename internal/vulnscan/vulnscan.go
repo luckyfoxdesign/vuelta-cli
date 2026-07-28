@@ -174,7 +174,7 @@ func (s Scanner) commandWithDatabase(
 	image string,
 	egressConfig config.EgressConfig,
 	databaseVolume string,
-	databaseReadOnly bool,
+	initializeDatabase bool,
 	name string,
 	args ...string,
 ) ([]byte, error) {
@@ -192,7 +192,7 @@ func (s Scanner) commandWithDatabase(
 	}
 	return dockerCommandWithDatabase(
 		ctx, docker, bundle, image, egressConfig,
-		databaseVolume, databaseReadOnly, name, args...,
+		databaseVolume, initializeDatabase, name, args...,
 	)
 }
 
@@ -213,7 +213,7 @@ func dockerCommandWithDatabase(
 	image string,
 	egressConfig config.EgressConfig,
 	databaseVolume string,
-	databaseReadOnly bool,
+	initializeDatabase bool,
 	name string,
 	args ...string,
 ) ([]byte, error) {
@@ -230,7 +230,7 @@ func dockerCommandWithDatabase(
 	}
 	result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
 		Image: image, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL, Tool: toolEnvironment,
-		TrivyDBVolume: databaseVolume, TrivyDBReadOnly: databaseReadOnly,
+		TrivyDBVolume: databaseVolume, TrivyDBInitialize: initializeDatabase,
 		Memory: "2g", Tmpfs: "2g",
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: scannerStdoutMaxBytes},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: scannerStderrTailBytes},
@@ -300,7 +300,7 @@ func (s Scanner) trivyCommand(
 		scanArgs = append(scanArgs, "--skip-db-update")
 	}
 	output, err := s.commandWithDatabase(
-		ctx, bundle, image, egressConfig, volume, true,
+		ctx, bundle, image, egressConfig, volume, false,
 		"trivy", scanArgs...,
 	)
 	if err != nil && isTrivyDatabaseRuntimeFailure(err) {

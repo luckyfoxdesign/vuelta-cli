@@ -156,7 +156,7 @@ func (s Scanner) ensureTrivyDatabase(
 	var lastErr error
 	for attempt := 1; attempt <= trivyDatabaseAttempts; attempt++ {
 		_, acquireErr := s.commandWithDatabase(
-			ctx, bundle, image, egressConfig, volume, false,
+			ctx, bundle, image, egressConfig, volume, true,
 			"trivy", "image", "--download-db-only", "--no-progress",
 		)
 		if acquireErr == nil {
@@ -208,7 +208,7 @@ func (s Scanner) probeTrivyDatabase(
 	maxAgeHours int,
 ) (time.Time, error) {
 	output, err := s.commandWithDatabase(
-		ctx, bundle, image, egressConfig, volume, true,
+		ctx, bundle, image, egressConfig, volume, false,
 		"trivy", "version", "--format", "json",
 	)
 	if err != nil {

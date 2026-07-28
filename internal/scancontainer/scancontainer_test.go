@@ -133,12 +133,11 @@ func TestRunUsesProfileDeclaredNonRootUser(t *testing.T) {
 	}
 }
 
-func TestRunMountsOnlyAllowlistedTrivyDatabaseVolume(t *testing.T) {
+func TestRunMountsAllowlistedTrivyDatabaseVolumeWritableForSQLite(t *testing.T) {
 	docker := &fakeDocker{}
 	request := validRequest(t)
 	request.Tool = "trivy"
 	request.TrivyDBVolume = "vuelta-trivy-db-0123456789abcdef"
-	request.TrivyDBReadOnly = true
 	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-trivy-cache", nil }}
 	if _, err := runner.Run(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -157,7 +156,7 @@ func TestRunMountsOnlyAllowlistedTrivyDatabaseVolume(t *testing.T) {
 	for _, required := range []string{
 		"TRIVY_CACHE_DIR=/tmp/trivy",
 		"TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
-		"type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db,readonly",
+		"type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db",
 	} {
 		if !strings.Contains(create, required) {
 			t.Fatalf("Trivy create args missing %q: %s", required, create)
@@ -166,6 +165,22 @@ func TestRunMountsOnlyAllowlistedTrivyDatabaseVolume(t *testing.T) {
 	if strings.Contains(create, "type=bind") {
 		t.Fatalf("Trivy database cache exposed a host path: %s", create)
 	}
+	if strings.Contains(create, "dst=/tmp/trivy/db,readonly") {
+		t.Fatalf("Trivy database cache is read-only despite SQLite compatibility writes: %s", create)
+	}
+	var cacheTag string
+	for _, dockerRequest := range docker.requests {
+		if len(dockerRequest.Args) == 4 &&
+			dockerRequest.Args[0] == "image" &&
+			dockerRequest.Args[1] == "tag" {
+			cacheTag = strings.Join(dockerRequest.Args, " ")
+			break
+		}
+	}
+	wantCacheTag := "image tag " + request.Image + " vuelta-scanner-cache:trivy-" + strings.Repeat("a", 64)
+	if cacheTag != wantCacheTag {
+		t.Fatalf("Trivy scanner cache tag = %q, want %q", cacheTag, wantCacheTag)
+	}
 }
 
 func TestRunInitializesWritableTrivyDatabaseVolumeWithoutExecutingLoader(t *testing.T) {
@@ -173,29 +188,89 @@ func TestRunInitializesWritableTrivyDatabaseVolumeWithoutExecutingLoader(t *test
 	request := validRequest(t)
 	request.Tool = "trivy"
 	request.TrivyDBVolume = "vuelta-trivy-db-0123456789abcdef"
+	request.TrivyDBInitialize = true
 	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-trivy-acquire", nil }}
 	if _, err := runner.Run(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	loader := strings.Join(docker.requests[0].Args, " ")
 	if !strings.Contains(loader, "--network none") ||
-		!strings.Contains(loader, "type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db") {
-		t.Fatalf("writable acquisition loader did not initialize the managed volume: %s", loader)
+		strings.Contains(loader, "type=volume,src=vuelta-trivy-db-0123456789abcdef") {
+		t.Fatalf("stopped input loader unexpectedly owns database initialization: %s", loader)
 	}
-	if len(docker.requests) < 3 || docker.requests[2].Stdin == nil {
-		t.Fatal("trusted database cache initializer was not copied")
+	commands := make([]string, 0, len(docker.requests))
+	for _, dockerRequest := range docker.requests {
+		commands = append(commands, dockerRequest.Args[0])
 	}
-	initializer, err := io.ReadAll(docker.requests[2].Stdin)
-	if err != nil {
+	if !reflect.DeepEqual(commands, []string{
+		"create", "image", "cp", "create", "start", "rm", "create", "start", "rm",
+		"commit", "rm", "create", "start", "rm", "image",
+	}) {
+		t.Fatalf("writable Trivy lifecycle = %v", commands)
+	}
+}
+
+func TestInitializeTrivyDatabaseVolumeUsesStartedHardenedContainers(t *testing.T) {
+	docker := &fakeDocker{}
+	request := validRequest(t)
+	request.Tool = "trivy"
+	request.TrivyDBVolume = "vuelta-trivy-db-0123456789abcdef"
+	if err := initializeTrivyDatabaseVolume(
+		context.Background(),
+		docker,
+		"vuelta-scan-trivy-db-init",
+		request,
+	); err != nil {
 		t.Fatal(err)
 	}
-	reader := tar.NewReader(bytes.NewReader(initializer))
-	header, err := reader.Next()
-	if err != nil {
-		t.Fatal(err)
+	if len(docker.requests) != 6 {
+		t.Fatalf("initializer Docker calls = %d, want 6", len(docker.requests))
 	}
-	if header.Name != "tmp/trivy/db/" || header.Uid != 65532 || header.Gid != 65532 || header.Mode != 0o700 {
-		t.Fatalf("database initializer header = %#v", header)
+	chownCreate := strings.Join(docker.requests[0].Args, " ")
+	for _, required := range []string{
+		"--pull never",
+		"--network none",
+		"--read-only",
+		"--security-opt no-new-privileges",
+		"--cap-drop ALL",
+		"--cap-add CHOWN",
+		"--user 0:0",
+		"type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db",
+		"--entrypoint /bin/chown",
+		"-R 65532:65532 /tmp/trivy/db",
+	} {
+		if !strings.Contains(chownCreate, required) {
+			t.Fatalf("ownership initializer create args missing %q: %s", required, chownCreate)
+		}
+	}
+	if strings.Contains(chownCreate, "type=bind") {
+		t.Fatalf("ownership initializer exposed a host path: %s", chownCreate)
+	}
+	if got := strings.Join(docker.requests[1].Args, " "); got != "start -a vuelta-scan-trivy-db-init" {
+		t.Fatalf("ownership initializer start = %q", got)
+	}
+	if got := strings.Join(docker.requests[2].Args, " "); got != "rm -f vuelta-scan-trivy-db-init" {
+		t.Fatalf("ownership initializer cleanup = %q", got)
+	}
+	chmodCreate := strings.Join(docker.requests[3].Args, " ")
+	for _, required := range []string{
+		"--cap-drop ALL",
+		"--user 65532:65532",
+		"--entrypoint /bin/chmod",
+		"0700 /tmp/trivy/db",
+	} {
+		if !strings.Contains(chmodCreate, required) {
+			t.Fatalf("mode initializer create args missing %q: %s", required, chmodCreate)
+		}
+	}
+	if strings.Contains(chmodCreate, "--cap-add") {
+		t.Fatalf("mode initializer unexpectedly gained a capability: %s", chmodCreate)
+	}
+	if got := strings.Join(docker.requests[4].Args, " "); got != "start -a vuelta-scan-trivy-db-init" {
+		t.Fatalf("mode initializer start = %q", got)
+	}
+	if got := strings.Join(docker.requests[5].Args, " "); got != "rm -f vuelta-scan-trivy-db-init" {
+		t.Fatalf("mode initializer cleanup = %q", got)
 	}
 }
 
