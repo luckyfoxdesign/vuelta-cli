@@ -126,7 +126,12 @@ const (
 	stageReport        = "report"
 )
 
-const reasonLockfileMissing = "lockfile_missing"
+const (
+	reasonLockfileMissing       = "lockfile_missing"
+	defaultCandidateScanTimeout = 2 * time.Minute
+)
+
+var errCandidateScanDeadline = errors.New("candidate scan deadline exceeded")
 
 // scanStageResult reports one independent scan stage so a failure in one
 // stage never hides the outcome of another.
@@ -723,6 +728,7 @@ type scanStageRunners struct {
 	alerts           func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
+	candidateTimeout time.Duration
 }
 
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
@@ -923,7 +929,23 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		err = target.dockerErr
 	} else {
 		progress.start(scanPhaseMessage(options, target, packageProgressMessage(identityWorkspace.PackageManager)))
-		candidates, manager, verified, err = runners.packages(ctx, cfg, target, options, policy, minAge)
+		timeout := runners.candidateTimeout
+		if timeout <= 0 {
+			timeout = defaultCandidateScanTimeout
+		}
+		candidateCtx, cancelCandidate := context.WithTimeoutCause(ctx, timeout, errCandidateScanDeadline)
+		candidates, manager, verified, err = runners.packages(candidateCtx, cfg, target, options, policy, minAge)
+		deadlineCause := context.Cause(candidateCtx)
+		cancelCandidate()
+		if errors.Is(deadlineCause, errCandidateScanDeadline) {
+			if manager == "" {
+				manager = packageToolName(identityWorkspace)
+			}
+			err = &ecosystem.CandidateError{
+				Kind: ecosystem.CandidateFailureTimeout, Manager: manager,
+				ExitCode: -1, Deadline: timeout, Err: context.DeadlineExceeded,
+			}
+		}
 		progress.stop()
 	}
 	result.Diagnostics = append(result.Diagnostics, packageDiagnostics...)
@@ -1756,6 +1778,8 @@ func scanFailureContract(code, hint string, err error) (string, string) {
 	var candidateErr *ecosystem.CandidateError
 	if errors.As(err, &candidateErr) {
 		switch candidateErr.Kind {
+		case ecosystem.CandidateFailureTimeout:
+			return "package_scan_timeout", "Retry the candidate scan; if it repeats, review package-manager memory use and bounded registry diagnostics"
 		case ecosystem.CandidateFailureManager:
 			return "package_manager_failure", "Review the bounded package-manager stderr diagnostic and registry availability"
 		case ecosystem.CandidateFailureNonJSON:

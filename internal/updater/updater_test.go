@@ -197,7 +197,7 @@ func TestPackageScannerReceivesOnlyMinimalBundle(t *testing.T) {
 	}
 	scanner := packageScanner{
 		Kind: "npm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
-		Run: func(_ context.Context, _ string, _ []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error) {
+		Run: func(_ context.Context, _ string, _ []string, bundle scaninput.Bundle, _ string) (ReadOnlyScanOutput, error) {
 			if _, ok := bundle.Content("package.json"); !ok {
 				t.Fatal("package manifest missing from minimal bundle")
 			}
@@ -232,7 +232,7 @@ func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
 	scanner := packageScanner{
 		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
 		AcceptedExitCodes: []int{1},
-		Run: func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+		Run: func(context.Context, string, []string, scaninput.Bundle, string) (ReadOnlyScanOutput, error) {
 			return ReadOnlyScanOutput{
 				Stdout: `{"lodash":{"latest":"4.18.1","wanted":"4.17.20","dependencyType":"dependencies"}}`,
 				Stderr: "pnpm notice: update available",
@@ -243,7 +243,7 @@ func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
 	if err != nil || len(candidates) != 1 || candidates[0].Name != "lodash" || candidates[0].Target != "4.18.1" {
 		t.Fatalf("Scan() = %#v, %v", candidates, err)
 	}
-	scanner.Run = func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+	scanner.Run = func(context.Context, string, []string, scaninput.Bundle, string) (ReadOnlyScanOutput, error) {
 		return ReadOnlyScanOutput{Stdout: `not-json`}, fakeExitCode(1)
 	}
 	if _, err := scanner.Scan(context.Background(), root); err == nil || !strings.Contains(err.Error(), "parse pnpm") {
@@ -262,7 +262,7 @@ func TestPNPMScannerReturnsBoundedTypedManagerFailure(t *testing.T) {
 	scanner := packageScanner{
 		Kind: "pnpm", Image: "node@sha256:" + strings.Repeat("a", 64), Contract: contract,
 		AcceptedExitCodes: []int{1},
-		Run: func(context.Context, string, []string, scaninput.Bundle) (ReadOnlyScanOutput, error) {
+		Run: func(context.Context, string, []string, scaninput.Bundle, string) (ReadOnlyScanOutput, error) {
 			return ReadOnlyScanOutput{
 				Stdout: "arbitrary project output is not diagnostic input",
 				Stderr: "FIRST token=fixture-value " + strings.Repeat("x", 2048) + " LAST",

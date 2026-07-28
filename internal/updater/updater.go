@@ -27,6 +27,7 @@ const (
 	discoveryOutputMaxBytes = 8 << 20
 	discoveryErrorBytes     = 16 << 10
 	applyOutputTailBytes    = 128 << 10
+	defaultDiscoveryMemory  = "1g"
 )
 
 // Updater updates dependency versions for a single project.
@@ -48,7 +49,7 @@ type ReadOnlyScanOutput struct {
 
 // ReadOnlyDockerRunner executes discovery against an in-memory minimal input
 // archive rather than a host directory mount.
-type ReadOnlyDockerRunner func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error)
+type ReadOnlyDockerRunner func(ctx context.Context, image string, args []string, bundle scaninput.Bundle, memory string) (ReadOnlyScanOutput, error)
 
 // ErrEgressPolicyUnavailable is returned when the registry allowlist policy
 // required for an update container has not been configured. The runner must
@@ -130,7 +131,7 @@ func NewReadOnlyDockerRunnerForProfile(egressConfig config.EgressConfig, user, p
 // NewReadOnlyDockerRunnerWithProfile returns a discovery runner with explicit
 // profile execution constraints.
 func NewReadOnlyDockerRunnerWithProfile(docker dockerexec.Runner, egressConfig config.EgressConfig, user, platform string) ReadOnlyDockerRunner {
-	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle) (ReadOnlyScanOutput, error) {
+	return func(ctx context.Context, image string, args []string, bundle scaninput.Bundle, memory string) (ReadOnlyScanOutput, error) {
 		network, proxyURL, err := egress.ResolveWith(ctx, egressConfig, docker)
 		if err != nil {
 			return ReadOnlyScanOutput{}, err
@@ -138,9 +139,12 @@ func NewReadOnlyDockerRunnerWithProfile(docker dockerexec.Runner, egressConfig c
 		if err := ctx.Err(); err != nil {
 			return ReadOnlyScanOutput{}, err
 		}
+		if memory == "" {
+			memory = defaultDiscoveryMemory
+		}
 		result, err := (scancontainer.Runner{Docker: docker}).Run(ctx, scancontainer.Request{
 			Image: image, Platform: platform, User: user, Args: args, Archive: bundle.Archive, Network: network, Proxy: proxyURL,
-			Memory: "1g", Tmpfs: "64m",
+			Memory: memory, Tmpfs: "64m",
 			Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: discoveryOutputMaxBytes},
 			Stderr: dockerexec.Capture{Mode: dockerexec.Excerpt, Bytes: discoveryErrorBytes},
 		})

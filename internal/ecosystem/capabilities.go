@@ -141,6 +141,7 @@ type ScannerSpec struct {
 	Decoder           string
 	AcceptedExitCodes []int
 	ReleaseAge        bool
+	Memory            string
 	LegacyImageKey    string
 	LegacyToolKey     string
 }

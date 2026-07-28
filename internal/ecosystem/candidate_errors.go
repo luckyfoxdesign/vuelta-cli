@@ -3,6 +3,7 @@ package ecosystem
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // CandidateFailureKind is a stable machine-readable candidate scan failure.
@@ -13,6 +14,7 @@ const (
 	CandidateFailureTruncatedJSON  CandidateFailureKind = "truncated_json"
 	CandidateFailureSchemaMismatch CandidateFailureKind = "schema_mismatch"
 	CandidateFailureManager        CandidateFailureKind = "package_manager_failure"
+	CandidateFailureTimeout        CandidateFailureKind = "package_scan_timeout"
 )
 
 // CandidateError distinguishes scanner execution failures from structured
@@ -22,11 +24,17 @@ type CandidateError struct {
 	Manager  string
 	ExitCode int
 	Detail   string
+	Deadline time.Duration
 	Err      error
 }
 
 func (e *CandidateError) Error() string {
 	switch e.Kind {
+	case CandidateFailureTimeout:
+		if e.Deadline > 0 {
+			return fmt.Sprintf("%s candidate command exceeded deadline of %s", e.Manager, e.Deadline)
+		}
+		return fmt.Sprintf("%s candidate command exceeded its deadline", e.Manager)
 	case CandidateFailureManager:
 		if e.ExitCode >= 0 {
 			return fmt.Sprintf("%s candidate command failed with exit code %d", e.Manager, e.ExitCode)

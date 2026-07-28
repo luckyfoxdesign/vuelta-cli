@@ -141,6 +141,7 @@ func ResolveCandidateScannerWithOptions(ws config.Workspace, cfg config.Config, 
 			}
 			scanners = append(scanners, packageScanner{
 				Kind: spec.Kind, Image: image, Args: spec.Args, AcceptedExitCodes: spec.AcceptedExitCodes,
+				Memory: spec.Memory,
 				Decode: adapter.(ecosystem.CandidateDecoder),
 				Run:    run, Contract: packageContract, RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
 			})
@@ -185,6 +186,7 @@ func profilePackageScanner(profile config.ToolchainProfile, cfg config.Config, w
 	}
 	return packageScanner{
 		Kind: spec.Kind, Image: profile.Image, Args: spec.Args, AcceptedExitCodes: spec.AcceptedExitCodes,
+		Memory: spec.Memory,
 		Decode: adapter.(ecosystem.CandidateDecoder),
 		Run:    NewReadOnlyDockerRunnerForProfile(cfg.Update.Egress, profile.User, profile.Platform), Contract: contract,
 		RepositoryRoot: ws.Path, RequireTracked: options.RequireTracked,
@@ -267,6 +269,7 @@ type packageScanner struct {
 	Kind, Image       string
 	Args              []string
 	AcceptedExitCodes []int
+	Memory            string
 	Decode            ecosystem.CandidateDecoder
 	Run               ReadOnlyDockerRunner
 	Contract          scaninput.Contract
@@ -289,7 +292,7 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 		return CandidateReport{}, err
 	}
 	defer bundle.Destroy()
-	output, err := s.Run(ctx, s.Image, s.Args, bundle)
+	output, err := s.Run(ctx, s.Image, s.Args, bundle, s.Memory)
 	if err != nil && !acceptedDiscoveryExit(s.AcceptedExitCodes, err) {
 		exitCode := -1
 		var exit exitCoder

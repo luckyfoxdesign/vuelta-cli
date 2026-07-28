@@ -82,6 +82,20 @@ func TestPNPMVersionPolicyNormalizesCorepackIntegrity(t *testing.T) {
 	}
 }
 
+func TestPNPMCandidateScannerHasBoundedWorkingMemory(t *testing.T) {
+	t.Parallel()
+	spec, err := PNPM().(ecosystem.ScannerProvider).Scanner(ecosystem.ScannerRequest{
+		ProfileScanner: "pnpm", ScannerVersion: "11.8.0", InstalledTool: true,
+		MinReleaseAgeDays: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Memory != "2g" {
+		t.Fatalf("pnpm scanner memory = %q, want 2g", spec.Memory)
+	}
+}
+
 func pnpmInputs(version, lockVersion string) map[string][]byte {
 	return map[string][]byte{
 		"package.json":   []byte(fmt.Sprintf(`{"packageManager":"pnpm@%s"}`, version)),

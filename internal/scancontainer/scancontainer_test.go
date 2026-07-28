@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/runlease"
@@ -17,6 +18,7 @@ import (
 type fakeDocker struct {
 	requests     []dockerexec.Request
 	failAt       string
+	blockAt      string
 	commitOutput string
 	result       dockerexec.Result
 }
@@ -35,6 +37,10 @@ func (f *fakeDocker) Run(ctx context.Context, request dockerexec.Request) (docke
 		request.Stdin = bytes.NewReader(data)
 	}
 	f.requests = append(f.requests, request)
+	if request.Args[0] == f.blockAt {
+		<-ctx.Done()
+		return dockerexec.Result{}, ctx.Err()
+	}
 	if request.Args[0] == f.failAt {
 		return dockerexec.Result{}, errors.New("injected Docker failure")
 	}
@@ -415,6 +421,29 @@ func TestRunUsesIndependentCleanupAfterCancellation(t *testing.T) {
 	}
 	if len(docker.requests) != 0 {
 		t.Fatalf("canceled create unexpectedly removed an unowned resource: %#v", docker.requests)
+	}
+}
+
+func TestRunCancellationStopsAttachAndCleansOnlyOwnedResources(t *testing.T) {
+	docker := &fakeDocker{blockAt: "start"}
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-blocked", nil }}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := runner.Run(ctx, validRequest(t))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run error = %v, want deadline exceeded", err)
+	}
+	commands := make([]string, 0, len(docker.requests))
+	for _, request := range docker.requests {
+		commands = append(commands, request.Args[0])
+	}
+	want := []string{"create", "cp", "commit", "rm", "create", "start", "rm", "image"}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("Docker lifecycle after attach cancellation = %v, want %v", commands, want)
+	}
+	removeFinal := docker.requests[len(docker.requests)-2].Args
+	if !reflect.DeepEqual(removeFinal, []string{"rm", "-f", "vuelta-scan-blocked"}) {
+		t.Fatalf("final cleanup targeted unexpected resource: %v", removeFinal)
 	}
 }
 

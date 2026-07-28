@@ -379,6 +379,70 @@ func TestScanStagesContinueAfterIndependentFailures(t *testing.T) {
 	}
 }
 
+func TestCandidateDeadlinePreservesVulnerabilitiesAndNextScanSucceeds(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"package.json":   `{"packageManager":"pnpm@11.8.0"}`,
+		"pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace := config.Workspace{
+		Name: "blocked-pnpm", Path: root, Stack: config.StackNode, PackageManager: "pnpm",
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+	}
+	target := scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace}
+	packageCalls := 0
+	runners := scanStageRunners{
+		vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+			return []vulnscan.Finding{{ID: "CVE-PRESERVED"}}, nil, nil, "trivy", true, nil
+		},
+		alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+			return nil, false, nil
+		},
+		packages: func(ctx context.Context, _ config.Config, _ scanTarget, _ scanOptions, _ config.LocalPackagePolicy, _ time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			packageCalls++
+			if packageCalls == 1 {
+				<-ctx.Done()
+				return nil, "pnpm", false, ctx.Err()
+			}
+			return []updatesnapshot.Candidate{{
+				Kind: "pnpm", Name: "example", Current: "1.0.0", Target: "2.0.0",
+			}}, "pnpm", true, nil
+		},
+		candidateTimeout: 20 * time.Millisecond,
+	}
+
+	first := scanOneTargetWith(
+		context.Background(), config.Config{}, target, scanOptions{},
+		config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners,
+	)
+	if first.Status != "partial" || len(first.Vulnerabilities) != 1 ||
+		first.Vulnerabilities[0] != "CVE-PRESERVED" || !hasFailedStage(first, stageCandidate) {
+		t.Fatalf("timed-out result lost completed stages: %#v", first)
+	}
+	if first.Error == nil || first.Error.Code != "package_scan_timeout" ||
+		first.Error.Stage != stageCandidate || first.Error.Category != "timeout" ||
+		!strings.Contains(first.Error.Message, "pnpm") ||
+		!strings.Contains(first.Error.Message, "20ms") {
+		t.Fatalf("candidate timeout contract = %#v", first.Error)
+	}
+	if first.PackageUpdates == nil || first.PackageUpdates.Reason != "package_scan_timeout" {
+		t.Fatalf("package availability = %#v", first.PackageUpdates)
+	}
+
+	second := scanOneTargetWith(
+		context.Background(), config.Config{}, target, scanOptions{},
+		config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners,
+	)
+	if hasFailedStage(second, stageCandidate) || len(second.Candidates) != 1 ||
+		second.Candidates[0].Name != "example" {
+		t.Fatalf("subsequent candidate scan did not recover: %#v", second)
+	}
+}
+
 func TestManifestOnlyNPMScanPreservesReadOnlyFindingsAndNeverRunsMutationStages(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"demo"}`), 0o600); err != nil {

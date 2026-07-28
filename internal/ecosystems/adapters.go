@@ -317,7 +317,7 @@ func PNPM() ecosystem.Adapter {
 				}
 				return ecosystem.ScannerSpec{
 					Kind: "pnpm", ExpectedScanner: "pnpm", Args: args, Decoder: "pnpm",
-					AcceptedExitCodes: []int{1}, ReleaseAge: true, LegacyImageKey: "node",
+					AcceptedExitCodes: []int{1}, ReleaseAge: true, Memory: "2g", LegacyImageKey: "node",
 				}, nil
 			}},
 			decoderCapability: decoderCapability{kind: "pnpm"},
