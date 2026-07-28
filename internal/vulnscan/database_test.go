@@ -148,13 +148,20 @@ func TestParseTrivyDatabaseVersionValidatesFreshnessInputs(t *testing.T) {
 
 func TestReadyDatabaseSessionIsAFreshHitWithoutDockerOrDownload(t *testing.T) {
 	image := "scanner@sha256:" + strings.Repeat("a", 64)
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	session := &databaseSession{}
-	session.markReady(trivyDatabaseVolume(image))
-	scanner := Scanner{database: session, Docker: panicDocker{}}
-	if err := scanner.ensureTrivyDatabase(
+	session.markReady(trivyDatabaseVolume(image), databaseCache{
+		volume: trivyDatabaseVolume(image), updatedAt: now.Add(-time.Hour),
+	})
+	scanner := Scanner{database: session, Docker: panicDocker{}, Now: func() time.Time { return now }}
+	cache, err := scanner.ensureTrivyDatabase(
 		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("fresh in-session cache hit failed: %v", err)
+	}
+	if cache.volume != trivyDatabaseVolume(image) {
+		t.Fatalf("cache volume = %q", cache.volume)
 	}
 }
 
@@ -170,6 +177,180 @@ func TestDatabaseVolumeResetIsOwnedAndAtomicAtTheDockerBoundary(t *testing.T) {
 	}
 	if !docker.exists || !reflect.DeepEqual(docker.labels, managedDatabaseLabels()) {
 		t.Fatalf("replacement cache = exists:%t labels:%#v", docker.exists, docker.labels)
+	}
+}
+
+func TestFreshDatabaseCacheAvoidsDownloadAcrossScannerSessions(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("a", 64)
+	volumes := trivyDatabaseVolumes(image)
+	lifecycle := newDatabaseLifecycle(now)
+	lifecycle.addDatabase(volumes[0], now.Add(-time.Hour))
+
+	first := lifecycle.scanner(now)
+	cache, err := first.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	if err != nil || cache.volume != volumes[0] {
+		t.Fatalf("first cache selection = %#v, %v", cache, err)
+	}
+	second := lifecycle.scanner(now)
+	cache, err = second.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	if err != nil || cache.volume != volumes[0] {
+		t.Fatalf("second cache selection = %#v, %v", cache, err)
+	}
+	if lifecycle.downloads != 0 {
+		t.Fatalf("fresh cache triggered %d downloads", lifecycle.downloads)
+	}
+}
+
+func TestExpiredDatabaseRefreshesInactiveGenerationBeforeActivation(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("b", 64)
+	volumes := trivyDatabaseVolumes(image)
+	lifecycle := newDatabaseLifecycle(now)
+	staleUpdated := now.Add(-25 * time.Hour)
+	lifecycle.addDatabase(volumes[0], staleUpdated)
+
+	scanner := lifecycle.scanner(now)
+	cache, err := scanner.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.volume != volumes[1] || lifecycle.downloads != 1 || lifecycle.integrityProbes != 1 {
+		t.Fatalf(
+			"refresh result = volume:%q downloads:%d integrity_probes:%d",
+			cache.volume, lifecycle.downloads, lifecycle.integrityProbes,
+		)
+	}
+	if got, ok := lifecycle.databaseUpdated(volumes[0]); !ok || !got.Equal(staleUpdated) {
+		t.Fatalf("last known-good generation was changed: %v, exists=%t", got, ok)
+	}
+
+	second := lifecycle.scanner(now)
+	secondCache, err := second.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	if err != nil || secondCache.volume != volumes[1] || lifecycle.downloads != 1 {
+		t.Fatalf(
+			"post-refresh cache hit = %#v, %v; downloads=%d",
+			secondCache, err, lifecycle.downloads,
+		)
+	}
+}
+
+func TestFailedDatabaseRefreshPreservesStaleGenerationAndReportsAge(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("c", 64)
+	volumes := trivyDatabaseVolumes(image)
+	lifecycle := newDatabaseLifecycle(now)
+	staleUpdated := now.Add(-31 * time.Hour)
+	lifecycle.addDatabase(volumes[0], staleUpdated)
+	lifecycle.failDownloads = true
+
+	scanner := lifecycle.scanner(now)
+	scanner.DatabaseBackoff = func(context.Context, time.Duration) error { return nil }
+	_, err := scanner.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	var databaseErr *DatabaseAcquisitionError
+	if !errors.As(err, &databaseErr) {
+		t.Fatalf("refresh error = %v, want DatabaseAcquisitionError", err)
+	}
+	if databaseErr.Kind != FailureTransientTransport ||
+		databaseErr.CacheStatus != "stale" ||
+		databaseErr.DatabaseAgeHours == nil ||
+		*databaseErr.DatabaseAgeHours != 31 ||
+		lifecycle.downloads != trivyDatabaseAttempts {
+		t.Fatalf("refresh error = %#v; downloads=%d", databaseErr, lifecycle.downloads)
+	}
+	if got, ok := lifecycle.databaseUpdated(volumes[0]); !ok || !got.Equal(staleUpdated) {
+		t.Fatalf("failed refresh destroyed last known-good generation: %v, exists=%t", got, ok)
+	}
+	if _, ok := lifecycle.databaseUpdated(volumes[1]); ok {
+		t.Fatal("failed candidate generation remained active")
+	}
+}
+
+func TestInvalidRefreshedDatabaseNeverBecomesActive(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("9", 64)
+	volumes := trivyDatabaseVolumes(image)
+	lifecycle := newDatabaseLifecycle(now)
+	staleUpdated := now.Add(-26 * time.Hour)
+	lifecycle.addDatabase(volumes[0], staleUpdated)
+	lifecycle.failIntegrity = true
+
+	scanner := lifecycle.scanner(now)
+	_, err := scanner.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	var databaseErr *DatabaseAcquisitionError
+	if !errors.As(err, &databaseErr) ||
+		databaseErr.Kind != FailureIntegrity ||
+		databaseErr.CacheStatus != "stale" {
+		t.Fatalf("integrity failure = %#v", databaseErr)
+	}
+	if got, ok := lifecycle.databaseUpdated(volumes[0]); !ok || !got.Equal(staleUpdated) {
+		t.Fatalf("integrity failure changed last known-good generation: %v, exists=%t", got, ok)
+	}
+	if _, ok := lifecycle.databaseUpdated(volumes[1]); ok {
+		t.Fatal("unvalidated candidate generation remained active")
+	}
+}
+
+func TestConcurrentDatabaseRefreshDownloadsOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed scanner cache is unsupported on Windows")
+	}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("d", 64)
+	lifecycle := newDatabaseLifecycle(now)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			scanner := lifecycle.scanner(now)
+			_, err := scanner.ensureTrivyDatabase(
+				context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+			)
+			results <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lifecycle.downloads != 1 {
+		t.Fatalf("concurrent refresh performed %d downloads", lifecycle.downloads)
+	}
+}
+
+func TestChangingScannerDigestUsesASeparateDatabaseGeneration(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	firstImage := "scanner@sha256:" + strings.Repeat("e", 64)
+	secondImage := "scanner@sha256:" + strings.Repeat("f", 64)
+	if trivyDatabaseVolumes(firstImage) == trivyDatabaseVolumes(secondImage) {
+		t.Fatal("different scanner digests share database generations")
+	}
+	lifecycle := newDatabaseLifecycle(now)
+	for _, image := range []string{firstImage, secondImage} {
+		scanner := lifecycle.scanner(now)
+		if _, err := scanner.ensureTrivyDatabase(
+			context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lifecycle.downloads != 2 {
+		t.Fatalf("two scanner digests performed %d database downloads", lifecycle.downloads)
 	}
 }
 
@@ -243,6 +424,126 @@ type databaseVolumeDocker struct {
 	exists     bool
 	labels     map[string]string
 	operations []string
+}
+
+type databaseLifecycle struct {
+	mu              sync.Mutex
+	now             time.Time
+	volumes         map[string]map[string]string
+	updated         map[string]time.Time
+	downloads       int
+	integrityProbes int
+	failDownloads   bool
+	failIntegrity   bool
+}
+
+func newDatabaseLifecycle(now time.Time) *databaseLifecycle {
+	return &databaseLifecycle{
+		now: now, volumes: make(map[string]map[string]string), updated: make(map[string]time.Time),
+	}
+}
+
+func (d *databaseLifecycle) Path() (string, error) { return "/usr/bin/docker", nil }
+
+func (d *databaseLifecycle) Run(_ context.Context, request dockerexec.Request) (dockerexec.Result, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(request.Args) < 2 || request.Args[0] != "volume" {
+		return dockerexec.Result{}, errors.New("unexpected Docker request")
+	}
+	name := request.Args[len(request.Args)-1]
+	switch request.Args[1] {
+	case "create":
+		if _, ok := d.volumes[name]; !ok {
+			d.volumes[name] = managedDatabaseLabels()
+		}
+		return dockerexec.Result{Stdout: []byte(name + "\n")}, nil
+	case "inspect":
+		labels, ok := d.volumes[name]
+		if !ok {
+			return dockerexec.Result{}, errors.New("volume does not exist")
+		}
+		data, err := json.Marshal([]any{map[string]any{
+			"Name": name, "Driver": "local", "Scope": "local",
+			"Labels": labels, "Options": map[string]string{},
+		}})
+		return dockerexec.Result{Stdout: data}, err
+	case "rm":
+		if _, ok := d.volumes[name]; !ok {
+			return dockerexec.Result{}, errors.New("volume does not exist")
+		}
+		delete(d.volumes, name)
+		delete(d.updated, name)
+		return dockerexec.Result{}, nil
+	default:
+		return dockerexec.Result{}, errors.New("unexpected volume operation")
+	}
+}
+
+func (d *databaseLifecycle) scanner(now time.Time) Scanner {
+	return Scanner{
+		Docker: d, database: &databaseSession{}, Now: func() time.Time { return now },
+		databaseCommand: func(
+			_ context.Context,
+			_ scaninput.Bundle,
+			_ string,
+			_ config.EgressConfig,
+			volume string,
+			_ bool,
+			_ string,
+			args ...string,
+		) ([]byte, error) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if len(args) >= 2 && args[0] == "image" && args[1] == "--download-db-only" {
+				d.downloads++
+				if d.failDownloads {
+					return nil, errors.New("download vulnerability database: unexpected EOF")
+				}
+				d.updated[volume] = d.now.Add(-time.Hour)
+				return nil, nil
+			}
+			if len(args) >= 1 && args[0] == "version" {
+				updated, ok := d.updated[volume]
+				if !ok {
+					return nil, errors.New("vulnerability database metadata.json is missing")
+				}
+				return trivyDatabaseVersionJSON(updated), nil
+			}
+			if len(args) >= 1 && args[0] == "fs" {
+				if _, ok := d.updated[volume]; !ok {
+					return nil, errors.New("vulnerability database is missing")
+				}
+				d.integrityProbes++
+				if d.failIntegrity {
+					return nil, errors.New("vulnerability database integrity checksum mismatch")
+				}
+				return []byte(`{"Results":[]}`), nil
+			}
+			return nil, errors.New("unexpected Trivy database command")
+		},
+	}
+}
+
+func (d *databaseLifecycle) addDatabase(volume string, updated time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.volumes[volume] = managedDatabaseLabels()
+	d.updated[volume] = updated
+}
+
+func (d *databaseLifecycle) databaseUpdated(volume string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	updated, ok := d.updated[volume]
+	return updated, ok
+}
+
+func trivyDatabaseVersionJSON(updated time.Time) []byte {
+	return []byte(`{"VulnerabilityDB":{"Version":2,"UpdatedAt":"` +
+		updated.Format(time.RFC3339) + `","NextUpdate":"` +
+		updated.Add(6*time.Hour).Format(time.RFC3339) + `","DownloadedAt":"` +
+		updated.Add(time.Hour).Format(time.RFC3339) + `"}}`)
 }
 
 func (*databaseVolumeDocker) Path() (string, error) { return "/usr/bin/docker", nil }

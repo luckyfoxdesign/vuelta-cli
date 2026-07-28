@@ -105,6 +105,17 @@ type ImageSkip struct {
 // gate behavior can be tested without a daemon or a network connection.
 type Command func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
 
+type databaseCommand func(
+	ctx context.Context,
+	bundle scaninput.Bundle,
+	image string,
+	egressConfig config.EgressConfig,
+	databaseVolume string,
+	initializeDatabase bool,
+	name string,
+	args ...string,
+) ([]byte, error)
+
 // ProgressFunc synchronously reports one observable scanner step. Callers
 // must return quickly; a nil callback disables progress entirely.
 type ProgressFunc func(detail string, done, total int)
@@ -139,6 +150,7 @@ type Scanner struct {
 	dependencyProgress   ProgressFunc
 	imageProgress        ProgressFunc
 	database             *databaseSession
+	databaseCommand      databaseCommand
 }
 
 // NewAdhocScanner returns the narrow scanner used only for an explicit
@@ -178,6 +190,11 @@ func (s Scanner) commandWithDatabase(
 	name string,
 	args ...string,
 ) ([]byte, error) {
+	if s.databaseCommand != nil {
+		return s.databaseCommand(
+			ctx, bundle, image, egressConfig, databaseVolume, initializeDatabase, name, args...,
+		)
+	}
 	if s.Command != nil {
 		private, err := scaninput.MaterializePrivate(ctx, bundle)
 		if err != nil {
@@ -288,10 +305,11 @@ func (s Scanner) trivyCommand(
 	if s.database == nil {
 		s.database = &databaseSession{}
 	}
-	if err := s.ensureTrivyDatabase(ctx, bundle, image, egressConfig, maxAgeHours); err != nil {
+	cache, err := s.ensureTrivyDatabase(ctx, bundle, image, egressConfig, maxAgeHours)
+	if err != nil {
 		return nil, err
 	}
-	volume := trivyDatabaseVolume(image)
+	volume := cache.volume
 	scanArgs := make([]string, 0, len(args)+1)
 	if len(args) > 0 {
 		scanArgs = append(scanArgs, args[0], "--skip-db-update")
@@ -305,10 +323,14 @@ func (s Scanner) trivyCommand(
 	)
 	if err != nil && isTrivyDatabaseRuntimeFailure(err) {
 		kind := classifyDatabaseFailure(err)
-		invalidateErr := s.invalidateTrivyDatabase(volume)
+		invalidateErr := s.invalidateTrivyDatabase(trivyDatabaseVolume(image), volume)
+		ageHours := int(s.now().Sub(cache.updatedAt) / time.Hour)
+		if ageHours < 0 {
+			ageHours = 0
+		}
 		return nil, &DatabaseAcquisitionError{
 			Kind: kind, Attempts: 1, History: []string{"cached database use: " + string(kind)},
-			Err: errors.Join(err, invalidateErr),
+			CacheStatus: "invalid", DatabaseAgeHours: &ageHours, Err: errors.Join(err, invalidateErr),
 		}
 	}
 	return output, err

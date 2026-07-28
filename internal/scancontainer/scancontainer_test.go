@@ -219,6 +219,24 @@ func TestRunMountsAllowlistedTrivyDatabaseVolumeWritableForSQLite(t *testing.T) 
 	}
 }
 
+func TestTrivyScannerCacheTagTracksExactDigestAndIsNotDangling(t *testing.T) {
+	firstDigest := strings.Repeat("a", 64)
+	secondDigest := strings.Repeat("b", 64)
+	first := trivyScannerCacheTag("aquasec/trivy@sha256:" + firstDigest)
+	second := trivyScannerCacheTag("aquasec/trivy@sha256:" + secondDigest)
+	if first != "vuelta-scanner-cache:trivy-"+firstDigest {
+		t.Fatalf("first cache tag = %q", first)
+	}
+	if second != "vuelta-scanner-cache:trivy-"+secondDigest || second == first {
+		t.Fatalf("changed digest cache tag = %q", second)
+	}
+	for _, tag := range []string{first, second} {
+		if strings.Contains(tag, "<none>") || !strings.Contains(tag, ":trivy-") {
+			t.Fatalf("retained scanner image would remain dangling: %q", tag)
+		}
+	}
+}
+
 func TestRunInitializesWritableTrivyDatabaseVolumeWithoutExecutingLoader(t *testing.T) {
 	docker := &fakeDocker{}
 	request := validRequest(t)

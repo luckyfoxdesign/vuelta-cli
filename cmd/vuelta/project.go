@@ -15,14 +15,16 @@ import (
 )
 
 type jsonCommandError struct {
-	Code         string   `json:"code"`
-	Message      string   `json:"message"`
-	Hint         string   `json:"hint,omitempty"`
-	Stage        string   `json:"stage,omitempty"`
-	Category     string   `json:"category,omitempty"`
-	ExitCode     *int     `json:"exit_code,omitempty"`
-	StderrTail   string   `json:"stderr_tail,omitempty"`
-	RetryHistory []string `json:"retry_history,omitempty"`
+	Code             string   `json:"code"`
+	Message          string   `json:"message"`
+	Hint             string   `json:"hint,omitempty"`
+	Stage            string   `json:"stage,omitempty"`
+	Category         string   `json:"category,omitempty"`
+	ExitCode         *int     `json:"exit_code,omitempty"`
+	StderrTail       string   `json:"stderr_tail,omitempty"`
+	RetryHistory     []string `json:"retry_history,omitempty"`
+	CacheStatus      string   `json:"cache_status,omitempty"`
+	DatabaseAgeHours *int     `json:"database_age_hours,omitempty"`
 }
 
 type jsonCommandEnvelope struct {

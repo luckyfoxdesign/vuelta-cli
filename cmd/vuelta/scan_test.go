@@ -696,6 +696,7 @@ func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	databaseAgeHours := 31
 	databaseErr := &vulnscan.DatabaseAcquisitionError{
 		Kind: vulnscan.FailureTransientTransport, Attempts: 3,
 		History: []string{
@@ -703,6 +704,7 @@ func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing
 			"attempt 2: transient_transport",
 			"attempt 3: transient_transport",
 		},
+		CacheStatus: "stale", DatabaseAgeHours: &databaseAgeHours,
 		Err: errors.New("unexpected EOF"),
 	}
 	runners := scanStageRunners{
@@ -735,6 +737,9 @@ func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing
 	if result.Error == nil ||
 		result.Error.Code != "trivy_database_transient_transport" ||
 		result.Error.Category != "trivy_database_transient_transport" ||
+		result.Error.CacheStatus != "stale" ||
+		result.Error.DatabaseAgeHours == nil ||
+		*result.Error.DatabaseAgeHours != databaseAgeHours ||
 		!reflect.DeepEqual(result.Error.RetryHistory, databaseErr.History) {
 		t.Fatalf("structured database error = %#v", result.Error)
 	}
@@ -745,8 +750,11 @@ func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing
 		}
 	}
 	if databaseCapability == nil ||
-		databaseCapability.Status != "unavailable" ||
-		databaseCapability.Reason != "trivy_database_transient_transport" {
+		databaseCapability.Status != "stale" ||
+		databaseCapability.Reason != "trivy_database_transient_transport" ||
+		databaseCapability.CacheStatus != "stale" ||
+		databaseCapability.DatabaseAgeHours == nil ||
+		*databaseCapability.DatabaseAgeHours != databaseAgeHours {
 		t.Fatalf("database capability = %#v", result.Capabilities)
 	}
 	if !containsSubstring(result.Warnings, "retry_history=attempt 1: transient_transport") {

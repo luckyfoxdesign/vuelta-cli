@@ -45,10 +45,12 @@ const (
 // metadata; the wrapped command error remains available to hardened
 // classifiers without being interpolated into user-facing text.
 type DatabaseAcquisitionError struct {
-	Kind     DatabaseFailure
-	Attempts int
-	History  []string
-	Err      error
+	Kind             DatabaseFailure
+	Attempts         int
+	History          []string
+	CacheStatus      string
+	DatabaseAgeHours *int
+	Err              error
 }
 
 func (e *DatabaseAcquisitionError) Error() string {
@@ -59,7 +61,14 @@ func (e *DatabaseAcquisitionError) Error() string {
 	if attempts < 1 {
 		attempts = 1
 	}
-	return fmt.Sprintf("Trivy database acquisition failed: category=%s, attempts=%d", e.Kind, attempts)
+	message := fmt.Sprintf("Trivy database acquisition failed: category=%s, attempts=%d", e.Kind, attempts)
+	if e.CacheStatus != "" {
+		message += ", cache_status=" + e.CacheStatus
+	}
+	if e.DatabaseAgeHours != nil {
+		message += fmt.Sprintf(", database_age_hours=%d", *e.DatabaseAgeHours)
+	}
+	return message
 }
 
 func (e *DatabaseAcquisitionError) Unwrap() error {
@@ -80,22 +89,31 @@ func (e *DatabaseAcquisitionError) RetryHistory() []string {
 
 type databaseSession struct {
 	mu    sync.Mutex
-	ready map[string]bool
+	ready map[string]databaseCache
 }
 
-func (s *databaseSession) isReady(key string) bool {
+type databaseCache struct {
+	volume    string
+	updatedAt time.Time
+}
+
+func (s *databaseSession) readyCache(key string, maxAgeHours int, now time.Time) (databaseCache, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ready != nil && s.ready[key]
+	cache, ok := s.ready[key]
+	if !ok || checkDatabaseAge(cache.updatedAt, maxAgeHours, now) != nil {
+		return databaseCache{}, false
+	}
+	return cache, true
 }
 
-func (s *databaseSession) markReady(key string) {
+func (s *databaseSession) markReady(key string, cache databaseCache) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ready == nil {
-		s.ready = make(map[string]bool)
+		s.ready = make(map[string]databaseCache)
 	}
-	s.ready[key] = true
+	s.ready[key] = cache
 }
 
 func (s *databaseSession) markInvalid(key string) {
@@ -111,92 +129,147 @@ func trivyDatabaseVolume(image string) string {
 	return fmt.Sprintf("vuelta-trivy-db-%x", sum[:8])
 }
 
+func trivyDatabaseVolumes(image string) [2]string {
+	first := trivyDatabaseVolume(image)
+	sum := sha256.Sum256([]byte(image + "\x00ghcr.io/aquasecurity/trivy-db\x00generation-2"))
+	return [2]string{first, fmt.Sprintf("vuelta-trivy-db-%x", sum[:8])}
+}
+
 func (s Scanner) ensureTrivyDatabase(
 	ctx context.Context,
 	bundle scaninput.Bundle,
 	image string,
 	egressConfig config.EgressConfig,
 	maxAgeHours int,
-) error {
+) (databaseCache, error) {
 	if s.Command != nil {
-		return nil
+		return databaseCache{}, nil
 	}
-	volume := trivyDatabaseVolume(image)
-	if s.database != nil && s.database.isReady(volume) {
-		return nil
+	volumes := trivyDatabaseVolumes(image)
+	family := volumes[0]
+	if s.database != nil {
+		if cache, ok := s.database.readyCache(family, maxAgeHours, s.now()); ok {
+			return cache, nil
+		}
 	}
-	lock, err := acquireDatabaseLock(ctx, volume)
+	lock, err := acquireDatabaseLock(ctx, family)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return databaseCache{}, ctxErr
 		}
-		return &DatabaseAcquisitionError{Kind: FailureInvalidDatabase, Attempts: 1, History: []string{"coordination: invalid_database"}, Err: err}
+		return databaseCache{}, newDatabaseAcquisitionError(
+			FailureInvalidDatabase, 1, []string{"coordination: invalid_database"}, nil, s.now(), err,
+		)
 	}
 	defer func() { _ = lock.Close() }()
-	if s.database != nil && s.database.isReady(volume) {
-		return nil
+	if s.database != nil {
+		if cache, ok := s.database.readyCache(family, maxAgeHours, s.now()); ok {
+			return cache, nil
+		}
 	}
 	docker := s.docker()
-	if err := ensureDatabaseVolume(ctx, docker, volume); err != nil {
-		return &DatabaseAcquisitionError{Kind: FailureInvalidDatabase, Attempts: 1, History: []string{"cache: invalid_database"}, Err: err}
-	}
-	if _, err := s.probeTrivyDatabase(ctx, bundle, image, egressConfig, volume, maxAgeHours); err == nil {
-		if s.database != nil {
-			s.database.markReady(volume)
+	for _, volume := range volumes {
+		if err := ensureDatabaseVolume(ctx, docker, volume); err != nil {
+			return databaseCache{}, newDatabaseAcquisitionError(
+				FailureInvalidDatabase, 1, []string{"cache: invalid_database"}, nil, s.now(), err,
+			)
 		}
-		return nil
-	} else if kind := classifyDatabaseFailure(err); kind != FailureInvalidDatabase {
-		return &DatabaseAcquisitionError{Kind: kind, Attempts: 1, History: []string{"probe: " + string(kind)}, Err: err}
 	}
-	if err := resetDatabaseVolume(ctx, docker, volume); err != nil {
-		return &DatabaseAcquisitionError{Kind: FailureInvalidDatabase, Attempts: 1, History: []string{"cache_reset: invalid_database"}, Err: err}
+
+	var fallback *databaseCache
+	for _, volume := range volumes {
+		updated, err := s.probeTrivyDatabase(ctx, bundle, image, egressConfig, volume, false)
+		if err != nil {
+			if kind := classifyDatabaseFailure(err); kind != FailureInvalidDatabase {
+				return databaseCache{}, newDatabaseAcquisitionError(
+					kind, 1, []string{"probe: " + string(kind)}, fallback, s.now(), err,
+				)
+			}
+			continue
+		}
+		cache := databaseCache{volume: volume, updatedAt: updated}
+		if checkDatabaseAge(updated, maxAgeHours, s.now()) == nil {
+			if s.database != nil {
+				s.database.markReady(family, cache)
+			}
+			return cache, nil
+		}
+		if fallback == nil || updated.After(fallback.updatedAt) {
+			copy := cache
+			fallback = &copy
+		}
+	}
+
+	candidate := volumes[0]
+	if fallback != nil && fallback.volume == candidate {
+		candidate = volumes[1]
+	}
+	if err := resetDatabaseVolume(ctx, docker, candidate); err != nil {
+		return databaseCache{}, newDatabaseAcquisitionError(
+			FailureInvalidDatabase, 1, []string{"candidate_reset: invalid_database"}, fallback, s.now(), err,
+		)
 	}
 
 	history := make([]string, 0, trivyDatabaseAttempts)
 	var lastErr error
 	for attempt := 1; attempt <= trivyDatabaseAttempts; attempt++ {
 		_, acquireErr := s.commandWithDatabase(
-			ctx, bundle, image, egressConfig, volume, true,
+			ctx, bundle, image, egressConfig, candidate, true,
 			"trivy", "image", "--download-db-only", "--no-progress",
 		)
+		var updated time.Time
 		if acquireErr == nil {
-			_, acquireErr = s.probeTrivyDatabase(ctx, bundle, image, egressConfig, volume, maxAgeHours)
+			updated, acquireErr = s.probeTrivyDatabase(ctx, bundle, image, egressConfig, candidate, true)
 		}
 		if acquireErr == nil {
+			acquireErr = checkDatabaseAge(updated, maxAgeHours, s.now())
+		}
+		if acquireErr == nil {
+			cache := databaseCache{volume: candidate, updatedAt: updated}
 			if s.database != nil {
-				s.database.markReady(volume)
+				s.database.markReady(family, cache)
 			}
-			return nil
+			return cache, nil
 		}
 		lastErr = acquireErr
 		kind := classifyDatabaseFailure(acquireErr)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			_ = cleanupDatabaseVolume(docker, volume)
-			return &DatabaseAcquisitionError{
-				Kind: FailureCancelled, Attempts: attempt,
-				History: append(history, fmt.Sprintf("attempt %d: cancelled", attempt)), Err: ctxErr,
-			}
+			_ = cleanupDatabaseVolume(docker, candidate)
+			return databaseCache{}, newDatabaseAcquisitionError(
+				FailureCancelled, attempt,
+				append(history, fmt.Sprintf("attempt %d: cancelled", attempt)),
+				fallback, s.now(), ctxErr,
+			)
 		}
 		history = append(history, fmt.Sprintf("attempt %d: %s", attempt, kind))
-		cleanupErr := cleanupDatabaseVolume(docker, volume)
+		cleanupErr := cleanupDatabaseVolume(docker, candidate)
 		if cleanupErr != nil {
-			return &DatabaseAcquisitionError{Kind: FailureInvalidDatabase, Attempts: attempt, History: history, Err: errors.Join(acquireErr, cleanupErr)}
+			return databaseCache{}, newDatabaseAcquisitionError(
+				FailureInvalidDatabase, attempt, history, fallback, s.now(), errors.Join(acquireErr, cleanupErr),
+			)
 		}
 		if kind != FailureTransientTransport || attempt == trivyDatabaseAttempts {
-			return &DatabaseAcquisitionError{Kind: kind, Attempts: attempt, History: history, Err: acquireErr}
+			return databaseCache{}, newDatabaseAcquisitionError(
+				kind, attempt, history, fallback, s.now(), acquireErr,
+			)
 		}
-		if err := ensureDatabaseVolume(ctx, docker, volume); err != nil {
-			return &DatabaseAcquisitionError{Kind: FailureInvalidDatabase, Attempts: attempt, History: history, Err: err}
+		if err := ensureDatabaseVolume(ctx, docker, candidate); err != nil {
+			return databaseCache{}, newDatabaseAcquisitionError(
+				FailureInvalidDatabase, attempt, history, fallback, s.now(), err,
+			)
 		}
 		if err := s.waitForDatabaseRetry(ctx, time.Duration(attempt)*200*time.Millisecond); err != nil {
-			_ = cleanupDatabaseVolume(docker, volume)
-			return &DatabaseAcquisitionError{
-				Kind: FailureCancelled, Attempts: attempt,
-				History: append(history, fmt.Sprintf("backoff %d: cancelled", attempt)), Err: err,
-			}
+			_ = cleanupDatabaseVolume(docker, candidate)
+			return databaseCache{}, newDatabaseAcquisitionError(
+				FailureCancelled, attempt,
+				append(history, fmt.Sprintf("backoff %d: cancelled", attempt)),
+				fallback, s.now(), err,
+			)
 		}
 	}
-	return &DatabaseAcquisitionError{Kind: FailureTransientTransport, Attempts: trivyDatabaseAttempts, History: history, Err: lastErr}
+	return databaseCache{}, newDatabaseAcquisitionError(
+		FailureTransientTransport, trivyDatabaseAttempts, history, fallback, s.now(), lastErr,
+	)
 }
 
 func (s Scanner) probeTrivyDatabase(
@@ -205,7 +278,7 @@ func (s Scanner) probeTrivyDatabase(
 	image string,
 	egressConfig config.EgressConfig,
 	volume string,
-	maxAgeHours int,
+	validateIntegrity bool,
 ) (time.Time, error) {
 	output, err := s.commandWithDatabase(
 		ctx, bundle, image, egressConfig, volume, false,
@@ -218,10 +291,43 @@ func (s Scanner) probeTrivyDatabase(
 	if err != nil {
 		return time.Time{}, err
 	}
-	if err := checkDatabaseAge(updated, maxAgeHours, s.now()); err != nil {
-		return time.Time{}, err
+	if validateIntegrity {
+		output, err = s.commandWithDatabase(
+			ctx, bundle, image, egressConfig, volume, false,
+			"trivy", "fs", "--skip-db-update", "--scanners", "vuln", "--format", "json", "/project",
+		)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if _, _, _, err := parseTrivy(output); err != nil {
+			return time.Time{}, errors.New("trivy database integrity probe returned an invalid report")
+		}
 	}
 	return updated, nil
+}
+
+func newDatabaseAcquisitionError(
+	kind DatabaseFailure,
+	attempts int,
+	history []string,
+	fallback *databaseCache,
+	now time.Time,
+	err error,
+) *DatabaseAcquisitionError {
+	result := &DatabaseAcquisitionError{
+		Kind: kind, Attempts: attempts, History: history, CacheStatus: "missing", Err: err,
+	}
+	if fallback == nil {
+		return result
+	}
+	age := now.Sub(fallback.updatedAt)
+	if age < 0 {
+		age = 0
+	}
+	ageHours := int(age / time.Hour)
+	result.CacheStatus = "stale"
+	result.DatabaseAgeHours = &ageHours
+	return result
 }
 
 func parseTrivyDatabaseVersion(data []byte) (time.Time, error) {
@@ -352,13 +458,13 @@ func cleanupDatabaseVolume(docker dockerexec.Runner, name string) error {
 	return removeDatabaseVolume(ctx, docker, name)
 }
 
-func (s Scanner) invalidateTrivyDatabase(volume string) error {
+func (s Scanner) invalidateTrivyDatabase(family, volume string) error {
 	if s.database != nil {
-		s.database.markInvalid(volume)
+		s.database.markInvalid(family)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	lock, err := acquireDatabaseLock(ctx, volume)
+	lock, err := acquireDatabaseLock(ctx, family)
 	if err != nil {
 		return err
 	}

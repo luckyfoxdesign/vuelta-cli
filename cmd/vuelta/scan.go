@@ -73,9 +73,11 @@ type scanToolchainResult struct {
 }
 
 type scanCapability struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Name             string `json:"name"`
+	Status           string `json:"status"`
+	Reason           string `json:"reason,omitempty"`
+	CacheStatus      string `json:"cache_status,omitempty"`
+	DatabaseAgeHours *int   `json:"database_age_hours,omitempty"`
 }
 
 // imageDrift reports that a tier-2/3 intent resolved to a different digest
@@ -1688,8 +1690,13 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 	}
 	var databaseErr *vulnscan.DatabaseAcquisitionError
 	if stage == stageVulnerability && errors.As(err, &databaseErr) {
+		status := "unavailable"
+		if databaseErr.CacheStatus == "stale" {
+			status = "stale"
+		}
 		result.Capabilities = append(result.Capabilities, scanCapability{
-			Name: "trivy_database", Status: "unavailable", Reason: code,
+			Name: "trivy_database", Status: status, Reason: code,
+			CacheStatus: databaseErr.CacheStatus, DatabaseAgeHours: databaseErr.DatabaseAgeHours,
 		})
 	}
 	category, exitCode, detail := classifySubprocessError(err)
@@ -1700,6 +1707,8 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 	if errors.As(err, &databaseErr) {
 		failure.Category = "trivy_database_" + string(databaseErr.Kind)
 		failure.RetryHistory = databaseErr.RetryHistory()
+		failure.CacheStatus = databaseErr.CacheStatus
+		failure.DatabaseAgeHours = databaseErr.DatabaseAgeHours
 	}
 	if result.Error == nil {
 		result.Error = failure
@@ -2178,10 +2187,17 @@ func writeScanDetails(result scanResult) {
 		_, _ = fmt.Fprintf(details, "  package updates:\t%s (%s)\n", result.PackageUpdates.Status, result.PackageUpdates.Reason)
 	}
 	for _, capability := range result.Capabilities {
+		cacheDetail := ""
+		if capability.CacheStatus != "" {
+			cacheDetail = ", cache " + capability.CacheStatus
+		}
+		if capability.DatabaseAgeHours != nil {
+			cacheDetail += fmt.Sprintf(", age %dh", *capability.DatabaseAgeHours)
+		}
 		if capability.Reason == "" {
-			_, _ = fmt.Fprintf(details, "  capability %s:\t%s\n", capability.Name, capability.Status)
+			_, _ = fmt.Fprintf(details, "  capability %s:\t%s%s\n", capability.Name, capability.Status, cacheDetail)
 		} else {
-			_, _ = fmt.Fprintf(details, "  capability %s:\t%s (%s)\n", capability.Name, capability.Status, capability.Reason)
+			_, _ = fmt.Fprintf(details, "  capability %s:\t%s (%s%s)\n", capability.Name, capability.Status, capability.Reason, cacheDetail)
 		}
 	}
 	for _, imageScan := range result.ImageScans {
