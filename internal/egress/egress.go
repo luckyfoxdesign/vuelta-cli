@@ -18,12 +18,13 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/egressproxy"
+	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 )
 
 const (
 	assetContractVersion = 1
 	networkContractValue = "1"
-	ownerLabel           = "com.luckyfoxdesign.vuelta.owner"
+	ownerLabel           = runlease.OwnerLabel
 	contractLabel        = "com.luckyfoxdesign.vuelta.contract"
 	ownerValue           = "managed-egress"
 	proxyUser            = "65532:65532"
@@ -151,6 +152,10 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 		return "", "", &StageError{Stage: "coordination", Err: err}
 	}
 	s.lock = lock
+	if err := reapStaleManagedResources(ctx, s.docker, s.cfg); err != nil {
+		s.releaseLock()
+		return "", "", &StageError{Stage: "orphan recovery", Err: err}
+	}
 	fallback, err := collisionFreeConfig(ctx, s.docker, s.cfg)
 	if err != nil {
 		s.releaseLock()
@@ -165,6 +170,10 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 			return "", "", &StageError{Stage: "coordination", Err: err}
 		}
 		s.lock = lock
+		if err := reapStaleManagedResources(ctx, s.docker, s.cfg); err != nil {
+			s.releaseLock()
+			return "", "", &StageError{Stage: "orphan recovery", Err: err}
+		}
 	}
 	imageID, contract, err := ensureAsset(ctx, s.docker)
 	if err != nil {
@@ -172,13 +181,17 @@ func (s *Session) Resolve(ctx context.Context) (string, string, error) {
 		return "", "", &StageError{Stage: "image preparation", Err: err}
 	}
 	s.imageID, s.contract = imageID, contract
-	created, err := ensureNetwork(ctx, s.docker, s.cfg.Network, s.cfg.ProxyContainer, networkContractValue)
+	resourceCtx := ctx
+	if s.cfg.Persistent {
+		resourceCtx = runlease.WithoutInvocation(ctx)
+	}
+	created, err := ensureNetwork(resourceCtx, s.docker, s.cfg.Network, s.cfg.ProxyContainer, networkContractValue)
 	if err != nil {
 		s.releaseLock()
 		return "", "", &StageError{Stage: "network preparation", Err: err}
 	}
 	s.networkCreated = created
-	created, err = ensureProxy(ctx, s.docker, s.cfg, imageID, contract)
+	created, err = ensureProxy(resourceCtx, s.docker, s.cfg, imageID, contract)
 	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), proxyCleanupTimeout)
 		_ = s.cleanupLocked(cleanupCtx)
@@ -349,11 +362,64 @@ func inspectAsset(ctx context.Context, docker dockerexec.Runner, image, contract
 }
 
 type networkIdentity struct {
-	Name           string `json:"name"`
-	Internal       bool   `json:"internal"`
-	Owner          string `json:"owner"`
-	Contract       string `json:"contract"`
-	ContainerCount int    `json:"container_count"`
+	Name              string `json:"name"`
+	Internal          bool   `json:"internal"`
+	Owner             string `json:"owner"`
+	Contract          string `json:"contract"`
+	LifecycleContract string `json:"lifecycle_contract"`
+	Invocation        string `json:"invocation"`
+	Resource          string `json:"resource"`
+	ContainerCount    int    `json:"container_count"`
+}
+
+type leaseIdentity struct {
+	Owner             string `json:"owner"`
+	LifecycleContract string `json:"lifecycle_contract"`
+	Invocation        string `json:"invocation"`
+	Resource          string `json:"resource"`
+}
+
+func reapStaleManagedResources(ctx context.Context, docker dockerexec.Runner, cfg config.EgressConfig) error {
+	invocations := discoverStaleInvocations(ctx, docker, cfg)
+	var cleanupErrors []error
+	for invocation := range invocations {
+		if err := runlease.Cleanup(ctx, docker, invocation); err != nil {
+			remaining := discoverStaleInvocations(ctx, docker, cfg)
+			if remaining[invocation] {
+				cleanupErrors = append(cleanupErrors, err)
+			}
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func discoverStaleInvocations(ctx context.Context, docker dockerexec.Runner, cfg config.EgressConfig) map[string]bool {
+	invocations := map[string]bool{}
+	network, networkErr := inspectNetwork(ctx, docker, cfg.Network)
+	if networkErr == nil && network.Name == cfg.Network && network.Owner == ownerValue && network.Contract == networkContractValue {
+		if exactLease(network.LifecycleContract, network.Invocation, network.Resource, runlease.ResourceEgressNetwork) {
+			invocations[network.Invocation] = true
+		}
+		if attached, err := networkContainers(ctx, docker, cfg.Network); err == nil {
+			for _, name := range attached {
+				lease, err := inspectContainerLease(ctx, docker, name)
+				if err == nil && lease.Owner == runlease.OwnerScanner &&
+					exactLease(lease.LifecycleContract, lease.Invocation, lease.Resource, runlease.ResourceScannerFinal) {
+					invocations[lease.Invocation] = true
+				}
+			}
+		}
+	}
+	if lease, err := inspectContainerLease(ctx, docker, cfg.ProxyContainer); err == nil &&
+		lease.Owner == ownerValue &&
+		exactLease(lease.LifecycleContract, lease.Invocation, lease.Resource, runlease.ResourceEgressProxy) {
+		invocations[lease.Invocation] = true
+	}
+	return invocations
+}
+
+func exactLease(contract, invocation, resource, expectedResource string) bool {
+	return contract == runlease.ContractValue && resource == expectedResource && runlease.ValidID(invocation)
 }
 
 func collisionFreeConfig(ctx context.Context, docker dockerexec.Runner, configured config.EgressConfig) (config.EgressConfig, error) {
@@ -420,8 +486,11 @@ func ensureNetwork(ctx context.Context, docker dockerexec.Runner, name, proxyCon
 		}
 		return false, nil
 	}
+	args := []string{"network", "create", "--internal", "--label", ownerLabel + "=" + ownerValue, "--label", contractLabel + "=" + contract}
+	args = runlease.AppendLifecycleLabelArgs(args, runlease.ResourceEgressNetwork, runlease.Invocation(ctx))
+	args = append(args, name)
 	_, createErr := docker.Run(ctx, dockerexec.Request{
-		Args:   []string{"network", "create", "--internal", "--label", ownerLabel + "=" + ownerValue, "--label", contractLabel + "=" + contract, name},
+		Args:   args,
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
 	})
@@ -449,7 +518,7 @@ func networkContainers(ctx context.Context, docker dockerexec.Runner, name strin
 }
 
 func inspectNetwork(ctx context.Context, docker dockerexec.Runner, name string) (networkIdentity, error) {
-	format := `{"name":{{json .Name}},"internal":{{json .Internal}},"owner":{{json (index .Labels "` + ownerLabel + `")}},"contract":{{json (index .Labels "` + contractLabel + `")}},"container_count":{{len .Containers}}}`
+	format := `{"name":{{json .Name}},"internal":{{json .Internal}},"owner":{{json (index .Labels "` + ownerLabel + `")}},"contract":{{json (index .Labels "` + contractLabel + `")}},"lifecycle_contract":{{json (index .Labels "` + runlease.ContractLabel + `")}},"invocation":{{json (index .Labels "` + runlease.InvocationLabel + `")}},"resource":{{json (index .Labels "` + runlease.ResourceLabel + `")}},"container_count":{{len .Containers}}}`
 	result, err := docker.Run(ctx, dockerexec.Request{
 		Args:   []string{"network", "inspect", "--format", format, name},
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 1024},
@@ -466,23 +535,26 @@ func inspectNetwork(ctx context.Context, docker dockerexec.Runner, name string) 
 }
 
 type containerIdentity struct {
-	ID           string   `json:"id"`
-	Image        string   `json:"image"`
-	Running      bool     `json:"running"`
-	Health       string   `json:"health"`
-	Owner        string   `json:"owner"`
-	Contract     string   `json:"contract"`
-	ReadOnly     bool     `json:"read_only"`
-	User         string   `json:"user"`
-	NetworkMode  string   `json:"network_mode"`
-	NetworkCount int      `json:"network_count"`
-	OnInternal   bool     `json:"on_internal"`
-	OnBridge     bool     `json:"on_bridge"`
-	CapDrop      []string `json:"cap_drop"`
-	SecurityOpt  []string `json:"security_opt"`
-	Memory       int64    `json:"memory"`
-	PidsLimit    int64    `json:"pids_limit"`
-	NanoCPUs     int64    `json:"nano_cpus"`
+	ID                string   `json:"id"`
+	Image             string   `json:"image"`
+	Running           bool     `json:"running"`
+	Health            string   `json:"health"`
+	Owner             string   `json:"owner"`
+	Contract          string   `json:"contract"`
+	LifecycleContract string   `json:"lifecycle_contract"`
+	Invocation        string   `json:"invocation"`
+	Resource          string   `json:"resource"`
+	ReadOnly          bool     `json:"read_only"`
+	User              string   `json:"user"`
+	NetworkMode       string   `json:"network_mode"`
+	NetworkCount      int      `json:"network_count"`
+	OnInternal        bool     `json:"on_internal"`
+	OnBridge          bool     `json:"on_bridge"`
+	CapDrop           []string `json:"cap_drop"`
+	SecurityOpt       []string `json:"security_opt"`
+	Memory            int64    `json:"memory"`
+	PidsLimit         int64    `json:"pids_limit"`
+	NanoCPUs          int64    `json:"nano_cpus"`
 }
 
 func ensureProxy(ctx context.Context, docker dockerexec.Runner, cfg config.EgressConfig, imageID, contract string) (bool, error) {
@@ -528,6 +600,10 @@ func createProxy(ctx context.Context, docker dockerexec.Runner, cfg config.Egres
 		"--user", proxyUser, "--cpus", "0.50", "--memory", "64m", "--pids-limit", "64",
 		"--env", "VUELTA_EGRESS_ALLOW_RULES=" + allowRules, imageID,
 	}
+	image := args[len(args)-1]
+	args = args[:len(args)-1]
+	args = runlease.AppendLifecycleLabelArgs(args, runlease.ResourceEgressProxy, runlease.Invocation(ctx))
+	args = append(args, image)
 	if _, err := docker.Run(ctx, dockerexec.Request{
 		Args: args, Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 256},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
@@ -574,7 +650,7 @@ func createProxy(ctx context.Context, docker dockerexec.Runner, cfg config.Egres
 }
 
 func inspectProxy(ctx context.Context, docker dockerexec.Runner, name, network string) (containerIdentity, error) {
-	format := `{"id":{{json .Id}},"image":{{json .Image}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"owner":{{json (index .Config.Labels "` + ownerLabel + `")}},"contract":{{json (index .Config.Labels "` + contractLabel + `")}},"read_only":{{json .HostConfig.ReadonlyRootfs}},"user":{{json .Config.User}},"network_mode":{{json .HostConfig.NetworkMode}},"network_count":{{len .NetworkSettings.Networks}},"on_internal":{{if index .NetworkSettings.Networks "` + network + `"}}true{{else}}false{{end}},"on_bridge":{{if index .NetworkSettings.Networks "bridge"}}true{{else}}false{{end}},"cap_drop":{{json .HostConfig.CapDrop}},"security_opt":{{json .HostConfig.SecurityOpt}},"memory":{{json .HostConfig.Memory}},"pids_limit":{{json .HostConfig.PidsLimit}},"nano_cpus":{{json .HostConfig.NanoCpus}}}`
+	format := `{"id":{{json .Id}},"image":{{json .Image}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"owner":{{json (index .Config.Labels "` + ownerLabel + `")}},"contract":{{json (index .Config.Labels "` + contractLabel + `")}},"lifecycle_contract":{{json (index .Config.Labels "` + runlease.ContractLabel + `")}},"invocation":{{json (index .Config.Labels "` + runlease.InvocationLabel + `")}},"resource":{{json (index .Config.Labels "` + runlease.ResourceLabel + `")}},"read_only":{{json .HostConfig.ReadonlyRootfs}},"user":{{json .Config.User}},"network_mode":{{json .HostConfig.NetworkMode}},"network_count":{{len .NetworkSettings.Networks}},"on_internal":{{if index .NetworkSettings.Networks "` + network + `"}}true{{else}}false{{end}},"on_bridge":{{if index .NetworkSettings.Networks "bridge"}}true{{else}}false{{end}},"cap_drop":{{json .HostConfig.CapDrop}},"security_opt":{{json .HostConfig.SecurityOpt}},"memory":{{json .HostConfig.Memory}},"pids_limit":{{json .HostConfig.PidsLimit}},"nano_cpus":{{json .HostConfig.NanoCpus}}}`
 	result, err := docker.Run(ctx, dockerexec.Request{
 		Args:   []string{"container", "inspect", "--format", format, name},
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 2048},
@@ -586,6 +662,23 @@ func inspectProxy(ctx context.Context, docker dockerexec.Runner, name, network s
 	var identity containerIdentity
 	if err := json.Unmarshal(result.Stdout, &identity); err != nil {
 		return containerIdentity{}, errors.New("approved Docker daemon returned malformed managed proxy metadata")
+	}
+	return identity, nil
+}
+
+func inspectContainerLease(ctx context.Context, docker dockerexec.Runner, name string) (leaseIdentity, error) {
+	format := `{"owner":{{json (index .Config.Labels "` + ownerLabel + `")}},"lifecycle_contract":{{json (index .Config.Labels "` + runlease.ContractLabel + `")}},"invocation":{{json (index .Config.Labels "` + runlease.InvocationLabel + `")}},"resource":{{json (index .Config.Labels "` + runlease.ResourceLabel + `")}}}`
+	result, err := docker.Run(ctx, dockerexec.Request{
+		Args:   []string{"container", "inspect", "--format", format, name},
+		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 1024},
+		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 4 << 10},
+	})
+	if err != nil {
+		return leaseIdentity{}, err
+	}
+	var identity leaseIdentity
+	if err := json.Unmarshal(result.Stdout, &identity); err != nil {
+		return leaseIdentity{}, errors.New("approved Docker daemon returned malformed lifecycle metadata")
 	}
 	return identity, nil
 }

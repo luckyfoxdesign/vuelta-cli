@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
+	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -42,6 +45,8 @@ const (
 )
 
 const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
+
+var startScanCleanupGuardian = runlease.StartGuardian
 
 type scanTarget struct {
 	workspace         *config.Workspace
@@ -244,9 +249,10 @@ func executeScan(args []string) error {
 		}
 	}
 	dockerReady := false
+	dockerPath := ""
 	dockerErr := configureDeveloperDocker(*cfg)
 	if dockerErr == nil {
-		_, dockerErr = dockerexec.Default().Path()
+		dockerPath, dockerErr = dockerexec.Default().Path()
 	}
 	if dockerErr != nil {
 		for index := range targets {
@@ -263,7 +269,35 @@ func executeScan(args []string) error {
 	if minAgeErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "invalid_invocation", fail(exitConfig, "%v", minAgeErr), "Use 0, a Go duration such as 168h, or a day duration such as 7d")
 	}
-	ctx := context.Background()
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	var cleanupGuardian *runlease.Guardian
+	if dockerReady {
+		invocation, invocationErr := runlease.NewID()
+		if invocationErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", invocationErr), "Run the scan again")
+		}
+		ctx, invocationErr = runlease.WithInvocation(ctx, invocation)
+		if invocationErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", invocationErr), "Run the scan again")
+		}
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "resolve cleanup guardian executable"), "Run the scan again")
+		}
+		guardianConfig := selection.Path
+		if selection.Scope == "project" {
+			guardianConfig = selection.MachineConfig
+		}
+		guardianConfig, executableErr = filepath.Abs(guardianConfig)
+		if executableErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "resolve cleanup guardian configuration"), "Run the scan again")
+		}
+		cleanupGuardian, executableErr = startScanCleanupGuardian(executable, guardianConfig, dockerPath, invocation)
+		if executableErr != nil {
+			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", executableErr), "Run the scan again")
+		}
+	}
 	var egressSession *egress.Session
 	if dockerReady {
 		egressSession = egress.NewSession(cfg.Update.Egress, dockerexec.Default())
@@ -278,18 +312,29 @@ func executeScan(args []string) error {
 		}
 		results = append(results, scanOneTarget(ctx, *cfg, target, targetOptions, policy, policyIdentity, minAge))
 	}
+	var egressCleanupErr error
 	if egressSession != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cleanupErr := egressSession.Close(cleanupCtx)
+		egressCleanupErr = egressSession.Close(cleanupCtx)
 		cancel()
 		if notice := egressSession.Notice(); notice != "" {
 			for index := range results {
 				results[index].Warnings = appendUniqueStrings(results[index].Warnings, notice)
 			}
 		}
-		if cleanupErr != nil {
+		if egressCleanupErr != nil {
 			for index := range results {
 				results[index].Warnings = appendUniqueStrings(results[index].Warnings, "managed egress cleanup failed; only Vuelta-owned invocation resources were targeted")
+			}
+		}
+	}
+	if cleanupGuardian != nil {
+		guardianCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		guardianErr := cleanupGuardian.Finish(guardianCtx, ctx.Err() == nil && egressCleanupErr == nil)
+		cancel()
+		if guardianErr != nil {
+			for index := range results {
+				results[index].Warnings = appendUniqueStrings(results[index].Warnings, "abnormal-termination Docker cleanup could not be confirmed")
 			}
 		}
 	}

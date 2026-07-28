@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 )
 
 const cleanupTimeout = 15 * time.Second
@@ -84,6 +85,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	loaderName := name + "-loader"
 	databaseInitializerName := name + "-db-init"
 	imageName := "vuelta-scan-input:" + strings.TrimPrefix(name, "vuelta-scan-")
+	invocation := runlease.Invocation(ctx)
 	loaderCreated := false
 	imageCreated := false
 	finalCreated := false
@@ -117,6 +119,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	}()
 
 	loaderArgs := []string{"create", "--name", loaderName, "--network", "none"}
+	loaderArgs = runlease.AppendLabelArgs(loaderArgs, runlease.OwnerScanner, runlease.ResourceScannerInput, invocation)
 	if request.Platform != "" {
 		loaderArgs = append(loaderArgs, "--platform", request.Platform)
 	}
@@ -151,11 +154,16 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 			return dockerexec.Result{}, err
 		}
 	}
+	commitArgs := []string{"commit"}
+	for _, label := range runlease.Labels(runlease.OwnerScanner, runlease.ResourceScannerInput, invocation) {
+		commitArgs = append(commitArgs, "--change", "LABEL "+label)
+	}
+	commitArgs = append(commitArgs, loaderName, imageName)
 	commitResult, err := docker.Run(ctx, dockerexec.Request{
 		// Pausing is Docker's default. Passing the deprecated --pause flag makes
 		// recent CLIs write a warning before the image ID and breaks the strict,
 		// bounded machine-output contract below.
-		Args:   []string{"commit", loaderName, imageName},
+		Args:   commitArgs,
 		Stdout: dockerexec.Capture{Mode: dockerexec.Limit, Bytes: 128},
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	})
@@ -175,7 +183,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result dockerexec.Res
 	}
 	loaderCreated = false
 	if _, err := docker.Run(ctx, dockerexec.Request{
-		Args:   createArgs(name, imageID, request),
+		Args:   createArgs(name, imageID, request, invocation),
 		Stderr: dockerexec.Capture{Mode: dockerexec.Tail, Bytes: 8 << 10},
 	}); err != nil {
 		return dockerexec.Result{}, fmt.Errorf("create final read-only scanner container: %w", err)
@@ -259,6 +267,7 @@ func runTrivyDatabaseInitializer(
 		"--mount", "type=volume,src=" + request.TrivyDBVolume + ",dst=/tmp/trivy/db",
 		"--entrypoint", entrypoint,
 	}
+	args = runlease.AppendLabelArgs(args, runlease.OwnerScanner, runlease.ResourceScannerDB, runlease.Invocation(ctx))
 	if capability != "" {
 		args = append(args, "--cap-add", capability)
 	}
@@ -384,7 +393,7 @@ func validateArchive(data []byte) error {
 	return nil
 }
 
-func createArgs(name, image string, request Request) []string {
+func createArgs(name, image string, request Request, invocation string) []string {
 	proxy := request.Proxy
 	user := request.User
 	if user == "" {
@@ -408,6 +417,7 @@ func createArgs(name, image string, request Request) []string {
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=" + request.Tmpfs,
 		"--workdir", "/project",
 	}
+	args = runlease.AppendLabelArgs(args, runlease.OwnerScanner, runlease.ResourceScannerFinal, invocation)
 	if request.Platform != "" {
 		args = append(args, "--platform", request.Platform)
 	}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 )
 
 const testImageID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -27,6 +28,8 @@ type lifecycleDocker struct {
 	running            bool
 	healthy            bool
 	neverHealthy       bool
+	scannerInvocations map[string]string
+	scannerContainerID string
 	calls              [][]string
 }
 
@@ -67,6 +70,11 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 		return dockerexec.Result{}, nil
 	case "container inspect":
 		requested := args[len(args)-1]
+		if invocation, ok := d.scannerInvocations[requested]; ok {
+			output := `{"owner":"` + runlease.OwnerScanner + `","lifecycle_contract":"` + runlease.ContractValue +
+				`","invocation":"` + invocation + `","resource":"` + runlease.ResourceScannerFinal + `"}`
+			return dockerexec.Result{Stdout: []byte(output)}, nil
+		}
 		if !d.containerExists || (d.containerName != "" && d.containerName != requested) {
 			return dockerexec.Result{}, errors.New("missing container")
 		}
@@ -91,17 +99,38 @@ func (d *lifecycleDocker) Run(_ context.Context, request dockerexec.Request) (do
 		}
 		output := `{"id":"container-id","image":"` + image + `","running":` + boolJSON(d.running) + `,"health":"` + health + `","owner":"` + owner + `","contract":"` + contract + `","read_only":true,"user":"65532:65532","network_mode":"bridge","network_count":` + intJSON(networkCount) + `,"on_internal":true,"on_bridge":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"memory":67108864,"pids_limit":64,"nano_cpus":500000000}`
 		return dockerexec.Result{Stdout: []byte(output)}, nil
+	case "container ls":
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, runlease.ResourceLabel+"="+runlease.ResourceScannerFinal) &&
+			len(d.scannerInvocations) > 0 {
+			return dockerexec.Result{Stdout: []byte(d.scannerContainerID + "\n")}, nil
+		}
+		return dockerexec.Result{}, nil
 	case "container rm":
+		if len(args) > 0 && args[len(args)-1] == d.scannerContainerID {
+			d.scannerInvocations = nil
+			filtered := d.networkAttachments[:0]
+			for _, attachment := range d.networkAttachments {
+				if !strings.HasPrefix(attachment, "vuelta-scan-") {
+					filtered = append(filtered, attachment)
+				}
+			}
+			d.networkAttachments = filtered
+			return dockerexec.Result{}, nil
+		}
 		d.containerExists, d.running, d.healthy, d.stale = false, false, false, false
 		return dockerexec.Result{}, nil
 	case "container create":
 		d.containerExists, d.containerName, d.foreign = true, optionValue(args, "--name"), false
+		d.containerContract = labelValue(args, contractLabel)
 		return dockerexec.Result{Stdout: []byte("container-id")}, nil
 	case "container start":
 		d.running, d.healthy = true, !d.neverHealthy
 		return dockerexec.Result{Stdout: []byte("vuelta-egress-proxy")}, nil
 	case "image inspect":
 		return dockerexec.Result{Stdout: []byte(`{"id":"` + testImageID + `","os":"linux","architecture":"amd64","user":"65532:65532","contract":"` + assetContract() + `"}`)}, nil
+	case "image ls", "network ls":
+		return dockerexec.Result{}, nil
 	default:
 		return dockerexec.Result{}, errors.New("unexpected command: " + strings.Join(args, " "))
 	}
@@ -125,6 +154,16 @@ func optionValue(args []string, option string) string {
 	for index := 0; index+1 < len(args); index++ {
 		if args[index] == option {
 			return args[index+1]
+		}
+	}
+	return ""
+}
+
+func labelValue(args []string, label string) string {
+	prefix := label + "="
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == "--label" && strings.HasPrefix(args[index+1], prefix) {
+			return strings.TrimPrefix(args[index+1], prefix)
 		}
 	}
 	return ""
@@ -322,6 +361,90 @@ func TestSessionCleanupTargetsOnlyResourcesItCreated(t *testing.T) {
 	}
 }
 
+func TestInvocationSessionLabelsTemporaryEgressButPersistentSessionDoesNot(t *testing.T) {
+	invocation := strings.Repeat("a", 32)
+	ctx, err := runlease.WithInvocation(context.Background(), invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryDocker := &lifecycleDocker{}
+	temporary := NewSession(testEgressConfig(), temporaryDocker)
+	if _, _, err := temporary.Resolve(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range [][]string{{"network", "create"}, {"container", "create"}} {
+		call := findCommand(temporaryDocker.calls, prefix...)
+		if call == nil {
+			t.Fatalf("missing create call %v: %v", prefix, temporaryDocker.calls)
+		}
+		for _, label := range []string{
+			runlease.ContractLabel + "=" + runlease.ContractValue,
+			runlease.InvocationLabel + "=" + invocation,
+		} {
+			if !containsPair(call, "--label", label) {
+				t.Fatalf("temporary create call lacks %q: %v", label, call)
+			}
+		}
+	}
+	if err := temporary.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	persistentDocker := &lifecycleDocker{}
+	cfg := testEgressConfig()
+	cfg.Persistent = true
+	persistent := NewSession(cfg, persistentDocker)
+	if _, _, err := persistent.Resolve(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range [][]string{{"network", "create"}, {"container", "create"}} {
+		call := findCommand(persistentDocker.calls, prefix...)
+		if call == nil {
+			t.Fatalf("missing persistent create call %v: %v", prefix, persistentDocker.calls)
+		}
+		if containsValue(call, runlease.InvocationLabel+"="+invocation) {
+			t.Fatalf("persistent resource inherited invocation label: %v", call)
+		}
+	}
+	if err := persistent.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOrphanRecoveryRemovesLabeledScannerBeforeNameCollisionCheck(t *testing.T) {
+	invocation := strings.Repeat("a", 32)
+	scannerID := strings.Repeat("b", 64)
+	cfg := testEgressConfig()
+	docker := &lifecycleDocker{
+		networkExists:      true,
+		networkName:        cfg.Network,
+		networkAttachments: []string{cfg.ProxyContainer, "vuelta-scan-orphan"},
+		containerExists:    true,
+		containerName:      cfg.ProxyContainer,
+		containerContract:  assetContract(),
+		running:            true,
+		healthy:            true,
+		scannerInvocations: map[string]string{"vuelta-scan-orphan": invocation},
+		scannerContainerID: scannerID,
+	}
+	if err := reapStaleManagedResources(context.Background(), docker, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(docker.scannerInvocations) != 0 {
+		t.Fatalf("orphan scanner was not removed: %v", docker.calls)
+	}
+	if !docker.networkExists || !docker.containerExists {
+		t.Fatalf("persistent egress was removed: network=%v proxy=%v", docker.networkExists, docker.containerExists)
+	}
+	resolved, err := collisionFreeConfig(context.Background(), docker, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != cfg {
+		t.Fatalf("subsequent scan fell back after recovery: got %#v want %#v", resolved, cfg)
+	}
+}
+
 func TestEmbeddedAssetContractIsDigestPinnedAndStable(t *testing.T) {
 	contract := assetContract()
 	if len(contract) != 64 || !strings.Contains(proxyDockerfile, "@sha256:") || strings.Contains(proxyDockerfile, "COPY egress/") {
@@ -353,6 +476,40 @@ func commandSeen(calls [][]string, prefix ...string) bool {
 func commandTargeted(calls [][]string, kind, action, target string) bool {
 	for _, call := range calls {
 		if len(call) >= 3 && call[0] == kind && call[1] == action && call[len(call)-1] == target {
+			return true
+		}
+	}
+	return false
+}
+
+func findCommand(calls [][]string, prefix ...string) []string {
+	for _, call := range calls {
+		if len(call) < len(prefix) {
+			continue
+		}
+		match := true
+		for index := range prefix {
+			match = match && call[index] == prefix[index]
+		}
+		if match {
+			return call
+		}
+	}
+	return nil
+}
+
+func containsPair(values []string, first, second string) bool {
+	for index := 0; index+1 < len(values); index++ {
+		if values[index] == first && values[index+1] == second {
+			return true
+		}
+	}
+	return false
+}
+
+func containsValue(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
 			return true
 		}
 	}

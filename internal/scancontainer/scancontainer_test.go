@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 )
 
 type fakeDocker struct {
@@ -116,6 +117,41 @@ func TestRunUsesCreateCopyStartRemoveWithoutHostMount(t *testing.T) {
 	cpArchive, err := io.ReadAll(docker.requests[1].Stdin)
 	if err != nil || !bytes.Equal(cpArchive, validRequest(t).Archive) {
 		t.Fatal("docker cp did not receive the exact in-memory archive")
+	}
+}
+
+func TestRunLabelsEphemeralResourcesWithExactInvocationLease(t *testing.T) {
+	docker := &fakeDocker{}
+	runner := Runner{Docker: docker, NewName: func() (string, error) { return "vuelta-scan-labeled", nil }}
+	invocation := strings.Repeat("a", 32)
+	ctx, err := runlease.WithInvocation(context.Background(), invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Run(ctx, validRequest(t)); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{0, 4} {
+		args := strings.Join(docker.requests[index].Args, " ")
+		for _, label := range []string{
+			runlease.OwnerLabel + "=" + runlease.OwnerScanner,
+			runlease.ContractLabel + "=" + runlease.ContractValue,
+			runlease.InvocationLabel + "=" + invocation,
+		} {
+			if !strings.Contains(args, "--label "+label) {
+				t.Fatalf("create request %d lacks label %q: %s", index, label, args)
+			}
+		}
+	}
+	if loader := strings.Join(docker.requests[0].Args, " "); !strings.Contains(loader, runlease.ResourceLabel+"="+runlease.ResourceScannerInput) {
+		t.Fatalf("loader resource label missing: %s", loader)
+	}
+	if scanner := strings.Join(docker.requests[4].Args, " "); !strings.Contains(scanner, runlease.ResourceLabel+"="+runlease.ResourceScannerFinal) {
+		t.Fatalf("scanner resource label missing: %s", scanner)
+	}
+	commit := strings.Join(docker.requests[2].Args, " ")
+	if !strings.Contains(commit, "--change LABEL "+runlease.ResourceLabel+"="+runlease.ResourceScannerInput) {
+		t.Fatalf("committed image resource label missing: %s", commit)
 	}
 }
 

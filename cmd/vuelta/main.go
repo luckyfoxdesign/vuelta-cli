@@ -38,6 +38,13 @@ func fail(code int, format string, args ...any) error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == cleanupGuardianCommand {
+		if err := runCleanupGuardian(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "vuelta cleanup guardian:", err)
+			os.Exit(exitFailure)
+		}
+		return
+	}
 	if os.Args[0] != "" {
 		executableName = os.Args[0]
 	}
