@@ -353,6 +353,7 @@ func (s Scenario) validate() error {
 			if i >= len(s.Args) || (s.Args[i] != "packages" && s.Args[i] != "vulnerabilities") {
 				return errors.New("--only requires packages or vulnerabilities")
 			}
+		case "--allow-project-config":
 		default:
 			return fmt.Errorf("argument %q is not allowed in corpus scenarios", s.Args[i])
 		}

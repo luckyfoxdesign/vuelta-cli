@@ -82,7 +82,8 @@ cases:
       - monorepo-or-workspaces
     scenarios:
       - name: default
-        args: []
+        args:
+          - --allow-project-config
         repeat: 2
 
   - name: gperdomor-oss-pnpm-workspace

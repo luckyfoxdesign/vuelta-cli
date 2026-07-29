@@ -78,6 +78,12 @@ func decodePNPMReport(data []byte, inputs map[string][]byte) (ecosystem.Candidat
 	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
 		return ecosystem.CandidateReport{}, pnpmCandidateError(ecosystem.CandidateFailureNonJSON, nil)
 	}
+	if bytes.HasPrefix(trimmed, []byte("[ERR_PNPM_")) {
+		return ecosystem.CandidateReport{}, pnpmCandidateError(
+			ecosystem.CandidateFailureManager,
+			errors.New("pnpm emitted a bracketed package-manager error"),
+		)
+	}
 
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	var root any
@@ -151,6 +157,9 @@ func validatePNPMRecord(family int, record map[string]any) error {
 	var allowed map[string]string
 	switch family {
 	case 8, 9, 10, 11:
+		// current and latest become normalized update-plan input. wanted,
+		// isDeprecated, and dependencyType are reviewed pnpm metadata: they are
+		// type-checked but deliberately do not influence the selected target.
 		allowed = map[string]string{
 			"current": "string", "latest": "string", "wanted": "string",
 			"isDeprecated": "bool", "dependencyType": "string",
@@ -167,6 +176,9 @@ func validatePNPMRecord(family int, record map[string]any) error {
 		case "string":
 			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("field %q must be a non-empty string", field)
+			} else if (field == "current" || field == "latest" || field == "wanted") &&
+				!candidatePartPattern.MatchString(text) {
+				return fmt.Errorf("field %q must be a valid candidate version", field)
 			} else if field == "dependencyType" &&
 				text != "dependencies" && text != "devDependencies" &&
 				text != "optionalDependencies" && text != "peerDependencies" {

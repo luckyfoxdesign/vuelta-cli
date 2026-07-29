@@ -31,6 +31,10 @@ cases:
 	if got := manifest.Cases[0].Scenarios[0].EffectiveRepeat(); got != 2 {
 		t.Fatalf("EffectiveRepeat() = %d, want 2", got)
 	}
+	withProjectConfig := strings.Replace(valid, "args: []", "args: [--allow-project-config]", 1)
+	if _, err := ParseManifest([]byte(withProjectConfig), false); err != nil {
+		t.Fatalf("ParseManifest() rejected reviewed project config scenario: %v", err)
+	}
 
 	tests := map[string]string{
 		"unknown":       strings.Replace(valid, "schema_version: 1", "schema_version: 1\nunknown: true", 1),

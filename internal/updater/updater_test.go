@@ -249,6 +249,20 @@ func TestPNPMScannerAcceptsExitOneOnlyAfterStrictJSONParsing(t *testing.T) {
 	if _, err := scanner.Scan(context.Background(), root); err == nil || !strings.Contains(err.Error(), "parse pnpm") {
 		t.Fatalf("malformed exit-one output error = %v", err)
 	}
+	scanner.Run = func(context.Context, string, []string, scaninput.Bundle, string) (ReadOnlyScanOutput, error) {
+		return ReadOnlyScanOutput{
+			Stdout: "[ERR_PNPM_CATALOG_ENTRY_NOT_FOUND_FOR_SPEC] No catalog entry 'demo' was found",
+		}, fakeExitCode(1)
+	}
+	_, err = scanner.Scan(context.Background(), root)
+	var candidateErr *ecosystem.CandidateError
+	if !errors.As(err, &candidateErr) ||
+		candidateErr.Kind != ecosystem.CandidateFailureManager ||
+		candidateErr.ExitCode != 1 ||
+		candidateErr.Detail != "" ||
+		strings.Contains(err.Error(), "demo") {
+		t.Fatalf("bracketed manager failure = %#v, %v", candidateErr, err)
+	}
 }
 
 func TestPNPMScannerReturnsBoundedTypedManagerFailure(t *testing.T) {

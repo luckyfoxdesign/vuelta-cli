@@ -292,20 +292,21 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 		return CandidateReport{}, err
 	}
 	defer bundle.Destroy()
-	output, err := s.Run(ctx, s.Image, s.Args, bundle, s.Memory)
-	if err != nil && !acceptedDiscoveryExit(s.AcceptedExitCodes, err) {
+	output, runErr := s.Run(ctx, s.Image, s.Args, bundle, s.Memory)
+	if runErr != nil && !acceptedDiscoveryExit(s.AcceptedExitCodes, runErr) {
 		exitCode := -1
 		var exit exitCoder
-		if errors.As(err, &exit) {
+		if errors.As(runErr, &exit) {
 			exitCode = exit.ExitCode()
 		}
 		return CandidateReport{}, &ecosystem.CandidateError{
 			Kind: ecosystem.CandidateFailureManager, Manager: s.Kind,
-			ExitCode: exitCode, Detail: safeerr.Excerpt([]byte(output.Stderr), 1024), Err: err,
+			ExitCode: exitCode, Detail: safeerr.Excerpt([]byte(output.Stderr), 1024), Err: runErr,
 		}
 	}
 	decoder := s.Decode
 	if decoder == nil {
+		var err error
 		decoder, err = decoderForKind(s.Kind)
 		if err != nil {
 			return CandidateReport{}, err
@@ -319,6 +320,16 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 	}
 	decoded, err := decoder.DecodeCandidates([]byte(output.Stdout), inputs)
 	if err != nil {
+		var candidateErr *ecosystem.CandidateError
+		var exit exitCoder
+		if errors.As(err, &candidateErr) &&
+			candidateErr.Kind == ecosystem.CandidateFailureManager &&
+			candidateErr.ExitCode < 0 &&
+			errors.As(runErr, &exit) {
+			withExitCode := *candidateErr
+			withExitCode.ExitCode = exit.ExitCode()
+			err = &withExitCode
+		}
 		return CandidateReport{}, fmt.Errorf("parse %s update candidates: %w", s.Kind, err)
 	}
 	report := CandidateReport{

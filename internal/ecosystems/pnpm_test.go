@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
@@ -19,7 +20,7 @@ func TestPNPMDecoderSupportedVersionMatrix(t *testing.T) {
 		{8, "8.15.9", "6.0", "1.0.0"},
 		{9, "9.15.0", "9.0", "1.0.0"},
 		{10, "10.14.0", "9.0", ""},
-		{11, "11.4.0", "9.0", "1.0.0"},
+		{11, "11.15.1", "9.0", ""},
 	}
 	for _, testCase := range tests {
 		testCase := testCase
@@ -61,6 +62,44 @@ func TestPNPMDecoderSeparatesOutputFailureKinds(t *testing.T) {
 			var candidateErr *ecosystem.CandidateError
 			if !errors.As(err, &candidateErr) || candidateErr.Kind != testCase.kind {
 				t.Fatalf("error = %#v, want kind %q", err, testCase.kind)
+			}
+		})
+	}
+}
+
+func TestPNPMDecoderClassifiesBracketedManagerError(t *testing.T) {
+	t.Parallel()
+	output, err := os.ReadFile(filepath.Join("testdata", "pnpm", "v11-catalog-error.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = PNPM().(ecosystem.CandidateDecoder).DecodeCandidates(
+		output,
+		pnpmInputs("11.15.1", "9.0"),
+	)
+	var candidateErr *ecosystem.CandidateError
+	if !errors.As(err, &candidateErr) ||
+		candidateErr.Kind != ecosystem.CandidateFailureManager ||
+		candidateErr.ExitCode != -1 ||
+		candidateErr.Detail != "" ||
+		strings.Contains(err.Error(), "demo-package") {
+		t.Fatalf("error = %#v, %v", candidateErr, err)
+	}
+}
+
+func TestPNPMDecoderRejectsMalformedCandidateVersions(t *testing.T) {
+	t.Parallel()
+	inputs := pnpmInputs("11.15.1", "9.0")
+	for _, field := range []string{"current", "latest", "wanted"} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+			output := fmt.Sprintf(`{"demo":{"latest":"2.0.0","%s":"2.0.0; unsafe"}}`, field)
+			_, err := PNPM().(ecosystem.CandidateDecoder).DecodeCandidates([]byte(output), inputs)
+			var candidateErr *ecosystem.CandidateError
+			if !errors.As(err, &candidateErr) ||
+				candidateErr.Kind != ecosystem.CandidateFailureSchemaMismatch {
+				t.Fatalf("error = %#v, want schema mismatch", err)
 			}
 		})
 	}
