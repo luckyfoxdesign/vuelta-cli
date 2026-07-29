@@ -11,6 +11,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystems"
 )
 
 func TestSelectRealWorldRuntimeConstraints(t *testing.T) {
@@ -45,7 +46,7 @@ func TestSelectRealWorldRuntimeConstraints(t *testing.T) {
 			manifestName: "pyproject.toml",
 			manifest:     "[tool.poetry.dependencies]\npython = \"^3.9\"\n",
 			lockName:     "poetry.lock", lock: "package = []\n",
-			wantRuntime: "3.13", wantConstraint: ">=3.9.0 <4.0.0",
+			wantRuntime: "3.14", wantConstraint: ">=3.9.0 <4.0.0",
 		},
 	}
 	for _, testCase := range tests {
@@ -235,15 +236,26 @@ func TestSelectEmbeddedDefaultMatrixWithoutConfigProfiles(t *testing.T) {
 		}
 	}
 
-	for _, runtimeVersion := range []string{"3.11", "3.12", "3.13"} {
-		for _, manager := range []string{"poetry", "uv"} {
+	for _, runtimeVersion := range ecosystems.SupportedPythonRuntimeFamilies() {
+		for _, manager := range []string{"poetry", "uv", "pip-tools", "requirements"} {
 			t.Run("python"+runtimeVersion+"-"+manager, func(t *testing.T) {
 				root := t.TempDir()
-				write(t, root, "pyproject.toml", fmt.Sprintf("[project]\nrequires-python = \"%s\"\n", runtimeVersion))
-				lock := map[string]string{"poetry": "poetry.lock", "uv": "uv.lock"}[manager]
-				write(t, root, lock, "version = 1\n")
+				write(t, root, "pyproject.toml", fmt.Sprintf("[project]\nrequires-python = \"==%s.*\"\n", runtimeVersion))
+				switch manager {
+				case "poetry":
+					write(t, root, "poetry.lock", "version = 1\n")
+				case "uv":
+					write(t, root, "uv.lock", "version = 1\n")
+				case "pip-tools":
+					write(t, root, "requirements.in", "example\n")
+					write(t, root, "requirements.txt", "example==1.0.0\n")
+				case "requirements":
+					write(t, root, "requirements.txt", "example==1.0.0\n")
+				}
 				selection, err := Select(config.Workspace{Path: root, Stack: config.StackPython, PackageManager: manager, Platform: "linux/arm64"}, config.Config{})
-				if err != nil || selection.Profile.Runtime != runtimeVersion || selection.Source != SourceDefault {
+				if err != nil || selection.Profile.Runtime != runtimeVersion ||
+					selection.Source != SourceDefault || selection.build == nil ||
+					selection.build.Args["BASE_IMAGE"] != "python:"+runtimeVersion+"-slim-bookworm" {
 					t.Fatalf("Select() = %#v, %v", selection, err)
 				}
 			})

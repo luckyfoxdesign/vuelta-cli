@@ -371,7 +371,7 @@ func Poetry() ecosystem.Adapter {
 		"python-poetry.Dockerfile", []string{"poetry.toml"},
 		func(runtime, manager string) map[string]string {
 			return map[string]string{
-				"BASE_IMAGE": "python:" + runtime + "-slim-bookworm", "POETRY_VERSION": manager,
+				"BASE_IMAGE": pythonBaseImage(runtime), "POETRY_VERSION": manager,
 			}
 		},
 		[]string{"poetry", "show", "--outdated", "--format", "json"},
@@ -386,7 +386,7 @@ func UV() ecosystem.Adapter {
 		"python-uv.Dockerfile", nil,
 		func(runtime, manager string) map[string]string {
 			return map[string]string{
-				"BASE_IMAGE": "python:" + runtime + "-slim-bookworm",
+				"BASE_IMAGE": pythonBaseImage(runtime),
 				"UV_IMAGE":   "ghcr.io/astral-sh/uv:" + manager,
 				"UV_VERSION": manager,
 			}
@@ -403,7 +403,7 @@ func PipTools() ecosystem.Adapter {
 		"vuelta-pip-tools-scan", defaultPipScanner, "python-pip-tools.Dockerfile", []string{"pip.conf"},
 		func(runtime, manager string) map[string]string {
 			return map[string]string{
-				"BASE_IMAGE":        "python:" + runtime + "-slim-bookworm",
+				"BASE_IMAGE":        pythonBaseImage(runtime),
 				"PIP_VERSION":       defaultPipVersion,
 				"PIP_TOOLS_VERSION": manager,
 				"SCANNER_VERSION":   defaultPipScanner,
@@ -431,7 +431,7 @@ func Requirements() ecosystem.Adapter {
 		detectionCapability:  detectionCapability{required: []string{"requirements.txt"}},
 		constraintCapability: constraintCapability{key: key, detect: detectRequirementsConstraints},
 		toolchainCapability: toolchainCapability{resolve: func(constraints ecosystem.Constraints) (ecosystem.ToolchainSpec, error) {
-			runtime, err := ecosystem.ResolveRuntime("python", constraints.Runtime, "3.12", []string{"3.12", "3.13", "3.11"})
+			runtime, err := resolvePythonRuntime(constraints.Runtime)
 			if err != nil {
 				return ecosystem.ToolchainSpec{}, err
 			}
@@ -446,7 +446,7 @@ func Requirements() ecosystem.Adapter {
 				Capabilities: ecosystem.ToolchainCapabilities{ReadOnlyDiscovery: true},
 				Dockerfile:   "python-pip-tools.Dockerfile",
 				BuildArgs: map[string]string{
-					"BASE_IMAGE": "python:" + runtime + "-slim-bookworm", "PIP_VERSION": defaultPipVersion,
+					"BASE_IMAGE": pythonBaseImage(runtime), "PIP_VERSION": defaultPipVersion,
 					"PIP_TOOLS_VERSION": defaultPipToolsVersion, "SCANNER_VERSION": defaultPipScanner,
 				},
 			}, nil
@@ -607,7 +607,7 @@ func pythonToolchain(
 	buildArgs func(runtime, manager string) map[string]string,
 ) toolchainCapability {
 	return toolchainCapability{resolve: func(constraints ecosystem.Constraints) (ecosystem.ToolchainSpec, error) {
-		runtime, err := ecosystem.ResolveRuntime("python", constraints.Runtime, "3.12", []string{"3.12", "3.13", "3.11"})
+		runtime, err := resolvePythonRuntime(constraints.Runtime)
 		if err != nil {
 			return ecosystem.ToolchainSpec{}, err
 		}
@@ -734,10 +734,23 @@ func detectRequirementsConstraints(root string, key ecosystem.Key, platform stri
 	if _, err := ecosystem.ReadRootFile(root, "requirements.txt", ecosystem.DefaultManifestLimit); err != nil {
 		return ecosystem.Constraints{}, err
 	}
-	return ecosystem.Constraints{
+	constraints := ecosystem.Constraints{
 		Key: key, Platform: platform, LockFormat: "requirements-direct",
 		RuntimeConstraintSource: ecosystem.RuntimeConstraintSourceDefault,
-	}, nil
+	}
+	data, present, err := readOptionalRootFile(root, pipToolsMetadataFile)
+	if err != nil {
+		return ecosystem.Constraints{}, err
+	}
+	if !present {
+		return constraints, nil
+	}
+	constraints.Runtime, err = parsePipToolsRuntimeMetadata(data)
+	if err != nil {
+		return ecosystem.Constraints{}, err
+	}
+	constraints.RuntimeConstraintSource = runtimeConstraintSource(constraints.Runtime)
+	return constraints, nil
 }
 
 func runtimeConstraintSource(runtime string) string {

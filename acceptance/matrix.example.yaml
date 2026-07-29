@@ -1,5 +1,5 @@
-# This matrix exercises the embedded adaptive defaults. Keep it outside
-# secret-bearing directories and add one case per supported phase-1 profile.
+# This matrix exercises embedded adaptive defaults. Keep it outside
+# secret-bearing directories and cover every reviewed Python boundary profile.
 engine: docker-engine # docker-desktop | docker-engine
 cases:
   - name: node22-pnpm9
@@ -16,26 +16,55 @@ cases:
     package_manager: npm
     expected_profile_id: default-node22-npm
     min_release_age_days: 0
-  - name: python312-poetry
+  - name: python310-poetry
+    fixture_root: testdata/fixtures/projects
+    fixture: py-poetry310-ok
+    stack: python
+    package_manager: poetry
+    expected_profile_id: default-python310-poetry
+    min_release_age_days: 0
+  - name: python314-poetry
     fixture_root: testdata/fixtures/projects
     fixture: py-poetry-real-ok
     stack: python
     package_manager: poetry
-    expected_profile_id: default-python312-poetry
+    expected_profile_id: default-python314-poetry
     min_release_age_days: 0
-  - name: python312-uv
+  - name: python310-uv
+    fixture_root: testdata/fixtures/projects
+    fixture: py-uv310-ok
+    stack: python
+    package_manager: uv
+    expected_profile_id: default-python310-uv
+    min_release_age_days: 0
+  - name: python314-uv
     fixture_root: testdata/fixtures/projects
     fixture: py-uv-ok
     stack: python
     package_manager: uv
-    expected_profile_id: default-python312-uv
+    expected_profile_id: default-python314-uv
     min_release_age_days: 0
-  - name: python312-pip-tools
+  - name: python310-pip-tools
+    fixture_root: testdata/fixtures/projects
+    fixture: py-pip-tools310-ok
+    stack: python
+    package_manager: pip-tools
+    expected_profile_id: default-python310-pip-tools
+    min_release_age_days: 0
+  - name: python314-pip-tools
     fixture_root: testdata/fixtures/projects
     fixture: py-pip-tools-ok
     stack: python
     package_manager: pip-tools
-    expected_profile_id: default-python312-pip-tools
+    expected_profile_id: default-python314-pip-tools
+    min_release_age_days: 0
+  - name: python310-requirements
+    fixture_root: testdata/fixtures/projects
+    fixture: py-requirements310-ok
+    stack: python
+    package_manager: requirements
+    expected_profile_id: default-python310-requirements
+    scan_only: true
     min_release_age_days: 0
   - name: python312-requirements
     fixture_root: testdata/fixtures/projects
@@ -43,5 +72,13 @@ cases:
     stack: python
     package_manager: requirements
     expected_profile_id: default-python312-requirements
+    scan_only: true
+    min_release_age_days: 0
+  - name: python314-requirements
+    fixture_root: testdata/fixtures/projects
+    fixture: py-requirements314-ok
+    stack: python
+    package_manager: requirements
+    expected_profile_id: default-python314-requirements
     scan_only: true
     min_release_age_days: 0

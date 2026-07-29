@@ -81,6 +81,39 @@ func TestPipToolsConstraintsTreatProjectMetadataAsOptional(t *testing.T) {
 	}
 }
 
+func TestRequirementsConstraintsUseOptionalProjectMetadataWithoutWideningScanInput(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writePipToolsFixture(t, root, pipToolsCompiledFile, "demo==1.0.0\n")
+	writePipToolsFixture(t, root, pipToolsMetadataFile, "[project]\nrequires-python = \"==3.14.*\"\n")
+
+	adapter := Requirements()
+	constraints, err := adapter.(ecosystem.ConstraintDetector).DetectConstraints(root, "linux/arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if constraints.Runtime != "==3.14.*" ||
+		constraints.RuntimeConstraintSource != ecosystem.RuntimeConstraintSourceProject ||
+		constraints.LockFormat != "requirements-direct" {
+		t.Fatalf("constraints = %#v", constraints)
+	}
+	spec, err := adapter.(ecosystem.ToolchainProvider).DefaultToolchain(constraints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Runtime != "3.14" {
+		t.Fatalf("selected runtime = %q, want 3.14", spec.Runtime)
+	}
+
+	input, err := adapter.(ecosystem.RootInputProvider).PackageInputForRoot(root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(input.Files) != 1 || input.Files[0].Path != pipToolsCompiledFile {
+		t.Fatalf("requirements scan input was widened: %#v", input.Files)
+	}
+}
+
 func TestPipToolsConstraintsRejectUnsafeSelectedMetadata(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

@@ -1,0 +1,8 @@
+[tool.poetry]
+name = "fixture-py-poetry310-ok"
+version = "0.1.0"
+description = "Python 3.10 Vuelta real-engine acceptance fixture"
+
+[tool.poetry.dependencies]
+python = "3.10.*"
+certifi = "2023.7.22"
