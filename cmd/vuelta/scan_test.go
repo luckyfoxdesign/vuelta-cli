@@ -950,6 +950,34 @@ func TestCandidateResultsSurvivePersistentTrivyDatabaseUnavailability(t *testing
 	}
 }
 
+func TestScannerPlatformMismatchUsesSafePublicFailureContract(t *testing.T) {
+	result := failedScanResult(
+		scanResult{},
+		stageVulnerability,
+		"vulnerability_scan_failed",
+		&vulnscan.ScannerPlatformError{},
+		"",
+	)
+	if result.Error == nil ||
+		result.Error.Code != "scanner_platform_mismatch" ||
+		result.Error.Category != "scanner_platform_mismatch" ||
+		result.Error.Message != "scanner image is incompatible with the Docker runtime platform" ||
+		!strings.Contains(result.Error.Hint, "scanner image") ||
+		!strings.Contains(result.Error.Hint, "Docker runtime platform") ||
+		result.Error.ExitCode != nil ||
+		result.Error.StderrTail != "" {
+		t.Fatalf("platform failure = %#v", result.Error)
+	}
+	if !isPartialCapabilityFailure(result.Error) {
+		t.Fatalf("platform failure is not a partial-capability category: %#v", result.Error)
+	}
+	for _, capability := range result.Capabilities {
+		if capability.Name == "trivy_database" {
+			t.Fatalf("platform mismatch changed database capability: %#v", result.Capabilities)
+		}
+	}
+}
+
 func TestStandaloneRequirementsPackagesOnlyIsScanOnly(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "requirements.txt"), []byte("flask==0.5\n"), 0o600); err != nil {

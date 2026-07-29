@@ -281,6 +281,9 @@ func (s Scanner) trivyCommand(
 			if err == nil {
 				return output, nil
 			}
+			if isScannerPlatformMismatch(err) {
+				return nil, &ScannerPlatformError{}
+			}
 			lastErr = err
 			kind := classifyDatabaseFailure(err)
 			history = append(history, fmt.Sprintf("attempt %d: %s", attempt, kind))
@@ -321,6 +324,9 @@ func (s Scanner) trivyCommand(
 		ctx, bundle, image, egressConfig, volume, false,
 		"trivy", scanArgs...,
 	)
+	if isScannerPlatformMismatch(err) {
+		return nil, &ScannerPlatformError{}
+	}
 	if err != nil && isTrivyDatabaseRuntimeFailure(err) {
 		kind := classifyDatabaseFailure(err)
 		invalidateErr := s.invalidateTrivyDatabase(trivyDatabaseVolume(image), volume)

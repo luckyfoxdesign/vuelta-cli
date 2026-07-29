@@ -180,6 +180,9 @@ func (s Scanner) ensureTrivyDatabase(
 	for _, volume := range volumes {
 		updated, err := s.probeTrivyDatabase(ctx, bundle, image, egressConfig, volume, false)
 		if err != nil {
+			if isScannerPlatformMismatch(err) {
+				return databaseCache{}, &ScannerPlatformError{}
+			}
 			if kind := classifyDatabaseFailure(err); kind != FailureInvalidDatabase {
 				return databaseCache{}, newDatabaseAcquisitionError(
 					kind, 1, []string{"probe: " + string(kind)}, fallback, s.now(), err,
@@ -240,6 +243,9 @@ func (s Scanner) ensureTrivyDatabase(
 				append(history, fmt.Sprintf("attempt %d: cancelled", attempt)),
 				fallback, s.now(), ctxErr,
 			)
+		}
+		if isScannerPlatformMismatch(acquireErr) {
+			return databaseCache{}, &ScannerPlatformError{}
 		}
 		history = append(history, fmt.Sprintf("attempt %d: %s", attempt, kind))
 		cleanupErr := cleanupDatabaseVolume(docker, candidate)

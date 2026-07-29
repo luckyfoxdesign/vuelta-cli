@@ -104,6 +104,43 @@ func TestTrivyDatabaseRetryClassification(t *testing.T) {
 	}
 }
 
+func TestTrivyScannerPlatformMismatchIsNotDatabaseFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "runtime architecture", message: "standard_init_linux.go: exec user process caused: exec format error"},
+		{
+			name:    "missing platform manifest",
+			message: "no matching manifest for linux/amd64 in the manifest list entries",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
+				calls++
+				return nil, errors.New(test.message)
+			})
+			root, workspace := adhocNPMWorkspace(t)
+			_, err := scanner.Scan(context.Background(), root, workspace, config.Config{
+				VulnScan: config.VulnScanConfig{DependencySource: "trivy", DatabaseMaxAgeHours: 24},
+			})
+			var platformErr *ScannerPlatformError
+			if !errors.As(err, &platformErr) || calls != 1 {
+				t.Fatalf("error = %v; calls=%d, want ScannerPlatformError after one call", err, calls)
+			}
+			var databaseErr *DatabaseAcquisitionError
+			if errors.As(err, &databaseErr) {
+				t.Fatalf("platform mismatch was reported as database failure: %#v", databaseErr)
+			}
+			if strings.Contains(err.Error(), test.message) {
+				t.Fatalf("public error exposed raw platform diagnostic: %q", err)
+			}
+		})
+	}
+}
+
 func TestTrivyDatabaseCancellationStopsBackoffAndFurtherAttempts(t *testing.T) {
 	calls := 0
 	scanner := NewAdhocScanner(func(context.Context, string, string, ...string) ([]byte, error) {
@@ -203,6 +240,42 @@ func TestFreshDatabaseCacheAvoidsDownloadAcrossScannerSessions(t *testing.T) {
 	}
 	if lifecycle.downloads != 0 {
 		t.Fatalf("fresh cache triggered %d downloads", lifecycle.downloads)
+	}
+}
+
+func TestScannerPlatformMismatchPreservesExistingDatabaseVolume(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	image := "scanner@sha256:" + strings.Repeat("7", 64)
+	volumes := trivyDatabaseVolumes(image)
+	lifecycle := newDatabaseLifecycle(now)
+	updated := now.Add(-time.Hour)
+	lifecycle.addDatabase(volumes[0], updated)
+
+	scanner := lifecycle.scanner(now)
+	scanner.databaseCommand = func(
+		context.Context,
+		scaninput.Bundle,
+		string,
+		config.EgressConfig,
+		string,
+		bool,
+		string,
+		...string,
+	) ([]byte, error) {
+		return nil, errors.New("exec format error: scanner@sha256:untrusted")
+	}
+	_, err := scanner.ensureTrivyDatabase(
+		context.Background(), scaninput.Bundle{}, image, config.EgressConfig{}, 24,
+	)
+	var platformErr *ScannerPlatformError
+	if !errors.As(err, &platformErr) {
+		t.Fatalf("error = %v, want ScannerPlatformError", err)
+	}
+	if got, ok := lifecycle.databaseUpdated(volumes[0]); !ok || !got.Equal(updated) {
+		t.Fatalf("platform mismatch changed valid database volume: %v, exists=%t", got, ok)
+	}
+	if lifecycle.downloads != 0 {
+		t.Fatalf("platform mismatch attempted %d database downloads", lifecycle.downloads)
 	}
 }
 

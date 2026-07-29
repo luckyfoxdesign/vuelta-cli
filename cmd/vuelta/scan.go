@@ -1377,6 +1377,7 @@ func isPartialCapabilityFailure(failure *jsonCommandError) bool {
 	}
 	switch failure.Code {
 	case "toolchain_incompatible", reasonLockfileMissing,
+		"scanner_platform_mismatch",
 		"trivy_database_transient_transport",
 		"trivy_database_integrity",
 		"trivy_database_authorization",
@@ -1894,6 +1895,12 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 		})
 	}
 	category, exitCode, detail := classifySubprocessError(err)
+	var platformErr *vulnscan.ScannerPlatformError
+	if errors.As(err, &platformErr) {
+		category = "scanner_platform_mismatch"
+		exitCode = nil
+		detail = ""
+	}
 	failure := &jsonCommandError{
 		Code: code, Message: err.Error(), Hint: hint,
 		Stage: stage, Category: category, ExitCode: exitCode, StderrTail: detail,
@@ -1928,6 +1935,10 @@ func recordScanStageFailure(result scanResult, stage, code string, err error, hi
 }
 
 func scanFailureContract(code, hint string, err error) (string, string) {
+	var platformErr *vulnscan.ScannerPlatformError
+	if errors.As(err, &platformErr) {
+		return "scanner_platform_mismatch", "Use a scanner image that publishes an image for the approved Docker runtime platform"
+	}
 	var databaseErr *vulnscan.DatabaseAcquisitionError
 	if errors.As(err, &databaseErr) {
 		switch databaseErr.Kind {
