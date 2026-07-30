@@ -297,9 +297,8 @@ func TestEffectiveMinReleaseAge(t *testing.T) {
 		want       time.Duration
 	}{
 		{configured: 7, policy: 14, want: 14 * 24 * time.Hour},
-		{value: "0", configured: 7, policy: 14, want: 0},
-		{value: "12h", configured: 7, policy: 14, want: 12 * time.Hour},
-		{value: "7d", want: 7 * 24 * time.Hour},
+		{value: "14d", want: 14 * 24 * time.Hour},
+		{value: "336h", want: 14 * 24 * time.Hour},
 	} {
 		got, err := effectiveMinReleaseAge(test.value, test.configured, test.policy)
 		if err != nil {
@@ -307,6 +306,11 @@ func TestEffectiveMinReleaseAge(t *testing.T) {
 		}
 		if got != test.want {
 			t.Fatalf("effective age for %q = %s, want %s", test.value, got, test.want)
+		}
+	}
+	for _, value := range []string{"0", "12h", "7d"} {
+		if _, err := effectiveMinReleaseAge(value, 14, 0); err == nil {
+			t.Fatalf("unsafe effective age %q was accepted", value)
 		}
 	}
 }
@@ -1495,7 +1499,7 @@ func TestHumanScanOutputUsesCompactTableAndOptionalDetails(t *testing.T) {
 		"npm", "lodash", "4.17.20", "4.17.23", "available",
 		"Result: 1 package update available; 1 vulnerability found.",
 		"Vulnerabilities:", "CVE", "SEVERITY", "CVE-2024-1", "HIGH",
-		"Next: vuelta update --directory /tmp/project --config /tmp/config.yaml",
+		"Next: vuelta update local --directory /tmp/project --config /tmp/config.yaml",
 	} {
 		if !strings.Contains(stdout, wanted) {
 			t.Fatalf("compact output %q does not contain %q", stdout, wanted)
@@ -1600,7 +1604,7 @@ func TestProjectScanReportIsBoundedEscapedAndNamesSnapshotAuthority(t *testing.T
 	}
 	for _, wanted := range []string{
 		"Status: **ready**", "bad\\|name", "&lt;script&gt;", "abcdefghijklmnopqrstuv",
-		"vuelta update --directory /projects/api", "authority is the selected JSON snapshot",
+		"vuelta update local --directory /projects/api", "authority is the selected JSON snapshot",
 	} {
 		if !strings.Contains(report, wanted) {
 			t.Fatalf("report lacks %q:\n%s", wanted, report)

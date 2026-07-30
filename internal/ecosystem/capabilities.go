@@ -1,5 +1,7 @@
 package ecosystem
 
+import "time"
+
 // InputStage identifies one consumer of repository input.
 type InputStage string
 
@@ -206,6 +208,9 @@ type Candidate struct {
 	File        string
 	Line        int
 	Disposition string
+	Ownership   string
+	PublishedAt time.Time
+	Yanked      bool
 }
 
 // PlannedMutationRequest binds reviewed snapshot candidates to explicit core

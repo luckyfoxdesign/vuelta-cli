@@ -1,0 +1,48 @@
+# Copy this file to .github/workflows/vuelta-update.yml in a managed
+# repository. Replace both engine pins with the same reviewed 40-hex Vuelta
+# commit. The server dispatches only the five declared inputs below.
+name: Vuelta dependency update
+run-name: vuelta-update-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Opaque Vuelta operation ID
+        required: true
+        type: string
+      base_commit:
+        description: Exact reviewed base commit
+        required: true
+        type: string
+      policy_version:
+        description: Vuelta update policy contract
+        required: true
+        type: string
+      cooldown_days:
+        description: Machine-owned stable release cooldown
+        required: true
+        type: string
+      include_major:
+        description: Explicit reviewed major-update authorization
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: vuelta-update-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    uses: luckyfoxdesign/vuelta/.github/workflows/vuelta-update-engine.yml@REPLACE_WITH_40_HEX_VUELTA_COMMIT
+    with:
+      request_id: ${{ inputs.request_id }}
+      base_commit: ${{ inputs.base_commit }}
+      policy_version: ${{ inputs.policy_version }}
+      cooldown_days: ${{ inputs.cooldown_days }}
+      include_major: ${{ inputs.include_major }}
+      engine_ref: REPLACE_WITH_40_HEX_VUELTA_COMMIT

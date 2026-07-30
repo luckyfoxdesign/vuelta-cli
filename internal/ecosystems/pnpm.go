@@ -116,7 +116,7 @@ func decodePNPMReport(data []byte, inputs map[string][]byte) (ecosystem.Candidat
 		latest, _ := record["latest"].(string)
 		current, _ := record["current"].(string)
 		candidates = append(candidates, ecosystem.Candidate{
-			Kind: "pnpm", Name: name, Current: current, Target: latest,
+			Kind: "pnpm", Name: name, Current: current, Target: latest, Ownership: "direct",
 		})
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })

@@ -59,14 +59,24 @@ const (
 // Candidate is one dependency or image version chosen by a read-only scan.
 // Values are metadata only and are never interpreted as a shell command.
 type Candidate struct {
-	Kind               string `json:"kind"`
-	Name               string `json:"name"`
-	Current            string `json:"current"`
-	Target             string `json:"target"`
-	File               string `json:"file,omitempty"`
-	Line               int    `json:"line,omitempty"`
-	Disposition        string `json:"disposition,omitempty"`
-	ReleaseAgeVerified bool   `json:"release_age_verified"`
+	Kind               string    `json:"kind"`
+	Name               string    `json:"name"`
+	Current            string    `json:"current"`
+	Target             string    `json:"target"`
+	File               string    `json:"file,omitempty"`
+	Line               int       `json:"line,omitempty"`
+	Disposition        string    `json:"disposition,omitempty"`
+	ReleaseAgeVerified bool      `json:"release_age_verified"`
+	Direct             bool      `json:"direct"`
+	Yanked             bool      `json:"yanked,omitempty"`
+	Stable             bool      `json:"stable"`
+	PublicationTime    time.Time `json:"publication_time,omitempty"`
+	FirstObservedAt    time.Time `json:"first_observed_at,omitempty"`
+	EligibleAt         time.Time `json:"eligible_at,omitempty"`
+	VersionClass       string    `json:"version_class,omitempty"`
+	PolicyDisposition  string    `json:"policy_disposition,omitempty"`
+	PolicyReason       string    `json:"policy_reason,omitempty"`
+	Ownership          string    `json:"ownership,omitempty"`
 }
 
 // InputIdentity binds a plan to its typed stage set and exact file contents.
@@ -742,6 +752,30 @@ func validateSnapshot(snapshot Snapshot) error {
 		}
 		if filepath.IsAbs(candidate.File) || candidate.File == ".." || strings.HasPrefix(filepath.Clean(candidate.File), ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: candidate file escapes the workspace", ErrInvalid)
+		}
+		if candidate.Ownership != "" && candidate.Ownership != "direct" &&
+			candidate.Ownership != "transitive" && candidate.Ownership != "unknown" {
+			return fmt.Errorf("%w: candidate ownership is invalid", ErrInvalid)
+		}
+		if candidate.PolicyDisposition != "" {
+			if candidate.PolicyDisposition != "routine" && candidate.PolicyDisposition != "deferred" &&
+				candidate.PolicyDisposition != "excluded" {
+				return fmt.Errorf("%w: candidate policy disposition is invalid", ErrInvalid)
+			}
+			if candidate.VersionClass != "patch" && candidate.VersionClass != "minor" &&
+				candidate.VersionClass != "major" && candidate.VersionClass != "unknown" &&
+				candidate.VersionClass != "prerelease" {
+				return fmt.Errorf("%w: candidate version class is invalid", ErrInvalid)
+			}
+			if candidate.FirstObservedAt.IsZero() || candidate.EligibleAt.IsZero() ||
+				candidate.PolicyReason == "" || !toolchainIDPattern.MatchString(candidate.PolicyReason) {
+				return fmt.Errorf("%w: candidate policy metadata is incomplete", ErrInvalid)
+			}
+			if candidate.PolicyDisposition == "routine" &&
+				(!candidate.Direct || !candidate.Stable ||
+					(candidate.VersionClass != "patch" && candidate.VersionClass != "minor")) {
+				return fmt.Errorf("%w: inadmissible routine candidate", ErrInvalid)
+			}
 		}
 	}
 	return nil

@@ -1,16 +1,16 @@
 # vuelta
 
-A one-shot CLI that creates reviewable dependency-update snapshots, applies
-one explicitly selected snapshot inside a sandbox, and runs the project's
-checks. It has no resident daemon. Optional
-launchd/systemd automation invokes the separate `vuelta-scheduler` helper,
-which uses the same JSON `scan` → `update` workflow as a human operator.
+A one-shot CLI that scans configured projects read-only, records bounded
+dependency history in machine-owned SQLite, and dispatches reviewed updates to
+GitHub-hosted runners. The production server never resolves lock files, runs
+project tests, or builds images during the normal update path. It has no
+resident daemon; launchd/systemd invokes scans and typed command consumption.
 
 Node and Python scans resolve adaptive defaults from declarative runtime,
 manager, lock, and platform metadata. Scanner Dockerfiles are embedded in the
 binary, built locally on first use, and cached by content hash; an explicit
 `update.toolchain_profiles` entry is only an operator override. Snapshot format
-6 records the profile source, local image identity, runtime and tool versions,
+7 records the profile source, local image identity, runtime and tool versions,
 platform, non-root user, lock support, and security capabilities. See
 `scanner-images/` and the real-engine section of `../docs/runbook-local.md`.
 
@@ -74,14 +74,17 @@ internal/
   scanner/        # validates only explicitly configured project paths, detects stack
   updater/        # read-only candidate scan and per-stack updates (python/js/docker)
   updatesnapshot/ # atomic, short-lived package-update plans
+  updatepolicy/   # delayed-latest direct dependency policy
+  history/        # machine-owned SQLite schema and repositories
+  githubactions/  # narrow workflow dispatch and known-run synchronization
   vulnscan/       # trivy/osv-scanner integration
   githubalerts/   # read-only GitHub Dependabot/Security Advisories client
   sandbox/        # one-off sandboxed working copy for update/test
   testrunner/     # runs docker compose test
   gitops/         # commit, push, tags
-  notify/         # webhook/telegram notifications
+  notify/         # deprecated compatibility package; core does not call it
   scheduler/      # scan/update JSON orchestration and aggregate policy
-deploy/           # launchd/systemd scheduler examples
+deploy/           # scheduler units and GitHub update workflow contract/example
 config.example.yaml
 ```
 
@@ -100,14 +103,13 @@ are never printed, and ambiguous conversions fail closed. The
 same reviewed operation is available explicitly as `vuelta config migrate`;
 scripts use `vuelta --no-input config migrate --yes`. Explicit unsupported
 versions and configs that do not validate under the current schema still fail
-closed without being changed. Webhook URLs
-and Telegram bot tokens are never stored in YAML: the config refers only to the
-fixed `VUELTA_NOTIFY_WEBHOOK_URL` and `VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN`
-environment variables, which are resolved only when a notification is sent.
-See the file for the full schema:
-notification targets, vulnerability scan settings, GitHub advisories,
-optional package-scanner overrides, the list of `workspaces` to manage, and
-the git allowlist that gates which files an update is allowed to touch.
+closed without being changed. `state.database_path` selects the protected
+machine-owned SQLite database; when omitted it defaults beside the machine
+config under `state/history.db`. GitHub credentials remain environment-only
+through the fixed allowlisted `github_actions.token_env` reference. Legacy
+`notify` references are accepted during migration, but core scan/update paths
+write structured SQLite events and outbox intents and never call Telegram or
+webhook APIs. See `config.example.yaml` for the full schema.
 
 `vuelta` never scans parent directories or auto-discovers projects: only
 paths listed under `workspaces[]` are ever touched.
@@ -370,9 +372,9 @@ project config remains saved and scan reports the existing explicit
 
 Global multi-project operations (`scan --all`, `scan --project`, scheduler,
 and administrative commands) continue to use machine authority while each
-target is onboarded and stores state only in its own root. Select a specific
-machine config with the global `--config PATH` option. The normal dependency
-workflow remains two steps:
+target is onboarded and stores short-lived execution inputs in its own root.
+Select a specific machine config with the global `--config PATH` option. The
+normal server workflow is:
 
 Legacy scripts that intentionally use a machine-config workspace with
 `--directory` must now pass that machine config explicitly; local scan never
@@ -380,7 +382,9 @@ silently falls back to an unrelated global workspace.
 
 ```bash
 vuelta scan --all --timeout 10m
-vuelta update --directory /path/to/project
+vuelta status
+vuelta update api
+vuelta update status api
 ```
 
 After onboarding, `scan` is read-only with respect to manifests and source:
@@ -411,14 +415,32 @@ Every per-project JSON result includes `package_updates` with status
 `available`, `scan_only`, or `unavailable`. Non-available states include a
 stable machine-readable reason code; corpus and automation contracts match
 that code exactly rather than parsing human diagnostics.
-`update` resolves exactly the current directory, or `--directory PATH`, before
-opening state. Without `--snapshot`, it bounded-enumerates only that project's
-snapshot directory and deterministically selects the newest validated
-`created_at` (ID breaks ties). `--snapshot ID` selects one exact plan from the
-same target for automation. The selected ID, creation/expiry timestamps, and
-candidates are displayed before confirmation. An invalid, stale, or expired
-newest plan fails closed without falling back to an older one. Use `--dry-run`
-to run checks in a disposable copy without durable changes.
+Every completed scan also writes a short transaction to the machine database:
+the scan run, current dependency state, first observation and eligibility
+times, and an installed-version event only when the resolved version changes.
+Identical scans update `last_seen_at` without appending duplicate events. A
+database write failure is reported while the current in-memory and
+project-local scan report remain available.
+
+`update PROJECT` selects the newest valid snapshot for the exact configured
+project and base commit. It displays routine and deferred candidates, requires
+confirmation, dispatches the allowlisted GitHub workflow, records the returned
+run, and exits without changing the server checkout. Routine candidates are
+direct stable patch/minor releases that passed the machine-owned 14-day
+cooldown. Major and unknown changes are deferred; `--include-major` is an
+explicit reviewed exception and never admits prerelease, yanked, transitive,
+or unknown candidates.
+
+The GitHub wrapper rechecks the exact commit and candidates with the same
+pinned Vuelta engine, performs one package-manager resolution, validates
+changed paths, runs security and repository verification gates, pushes one
+review branch, and creates a pull request only after success. It has no deploy
+step or production credentials. See `deploy/github-update-workflow.md`.
+
+`status`, `history PROJECT`, and `update status [PROJECT]` read SQLite.
+Status commands synchronize only already-known unfinished GitHub run IDs.
+GitHub outages leave the last state visible as stale and never repeat a
+dispatch.
 
 For a `requirements.txt`-only Python project, candidate discovery remains
 read-only and the result is `scan_only`. JSON includes
@@ -461,10 +483,11 @@ vuelta scan --directory /path/to/project \
   --config ~/.config/vuelta/config.yaml
 ```
 
-After reviewing the returned snapshot, apply exactly that snapshot:
+The separately named compatibility path can still apply an exact snapshot on
+a non-production workstation:
 
 ```bash
-vuelta update --directory /path/to/project --snapshot SNAPSHOT_ID --yes \
+vuelta update local --directory /path/to/project --snapshot SNAPSHOT_ID --yes \
   --config ~/.config/vuelta/config.yaml
 ```
 
@@ -485,15 +508,13 @@ its single result envelope on stdout; plans, progress, and diagnostics remain
 on stderr. Do not put test logs, diffs, webhook URLs, or Telegram tokens in
 notification text or audit fields.
 
-Scheduling is external. `vuelta-scheduler` runs one `scan --all --json`,
-structurally selects only `status: ready` results, and invokes one
-`update --yes --json --directory PATH --snapshot SNAPSHOT_ID` process per
-ready snapshot. It never parses
-human output or passes result fields through a shell. `--failure-policy` is
-explicitly `continue` or `stop`; `--findings-policy` is `report` or `fail`.
-The continue policy preserves successful independent updates while returning
-a non-zero aggregate result for partial scan or update failures. Findings-only
-policy failures return 5, and cancellation returns 130.
+Scheduling is external. Production timers run sequential `scan --all` and may
+run `commands consume` to process one typed `request_update` row. There is no
+update-all command. Queue records contain a closed command type and stable
+identifiers only; stale, duplicate, unknown, and non-update records never
+reach execution, and no queue value is interpreted as shell text. The older
+`vuelta-scheduler` helper remains a local compatibility surface and is not the
+production update default.
 
 Templates live in `deploy/`: load `com.vuelta.schedule.plist` with `launchctl`
 on macOS after replacing `REPLACE_ME`, or install both binaries plus
@@ -504,6 +525,7 @@ project paths.
 
 ## Status
 
-Implemented: configuration, scan/update pipeline, security gates, and
-notifications. Phase-2 deployment code is parked outside the tracked build.
-The optional autofix runner is parked with the same phase-2 code.
+Implemented: configuration, read-only scanning, SQLite history/event/outbox
+state, delayed-latest policy, GitHub Actions update dispatch/synchronization,
+the explicit local compatibility pipeline, and security gates. Blue-green
+deployment and the SQLite-backed Telegram bridge remain separate tasks.

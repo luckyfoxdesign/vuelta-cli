@@ -51,7 +51,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--stack"}, valueName: "STACK", description: "resolve first-run ambiguous stack detection: python, node, or docker"},
 			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
-			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (default 7d; 0 disables)"},
+			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (machine floor 14d)"},
 			{names: []string{"--timeout"}, valueName: "DURATION", description: "maximum duration per project (default 4m; maximum 1h)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
@@ -63,20 +63,60 @@ var commandDefinitions = []commandDefinition{
 		takesConfig: true, handler: "scan",
 	},
 	{
-		path: []string{"update"}, usage: "vuelta update [options]",
-		description: "apply the newest validated snapshot from one exact project", group: "Everyday commands",
-		examples: []string{"vuelta update", "vuelta update --directory /path/to/project", "vuelta update --directory /path/to/project --snapshot SNAPSHOT_ID --yes --json"},
+		path: []string{"update"}, usage: "vuelta update PROJECT [options]",
+		description: "request a reviewed dependency update on GitHub Actions", group: "Everyday commands",
+		examples: []string{"vuelta update api", "vuelta update api --yes --json", "vuelta update status api"},
 		options: []optionDefinition{
-			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "select one exact project root (default: current directory)"},
-			{names: []string{"--snapshot"}, valueName: "ID", description: "select one exact snapshot from that project"},
+			{names: []string{"--yes"}, description: "confirm the displayed plan"},
+			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
+			{names: []string{"--include-major"}, description: "explicitly include reviewed stable major candidates"},
+			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "retired here; use 'vuelta update local'"},
+			{names: []string{"--snapshot"}, valueName: "ID", description: "retired here; use 'vuelta update local'"},
+			{names: []string{"--dry-run"}, description: "retired here; use 'vuelta update local'"},
+			{names: []string{"--allow-scripts"}, description: "retired here; use 'vuelta update local'"},
+			{names: []string{"--allow-unverified-release-age"}, description: "retired here; use 'vuelta update local'"},
+		},
+		security:    []string{"The server checkout is never mutated. GitHub receives only the exact base commit, request ID, and closed policy inputs; the workflow revalidates candidates before changing files."},
+		takesConfig: true, handler: "update",
+	},
+	{
+		path: []string{"update", "status"}, usage: "vuelta update status [PROJECT] [--json]",
+		description: "synchronize and show known GitHub update runs",
+		examples:    []string{"vuelta update status api", "vuelta update status --json"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "update status",
+	},
+	{
+		path: []string{"update", "local"}, usage: "vuelta update local [options]",
+		description: "explicit compatibility path for containerized local mutation",
+		examples:    []string{"vuelta update local --directory /path/to/project --dry-run"},
+		options: []optionDefinition{
+			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "select one exact project root"},
+			{names: []string{"--snapshot"}, valueName: "ID", description: "select one exact project-local snapshot"},
 			{names: []string{"--dry-run"}, description: "run in a disposable copy without durable changes"},
 			{names: []string{"--yes"}, description: "confirm the displayed plan"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts"},
 			{names: []string{"--allow-unverified-release-age"}, description: "allow candidates whose release age was not verified"},
+			{names: []string{"--routine-only"}, description: "apply only delayed-latest routine candidates"},
+			{names: []string{"--include-major"}, description: "include eligible stable majors with --routine-only"},
 		},
-		security:    []string{"The target root is selected before any snapshot is opened. Only that project's bounded .vuelta/snapshots directory is considered; every plan is validated before environment checks and durable updates require confirmation."},
-		takesConfig: true, handler: "update",
+		security:    []string{"This separately named compatibility path may mutate only its selected sandboxed project and is never used by unattended server workflows."},
+		takesConfig: true, handler: "update local",
+	},
+	{
+		path: []string{"status"}, usage: "vuelta status [--json] [config-path]",
+		description: "show durable project and operation status", group: "Everyday commands",
+		examples:    []string{"vuelta status", "vuelta status --json"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "status",
+	},
+	{
+		path: []string{"history"}, usage: "vuelta history PROJECT [--json] [config-path]",
+		description: "show installed dependency version changes", group: "Operations",
+		examples:    []string{"vuelta history api", "vuelta history api --json"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "history",
 	},
 	{
 		path: []string{"project"}, usage: "vuelta project <command>",
@@ -163,6 +203,17 @@ var commandDefinitions = []commandDefinition{
 		examples: []string{"vuelta help scan", "vuelta help update", "vuelta help --all"},
 		options:  []optionDefinition{{names: []string{"--all"}, description: "include CI and server commands"}}, handler: "help",
 	},
+	{
+		path: []string{"commands"}, usage: "vuelta commands <command>",
+		description: "consume typed machine-state commands", group: "CI and server commands",
+		hidden: true,
+	},
+	{
+		path: []string{"commands", "consume"}, usage: "vuelta commands consume [--json] [config-path]",
+		description: "consume one bounded typed update request",
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "commands consume", hidden: true,
+	},
 }
 
 type globalOptions struct {
@@ -231,7 +282,7 @@ func (c *cli) run(args []string) error {
 	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
-	if globals.config != "" && definition.takesConfig && definition.handler != "update" {
+	if globals.config != "" && definition.takesConfig && definition.handler != "update" && definition.handler != "update local" {
 		if containsArgument(commandArgs, "--") {
 			commandArgs = append(commandArgs, globals.config)
 		} else {
@@ -248,7 +299,7 @@ func (c *cli) run(args []string) error {
 		}
 		return err
 	}
-	if globals.noInput && definition.handler == "update" {
+	if globals.noInput && (definition.handler == "update" || definition.handler == "update local") {
 		normalized = append([]string{"--non-interactive"}, normalized...)
 	}
 	if globals.noInput && definition.handler == "scan" {
@@ -257,7 +308,7 @@ func (c *cli) run(args []string) error {
 	if globals.noColor && definition.handler == "scan" {
 		normalized = append([]string{"--internal-no-color"}, normalized...)
 	}
-	if globals.config != "" && definition.handler == "update" {
+	if globals.config != "" && (definition.handler == "update" || definition.handler == "update local") {
 		normalized = append([]string{"--internal-config", globals.config}, normalized...)
 	}
 	return dispatchCommand(definition.handler, normalized)
@@ -361,6 +412,11 @@ func resolveCommand(args []string) (commandDefinition, []string, error) {
 		path = append(path, argument)
 		index++
 		if current.handler != "" {
+			if index < len(args) && !strings.HasPrefix(args[index], "-") {
+				if _, ok := findChild(childCommands(path), args[index]); ok {
+					continue
+				}
+			}
 			break
 		}
 	}
@@ -485,6 +541,16 @@ func dispatchCommand(handler string, args []string) error {
 		return runScan(args)
 	case "update":
 		return executeUpdate(args)
+	case "update status":
+		return executeUpdateStatus(args)
+	case "update local":
+		return executeLocalUpdate(args)
+	case "status":
+		return executeStatus(args)
+	case "history":
+		return executeHistory(args)
+	case "commands consume":
+		return executeCommandConsume(args)
 	case "config validate":
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":

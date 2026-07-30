@@ -7,12 +7,16 @@ Examples:
 
 Everyday commands:
   scan         find vulnerabilities and package candidates; create snapshots only for safely mutable manifests
-  update       apply the newest validated snapshot from one exact project
+  update       request a reviewed dependency update on GitHub Actions
+  status       show durable project and operation status
 
 Configuration:
   project      list or add configured projects
   config       create or validate configuration
   environment  trust local Docker environments
+
+Operations:
+  history      show installed dependency version changes
 
 Help:
   help         show top-level or command-specific help

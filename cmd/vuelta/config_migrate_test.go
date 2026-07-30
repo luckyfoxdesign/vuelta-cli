@@ -35,7 +35,7 @@ func TestConfigMigratePreservesSettingsAndRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load migrated config: %v", err)
 	}
-	if loaded.SchemaVersion != config.CurrentSchemaVersion || loaded.Update.MinReleaseAgeDays != 7 {
+	if loaded.SchemaVersion != config.CurrentSchemaVersion || loaded.Update.MinReleaseAgeDays != 14 {
 		t.Fatalf("migrated config = %#v", loaded)
 	}
 	updated, err := os.ReadFile(path)

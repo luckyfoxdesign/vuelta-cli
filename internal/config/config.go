@@ -49,12 +49,20 @@ func RetiredMachineConfigFields() []string {
 type Config struct {
 	SchemaVersion    int                    `yaml:"schema_version"`
 	Docker           *DockerConfig          `yaml:"docker,omitempty"`
+	State            StateConfig            `yaml:"state"`
 	Notify           NotifyConfig           `yaml:"notify"`
 	VulnScan         VulnScanConfig         `yaml:"vuln_scan"`
 	GithubAdvisories GithubAdvisoriesConfig `yaml:"github_advisories"`
+	GithubActions    GithubActionsConfig    `yaml:"github_actions"`
 	Update           UpdateConfig           `yaml:"update"`
 	Workspaces       []Workspace            `yaml:"workspaces"`
 	Git              GitConfig              `yaml:"git"`
+}
+
+// StateConfig selects the machine-owned SQLite file. Empty uses the protected
+// default adjacent to the selected machine config.
+type StateConfig struct {
+	DatabasePath string `yaml:"database_path,omitempty"`
 }
 
 // DockerConfig holds the developer-side daemon authority used by scan and
@@ -124,6 +132,13 @@ type ImageScanConfig struct {
 }
 
 type GithubAdvisoriesConfig struct {
+	APIURL   string `yaml:"api_url"`
+	TokenEnv string `yaml:"token_env"`
+}
+
+// GithubActionsConfig contains machine authority only. Repository and workflow
+// identities remain versioned with each workspace.
+type GithubActionsConfig struct {
 	APIURL   string `yaml:"api_url"`
 	TokenEnv string `yaml:"token_env"`
 }
@@ -250,6 +265,14 @@ type Workspace struct {
 	// Older configs continue to use git.allowed_changed_paths.
 	AllowedChangedPaths []string          `yaml:"allowed_changed_paths,omitempty"`
 	DockerImages        *DockerImagesSpec `yaml:"docker_images,omitempty"`
+	Github              *GithubWorkflow   `yaml:"github,omitempty"`
+}
+
+// GithubWorkflow is the narrow repository-owned workflow identity. It cannot
+// contain credentials, arbitrary API URLs, or executable text.
+type GithubWorkflow struct {
+	Repository string `yaml:"repository"`
+	Workflow   string `yaml:"workflow"`
 }
 
 type GitConfig struct {
@@ -363,7 +386,7 @@ func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true) // reject unknown keys, e.g. an arbitrary shell "cmd" smuggled into a verification profile
 
-	cfg := Config{Update: UpdateConfig{MinReleaseAgeDays: 7, SnapshotTTLHours: 24}}
+	cfg := Config{Update: UpdateConfig{MinReleaseAgeDays: 14, SnapshotTTLHours: 24}}
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
@@ -492,8 +515,8 @@ func (c *Config) Validate() error {
 	if c.Docker != nil {
 		errs = append(errs, validateDockerEndpoint("docker.developer", c.Docker.Developer, false)...)
 	}
-	if c.Update.MinReleaseAgeDays < 0 {
-		errs = append(errs, errors.New("update.min_release_age_days: must not be negative"))
+	if c.Update.MinReleaseAgeDays < 14 {
+		errs = append(errs, errors.New("update.min_release_age_days: must be at least the machine safety default of 14"))
 	}
 	if c.Update.SnapshotTTLHours != 0 && (c.Update.SnapshotTTLHours < 1 || c.Update.SnapshotTTLHours > 168) {
 		errs = append(errs, errors.New("update.snapshot_ttl_hours: must be between 1 and 168"))
@@ -513,6 +536,10 @@ func (c *Config) Validate() error {
 
 	errs = append(errs, validateSecurityConfig(*c)...)
 	errs = append(errs, validateNotifyConfig(c.Notify)...)
+	errs = append(errs, validateGithubActionsConfig(c.GithubActions)...)
+	if c.State.DatabasePath != "" && (!filepath.IsAbs(c.State.DatabasePath) || filepath.Clean(c.State.DatabasePath) != c.State.DatabasePath) {
+		errs = append(errs, errors.New("state.database_path: must be a clean absolute path when configured"))
+	}
 	if c.Git.PushMode != "" && c.Git.PushMode != "review_branch" && c.Git.PushMode != "direct_branch" {
 		errs = append(errs, fmt.Errorf("git.push_mode: %q is not supported (review_branch|direct_branch)", c.Git.PushMode))
 	}
@@ -585,6 +612,30 @@ func validateNotifyConfig(c NotifyConfig) []error {
 	}
 	if (c.Telegram.BotTokenEnv == "") != (c.Telegram.ChatID == "") {
 		errs = append(errs, errors.New("notify.telegram: bot_token_env and chat_id must be configured together"))
+	}
+	return errs
+}
+
+var githubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+var githubWorkflowPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml$`)
+
+func validateGithubActionsConfig(c GithubActionsConfig) []error {
+	var errs []error
+	if c.TokenEnv != "" && !AllowedGithubTokenEnv(c.TokenEnv) {
+		errs = append(errs, fmt.Errorf("github_actions.token_env: %q is not an allowed token variable (%s)", c.TokenEnv, strings.Join(githubTokenEnvNames, "|")))
+	}
+	if c.APIURL != "" {
+		u, err := url.Parse(c.APIURL)
+		switch {
+		case err != nil || u.Scheme != "https" || u.Hostname() == "":
+			errs = append(errs, errors.New("github_actions.api_url: must be an https URL with a host"))
+		case u.User != nil:
+			errs = append(errs, errors.New("github_actions.api_url: must not contain userinfo credentials"))
+		case u.Port() != "" && u.Port() != "443":
+			errs = append(errs, errors.New("github_actions.api_url: must use the default https port"))
+		case u.RawQuery != "" || u.Fragment != "":
+			errs = append(errs, errors.New("github_actions.api_url: must not contain a query or fragment"))
+		}
 	}
 	return errs
 }
@@ -752,6 +803,15 @@ func validateWorkspace(i int, ws Workspace) []error {
 	}
 	if ws.Platform != "" && ws.Platform != "linux/amd64" && ws.Platform != "linux/arm64" {
 		errs = append(errs, fmt.Errorf("%s.platform: must be linux/amd64 or linux/arm64", label))
+	}
+	if ws.Github != nil {
+		if !githubRepositoryPattern.MatchString(ws.Github.Repository) || strings.HasPrefix(ws.Github.Repository, ".") ||
+			strings.Contains(ws.Github.Repository, "..") {
+			errs = append(errs, fmt.Errorf("%s.github.repository: must be an exact owner/repository identifier", label))
+		}
+		if !githubWorkflowPattern.MatchString(ws.Github.Workflow) || strings.Contains(ws.Github.Workflow, "..") {
+			errs = append(errs, fmt.Errorf("%s.github.workflow: must be one workflow filename such as vuelta-update.yml", label))
+		}
 	}
 
 	if ws.Path == "" {

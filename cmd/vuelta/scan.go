@@ -26,12 +26,14 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
+	"github.com/luckyfoxdesign/vuelta/internal/history"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/runlease"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
+	"github.com/luckyfoxdesign/vuelta/internal/updatepolicy"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -178,6 +180,8 @@ type scanResult struct {
 	Capabilities          []scanCapability           `json:"capabilities"`
 	ImageScans            []imageScanRecord          `json:"image_scans"`
 	Error                 *jsonCommandError          `json:"error,omitempty"`
+	StartedAt             time.Time                  `json:"-"`
+	CompletedAt           time.Time                  `json:"-"`
 }
 
 type scanSummary struct {
@@ -222,6 +226,7 @@ type scanOptions struct {
 	progressIndex             int
 	progressTotal             int
 	stageTracker              *scanStageTracker
+	historyStore              *history.Store
 }
 
 type scanStageTracker struct {
@@ -300,7 +305,23 @@ func executeScan(args []string) error {
 	}
 	minAge, minAgeErr := effectiveMinReleaseAge(options.minReleaseAge, cfg.Update.MinReleaseAgeDays, policy.MinReleaseAgeDays)
 	if minAgeErr != nil {
-		return scanTopLevelFailure(options.jsonOutput, "invalid_invocation", fail(exitConfig, "%v", minAgeErr), "Use 0, a Go duration such as 168h, or a day duration such as 7d")
+		return scanTopLevelFailure(options.jsonOutput, "invalid_invocation", fail(exitConfig, "%v", minAgeErr), "Use a duration of at least 14d, such as 336h or 21d")
+	}
+	machineConfigPath := selection.Path
+	if selection.Scope == "project" {
+		machineConfigPath = selection.MachineConfig
+	}
+	historyPath, historyPathErr := history.ResolvePath(machineConfigPath, cfg.State.DatabasePath)
+	if historyPathErr != nil {
+		warnings = appendUniqueStrings(warnings, "history database path is invalid: "+historyPathErr.Error())
+	} else {
+		historyStore, historyErr := history.Open(context.Background(), historyPath)
+		if historyErr != nil {
+			warnings = appendUniqueStrings(warnings, "history database is unavailable; this scan result will not be durable: "+historyErr.Error())
+		} else {
+			defer func() { _ = historyStore.Close() }()
+			options.historyStore = historyStore
+		}
 	}
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
@@ -366,6 +387,9 @@ func executeScan(args []string) error {
 		}
 	}
 	results = writeProjectScanReports(results, options, time.Now().UTC())
+	if options.historyStore != nil {
+		results = persistScanHistory(context.Background(), options.historyStore, results)
+	}
 	summary := summarizeScan(results)
 	if options.jsonOutput {
 		if err := writeJSONEnvelope(jsonCommandEnvelope{
@@ -406,7 +430,10 @@ func runScanTargets(ctx context.Context, targets []scanTarget, options scanOptio
 			targetOptions.progressTotal = len(targets)
 		}
 		targetCtx, cancel := context.WithTimeoutCause(ctx, timeout, errProjectScanDeadline)
+		startedAt := time.Now().UTC()
 		result := runner(targetCtx, target, targetOptions)
+		result.StartedAt = startedAt
+		result.CompletedAt = time.Now().UTC()
 		cause := context.Cause(targetCtx)
 		cancel()
 		if errors.Is(cause, errProjectScanDeadline) && !targetOptions.stageTracker.completed {
@@ -748,23 +775,125 @@ func effectiveMinReleaseAge(value string, configuredDays, policyDays int) (time.
 		if policyDays > days {
 			days = policyDays
 		}
+		if days < 14 {
+			days = 14
+		}
 		return time.Duration(days) * 24 * time.Hour, nil
-	}
-	if value == "0" {
-		return 0, nil
 	}
 	if strings.HasSuffix(value, "d") {
 		var days int
 		if _, err := fmt.Sscanf(value, "%dd", &days); err != nil || days < 0 || fmt.Sprintf("%dd", days) != value {
 			return 0, fmt.Errorf("invalid --min-release-age %q", value)
 		}
-		return time.Duration(days) * 24 * time.Hour, nil
+		duration := time.Duration(days) * 24 * time.Hour
+		if duration < updatepolicy.MinimumCooldown {
+			return 0, fmt.Errorf("--min-release-age cannot shorten the machine safety default of 14d")
+		}
+		return duration, nil
 	}
 	duration, err := time.ParseDuration(value)
-	if err != nil || duration < 0 {
+	if err != nil || duration < updatepolicy.MinimumCooldown {
 		return 0, fmt.Errorf("invalid --min-release-age %q", value)
 	}
 	return duration, nil
+}
+
+func applyCandidatePolicy(
+	ctx context.Context,
+	store *history.Store,
+	target scanTarget,
+	candidates []updatesnapshot.Candidate,
+	cooldown time.Duration,
+	now time.Time,
+) ([]updatesnapshot.Candidate, error) {
+	project := target.name
+	if project == "" {
+		project = filepath.Base(target.path)
+	}
+	var lookupErrors []error
+	for index := range candidates {
+		candidate := &candidates[index]
+		direct := candidate.Disposition != "constrained"
+		switch candidate.Ownership {
+		case "direct":
+			direct = true
+		case "transitive", "unknown":
+			direct = false
+		}
+		firstObserved := now
+		if store != nil {
+			observed, found, err := store.FirstObservation(ctx, project, candidate.Kind, candidate.Name, candidate.Target)
+			if err != nil {
+				lookupErrors = append(lookupErrors, err)
+			} else if found {
+				firstObserved = observed
+			}
+		}
+		decision := updatepolicy.Evaluate(now, cooldown, updatepolicy.Candidate{
+			Current: candidate.Current, Target: candidate.Target, Direct: direct,
+			Yanked: candidate.Yanked, PublicationTime: candidate.PublicationTime,
+			FirstObservedAt: firstObserved,
+			AgeVerified:     candidate.ReleaseAgeVerified && cooldown >= updatepolicy.MinimumCooldown,
+		})
+		candidate.Direct = direct
+		candidate.Stable = decision.Stable
+		candidate.FirstObservedAt = decision.FirstObservedAt
+		candidate.EligibleAt = decision.EligibleAt
+		candidate.VersionClass = decision.VersionClass
+		candidate.PolicyDisposition = decision.Disposition
+		candidate.PolicyReason = decision.Reason
+	}
+	return candidates, errors.Join(lookupErrors...)
+}
+
+func persistScanHistory(ctx context.Context, store *history.Store, results []scanResult) []scanResult {
+	for index := range results {
+		result := &results[index]
+		project := result.Project
+		if project == "" {
+			project = filepath.Base(result.Directory)
+		}
+		baseCommit := ""
+		if result.SnapshotID != "" {
+			if snapshots, err := updatesnapshot.ProjectStore(result.Directory); err == nil {
+				if snapshot, loadErr := snapshots.Load(result.SnapshotID); loadErr == nil {
+					baseCommit = snapshot.Workspace.BaseRevision
+				}
+			}
+		}
+		status := "succeeded"
+		switch result.Status {
+		case "partial":
+			status = "partial"
+		case "failed":
+			status = "failed"
+		}
+		startedAt, completedAt := result.StartedAt, result.CompletedAt
+		if startedAt.IsZero() {
+			startedAt = time.Now().UTC()
+		}
+		if completedAt.IsZero() {
+			completedAt = startedAt
+		}
+		dependencies := make([]history.DependencyObservation, 0, len(result.Candidates))
+		for _, candidate := range result.Candidates {
+			dependencies = append(dependencies, history.DependencyObservation{
+				Ecosystem: candidate.Kind, Name: candidate.Name, Direct: candidate.Direct,
+				DeclaredVersion: candidate.Current, ResolvedVersion: candidate.Current,
+				NewestStable: candidate.Target, PublicationTime: candidate.PublicationTime,
+				FirstObservedAt: candidate.FirstObservedAt, EligibleAt: candidate.EligibleAt,
+				VersionClass: candidate.VersionClass, Disposition: candidate.PolicyDisposition,
+			})
+		}
+		if err := store.RecordScan(ctx, history.ScanRecord{
+			ProjectName: project, ProjectRoot: result.Directory, BaseCommit: baseCommit,
+			Status: status, StartedAt: startedAt, CompletedAt: completedAt,
+			Dependencies: dependencies,
+		}); err != nil {
+			result.Warnings = appendUniqueStrings(result.Warnings, "history write failed; the current scan result remains available: "+err.Error())
+		}
+	}
+	return results
 }
 
 func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration) scanResult {
@@ -1053,6 +1182,11 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		unverified = unverified || !candidates[index].ReleaseAgeVerified
 	}
 	result.Candidates = filterPolicyCandidates(candidates, policy.AllowedPackages)
+	var policyWarning error
+	result.Candidates, policyWarning = applyCandidatePolicy(ctx, options.historyStore, target, result.Candidates, minAge, time.Now().UTC())
+	if policyWarning != nil {
+		result.Warnings = appendUniqueStrings(result.Warnings, "candidate history lookup failed; cooldown was conservatively restarted: "+policyWarning.Error())
+	}
 	result.Tools = append(result.Tools, scanToolResult{Name: manager, Status: "used"})
 	result = addStage(result, stageCandidate, stageSucceeded, "")
 	options.stageTracker.set(stageReleaseAge)
@@ -2182,7 +2316,10 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 	}
 	sort.SliceStable(ready, func(i, j int) bool { return ready[i].Project < ready[j].Project })
 	for _, result := range ready {
-		args := []string{"update", "--directory", result.Directory}
+		args := []string{"update", result.Project}
+		if result.Origin != updatesnapshot.OriginWorkspace || result.Project == "" {
+			args = []string{"update", "local", "--directory", result.Directory}
+		}
 		if machineConfig != "" {
 			args = append(args, "--config", machineConfig)
 		}
@@ -2296,7 +2433,10 @@ func buildProjectScanReport(result scanResult, options scanOptions, completedAt 
 		if result.SnapshotExpires != nil {
 			fmt.Fprintf(&report, "- Expires: `%s`\n", result.SnapshotExpires.UTC().Format(time.RFC3339))
 		}
-		args := []string{"update", "--directory", result.Directory}
+		args := []string{"update", result.Project}
+		if result.Origin != updatesnapshot.OriginWorkspace || result.Project == "" {
+			args = []string{"update", "local", "--directory", result.Directory}
+		}
 		if options.updateConfigPath != "" {
 			args = append(args, "--config", options.updateConfigPath)
 		}

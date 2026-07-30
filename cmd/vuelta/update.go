@@ -21,12 +21,12 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
-	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/pipeline"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
+	"github.com/luckyfoxdesign/vuelta/internal/updatepolicy"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -44,6 +44,8 @@ type updateOptions struct {
 	configFile                string
 	directory                 string
 	snapshotID                string
+	routineOnly               bool
+	includeMajor              bool
 }
 
 type updatePlan struct {
@@ -79,7 +81,7 @@ type updateSummary struct {
 	ChangedFiles int    `json:"changed_files"`
 }
 
-func executeUpdate(args []string) error {
+func executeLocalUpdate(args []string) error {
 	options, id, err := parseUpdateOptions(args)
 	if err != nil {
 		return updateTopLevelFailure(options.jsonOutput || updateJSONRequested(args), "invalid_invocation", err, "Run vuelta help update for usage")
@@ -124,6 +126,9 @@ func executeUpdate(args []string) error {
 		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Run a new targeted vuelta scan in this project")
 	}
 	id = snapshot.ID
+	if options.routineOnly {
+		snapshot.Candidates = routineSnapshotCandidates(snapshot.Candidates, options.includeMajor, time.Now().UTC())
+	}
 	if err := updatesnapshot.ValidateCandidates(snapshot, options.allowUnverifiedReleaseAge); err != nil {
 		return updateTopLevelFailure(options.jsonOutput, "snapshot_invalid", fail(exitSnapshot, "%v", err), "Review the candidate gate and run scan again if needed")
 	}
@@ -243,6 +248,8 @@ func parseUpdateOptions(args []string) (updateOptions, string, error) {
 	fs.StringVar(&options.directory, "directory", "", "exact target project directory")
 	fs.StringVar(&options.directory, "d", "", "exact target project directory")
 	fs.StringVar(&options.snapshotID, "snapshot", "", "select one exact project-local snapshot")
+	fs.BoolVar(&options.routineOnly, "routine-only", false, "apply only machine-policy routine candidates")
+	fs.BoolVar(&options.includeMajor, "include-major", false, "include eligible stable majors with routine-only")
 	if err := fs.Parse(args); err != nil {
 		return options, "", fail(exitConfig, "%v", err)
 	}
@@ -262,6 +269,21 @@ func parseUpdateOptions(args []string) (updateOptions, string, error) {
 		return options, "", fail(exitConfig, "positional snapshot IDs are retired; select the target with --directory and use --snapshot ID only for a fresh project-local plan")
 	}
 	return options, options.snapshotID, nil
+}
+
+func routineSnapshotCandidates(candidates []updatesnapshot.Candidate, includeMajor bool, now time.Time) []updatesnapshot.Candidate {
+	selected := make([]updatesnapshot.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.PolicyDisposition == updatepolicy.DispositionRoutine && candidate.Direct && candidate.Stable {
+			selected = append(selected, candidate)
+			continue
+		}
+		if includeMajor && candidate.Direct && candidate.Stable &&
+			candidate.VersionClass == updatepolicy.ClassMajor && !candidate.EligibleAt.After(now) {
+			selected = append(selected, candidate)
+		}
+	}
+	return selected
 }
 
 func loadUpdateConfiguration(targetRoot, machinePath string, allowMigrationPrompt bool) (*config.Config, error) {
@@ -428,7 +450,7 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	}
 	deps := pipeline.Deps{
 		Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}},
-		Notifier: notify.New(cfg.Notify), Logger: logger,
+		Logger: logger,
 	}
 	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
 		return updater.PlannedUpdater{

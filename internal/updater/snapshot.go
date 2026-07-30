@@ -340,7 +340,8 @@ func (s packageScanner) ScanReport(ctx context.Context, projectPath string) (Can
 		report.Candidates[index] = updatesnapshot.Candidate{
 			Kind: candidate.Kind, Name: candidate.Name, Current: candidate.Current,
 			Target: candidate.Target, File: candidate.File, Line: candidate.Line,
-			Disposition: candidate.Disposition,
+			Disposition: candidate.Disposition, Ownership: candidate.Ownership,
+			PublicationTime: candidate.PublishedAt, Yanked: candidate.Yanked,
 		}
 	}
 	for index, diagnostic := range decoded.Diagnostics {
@@ -417,7 +418,8 @@ func parsePackageReport(kind string, data []byte) (CandidateReport, error) {
 		report.Candidates[index] = updatesnapshot.Candidate{
 			Kind: candidate.Kind, Name: candidate.Name, Current: candidate.Current,
 			Target: candidate.Target, File: candidate.File, Line: candidate.Line,
-			Disposition: candidate.Disposition,
+			Disposition: candidate.Disposition, Ownership: candidate.Ownership,
+			PublicationTime: candidate.PublishedAt, Yanked: candidate.Yanked,
 		}
 	}
 	for index, diagnostic := range decoded.Diagnostics {
@@ -488,7 +490,7 @@ func (s dockerCandidateScanner) Scan(ctx context.Context, projectPath string) ([
 				return nil, fmt.Errorf("resolve digest for %s: %w", match.ref, err)
 			}
 			if digest != match.digest {
-				candidates = append(candidates, updatesnapshot.Candidate{Kind: "docker", Name: match.ref, Current: match.digest, Target: digest, File: rel})
+				candidates = append(candidates, updatesnapshot.Candidate{Kind: "docker", Name: match.ref, Current: match.digest, Target: digest, File: rel, Ownership: "direct"})
 			}
 		}
 	}

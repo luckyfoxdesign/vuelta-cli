@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
@@ -193,21 +194,44 @@ func collectCandidates(kind string, value any, candidates *[]ecosystem.Candidate
 					line = int(number)
 				}
 			}
+			ownership := "direct"
+			if rawDirect, present := value["direct"]; present {
+				direct, ok := rawDirect.(bool)
+				if !ok {
+					ownership = "unknown"
+				} else if !direct {
+					ownership = "transitive"
+				}
+			}
+			if dependencyType, ok := value["dependency_type"].(string); ok {
+				switch dependencyType {
+				case "direct", "transitive":
+					ownership = dependencyType
+				default:
+					ownership = "unknown"
+				}
+			}
+			yanked, _ := value["yanked"].(bool)
+			var publishedAt time.Time
+			if rawPublished, ok := value["published_at"].(string); ok {
+				publishedAt, _ = time.Parse(time.RFC3339, rawPublished)
+			}
 			*candidates = append(*candidates, ecosystem.Candidate{
 				Kind: kind, Name: name, Current: current, Target: target,
-				File: file, Line: line, Disposition: disposition,
+				File: file, Line: line, Disposition: disposition, Ownership: ownership,
+				PublishedAt: publishedAt.UTC(), Yanked: yanked,
 			})
 			return
 		}
 		for key, item := range value {
 			if target, ok := item.(string); ok {
-				*candidates = append(*candidates, ecosystem.Candidate{Kind: kind, Name: key, Target: target})
+				*candidates = append(*candidates, ecosystem.Candidate{Kind: kind, Name: key, Target: target, Ownership: "direct"})
 				continue
 			}
 			if record, ok := item.(map[string]any); ok {
 				if latest, ok := firstString(record, "latest", "latest_version", "wanted"); ok {
 					current, _ := firstString(record, "current", "version")
-					*candidates = append(*candidates, ecosystem.Candidate{Kind: kind, Name: key, Current: current, Target: latest})
+					*candidates = append(*candidates, ecosystem.Candidate{Kind: kind, Name: key, Current: current, Target: latest, Ownership: "direct"})
 				}
 			}
 		}
@@ -234,7 +258,7 @@ func collectUVCandidates(value any, candidates *[]ecosystem.Candidate) {
 			continue
 		}
 		current, _ := firstString(record, "version")
-		*candidates = append(*candidates, ecosystem.Candidate{Kind: "uv", Name: name, Current: current, Target: latest})
+		*candidates = append(*candidates, ecosystem.Candidate{Kind: "uv", Name: name, Current: current, Target: latest, Ownership: "unknown"})
 	}
 }
 

@@ -24,6 +24,30 @@ func TestNewConfigIsValidAndEmpty(t *testing.T) {
 	}
 }
 
+func TestCheckedInExampleUsesGeneratedTrivyPin(t *testing.T) {
+	data, err := os.ReadFile("../../config.example.yaml")
+	if err != nil {
+		t.Fatalf("read config example: %v", err)
+	}
+	var example struct {
+		VulnScan struct {
+			Image     string `yaml:"image"`
+			ImageScan struct {
+				Image string `yaml:"image"`
+			} `yaml:"image_scan"`
+		} `yaml:"vuln_scan"`
+	}
+	if err := yaml.Unmarshal(data, &example); err != nil {
+		t.Fatalf("parse config example: %v", err)
+	}
+	if example.VulnScan.Image != trivyImage {
+		t.Fatalf("dependency scanner image = %q, want generated pin %q", example.VulnScan.Image, trivyImage)
+	}
+	if example.VulnScan.ImageScan.Image != trivyImage {
+		t.Fatalf("image scanner image = %q, want generated pin %q", example.VulnScan.ImageScan.Image, trivyImage)
+	}
+}
+
 func TestSchemaMigrationPreservesLegacyConfigAndPermissions(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	data, err := yaml.Marshal(NewConfig())

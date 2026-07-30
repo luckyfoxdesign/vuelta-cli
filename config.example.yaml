@@ -1,6 +1,7 @@
 # Copy to ~/.config/vuelta/config.yaml and chmod 0600 it. The file must be a
-# regular, non-symlink file owned by the process uid. Notification credentials
-# are read from the fixed environment variables below only when sending.
+# regular, non-symlink file owned by the process uid. Legacy notify references
+# are accepted during migration but core operations write only SQLite outbox
+# intents; the separate bridge owns transport credentials and delivery.
 # Adhoc container scans use scan-time gates and an optional standalone policy
 # supplied explicitly with `vuelta scan --policy`.
 # Docker execution is disabled until this reviewed endpoint is configured.
@@ -10,6 +11,11 @@
 # Run `vuelta environment bootstrap --socket /absolute/path/to/docker.sock` to
 # display, confirm, normalize, and atomically persist these non-secret fields.
 schema_version: 1
+
+# Machine-owned durable state. Omit database_path to use the protected
+# ~/.config/vuelta/state/history.db default. Never place it in a managed repo.
+state:
+  # database_path: "/var/lib/vuelta/history.db"
 
 # docker:
 #   developer:
@@ -23,6 +29,8 @@ schema_version: 1
 #       required_security_options:
 #         - "name=seccomp,profile=builtin"
 notify:
+  # Deprecated compatibility fields. Vuelta core does not call either
+  # transport; migrate delivery to the SQLite-backed bridge.
   webhook_url_env: "" # to enable, set exactly "VUELTA_NOTIFY_WEBHOOK_URL"
   telegram:
     bot_token_env: "" # to enable with chat_id, set exactly "VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN"
@@ -36,7 +44,8 @@ vuln_scan:
   # Required only for a trivy or osv-scanner dependency source; omit it for
   # github-dependabot. This security-scanner pin is maintained as a reviewed
   # release input and is unrelated to adaptive package-scanner defaults.
-  image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
+  # Pin the multi-platform OCI index, not an architecture-specific manifest.
+  image: "aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f"
   # For dependency_source: osv-scanner use ghcr.io/google/osv-scanner@sha256:c41702c554122e8491c996b661d085919e42d54d49cfb9f2473beb5a3dfdf628.
   fail_on_severity: HIGH  # CRITICAL | HIGH | MEDIUM
   database_max_age_hours: 24  # stale/unreachable DB is a security-gate error, not a "clean" result
@@ -44,7 +53,7 @@ vuln_scan:
   image_scan:
     enabled: true
     tool: trivy          # trivy is the required portable scanner; docker_scout is optional enrichment
-    image: "aquasec/trivy@sha256:1c60229e5bc7f5830bf8aeb829442cb01f71ce3cd5b4d1b754f1f166c9945951"
+    image: "aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f"
     platforms: ["linux/amd64"]
     vex: auto            # apply verified VEX attestations if the registry/DHI publishes them
 
@@ -54,8 +63,15 @@ github_advisories:
   # Used only when dependency_source is github-dependabot. That selected source
   # is always fail-closed; private repositories need Dependabot alerts: read.
 
+github_actions:
+  api_url: "https://api.github.com"
+  # Fine-grained credential for only the configured repositories and Actions
+  # dispatch/read permissions. The value is read from this fixed environment
+  # variable and is never written to YAML or SQLite.
+  token_env: "VUELTA_GITHUB_TOKEN"
+
 update:
-  min_release_age_days: 7  # reject versions younger than N days — protects against freshly-published malicious releases
+  min_release_age_days: 14 # machine safety floor; project config and CLI cannot silently shorten it
   # `vuelta scan` saves a project-local read-only update plan for this period.
   # `vuelta update` rejects expired snapshots before environment checks.
   # The default is 24h; 1..168h is allowed.
@@ -114,6 +130,11 @@ workspaces:
     verification:
       version: 1
       state: scan_only
+    # The checked-in .vuelta.yaml owns this exact repository/workflow identity.
+    # The workflow itself is copied from deploy/vuelta-update.example.yml.
+    # github:
+    #   repository: "luckyfoxdesign/vuelta"
+    #   workflow: "vuelta-update.yml"
     # A ready multi-step profile uses explicit argv and never inherits a
     # service command:
     # verification:

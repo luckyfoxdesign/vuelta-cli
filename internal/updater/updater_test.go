@@ -365,7 +365,7 @@ func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []updatesnapshot.Candidate{{
-		Kind: "docker", Name: "node:20-alpine", Current: oldDigest, Target: newDigest, File: "Dockerfile",
+		Kind: "docker", Name: "node:20-alpine", Current: oldDigest, Target: newDigest, File: "Dockerfile", Ownership: "direct",
 	}}
 	if !reflect.DeepEqual(candidates, want) {
 		t.Fatalf("candidates = %#v, want %#v", candidates, want)

@@ -359,7 +359,7 @@ func NewConfig() *config.Config {
 			FailOnSeverity: "HIGH", DatabaseMaxAgeHours: 24,
 		},
 		Update: config.UpdateConfig{
-			MinReleaseAgeDays: 7,
+			MinReleaseAgeDays: 14,
 			SnapshotTTLHours:  24,
 			Egress: config.EgressConfig{
 				Network: "vuelta-cli-update-egress", ProxyContainer: "vuelta-cli-egress-proxy",
