@@ -119,6 +119,39 @@ var commandDefinitions = []commandDefinition{
 		takesConfig: true, handler: "history",
 	},
 	{
+		path: []string{"deploy"}, usage: "vuelta deploy [PROJECT] [--json]",
+		description: "synchronize one automatically discovered project release",
+		group:       "Everyday commands",
+		examples:    []string{"vuelta deploy sync", "vuelta deploy api", "vuelta deploy status api"},
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		security:    []string{"Deployment metadata and runtime overlays are machine-owned; managed repositories and their Nginx or Traefik configuration are never modified."},
+		takesConfig: true, handler: "deploy",
+	},
+	{
+		path: []string{"deploy", "sync"}, usage: "vuelta deploy sync [--json] [config-path]",
+		description: "discover and deploy ordinary releases for configured workspaces",
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "deploy sync",
+	},
+	{
+		path: []string{"deploy", "plan"}, usage: "vuelta deploy plan PROJECT [--json] [config-path]",
+		description: "show the derived zero-write deployment contract",
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "deploy plan",
+	},
+	{
+		path: []string{"deploy", "status"}, usage: "vuelta deploy status [PROJECT] [--json] [config-path]",
+		description: "show discovered contracts and exact release states",
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "deploy status",
+	},
+	{
+		path: []string{"deploy", "rollback"}, usage: "vuelta deploy rollback PROJECT [--json] [config-path]",
+		description: "restore the recorded previous immutable digest",
+		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
+		takesConfig: true, handler: "deploy rollback",
+	},
+	{
 		path: []string{"project"}, usage: "vuelta project <command>",
 		description: "list or add configured projects", group: "Configuration",
 		examples: []string{"vuelta project list", "vuelta project add . --name api"},
@@ -549,6 +582,16 @@ func dispatchCommand(handler string, args []string) error {
 		return executeStatus(args)
 	case "history":
 		return executeHistory(args)
+	case "deploy":
+		return executeDeploy(args)
+	case "deploy sync":
+		return executeDeploySync(args)
+	case "deploy plan":
+		return executeDeployPlan(args)
+	case "deploy status":
+		return executeDeployStatus(args)
+	case "deploy rollback":
+		return executeDeployRollback(args)
 	case "commands consume":
 		return executeCommandConsume(args)
 	case "config validate":

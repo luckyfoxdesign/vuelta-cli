@@ -527,7 +527,7 @@ func executeCommandConsume(args []string) error {
 	if err != nil {
 		return fail(exitFailure, "%v", err)
 	}
-	command, err := store.ClaimUpdateCommand(context.Background(), time.Now().UTC())
+	command, err := store.ClaimOperatorCommand(context.Background(), time.Now().UTC())
 	if closeErr := store.Close(); err == nil && closeErr != nil {
 		err = closeErr
 	}
@@ -542,21 +542,41 @@ func executeCommandConsume(args []string) error {
 			})
 		}
 		writer := newTextWriter(os.Stdout)
-		writer.println("No pending typed update command.")
+		writer.println("No pending typed operator command.")
 		return writer.result()
 	}
 	if time.Since(command.CreatedAt) > 15*time.Minute || command.CreatedAt.After(time.Now().UTC().Add(time.Minute)) {
 		if completionErr := completeOperatorCommand(cfg, selectedConfig, command.ID, false); completionErr != nil {
 			return fail(exitFailure, "reject stale command: %v", completionErr)
 		}
-		return fail(exitConfig, "typed update command %s is stale and was rejected", command.ID)
+		return fail(exitConfig, "typed operator command %s is stale and was rejected", command.ID)
 	}
-	dispatchArgs := []string{"--yes", "--non-interactive", "--internal-config", selectedConfig}
-	if jsonOutput {
-		dispatchArgs = append(dispatchArgs, "--json")
+	var dispatchErr error
+	switch command.Type {
+	case "request_update":
+		dispatchArgs := []string{"--yes", "--non-interactive", "--internal-config", selectedConfig}
+		if jsonOutput {
+			dispatchArgs = append(dispatchArgs, "--json")
+		}
+		dispatchArgs = append(dispatchArgs, command.Project)
+		dispatchErr = executeUpdate(dispatchArgs)
+	case "request_deploy":
+		dispatchArgs := []string{}
+		if jsonOutput {
+			dispatchArgs = append(dispatchArgs, "--json")
+		}
+		dispatchArgs = append(dispatchArgs, command.Project, "--", selectedConfig)
+		dispatchErr = executeDeploy(dispatchArgs)
+	case "request_rollback":
+		dispatchArgs := []string{}
+		if jsonOutput {
+			dispatchArgs = append(dispatchArgs, "--json")
+		}
+		dispatchArgs = append(dispatchArgs, command.Project, "--", selectedConfig)
+		dispatchErr = executeDeployRollback(dispatchArgs)
+	default:
+		dispatchErr = fail(exitConfig, "typed operator command %s is not executable by this consumer", command.Type)
 	}
-	dispatchArgs = append(dispatchArgs, command.Project)
-	dispatchErr := executeUpdate(dispatchArgs)
 	if completionErr := completeOperatorCommand(cfg, selectedConfig, command.ID, dispatchErr == nil); completionErr != nil {
 		if dispatchErr != nil {
 			return errors.Join(dispatchErr, completionErr)

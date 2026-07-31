@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -373,6 +374,21 @@ func (s *Store) EnqueueCommand(ctx context.Context, command OperatorCommand) (st
 
 // ClaimUpdateCommand atomically claims the oldest pending update request.
 func (s *Store) ClaimUpdateCommand(ctx context.Context, now time.Time) (*OperatorCommand, error) {
+	return s.claimCommand(ctx, now, []string{"request_update"})
+}
+
+// ClaimOperatorCommand atomically claims the oldest closed command type.
+func (s *Store) ClaimOperatorCommand(ctx context.Context, now time.Time) (*OperatorCommand, error) {
+	return s.claimCommand(ctx, now, []string{
+		"request_scan", "request_update", "request_deploy", "request_rollback",
+	})
+}
+
+func (s *Store) claimCommand(
+	ctx context.Context,
+	now time.Time,
+	commandTypes []string,
+) (*OperatorCommand, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin operator command claim: %w", err)
@@ -380,11 +396,26 @@ func (s *Store) ClaimUpdateCommand(ctx context.Context, now time.Time) (*Operato
 	defer func() { _ = tx.Rollback() }()
 	var command OperatorCommand
 	var created string
-	err = tx.QueryRowContext(ctx, `SELECT id, command_type, project_name, subject_id,
+	placeholders := make([]string, len(commandTypes))
+	args := make([]any, len(commandTypes))
+	for index, commandType := range commandTypes {
+		if !allowedCommandTypes[commandType] {
+			return nil, errors.New("internal operator command claim type is invalid")
+		}
+		placeholders[index] = "?"
+		args[index] = commandType
+	}
+	if len(placeholders) == 0 {
+		return nil, errors.New("at least one operator command claim type is required")
+	}
+	query := `SELECT id, command_type, project_name, subject_id,
 		idempotency_key, created_at FROM operator_commands
-		WHERE status='pending' AND command_type='request_update'
-		ORDER BY created_at, id LIMIT 1`,
-	).Scan(&command.ID, &command.Type, &command.Project, &command.SubjectID, &command.IdempotencyKey, &created)
+		WHERE status='pending' AND command_type IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY created_at, id LIMIT 1`
+	err = tx.QueryRowContext(ctx, query, args...).Scan(
+		&command.ID, &command.Type, &command.Project, &command.SubjectID,
+		&command.IdempotencyKey, &created,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

@@ -90,6 +90,68 @@ func TestDispatchRejectsExecutableOrCrossRepositoryInput(t *testing.T) {
 	}
 }
 
+func TestDispatchReleaseUsesCentralWorkflowAndClosedBuildMetadata(t *testing.T) {
+	var dispatchBody struct {
+		Ref    string            `json:"ref"`
+		Inputs map[string]string `json:"inputs"`
+	}
+	client := newTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodPost:
+			if err := json.NewDecoder(request.Body).Decode(&dispatchBody); err != nil {
+				t.Fatal(err)
+			}
+			response.WriteHeader(http.StatusNoContent)
+		case http.MethodGet:
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`{"workflow_runs":[{
+				"id":321,"html_url":"https://github.com/example/control/actions/runs/321",
+				"status":"queued","conclusion":"","head_sha":"` + testCommit + `",
+				"head_branch":"main","display_title":"vuelta-release-` + testRequestID + `",
+				"created_at":"2026-07-30T12:00:00Z","updated_at":"2026-07-30T12:00:00Z"
+			}]}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	run, err := client.DispatchRelease(context.Background(), ReleaseDispatchRequest{
+		ReleaseRepository: "example/control", Workflow: "vuelta-release.yml", Ref: "main",
+		RequestID: testRequestID, SourceRepository: "example/api", SourceCommit: testCommit,
+		ImageRepository: "ghcr.io/example/api", BuildContext: ".",
+		Dockerfile: "docker/Dockerfile", BuildTarget: "runtime",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ID != 321 || dispatchBody.Inputs["source_repository"] != "example/api" ||
+		dispatchBody.Inputs["dockerfile"] != "docker/Dockerfile" ||
+		dispatchBody.Inputs["source_commit"] != testCommit {
+		t.Fatalf("run=%#v dispatch=%#v", run, dispatchBody)
+	}
+}
+
+func TestDispatchReleaseRejectsExecutablePathsAndNonGHCRImages(t *testing.T) {
+	client := newTestClient(t, http.NotFoundHandler())
+	base := ReleaseDispatchRequest{
+		ReleaseRepository: "example/control", Workflow: "vuelta-release.yml", Ref: "main",
+		RequestID: testRequestID, SourceRepository: "example/api", SourceCommit: testCommit,
+		ImageRepository: "ghcr.io/example/api", BuildContext: ".",
+		Dockerfile: "Dockerfile", BuildTarget: "runtime",
+	}
+	for _, mutate := range []func(*ReleaseDispatchRequest){
+		func(request *ReleaseDispatchRequest) { request.Dockerfile = "../Dockerfile" },
+		func(request *ReleaseDispatchRequest) { request.BuildTarget = "runtime;curl" },
+		func(request *ReleaseDispatchRequest) { request.ImageRepository = "docker.io/example/api" },
+		func(request *ReleaseDispatchRequest) { request.SourceRepository = "../api" },
+	} {
+		request := base
+		mutate(&request)
+		if _, err := client.DispatchRelease(context.Background(), request); err == nil {
+			t.Fatalf("unsafe release accepted: %#v", request)
+		}
+	}
+}
+
 func TestClientDoesNotFollowRedirects(t *testing.T) {
 	client := newTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		http.Redirect(response, &http.Request{}, "https://attacker.invalid", http.StatusFound)
@@ -136,5 +198,23 @@ func TestClientFailureDoesNotExposeResponseBody(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "sensitive") {
 		t.Fatalf("response body escaped into error: %v", err)
+	}
+}
+
+func TestBranchHeadUsesConfiguredBranchWithoutServerFetch(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/repos/example/api/commits" ||
+			request.URL.Query().Get("sha") != "production/main" {
+			t.Fatalf("request = %s?%s", request.URL.Path, request.URL.RawQuery)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`[{"sha":"` + testCommit + `"}]`))
+	}))
+	head, err := client.BranchHead(context.Background(), "example/api", "production/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != testCommit {
+		t.Fatalf("head = %q", head)
 	}
 }

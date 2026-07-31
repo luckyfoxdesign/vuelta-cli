@@ -28,6 +28,8 @@ var (
 	commitPattern     = regexp.MustCompile(`^[a-f0-9]{40}$`)
 	requestIDPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
 	refPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$`)
+	imagePattern      = regexp.MustCompile(`^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$`)
+	relativePattern   = regexp.MustCompile(`^[A-Za-z0-9_.][A-Za-z0-9_./-]{0,511}$`)
 )
 
 // Client sends credentials only to one validated HTTPS API origin.
@@ -94,6 +96,22 @@ type DispatchRequest struct {
 	Ref          string
 }
 
+// ReleaseDispatchRequest starts the central, Vuelta-owned release workflow.
+// Build metadata is derived from an exact configured workspace and contains
+// paths and identifiers only, never executable shell text or credentials.
+type ReleaseDispatchRequest struct {
+	ReleaseRepository string
+	Workflow          string
+	Ref               string
+	RequestID         string
+	SourceRepository  string
+	SourceCommit      string
+	ImageRepository   string
+	BuildContext      string
+	Dockerfile        string
+	BuildTarget       string
+}
+
 // Run is a bounded known workflow run view.
 type Run struct {
 	ID         int64     `json:"id"`
@@ -148,6 +166,50 @@ func (c *Client) Dispatch(ctx context.Context, request DispatchRequest) (Run, er
 	return Run{}, errors.New("GitHub accepted the dispatch but its exact run was not visible before the bounded lookup deadline")
 }
 
+// DispatchRelease requests one central release build and finds the exact run
+// by its opaque request-specific title. The workflow's head SHA belongs to the
+// control repository, so source identity remains a separate closed input.
+func (c *Client) DispatchRelease(ctx context.Context, request ReleaseDispatchRequest) (Run, error) {
+	if err := validateReleaseRequest(request); err != nil {
+		return Run{}, err
+	}
+	started := c.now().UTC().Add(-time.Minute)
+	body := struct {
+		Ref    string            `json:"ref"`
+		Inputs map[string]string `json:"inputs"`
+	}{
+		Ref: request.Ref,
+		Inputs: map[string]string{
+			"request_id": request.RequestID, "contract_version": strconv.Itoa(policyVersion),
+			"source_repository": request.SourceRepository, "source_commit": request.SourceCommit,
+			"image_repository": request.ImageRepository, "build_context": request.BuildContext,
+			"dockerfile": request.Dockerfile, "build_target": request.BuildTarget,
+		},
+	}
+	var response struct{}
+	if err := c.doJSON(ctx, http.MethodPost,
+		fmt.Sprintf("/repos/%s/actions/workflows/%s/dispatches", request.ReleaseRepository, request.Workflow),
+		body, http.StatusNoContent, &response,
+	); err != nil {
+		return Run{}, fmt.Errorf("dispatch GitHub release workflow: %w", err)
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		run, found, err := c.findReleaseRun(ctx, request, started)
+		if err != nil {
+			return Run{}, err
+		}
+		if found {
+			return run, nil
+		}
+		if attempt < 9 {
+			if err := c.wait(ctx, time.Second); err != nil {
+				return Run{}, err
+			}
+		}
+	}
+	return Run{}, errors.New("GitHub accepted the release dispatch but its exact run was not visible before the bounded lookup deadline")
+}
+
 func validateRequest(request DispatchRequest) error {
 	switch {
 	case !repositoryPattern.MatchString(request.Repository) || strings.Contains(request.Repository, ".."):
@@ -160,6 +222,31 @@ func validateRequest(request DispatchRequest) error {
 		return errors.New("GitHub update ref is invalid")
 	case !requestIDPattern.MatchString(request.RequestID):
 		return errors.New("GitHub update request ID is invalid")
+	default:
+		return nil
+	}
+}
+
+func validateReleaseRequest(request ReleaseDispatchRequest) error {
+	switch {
+	case !repositoryPattern.MatchString(request.ReleaseRepository) || strings.Contains(request.ReleaseRepository, ".."):
+		return errors.New("GitHub release repository must be one exact owner/repository identifier")
+	case !workflowPattern.MatchString(request.Workflow) || strings.Contains(request.Workflow, ".."):
+		return errors.New("GitHub release workflow must be one YAML filename")
+	case !refPattern.MatchString(request.Ref) || strings.Contains(request.Ref, "..") || strings.Contains(request.Ref, "//"):
+		return errors.New("GitHub release workflow ref is invalid")
+	case !requestIDPattern.MatchString(request.RequestID):
+		return errors.New("GitHub release request ID is invalid")
+	case !repositoryPattern.MatchString(request.SourceRepository) || strings.Contains(request.SourceRepository, ".."):
+		return errors.New("GitHub source repository must be one exact owner/repository identifier")
+	case !commitPattern.MatchString(request.SourceCommit):
+		return errors.New("GitHub release source commit must be a full lowercase SHA")
+	case !imagePattern.MatchString(request.ImageRepository) || strings.Contains(request.ImageRepository, ".."):
+		return errors.New("GitHub release image repository must be one allowlisted GHCR path")
+	case !safeRelative(request.BuildContext), !safeRelative(request.Dockerfile):
+		return errors.New("GitHub release build paths must be clean project-relative paths")
+	case request.BuildTarget != "" && !refPattern.MatchString(request.BuildTarget):
+		return errors.New("GitHub release build target is invalid")
 	default:
 		return nil
 	}
@@ -200,6 +287,49 @@ func (c *Client) findDispatchedRun(ctx context.Context, request DispatchRequest,
 	return Run{}, false, nil
 }
 
+func (c *Client) findReleaseRun(
+	ctx context.Context,
+	request ReleaseDispatchRequest,
+	started time.Time,
+) (Run, bool, error) {
+	query := url.Values{
+		"event": {"workflow_dispatch"}, "created": {">=" + started.Format(time.RFC3339)}, "per_page": {"20"},
+	}
+	var response struct {
+		Runs []struct {
+			ID           int64  `json:"id"`
+			HTMLURL      string `json:"html_url"`
+			Status       string `json:"status"`
+			Conclusion   string `json:"conclusion"`
+			HeadSHA      string `json:"head_sha"`
+			HeadBranch   string `json:"head_branch"`
+			DisplayTitle string `json:"display_title"`
+			CreatedAt    string `json:"created_at"`
+			UpdatedAt    string `json:"updated_at"`
+		} `json:"workflow_runs"`
+	}
+	path := fmt.Sprintf("/repos/%s/actions/workflows/%s/runs?%s",
+		request.ReleaseRepository, request.Workflow, query.Encode())
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, http.StatusOK, &response); err != nil {
+		return Run{}, false, fmt.Errorf("find dispatched GitHub release run: %w", err)
+	}
+	expectedTitle := "vuelta-release-" + request.RequestID
+	for _, candidate := range response.Runs {
+		if candidate.DisplayTitle != expectedTitle {
+			continue
+		}
+		return parseRun(candidate.ID, candidate.HTMLURL, candidate.Status, candidate.Conclusion,
+			candidate.HeadSHA, candidate.HeadBranch, candidate.CreatedAt, candidate.UpdatedAt)
+	}
+	return Run{}, false, nil
+}
+
+func safeRelative(value string) bool {
+	return relativePattern.MatchString(value) && value != ".." &&
+		!strings.HasPrefix(value, "../") && !strings.Contains(value, "/../") &&
+		!strings.Contains(value, "//")
+}
+
 // GetRun reads one already-known run ID from the same configured repository.
 func (c *Client) GetRun(ctx context.Context, repository string, runID int64) (Run, error) {
 	if !repositoryPattern.MatchString(repository) || runID <= 0 {
@@ -224,6 +354,29 @@ func (c *Client) GetRun(ctx context.Context, repository string, runID int64) (Ru
 	run, _, err := parseRun(response.ID, response.HTMLURL, response.Status, response.Conclusion,
 		response.HeadSHA, response.HeadBranch, response.CreatedAt, response.UpdatedAt)
 	return run, err
+}
+
+// BranchHead resolves the newest exact commit on one configured branch
+// without requiring a server-side fetch or working-tree mutation.
+func (c *Client) BranchHead(ctx context.Context, repository, branch string) (string, error) {
+	if !repositoryPattern.MatchString(repository) || strings.Contains(repository, "..") ||
+		!refPattern.MatchString(branch) || strings.Contains(branch, "..") || strings.Contains(branch, "//") {
+		return "", errors.New("known GitHub repository and branch are required")
+	}
+	query := url.Values{"sha": {branch}, "per_page": {"1"}}
+	var response []struct {
+		SHA string `json:"sha"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet,
+		fmt.Sprintf("/repos/%s/commits?%s", repository, query.Encode()),
+		nil, http.StatusOK, &response,
+	); err != nil {
+		return "", fmt.Errorf("read configured GitHub branch head: %w", err)
+	}
+	if len(response) != 1 || !commitPattern.MatchString(response[0].SHA) {
+		return "", errors.New("configured GitHub branch returned no exact commit")
+	}
+	return response[0].SHA, nil
 }
 
 func parseRun(id int64, htmlURL, status, conclusion, headSHA, headBranch, created, updated string) (Run, bool, error) {

@@ -9,6 +9,7 @@ Everyday commands:
   scan         find vulnerabilities and package candidates; create snapshots only for safely mutable manifests
   update       request a reviewed dependency update on GitHub Actions
   status       show durable project and operation status
+  deploy       synchronize one automatically discovered project release
 
 Configuration:
   project      list or add configured projects

@@ -1,10 +1,11 @@
 # vuelta
 
-A one-shot CLI that scans configured projects read-only, records bounded
-dependency history in machine-owned SQLite, and dispatches reviewed updates to
-GitHub-hosted runners. The production server never resolves lock files, runs
-project tests, or builds images during the normal update path. It has no
-resident daemon; launchd/systemd invokes scans and typed command consumption.
+A one-shot CLI that scans and deploys configured projects without changing
+their repositories. It records bounded history in machine-owned SQLite and
+dispatches builds to a central GitHub-hosted release engine. The production
+server never resolves lock files, runs project tests, or builds images during
+the normal update or deploy path. It has no resident daemon;
+launchd/systemd invokes synchronization and typed command consumption.
 
 Node and Python scans resolve adaptive defaults from declarative runtime,
 manager, lock, and platform metadata. Scanner Dockerfiles are embedded in the
@@ -68,6 +69,7 @@ error details are needed; `--json` remains the stable automation interface.
 
 ```text
 cmd/vuelta/       # main.go, CLI entrypoint
+cmd/vuelta-gateway/ # minimal machine-owned blue/green gateway
 cmd/vuelta-scheduler/ # external JSON orchestration helper
 internal/
   config/         # config.yaml parsing and validation
@@ -77,6 +79,8 @@ internal/
   updatepolicy/   # delayed-latest direct dependency policy
   history/        # machine-owned SQLite schema and repositories
   githubactions/  # narrow workflow dispatch and known-run synchronization
+  deploy/         # zero-edit discovery and blue/green release runtime
+  gateway/        # atomic reverse-proxy configuration
   vulnscan/       # trivy/osv-scanner integration
   githubalerts/   # read-only GitHub Dependabot/Security Advisories client
   sandbox/        # one-off sandboxed working copy for update/test
@@ -84,7 +88,7 @@ internal/
   gitops/         # commit, push, tags
   notify/         # deprecated compatibility package; core does not call it
   scheduler/      # scan/update JSON orchestration and aggregate policy
-deploy/           # scheduler units and GitHub update workflow contract/example
+deploy/           # units, central release engine, and gateway image
 config.example.yaml
 ```
 
@@ -234,10 +238,10 @@ repository for each scenario.
   an untracked file deliberately so rollback behavior remains observable.
 
 The Go test suite starts in-memory GitHub-alert and registry stand-ins; it
-does not contact GitHub, a package registry, or an OCI registry. The deploy
-target mock accepts only well-formed immutable candidate fields and can model
-either `healthy` or `rolled_back` results. Cryptographic tag verification and
-the real deployment adapter are owned by part G.
+does not contact GitHub, a package registry, or an OCI registry. Deployment
+tests use bounded fake GitHub, Docker, resource, health, and gateway
+boundaries; production execution verifies exact OCI source/revision labels and
+immutable repository digests.
 
 ## Real-world corpus scan
 
@@ -442,6 +446,48 @@ Status commands synchronize only already-known unfinished GitHub run IDs.
 GitHub outages leave the last state visible as stale and never repeat a
 dispatch.
 
+### Zero-edit production deploy
+
+`vuelta deploy sync` is the complete unattended deploy entrypoint. For every
+existing `workspaces[]` root, it derives a deployment contract from the root
+Git repository, conventional Compose files, Docker health checks, and the
+running proxy network. There is no onboarding command and Vuelta never adds or
+changes a project workflow, Dockerfile, Compose file, `.env`, Nginx
+configuration, Traefik configuration, or repository ignore rule.
+
+```bash
+vuelta deploy plan api
+vuelta deploy sync
+vuelta deploy status api
+vuelta deploy rollback api
+```
+
+The central `.github/workflows/vuelta-release-engine.yml` requires a successful
+GitHub check suite for the exact remote project commit, then checks it out on a
+GitHub-hosted runner and publishes an OCI-labelled immutable image. The source
+read token is absent while project build code runs. The server pulls that exact
+release, starts a second slot from a machine-owned
+Compose overlay outside the project, checks health, switches the
+machine-owned gateway, smoke-checks the new route, drains the previous slot,
+and replaces private companion services sequentially.
+
+Existing Nginx deployments keep their fixed Docker DNS upstream; Vuelta
+adopts that name for its gateway without editing Nginx. Existing Traefik
+deployments get a machine-owned higher-priority gateway router assembled from
+an allowlist of already-running router labels; project labels remain
+unchanged. Ambiguous topology, an external companion without a health check,
+insufficient resources, unavailable immutable image identity, an incomplete
+source check suite, or detected migration changes blocks the release safely.
+Migration approval is recorded
+against the exact project, commit, digest, and changed paths, but execution
+stays blocked until a separately reviewed migration adapter exists.
+
+Machine config supplies only global authority: central release repository,
+workflow/ref, registry identity, digest-pinned gateway image, resource floors,
+and drain time. Credentials remain in the allowlisted
+`github_actions.token_env` environment variable. See
+`config.example.yaml` and `../docs/runbook-prod.md`.
+
 For a `requirements.txt`-only Python project, candidate discovery remains
 read-only and the result is `scan_only`. JSON includes
 `package_updates: {"status":"scan_only","reason":"manifest_has_no_safe_mutation_contract"}`
@@ -508,13 +554,14 @@ its single result envelope on stdout; plans, progress, and diagnostics remain
 on stderr. Do not put test logs, diffs, webhook URLs, or Telegram tokens in
 notification text or audit fields.
 
-Scheduling is external. Production timers run sequential `scan --all` and may
-run `commands consume` to process one typed `request_update` row. There is no
+Scheduling is external. Production timers run sequential `scan --all` and
+`deploy sync`, and may run `commands consume` to process one typed
+`request_update`, `request_deploy`, or `request_rollback` row. There is no
 update-all command. Queue records contain a closed command type and stable
-identifiers only; stale, duplicate, unknown, and non-update records never
-reach execution, and no queue value is interpreted as shell text. The older
-`vuelta-scheduler` helper remains a local compatibility surface and is not the
-production update default.
+identifiers only; stale, duplicate, and unknown records never reach execution,
+and no queue value is interpreted as shell text. The older `vuelta-scheduler`
+helper remains a local compatibility surface and is not the production
+default.
 
 Templates live in `deploy/`: load `com.vuelta.schedule.plist` with `launchctl`
 on macOS after replacing `REPLACE_ME`, or install both binaries plus
@@ -527,5 +574,6 @@ project paths.
 
 Implemented: configuration, read-only scanning, SQLite history/event/outbox
 state, delayed-latest policy, GitHub Actions update dispatch/synchronization,
-the explicit local compatibility pipeline, and security gates. Blue-green
-deployment and the SQLite-backed Telegram bridge remain separate tasks.
+the explicit local compatibility pipeline, security gates, and zero-edit
+GitHub-built blue/green deployment. The SQLite-backed Telegram bridge remains
+a separate task.

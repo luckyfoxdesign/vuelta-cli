@@ -54,6 +54,7 @@ type Config struct {
 	VulnScan         VulnScanConfig         `yaml:"vuln_scan"`
 	GithubAdvisories GithubAdvisoriesConfig `yaml:"github_advisories"`
 	GithubActions    GithubActionsConfig    `yaml:"github_actions"`
+	Deploy           DeployConfig           `yaml:"deploy"`
 	Update           UpdateConfig           `yaml:"update"`
 	Workspaces       []Workspace            `yaml:"workspaces"`
 	Git              GitConfig              `yaml:"git"`
@@ -139,8 +140,23 @@ type GithubAdvisoriesConfig struct {
 // GithubActionsConfig contains machine authority only. Repository and workflow
 // identities remain versioned with each workspace.
 type GithubActionsConfig struct {
-	APIURL   string `yaml:"api_url"`
-	TokenEnv string `yaml:"token_env"`
+	APIURL            string `yaml:"api_url"`
+	TokenEnv          string `yaml:"token_env"`
+	ReleaseRepository string `yaml:"release_repository,omitempty"`
+	ReleaseWorkflow   string `yaml:"release_workflow,omitempty"`
+	ReleaseRef        string `yaml:"release_ref,omitempty"`
+	RegistryUser      string `yaml:"registry_user,omitempty"`
+}
+
+// DeployConfig contains only global machine-owned safety policy and the
+// immutable Vuelta gateway image. Per-project deployment settings are always
+// discovered; they are never added to managed repositories.
+type DeployConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	GatewayImage    string `yaml:"gateway_image,omitempty"`
+	DrainSeconds    int    `yaml:"drain_seconds,omitempty"`
+	MinFreeMemoryMB int    `yaml:"min_free_memory_mb,omitempty"`
+	MinFreeDiskMB   int    `yaml:"min_free_disk_mb,omitempty"`
 }
 
 // githubTokenEnvNames is the fixed allowlist for github_advisories.token_env.
@@ -537,6 +553,8 @@ func (c *Config) Validate() error {
 	errs = append(errs, validateSecurityConfig(*c)...)
 	errs = append(errs, validateNotifyConfig(c.Notify)...)
 	errs = append(errs, validateGithubActionsConfig(c.GithubActions)...)
+	errs = append(errs, validateDeployConfig(c.Deploy)...)
+	errs = append(errs, validateDeployAuthority(c.Deploy, c.GithubActions)...)
 	if c.State.DatabasePath != "" && (!filepath.IsAbs(c.State.DatabasePath) || filepath.Clean(c.State.DatabasePath) != c.State.DatabasePath) {
 		errs = append(errs, errors.New("state.database_path: must be a clean absolute path when configured"))
 	}
@@ -637,7 +655,59 @@ func validateGithubActionsConfig(c GithubActionsConfig) []error {
 			errs = append(errs, errors.New("github_actions.api_url: must not contain a query or fragment"))
 		}
 	}
+	if (c.ReleaseRepository == "") != (c.ReleaseWorkflow == "") {
+		errs = append(errs, errors.New("github_actions: release_repository and release_workflow must be configured together"))
+	}
+	if c.ReleaseRepository != "" &&
+		(!githubRepositoryPattern.MatchString(c.ReleaseRepository) || strings.Contains(c.ReleaseRepository, "..")) {
+		errs = append(errs, errors.New("github_actions.release_repository: must be one exact owner/repository identifier"))
+	}
+	if c.ReleaseWorkflow != "" &&
+		(!githubWorkflowPattern.MatchString(c.ReleaseWorkflow) || strings.Contains(c.ReleaseWorkflow, "..")) {
+		errs = append(errs, errors.New("github_actions.release_workflow: must be one workflow YAML filename"))
+	}
+	if c.ReleaseRepository != "" {
+		if c.ReleaseRef == "" {
+			errs = append(errs, errors.New("github_actions.release_ref: is required with the central release workflow"))
+		} else if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$`).MatchString(c.ReleaseRef) ||
+			strings.Contains(c.ReleaseRef, "..") || strings.Contains(c.ReleaseRef, "//") {
+			errs = append(errs, errors.New("github_actions.release_ref: is invalid"))
+		}
+		if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`).MatchString(c.RegistryUser) {
+			errs = append(errs, errors.New("github_actions.registry_user: is required and invalid"))
+		}
+	} else if c.ReleaseRef != "" || c.RegistryUser != "" {
+		errs = append(errs, errors.New("github_actions: release_ref and registry_user require release_repository"))
+	}
 	return errs
+}
+
+func validateDeployConfig(c DeployConfig) []error {
+	var errs []error
+	if c.Enabled && !digestRefPattern.MatchString(c.GatewayImage) {
+		errs = append(errs, errors.New("deploy.gateway_image: an exact digest-pinned image is required when deploy is enabled"))
+	}
+	if c.DrainSeconds != 0 && (c.DrainSeconds < 5 || c.DrainSeconds > 300) {
+		errs = append(errs, errors.New("deploy.drain_seconds: must be between 5 and 300"))
+	}
+	if c.MinFreeMemoryMB != 0 && (c.MinFreeMemoryMB < 128 || c.MinFreeMemoryMB > 1<<20) {
+		errs = append(errs, errors.New("deploy.min_free_memory_mb: must be between 128 and 1048576"))
+	}
+	if c.MinFreeDiskMB != 0 && (c.MinFreeDiskMB < 256 || c.MinFreeDiskMB > 1<<24) {
+		errs = append(errs, errors.New("deploy.min_free_disk_mb: must be between 256 and 16777216"))
+	}
+	return errs
+}
+
+func validateDeployAuthority(deploy DeployConfig, github GithubActionsConfig) []error {
+	if !deploy.Enabled {
+		return nil
+	}
+	if github.ReleaseRepository == "" || github.ReleaseWorkflow == "" ||
+		github.ReleaseRef == "" || github.RegistryUser == "" {
+		return []error{errors.New("deploy.enabled: central github_actions release repository, workflow, ref, and registry_user are required")}
+	}
+	return nil
 }
 
 // SnapshotTTL returns the validated lifetime of a package update plan.

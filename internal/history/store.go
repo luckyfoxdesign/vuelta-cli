@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	currentSchemaVersion = 1
+	currentSchemaVersion = 2
 	maxNameBytes         = 256
 	maxPathBytes         = 4096
 	maxSummaryBytes      = 1024
+	maxContractBytes     = 32 << 10
 )
 
 // Store serializes writes through one database/sql connection. SQLite still
@@ -179,6 +180,12 @@ func (s *Store) initialize(ctx context.Context) error {
 		if err := s.migrateV1(ctx); err != nil {
 			return err
 		}
+		userVersion = 1
+	}
+	if userVersion == 1 {
+		if err := s.migrateV2(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -196,7 +203,7 @@ func (s *Store) migrateV1(ctx context.Context) error {
 	}
 	now := formatTime(time.Now())
 	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", currentSchemaVersion, now,
+		"INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", 1, now,
 	); err != nil {
 		return fmt.Errorf("record history schema migration v1: %w", err)
 	}
@@ -205,6 +212,32 @@ func (s *Store) migrateV1(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit history schema migration v1: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateV2(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin history schema migration v2: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, statement := range schemaV2 {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply history schema migration v2: %w", err)
+		}
+	}
+	now := formatTime(time.Now())
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", 2, now,
+	); err != nil {
+		return fmt.Errorf("record history schema migration v2: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+		return fmt.Errorf("set history schema version v2: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit history schema migration v2: %w", err)
 	}
 	return nil
 }
@@ -323,6 +356,60 @@ var schemaV1 = []string{
 		consumed_at TEXT
 	) STRICT`,
 	`CREATE INDEX operator_commands_pending ON operator_commands(status, created_at)`,
+}
+
+var schemaV2 = []string{
+	`ALTER TABLE approval_requests ADD COLUMN subject_summary TEXT NOT NULL DEFAULT '{}'`,
+	`ALTER TABLE approval_requests ADD COLUMN decision_identity TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE deployment_contracts (
+		project_id INTEGER PRIMARY KEY REFERENCES projects(id),
+		fingerprint TEXT NOT NULL,
+		repository TEXT NOT NULL,
+		branch TEXT NOT NULL,
+		commit_sha TEXT NOT NULL,
+		compose_files TEXT NOT NULL,
+		services TEXT NOT NULL,
+		traffic_service TEXT NOT NULL,
+		stable_upstream TEXT NOT NULL,
+		internal_port INTEGER NOT NULL CHECK(internal_port BETWEEN 0 AND 65535),
+		migration_paths TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('ready', 'blocked')),
+		blockers TEXT NOT NULL,
+		discovered_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	) STRICT`,
+	`CREATE TABLE deployment_releases (
+		id TEXT PRIMARY KEY,
+		operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+		project_id INTEGER NOT NULL REFERENCES projects(id),
+		release_repository TEXT NOT NULL,
+		release_workflow TEXT NOT NULL,
+		github_run_id INTEGER NOT NULL DEFAULT 0,
+		run_url TEXT NOT NULL DEFAULT '',
+		source_repository TEXT NOT NULL,
+		source_commit TEXT NOT NULL,
+		image_repository TEXT NOT NULL,
+		candidate_digest TEXT NOT NULL DEFAULT '',
+		previous_digest TEXT NOT NULL DEFAULT '',
+		candidate_slot TEXT NOT NULL DEFAULT '',
+		previous_slot TEXT NOT NULL DEFAULT '',
+		contract_fingerprint TEXT NOT NULL,
+		state TEXT NOT NULL CHECK(state IN (
+			'discovered', 'building', 'ready', 'pulling', 'starting', 'healthy',
+			'switching', 'draining', 'deployed', 'blocked', 'failed', 'rolled_back'
+		)),
+		requested_at TEXT NOT NULL,
+		started_at TEXT,
+		switched_at TEXT,
+		completed_at TEXT,
+		updated_at TEXT NOT NULL,
+		UNIQUE(project_id, source_commit)
+	) STRICT`,
+	`CREATE INDEX deployment_releases_project_updated
+		ON deployment_releases(project_id, updated_at DESC)`,
+	`CREATE UNIQUE INDEX deployment_releases_known_run
+		ON deployment_releases(release_repository, github_run_id)
+		WHERE github_run_id > 0`,
 }
 
 func newID() (string, error) {

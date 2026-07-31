@@ -17,6 +17,7 @@
 app/
 ├── AGENTS.md, CLAUDE.md, PROJECT_MAP.md
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
+├── cmd/vuelta-gateway/  # minimal machine-owned blue/green HTTP gateway
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
 ├── cmd/vuelta-corpus/   # manual real-world corpus harness
 ├── internal/            # ecosystem adapters, config, scanner, updater, toolchain,
@@ -24,8 +25,8 @@ app/
 ├── acceptance/          # opt-in real-engine matrix and pinned corpus manifest
 ├── scanner-images/      # embedded exact-version scanner build inputs
 ├── egress/              # local registry-allowlisting forward proxy
-├── .github/workflows/   # reusable GitHub-hosted update engine
-├── deploy/              # scheduler and GitHub update workflow examples
+├── .github/workflows/   # reusable update and central release engines
+├── deploy/              # scheduler units, release engine, gateway image
 ├── config.example.yaml, Makefile
 ├── Dockerfile, compose.yml, .golangci.yml
 └── scripts/update-project-map.sh
@@ -40,6 +41,10 @@ docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
 vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint
+vuelta deploy plan PROJECT     # discover without project writes
+vuelta deploy sync             # build/release/switch every ready workspace
+vuelta deploy status [PROJECT] # durable contract and release state
+vuelta deploy rollback PROJECT # restore recorded immutable prior digest
 scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
 scripts/corpus-scan.sh ROOT [MODE] # manual pinned corpus scan and reports
 scripts/corpus-refresh.sh ROOT # validated candidate pins without manifest mutation
@@ -51,6 +56,7 @@ make build                     # both cross-build targets
 ## Entrypoints
 
 - `cmd/vuelta-corpus/main.go` — `vuelta-corpus` binary entrypoint.
+- `cmd/vuelta-gateway/main.go` — `vuelta-gateway` binary entrypoint.
 - `cmd/vuelta-scheduler/main.go` — `vuelta-scheduler` binary entrypoint.
 - `cmd/vuelta/main.go` — `vuelta` binary entrypoint.
 
@@ -67,8 +73,8 @@ make build                     # both cross-build targets
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
 - `Makefile` — Docker-only cross-build targets for the CLI and scheduler.
 - `.golangci.yml` — lint rules.
-- `.github/workflows/` — pinned reusable GitHub-hosted update workflow.
-- `deploy/` — external scheduling and managed-repository update workflow examples.
+- `.github/workflows/` — pinned reusable update workflow and central zero-edit release engine.
+- `deploy/` — external scheduling, central release script, systemd deploy synchronization, and digest-pinned gateway image.
 - `scripts/update-project-map.sh` — updates this repo map generated block.
 
 ## Notable Directories
@@ -78,11 +84,13 @@ make build                     # both cross-build targets
 - `internal/config/` — strictly loads machine config and the narrow project-owned .vuelta.yaml schema. Project paths resolve relative to their config without granting project policy control over machine authority.  Validation never walks parent directories or discovers projects; the CLI resolver supplies an exact selected root or configured workspace.
 - `internal/configinit/` — creates protected config containers, guards unsafe roots, deterministically detects a selected project's supported files without requiring Git, and applies atomic reviewed edits. It never walks parent directories or reads unallowlisted files.
 - `internal/corpus/` — implements the offline-testable core of the manual real-world scan harness. Network access and process execution are supplied through narrow interfaces so the standard test suite never needs GitHub or Docker.
+- `internal/deploy/` — discovers and executes machine-owned deployments without writing configuration into managed repositories.
 - `internal/dockerexec/` — is the single process boundary for Docker CLI commands. It binds commands to one verified absolute executable and approved local Unix socket, attests daemon identity/capabilities, and runs every command with a minimal environment and bounded output collectors.
 - `internal/ecosystem/` — defines immutable adapter identity, normalized data contracts, typed capability errors, and deterministic registry construction. It owns no command or container execution boundary.
 - `internal/ecosystems/` — contains concrete built-in stack/package-manager adapters, structured candidate decoders, and data-only mutation policies.
 - `internal/egress/` — owns the fail-closed Docker network and registry proxy used by networked scanner stages.
 - `internal/egressproxy/` — implements the embedded registry-allowlisting forward proxy used by Vuelta-managed scanner networks.
+- `internal/gateway/` — provides the minimal Vuelta-owned stable HTTP hop used when an existing reverse proxy already targets a fixed Docker DNS name.
 - `internal/gitexec/` — is the single process boundary for production Git commands.  Security invariants:   - the executable is selected only from compiled-in absolute system paths;   - children receive a small explicit environment, never the caller's Git,     askpass, proxy, or executable-selection variables;   - system/global config, hooks, fsmonitor, credential helpers, external     diff, automatic maintenance, signing, and unsafe protocols are disabled;   - callers may run only the reviewed command set and may add only a private     absolute GIT_INDEX_FILE.  Repository data and ordinary non-executable repository configuration remain visible to Git. Callers must still validate remote names, refs, and paths at their own trust boundary before placing them in argv.
 - `internal/githubactions/` — implements the narrow GitHub Actions API surface used to dispatch and inspect Vuelta update workflows.
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
@@ -107,7 +115,7 @@ make build                     # both cross-build targets
 - `internal/updatepolicy/` — applies Vuelta's machine-owned delayed-latest policy to normalized, non-executable dependency metadata.
 - `internal/updater/` — executes adapter-provided reviewed scanner and mutation argv inside core-owned hardened containers, then applies validated dependency and Docker image plans inside a sandboxed working copy.
 - `internal/updatesnapshot/` — stores short-lived, project-local read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
-- `internal/vulnscan/` — runs pinned Trivy and/or OSV-Scanner containers for CVE scanning of dependencies and built images.
+- `internal/vulnscan/` — TODO: describe this package.
 <!-- generated:end -->
 
 <!-- manual:start -->
@@ -121,8 +129,8 @@ make build                     # both cross-build targets
   mutation.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - Package ecosystem behavior is selected through one explicit built-in catalog; core orchestration has no manager-name registry tables or switches.
-- `deploy/` contains scheduler and GitHub update workflow examples; the binary
-  remains a one-shot CLI and the update workflow cannot deploy.
+- `deploy/` contains scheduler units, the central release engine, and the
+  machine-owned gateway image. Managed projects do not receive Vuelta files.
 
 ## Conventions
 

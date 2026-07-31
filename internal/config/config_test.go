@@ -152,6 +152,41 @@ func TestValidateDockerEndpointRequiresPinnedIdentityAndLocalSocket(t *testing.T
 	}
 }
 
+func TestValidateDeployRequiresCentralWorkflowAndPinnedGateway(t *testing.T) {
+	if errs := validateDeployConfig(DeployConfig{
+		Enabled: true, GatewayImage: "ghcr.io/example/gateway:latest",
+	}); len(errs) == 0 {
+		t.Fatal("mutable gateway image was accepted")
+	}
+	if errs := validateDeployConfig(DeployConfig{
+		Enabled:      true,
+		GatewayImage: "ghcr.io/example/gateway@sha256:" + strings.Repeat("a", 64),
+		DrainSeconds: 30, MinFreeMemoryMB: 512, MinFreeDiskMB: 2048,
+	}); len(errs) != 0 {
+		t.Fatalf("valid deploy config errors = %v", errs)
+	}
+	if errs := validateGithubActionsConfig(GithubActionsConfig{
+		ReleaseRepository: "example/control", ReleaseWorkflow: "vuelta-release.yml",
+	}); len(errs) == 0 {
+		t.Fatal("incomplete central release configuration was accepted")
+	}
+	if errs := validateGithubActionsConfig(GithubActionsConfig{
+		ReleaseRepository: "example/control", ReleaseWorkflow: "vuelta-release.yml",
+		ReleaseRef: "main", RegistryUser: "example",
+	}); len(errs) != 0 {
+		t.Fatalf("valid central release config errors = %v", errs)
+	}
+	if errs := validateDeployAuthority(DeployConfig{Enabled: true}, GithubActionsConfig{}); len(errs) != 1 {
+		t.Fatalf("missing deploy authority errors = %v", errs)
+	}
+	if errs := validateDeployAuthority(DeployConfig{Enabled: true}, GithubActionsConfig{
+		ReleaseRepository: "example/control", ReleaseWorkflow: "vuelta-release.yml",
+		ReleaseRef: "main", RegistryUser: "example",
+	}); len(errs) != 0 {
+		t.Fatalf("valid deploy authority errors = %v", errs)
+	}
+}
+
 func TestValidateRejectsUnsafeVerificationCommand(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {

@@ -1,0 +1,85 @@
+name: Vuelta release engine
+run-name: vuelta-release-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      contract_version:
+        required: true
+        type: string
+      source_repository:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+      image_repository:
+        required: true
+        type: string
+      build_context:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      build_target:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: vuelta-release-${{ inputs.source_repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the Vuelta release engine
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: engine
+          persist-credentials: false
+
+      - name: Verify the exact source commit check suite
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_READ_TOKEN: ${{ secrets.VUELTA_SOURCE_READ_TOKEN }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+        run: sh engine/deploy/release-engine.sh verify
+
+      - name: Check out the exact project commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+          token: ${{ secrets.VUELTA_SOURCE_READ_TOKEN }}
+
+      - name: Build without source or registry credentials
+        env:
+          BUILD_CONTEXT: ${{ inputs.build_context }}
+          BUILD_TARGET: ${{ inputs.build_target }}
+          CONTRACT_VERSION: ${{ inputs.contract_version }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+        run: sh engine/deploy/release-engine.sh build "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/release-image.tar"
+
+      - name: Publish the already-built exact image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: sh engine/deploy/release-engine.sh publish "$RUNNER_TEMP/release-image.tar"

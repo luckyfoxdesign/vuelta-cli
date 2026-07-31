@@ -69,6 +69,25 @@ github_actions:
   # dispatch/read permissions. The value is read from this fixed environment
   # variable and is never written to YAML or SQLite.
   token_env: "VUELTA_GITHUB_TOKEN"
+  # Deploy uses one central Vuelta-owned workflow; managed projects do not add
+  # workflow files. Uncomment all four fields together when deploy.enabled is
+  # true. registry_user is an identifier, not a credential.
+  # release_repository: "luckyfoxdesign/vuelta"
+  # release_workflow: "vuelta-release-engine.yml"
+  # release_ref: "main"
+  # registry_user: "luckyfoxdesign"
+
+deploy:
+  # `vuelta deploy sync` derives contracts from existing workspaces, Compose,
+  # Git, and running Docker metadata. It never writes into project repos or
+  # their Nginx/Traefik configuration.
+  enabled: false
+  # Required as an immutable digest when enabled. This image contains only the
+  # minimal Vuelta HTTP gateway used behind existing fixed Docker upstreams.
+  # gateway_image: "ghcr.io/luckyfoxdesign/vuelta-gateway@sha256:<64-hex-digest>"
+  drain_seconds: 30
+  min_free_memory_mb: 512
+  min_free_disk_mb: 2048
 
 update:
   min_release_age_days: 14 # machine safety floor; project config and CLI cannot silently shorten it

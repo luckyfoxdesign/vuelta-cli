@@ -1,9 +1,9 @@
 [Unit]
-Description=Run Vuelta verified production deploy worker
+Description=Synchronize Vuelta zero-edit releases
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=1min
+OnUnitActiveSec=5min
 Persistent=true
 Unit=vuelta-deploy-worker.service
 
