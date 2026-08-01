@@ -293,7 +293,7 @@ func TestBuildExplicitMultiStepVerificationFromDeclarativeMetadata(t *testing.T)
 func validVerificationCompose(service string) string {
 	return "services:\n  " + service + ":\n" +
 		"    image: node:22@sha256:" + strings.Repeat("1", 64) + "\n" +
-		"    user: \"65532:65532\"\n    cap_drop: [\"ALL\"]\n" +
+		"    user: \"65532:65532\"\n    read_only: true\n    cap_drop: [\"ALL\"]\n" +
 		"    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n" +
 		"    mem_limit: 1g\n    pids_limit: 128\n    networks: [verify]\n" +
 		"networks:\n  verify:\n    internal: true\n"

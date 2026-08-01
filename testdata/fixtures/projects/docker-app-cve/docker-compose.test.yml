@@ -2,6 +2,7 @@ services:
   test:
     image: alpine:3.20@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
     user: "65532:65532"
+    read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     cpus: "1"

@@ -111,6 +111,7 @@ services:
   test:
     image: golang:1.26-alpine@sha256:%s
     user: "65532:65532"
+    read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     cpus: "1"
@@ -615,6 +616,7 @@ services:
   test:
     image: golang:1.26-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111
     user: "65532:65532"
+    read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     cpus: "1"
@@ -674,6 +676,7 @@ func TestRunRejectsMissingRunnerHardening(t *testing.T) {
 		{"root user", "user: \"65532:65532\"", "user: \"0\"", "non-root UID"},
 		{"named user", "user: \"65532:65532\"", "user: \"nobody\"", "non-root UID"},
 		{"root group", "user: \"65532:65532\"", "user: \"65532:0\"", "non-root UID"},
+		{"read only", "read_only: true\n", "", "read_only"},
 		{"cap drop", "cap_drop: [\"ALL\"]", "cap_drop: []", "cap_drop"},
 		{"no new privileges", "security_opt: [\"no-new-privileges:true\"]", "security_opt: []", "no-new-privileges"},
 		{"cpu limit", "cpus: \"1\"", "cpus: \"0\"", "cpus"},

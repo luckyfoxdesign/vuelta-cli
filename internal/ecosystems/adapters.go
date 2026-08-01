@@ -161,6 +161,22 @@ func (c changeCapability) AllowedChangedPaths() []string {
 	return append([]string(nil), c.paths...)
 }
 
+// verifyEnvironmentCapability supplies the fixed writable-path environment a
+// generated compose.verify.yml service needs. Only adapters with a reviewed
+// verify template embed it; its absence is what "restrict to stacks with a
+// verify template" checks for.
+type verifyEnvironmentCapability struct {
+	env map[string]string
+}
+
+func (c verifyEnvironmentCapability) VerificationEnvironment() map[string]string {
+	out := make(map[string]string, len(c.env))
+	for key, value := range c.env {
+		out[key] = value
+	}
+	return out
+}
+
 type scanningAdapter struct {
 	baseAdapter
 	inputCapability
@@ -182,6 +198,12 @@ type mutableAdapter struct {
 
 type npmAdapter struct {
 	mutableAdapter
+	verifyEnvironmentCapability
+}
+
+type pnpmAdapter struct {
+	mutableAdapter
+	verifyEnvironmentCapability
 }
 
 type pipToolsAdapter struct {
@@ -218,7 +240,9 @@ func NPM() ecosystem.Adapter {
 			ReleaseAge: true, LegacyImageKey: "node", LegacyToolKey: "npm_check_updates",
 		}, nil
 	}}
-	return npmAdapter{mutableAdapter: mutableAdapter{
+	return npmAdapter{verifyEnvironmentCapability: verifyEnvironmentCapability{
+		env: map[string]string{"HOME": "/tmp", "npm_config_cache": "/tmp/npm"},
+	}, mutableAdapter: mutableAdapter{
 		scanningAdapter: scanningAdapter{
 			baseAdapter:            base(key, "npm", 100, false, ""),
 			inputCapability:        inputs("package.json", "package-lock.json", []string{".npmrc"}),
@@ -288,7 +312,9 @@ func NPM() ecosystem.Adapter {
 // PNPM returns the node/pnpm built-in adapter.
 func PNPM() ecosystem.Adapter {
 	key := ecosystem.Key{Stack: "node", PackageManager: "pnpm"}
-	return mutableAdapter{
+	return pnpmAdapter{verifyEnvironmentCapability: verifyEnvironmentCapability{
+		env: map[string]string{"HOME": "/tmp", "npm_config_cache": "/tmp/pnpm"},
+	}, mutableAdapter: mutableAdapter{
 		scanningAdapter: scanningAdapter{
 			baseAdapter:            base(key, "pnpm", 100, false, ""),
 			inputCapability:        inputs("package.json", "pnpm-lock.yaml", []string{".npmrc", "pnpm-workspace.yaml"}),
@@ -343,7 +369,7 @@ func PNPM() ecosystem.Adapter {
 				LockFile: "pnpm-lock.yaml", LegacyImageKey: "node", Mutations: mutations,
 			}, nil
 		}},
-	}
+	}}
 }
 
 // Bun returns the detected but deliberately scanner-unsupported node/bun

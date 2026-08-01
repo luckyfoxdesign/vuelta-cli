@@ -157,6 +157,22 @@ var commandDefinitions = []commandDefinition{
 		examples: []string{"vuelta project list", "vuelta project add . --name api"},
 	},
 	{
+		path: []string{"project", "verify"}, usage: "vuelta project verify <command>",
+		description: "generate a hardened verification Compose service",
+		examples: []string{"vuelta project verify init"},
+	},
+	{
+		path: []string{"project", "verify", "init"}, usage: "vuelta project verify init [--directory PATH] [--script NAME]",
+		description: "generate compose.verify.yml from detected project metadata",
+		examples:    []string{"vuelta project verify init", "vuelta project verify init --script build"},
+		options: []optionDefinition{
+			{names: []string{"--directory"}, valueName: "PATH", description: "project root to generate compose.verify.yml for (default: .)"},
+			{names: []string{"--script"}, valueName: "NAME", description: "explicit package.json script name (overrides automatic detection)"},
+		},
+		security: []string{"Writes only compose.verify.yml; it never touches .vuelta.yaml or the machine config, and never overwrites an existing file. The rendered service is re-validated through the same fail-closed Compose policy used before a real verification run, and the base image is always digest-pinned."},
+		handler:  "project verify init",
+	},
+	{
 		path: []string{"project", "list"}, usage: "vuelta project list [--json] [config-path]",
 		description: "list stable project names and canonical paths", examples: []string{"vuelta project list", "vuelta project list --json"},
 		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
@@ -606,6 +622,8 @@ func dispatchCommand(handler string, args []string) error {
 		return runProjectList(args)
 	case "project add":
 		return runProjectAdd(args)
+	case "project verify init":
+		return runProjectVerifyInit(args)
 	default:
 		return fail(exitConfig, "command %q is not executable", handler)
 	}

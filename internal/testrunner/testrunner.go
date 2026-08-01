@@ -233,6 +233,19 @@ func validSuccessExitCodes(codes []int) bool {
 	return true
 }
 
+// ValidateComposeService applies the same fail-closed Compose allowlist used
+// before a verification run to one sandbox-relative compose file and service,
+// without needing a full VerificationStep. Generators use it to reject their
+// own output before writing it.
+func ValidateComposeService(root, composeFile, service string) error {
+	sandboxRoot, composePath, err := resolveComposeFile(root, composeFile)
+	if err != nil {
+		return err
+	}
+	_, err = validateCompose(sandboxRoot, composePath, service)
+	return err
+}
+
 // validateCompose parses the compose file under the strict allowlist and
 // returns the YAML serialization of the validated model. Everything Docker
 // Compose will execute comes from this serialization.
@@ -498,6 +511,9 @@ func checkService(root string, cf composeFile, name string, svc composeService) 
 	}
 	if !isExplicitNonRootUser(svc.User) {
 		return zero, fmt.Errorf("service %q: user must be an explicit non-root UID", name)
+	}
+	if !svc.ReadOnly {
+		return zero, fmt.Errorf("service %q: read_only must be true", name)
 	}
 	if !hasAllCapabilityDrop(svc.CapDrop) {
 		return zero, fmt.Errorf("service %q: cap_drop must include ALL", name)

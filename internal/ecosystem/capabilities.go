@@ -59,6 +59,15 @@ type VerificationProvider interface {
 	VerificationScript(command []string) (string, bool)
 }
 
+// VerificationEnvironmentProvider supplies the fixed container environment a
+// generated verify Compose service needs (writable cache/home paths under an
+// otherwise read-only root). Only adapters with a reviewed verify Compose
+// template implement it; its absence is the fail-closed signal that no
+// generator exists yet for that stack/package-manager pair.
+type VerificationEnvironmentProvider interface {
+	VerificationEnvironment() map[string]string
+}
+
 // Constraints contains normalized, allowlisted project metadata.
 type Constraints struct {
 	Key                     Key

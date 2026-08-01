@@ -2,6 +2,7 @@ services:
   test:
     image: node:22.14.0-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     user: "65532:65532"
+    read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     cpus: "1"
