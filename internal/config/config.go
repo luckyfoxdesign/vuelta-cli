@@ -37,7 +37,7 @@ var containerUserPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$
 // reviewed config migration flow; explicit unsupported versions fail closed.
 const CurrentSchemaVersion = 1
 
-var retiredMachineConfigFields = []string{"update.snapshot_state_dir"}
+var retiredMachineConfigFields = []string{"update.snapshot_state_dir", "notify"}
 
 // RetiredMachineConfigFields lists fields removable only through the reviewed
 // config migration flow. Active parsing remains strict and never accepts them.
@@ -50,7 +50,6 @@ type Config struct {
 	SchemaVersion    int                    `yaml:"schema_version"`
 	Docker           *DockerConfig          `yaml:"docker,omitempty"`
 	State            StateConfig            `yaml:"state"`
-	Notify           NotifyConfig           `yaml:"notify"`
 	VulnScan         VulnScanConfig         `yaml:"vuln_scan"`
 	GithubAdvisories GithubAdvisoriesConfig `yaml:"github_advisories"`
 	GithubActions    GithubActionsConfig    `yaml:"github_actions"`
@@ -89,26 +88,6 @@ type DockerDaemonIdentity struct {
 	MinimumAPIVersion       string   `yaml:"minimum_api_version" json:"minimum_api_version"`
 	RequiredSecurityOptions []string `yaml:"required_security_options" json:"required_security_options"`
 }
-
-type NotifyConfig struct {
-	WebhookURLEnv string         `yaml:"webhook_url_env"`
-	Telegram      TelegramConfig `yaml:"telegram"`
-}
-
-type TelegramConfig struct {
-	BotTokenEnv string `yaml:"bot_token_env"`
-	ChatID      string `yaml:"chat_id"`
-}
-
-const (
-	// NotifyWebhookURLEnv is the only environment variable that may supply a
-	// webhook credential. Keeping the name fixed prevents a config file from
-	// routing an unrelated process secret into a notification request.
-	NotifyWebhookURLEnv = "VUELTA_NOTIFY_WEBHOOK_URL"
-	// NotifyTelegramBotTokenEnv is the only environment variable that may
-	// supply a Telegram bot credential.
-	NotifyTelegramBotTokenEnv = "VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN"
-)
 
 type VulnScanConfig struct {
 	// DependencySource selects the only source used for dependency and lock-file
@@ -551,7 +530,6 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, validateSecurityConfig(*c)...)
-	errs = append(errs, validateNotifyConfig(c.Notify)...)
 	errs = append(errs, validateGithubActionsConfig(c.GithubActions)...)
 	errs = append(errs, validateDeployConfig(c.Deploy)...)
 	errs = append(errs, validateDeployAuthority(c.Deploy, c.GithubActions)...)
@@ -616,20 +594,6 @@ func validateToolchainProfile(index int, profile ToolchainProfile) []error {
 	}
 	if !profile.Capabilities.ReadOnlyDiscovery {
 		errs = append(errs, fmt.Errorf("%s.capabilities.read_only_discovery: must be true", label))
-	}
-	return errs
-}
-
-func validateNotifyConfig(c NotifyConfig) []error {
-	var errs []error
-	if c.WebhookURLEnv != "" && c.WebhookURLEnv != NotifyWebhookURLEnv {
-		errs = append(errs, fmt.Errorf("notify.webhook_url_env: must be %q when configured", NotifyWebhookURLEnv))
-	}
-	if c.Telegram.BotTokenEnv != "" && c.Telegram.BotTokenEnv != NotifyTelegramBotTokenEnv {
-		errs = append(errs, fmt.Errorf("notify.telegram.bot_token_env: must be %q when configured", NotifyTelegramBotTokenEnv))
-	}
-	if (c.Telegram.BotTokenEnv == "") != (c.Telegram.ChatID == "") {
-		errs = append(errs, errors.New("notify.telegram: bot_token_env and chat_id must be configured together"))
 	}
 	return errs
 }

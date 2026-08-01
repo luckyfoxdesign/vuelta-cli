@@ -1,7 +1,7 @@
 # Copy to ~/.config/vuelta/config.yaml and chmod 0600 it. The file must be a
-# regular, non-symlink file owned by the process uid. Legacy notify references
-# are accepted during migration but core operations write only SQLite outbox
-# intents; the separate bridge owns transport credentials and delivery.
+# regular, non-symlink file owned by the process uid. Core operations write
+# only SQLite outbox intents; the separate bridge owns transport credentials
+# and delivery.
 # Adhoc container scans use scan-time gates and an optional standalone policy
 # supplied explicitly with `vuelta scan --policy`.
 # Docker execution is disabled until this reviewed endpoint is configured.
@@ -28,14 +28,6 @@ state:
 #       minimum_api_version: "1.44"
 #       required_security_options:
 #         - "name=seccomp,profile=builtin"
-notify:
-  # Deprecated compatibility fields. Vuelta core does not call either
-  # transport; migrate delivery to the SQLite-backed bridge.
-  webhook_url_env: "" # to enable, set exactly "VUELTA_NOTIFY_WEBHOOK_URL"
-  telegram:
-    bot_token_env: "" # to enable with chat_id, set exactly "VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN"
-    chat_id: ""       # not a credential
-
 vuln_scan:
   # Exactly one dependency/lock-file source: trivy | osv-scanner | github-dependabot.
   # This replaces vuln_scan.tool and github_advisories.enabled. Delete those

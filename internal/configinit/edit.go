@@ -106,6 +106,9 @@ func PlanSchemaMigration(path string) (EditPlan, error) {
 			review = append(review, "remove retired "+config.RetiredMachineConfigFields()[0]+" (project-local state is selected from the exact target)")
 		}
 	}
+	if deleteMappingNode(root, "notify") {
+		review = append(review, "remove retired "+config.RetiredMachineConfigFields()[1]+" (the separate bridge owns transport configuration)")
+	}
 	if len(review) == 0 {
 		return EditPlan{
 			Original: original, Updated: original, Mode: mode, Exists: true, Changed: false,

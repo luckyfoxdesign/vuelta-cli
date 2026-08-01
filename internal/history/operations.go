@@ -326,6 +326,8 @@ type OperatorCommand struct {
 	Project        string
 	SubjectID      string
 	IdempotencyKey string
+	RequestedBy    string
+	SourceUpdateID int64
 	CreatedAt      time.Time
 }
 
@@ -360,14 +362,33 @@ func (s *Store) EnqueueCommand(ctx context.Context, command OperatorCommand) (st
 	if err := validateText("command subject", command.SubjectID, maxNameBytes, false); err != nil {
 		return "", err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO operator_commands(
-		id, command_type, project_name, subject_id, idempotency_key, created_at
-	) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING`,
+	if err := validateText("command requester", command.RequestedBy, maxNameBytes, false); err != nil {
+		return "", err
+	}
+	if command.SourceUpdateID < 0 {
+		return "", errors.New("command source update ID cannot be negative")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO operator_commands(
+		id, command_type, project_name, subject_id, idempotency_key, created_at,
+		requested_by, source_update_id
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING`,
 		command.ID, command.Type, command.Project, command.SubjectID,
-		command.IdempotencyKey, formatTime(command.CreatedAt),
+		command.IdempotencyKey, formatTime(command.CreatedAt), command.RequestedBy,
+		command.SourceUpdateID,
 	)
 	if err != nil {
 		return "", fmt.Errorf("enqueue operator command: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("inspect operator command insert: %w", err)
+	}
+	if inserted == 0 {
+		if err := s.db.QueryRowContext(ctx,
+			"SELECT id FROM operator_commands WHERE idempotency_key=?", command.IdempotencyKey,
+		).Scan(&command.ID); err != nil {
+			return "", fmt.Errorf("read idempotent operator command: %w", err)
+		}
 	}
 	return command.ID, nil
 }
@@ -409,12 +430,12 @@ func (s *Store) claimCommand(
 		return nil, errors.New("at least one operator command claim type is required")
 	}
 	query := `SELECT id, command_type, project_name, subject_id,
-		idempotency_key, created_at FROM operator_commands
+		idempotency_key, requested_by, source_update_id, created_at FROM operator_commands
 		WHERE status='pending' AND command_type IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY created_at, id LIMIT 1`
 	err = tx.QueryRowContext(ctx, query, args...).Scan(
 		&command.ID, &command.Type, &command.Project, &command.SubjectID,
-		&command.IdempotencyKey, &created,
+		&command.IdempotencyKey, &command.RequestedBy, &command.SourceUpdateID, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

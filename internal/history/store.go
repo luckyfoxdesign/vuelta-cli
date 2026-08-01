@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	currentSchemaVersion = 2
+	currentSchemaVersion = 3
 	maxNameBytes         = 256
 	maxPathBytes         = 4096
 	maxSummaryBytes      = 1024
@@ -186,6 +186,12 @@ func (s *Store) initialize(ctx context.Context) error {
 		if err := s.migrateV2(ctx); err != nil {
 			return err
 		}
+		userVersion = 2
+	}
+	if userVersion == 2 {
+		if err := s.migrateV3(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -238,6 +244,32 @@ func (s *Store) migrateV2(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit history schema migration v2: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateV3(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin history schema migration v3: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, statement := range schemaV3 {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply history schema migration v3: %w", err)
+		}
+	}
+	now := formatTime(time.Now())
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", 3, now,
+	); err != nil {
+		return fmt.Errorf("record history schema migration v3: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		return fmt.Errorf("set history schema version v3: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit history schema migration v3: %w", err)
 	}
 	return nil
 }
@@ -410,6 +442,34 @@ var schemaV2 = []string{
 	`CREATE UNIQUE INDEX deployment_releases_known_run
 		ON deployment_releases(release_repository, github_run_id)
 		WHERE github_run_id > 0`,
+}
+
+var schemaV3 = []string{
+	`ALTER TABLE notification_outbox ADD COLUMN approval_id TEXT REFERENCES approval_requests(id)`,
+	`ALTER TABLE notification_outbox ADD COLUMN lease_owner TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE notification_outbox ADD COLUMN lease_until TEXT`,
+	`ALTER TABLE notification_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)`,
+	`ALTER TABLE notification_outbox ADD COLUMN last_error_code TEXT NOT NULL DEFAULT ''`,
+	`CREATE INDEX notification_outbox_lease
+		ON notification_outbox(state, available_at, lease_until)`,
+	`CREATE TABLE notification_deliveries (
+		outbox_id TEXT PRIMARY KEY REFERENCES notification_outbox(id),
+		operation_id TEXT NOT NULL REFERENCES operations(id),
+		transport TEXT NOT NULL,
+		destination_id TEXT NOT NULL,
+		message_id INTEGER NOT NULL CHECK(message_id > 0),
+		delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('send', 'edit')),
+		delivered_at TEXT NOT NULL
+	) STRICT`,
+	`CREATE INDEX notification_deliveries_operation
+		ON notification_deliveries(operation_id, transport, destination_id, delivered_at DESC)`,
+	`CREATE TABLE bridge_cursors (
+		consumer TEXT PRIMARY KEY,
+		last_update_id INTEGER NOT NULL CHECK(last_update_id >= 0),
+		updated_at TEXT NOT NULL
+	) STRICT`,
+	`ALTER TABLE operator_commands ADD COLUMN requested_by TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE operator_commands ADD COLUMN source_update_id INTEGER NOT NULL DEFAULT 0 CHECK(source_update_id >= 0)`,
 }
 
 func newID() (string, error) {

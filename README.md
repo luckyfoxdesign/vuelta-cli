@@ -4,8 +4,9 @@ A one-shot CLI that scans and deploys configured projects without changing
 their repositories. It records bounded history in machine-owned SQLite and
 dispatches builds to a central GitHub-hosted release engine. The production
 server never resolves lock files, runs project tests, or builds images during
-the normal update or deploy path. It has no resident daemon;
-launchd/systemd invokes synchronization and typed command consumption.
+the normal update or deploy path. Vuelta core remains one-shot;
+launchd/systemd invokes synchronization and typed command consumption. The
+optional Telegram bridge is a separate resident process over SQLite.
 
 Node and Python scans resolve adaptive defaults from declarative runtime,
 manager, lock, and platform metadata. Scanner Dockerfiles are embedded in the
@@ -78,6 +79,7 @@ internal/
   updatesnapshot/ # atomic, short-lived package-update plans
   updatepolicy/   # delayed-latest direct dependency policy
   history/        # machine-owned SQLite schema and repositories
+  telegrambridge/ # bounded Telegram delivery and command/approval adapter
   githubactions/  # narrow workflow dispatch and known-run synchronization
   deploy/         # zero-edit discovery and blue/green release runtime
   gateway/        # atomic reverse-proxy configuration
@@ -86,7 +88,6 @@ internal/
   sandbox/        # one-off sandboxed working copy for update/test
   testrunner/     # runs docker compose test
   gitops/         # commit, push, tags
-  notify/         # deprecated compatibility package; core does not call it
   scheduler/      # scan/update JSON orchestration and aggregate policy
 deploy/           # units, central release engine, and gateway image
 config.example.yaml
@@ -111,9 +112,10 @@ closed without being changed. `state.database_path` selects the protected
 machine-owned SQLite database; when omitted it defaults beside the machine
 config under `state/history.db`. GitHub credentials remain environment-only
 through the fixed allowlisted `github_actions.token_env` reference. Legacy
-`notify` references are accepted during migration, but core scan/update paths
-write structured SQLite events and outbox intents and never call Telegram or
-webhook APIs. See `config.example.yaml` for the full schema.
+The retired `notify` block is removed by the reviewed `config migrate` flow.
+Core scan/update/deploy paths write structured SQLite events and outbox intents
+and never call Telegram or webhook APIs. Bridge credentials are not part of
+the Vuelta YAML schema. See `config.example.yaml` for the full core schema.
 
 `vuelta` never scans parent directories or auto-discovers projects: only
 paths listed under `workspaces[]` are ever touched.
@@ -554,9 +556,49 @@ its single result envelope on stdout; plans, progress, and diagnostics remain
 on stderr. Do not put test logs, diffs, webhook URLs, or Telegram tokens in
 notification text or audit fields.
 
+### SQLite-backed Telegram bridge
+
+`vuelta-telegram-bridge` is an optional transport process. It opens the same
+protected SQLite database as Vuelta, leases committed outbox rows, and sends or
+edits concise plain-text messages using Telegram long polling. A Telegram
+outage delays only delivery; it cannot fail or repeat a scan, update, deploy,
+or rollback.
+
+The bridge accepts one exact private chat and one exact user. It rejects group,
+channel, forwarded, bot-authored, oversized, malformed, and unauthorized
+control input. These commands are available:
+
+```text
+/status [PROJECT]
+/scan PROJECT
+/update PROJECT
+/deploy PROJECT
+/rollback PROJECT
+/details OPERATION_ID
+```
+
+State-changing commands create only closed `operator_commands` rows. The
+existing `vuelta commands consume` boundary revalidates the configured project
+and invokes fixed Vuelta entrypoints; no Telegram text becomes argv or shell
+input. Duplicate Telegram update IDs reuse the same idempotency key.
+
+Migration buttons carry only an opaque approval ID and action. SQLite accepts
+a decision only from the Telegram message recorded for that same pending,
+unexpired approval. Free-form yes/no is accepted only as a reply to that exact
+prompt. Approval remains an audited decision and does not bypass the currently
+blocked migration workflow.
+
+Build and install `vuelta-telegram-bridge-linux-amd64`, then review
+`deploy/vuelta-telegram-bridge.service` and copy
+`deploy/vuelta-telegram-bridge.env.example` to the protected server-only
+environment file. The bridge unit deliberately receives no Docker group,
+cannot see project checkouts, and needs write access only to `/var/lib/vuelta`.
+The bot token is read only from `VUELTA_TELEGRAM_BOT_TOKEN` and is never stored
+in YAML, SQLite, messages, or logs.
+
 Scheduling is external. Production timers run sequential `scan --all` and
 `deploy sync`, and may run `commands consume` to process one typed
-`request_update`, `request_deploy`, or `request_rollback` row. There is no
+`request_scan`, `request_update`, `request_deploy`, or `request_rollback` row. There is no
 update-all command. Queue records contain a closed command type and stable
 identifiers only; stale, duplicate, and unknown records never reach execution,
 and no queue value is interpreted as shell text. The older `vuelta-scheduler`
@@ -564,8 +606,8 @@ helper remains a local compatibility surface and is not the production
 default.
 
 Templates live in `deploy/`: load `com.vuelta.schedule.plist` with `launchctl`
-on macOS after replacing `REPLACE_ME`, or install both binaries plus
-`vuelta.service` and `vuelta.timer` on Linux. Scheduler stdout is one aggregate
+on macOS after replacing `REPLACE_ME`, or install the required binaries plus
+`vuelta.service`, `vuelta.timer`, and optional Telegram bridge unit on Linux. Scheduler stdout is one aggregate
 JSON document; child plans and diagnostics are kept on stderr. Adjust the
 example units to the intended unprivileged user, binary paths, and writable
 project paths.
@@ -574,6 +616,6 @@ project paths.
 
 Implemented: configuration, read-only scanning, SQLite history/event/outbox
 state, delayed-latest policy, GitHub Actions update dispatch/synchronization,
-the explicit local compatibility pipeline, security gates, and zero-edit
-GitHub-built blue/green deployment. The SQLite-backed Telegram bridge remains
-a separate task.
+the explicit local compatibility pipeline, security gates, zero-edit
+GitHub-built blue/green deployment, and the separate SQLite-backed Telegram
+bridge.

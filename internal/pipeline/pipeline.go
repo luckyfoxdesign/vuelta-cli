@@ -1,6 +1,6 @@
 // Package pipeline applies one selected workspace snapshot through preflight,
-// sandbox, security gates, update, diff/allowlist checks, tests, commit, push,
-// and notification. The runner uses the hardened
+// sandbox, security gates, update, diff/allowlist checks, tests, commit, and
+// push. The runner uses the hardened
 // isolation provided by sandbox, updater, and testrunner.
 package pipeline
 
@@ -17,7 +17,6 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitops"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
-	"github.com/luckyfoxdesign/vuelta/internal/notify"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
@@ -38,9 +37,43 @@ type Sandbox interface {
 type Report struct {
 	Findings []string
 	Ran      bool
-	// details is intentionally private: webhook/Telegram and commit code get
+	// details is intentionally private: summaries and commit code get
 	// only identifier references, never package paths, scanner output, or logs.
 	details []vulnscan.Finding
+}
+
+// ProjectResult is the structured, secret-free summary of one compatibility
+// pipeline run. Raw tests, diffs, and command output remain in private logs.
+type ProjectResult struct {
+	Project        string   `json:"project"`
+	Status         string   `json:"status"`
+	Reason         string   `json:"reason,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	AutofixApplied bool     `json:"autofix_applied"`
+	Packages       []string `json:"packages,omitempty"`
+	CVERefs        []string `json:"cve_refs,omitempty"`
+}
+
+// RunSummary is the final structured result returned to the local caller.
+type RunSummary struct {
+	Started  time.Time       `json:"started"`
+	Finished time.Time       `json:"finished"`
+	Results  []ProjectResult `json:"results"`
+}
+
+// Counts tallies results by status.
+func (s RunSummary) Counts() (updated, skipped, failed int) {
+	for _, result := range s.Results {
+		switch result.Status {
+		case "updated":
+			updated++
+		case "skipped", "dry_run":
+			skipped++
+		case "failed", "blocked":
+			failed++
+		}
+	}
+	return updated, skipped, failed
 }
 
 // SecurityGate runs the pre-update baseline and post-update CVE/GitHub
@@ -54,7 +87,6 @@ type SecurityGate interface {
 type Deps struct {
 	Sandbox  Sandbox
 	Security SecurityGate
-	Notifier *notify.Notifier
 	Logger   *logging.Logger
 	Docker   dockerexec.Runner
 	// Now returns the current time; defaults to time.Now when nil. Tests
@@ -89,9 +121,9 @@ func (d Deps) docker() dockerexec.Runner {
 
 // RunWorkspace executes pipeline steps 1-10 for a single workspace. It
 // never returns a Go error: every failure mode becomes a
-// notify.ProjectResult with Status "failed" so Run can keep going with the
+// ProjectResult with Status "failed" so Run can keep going with the
 // next workspace (part B §7 closing note: summary counts updated/skipped/failed).
-func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.Workspace, dryRun bool) (output notify.ProjectResult) {
+func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.Workspace, dryRun bool) (output ProjectResult) {
 	now := deps.now()
 	label := config.WorkspaceName(ws)
 
@@ -120,7 +152,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		_ = deps.Logger.Audit(audit)
 	}()
 	if pre.Skip != scanner.SkipNone {
-		return notify.ProjectResult{Project: project, Status: "skipped", Reason: string(pre.Skip)}
+		return ProjectResult{Project: project, Status: "skipped", Reason: string(pre.Skip)}
 	}
 
 	baseSHA, err := gitops.FetchAndBaseSHA(ctx, pre.CanonicalPath, ws.Remote, ws.Branch)
@@ -158,7 +190,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "update", err)
 	}
 	if !changed {
-		return notify.ProjectResult{Project: project, Status: "skipped", Reason: "no dependency changes", CVERefs: baseline.Findings}
+		return ProjectResult{Project: project, Status: "skipped", Reason: "no dependency changes", CVERefs: baseline.Findings}
 	}
 
 	// Step 4: verify the change touches only allowlisted paths.
@@ -186,7 +218,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "verification run", err)
 	}
 	if !result.Passed {
-		return notify.ProjectResult{Project: project, Status: "failed", Reason: "verification failed", CVERefs: post.Findings}
+		return ProjectResult{Project: project, Status: "failed", Reason: "verification failed", CVERefs: post.Findings}
 	}
 
 	if dryRun {
@@ -213,11 +245,11 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResult(project, "push", err)
 	}
 
-	return notify.ProjectResult{Project: project, Status: "updated", Branch: branch, CVERefs: post.Findings}
+	return ProjectResult{Project: project, Status: "updated", Branch: branch, CVERefs: post.Findings}
 }
 
-func dryRunResult(project string, post Report) notify.ProjectResult {
-	return notify.ProjectResult{
+func dryRunResult(project string, post Report) ProjectResult {
+	return ProjectResult{
 		Project: project,
 		Status:  "dry_run",
 		Reason:  "dry-run: commit/push skipped",
@@ -225,7 +257,7 @@ func dryRunResult(project string, post Report) notify.ProjectResult {
 	}
 }
 
-func failResult(project, stage string, err error) notify.ProjectResult {
+func failResult(project, stage string, err error) ProjectResult {
 	// Error strings from scanners, Docker, and tests can contain untrusted
 	// output. Keep notification results terse; the local private log owns
 	// diagnostic detail.
@@ -233,7 +265,7 @@ func failResult(project, stage string, err error) notify.ProjectResult {
 	if strings.HasPrefix(stage, "security") {
 		status = "blocked"
 	}
-	return notify.ProjectResult{Project: project, Status: status, Reason: stage}
+	return ProjectResult{Project: project, Status: status, Reason: stage}
 }
 
 // warnCleanupFailure reports a best-effort cleanup failure to stderr rather
@@ -257,25 +289,20 @@ func DefaultLockPath() (string, error) {
 	return filepath.Join(dir, "vuelta", "vuelta.lock"), nil
 }
 
-// Run executes RunWorkspace for every configured workspace, sequentially
-// and under a process lock, sending a per-project notification as each
-// workspace finishes and a final run summary at the end (part B §7 closing
-// note). --dry-run runs steps 1-7 for every workspace but never commits,
-// pushes, or queues a deploy candidate.
-func Run(ctx context.Context, deps Deps, cfg config.Config, lockPath string, dryRun bool) (notify.RunSummary, error) {
+// Run executes RunWorkspace for every configured workspace, sequentially and
+// under a process lock. --dry-run runs steps 1-7 for every workspace but never
+// commits, pushes, or queues a deploy candidate.
+func Run(ctx context.Context, deps Deps, cfg config.Config, lockPath string, dryRun bool) (RunSummary, error) {
 	lock, err := AcquireProcessLock(lockPath)
 	if err != nil {
-		return notify.RunSummary{}, err
+		return RunSummary{}, err
 	}
 	defer func() { warnCleanupFailure(fmt.Sprintf("process lock release (%s)", lockPath), lock.Release()) }()
 
-	summary := notify.RunSummary{Started: deps.now()}
+	summary := RunSummary{Started: deps.now()}
 	for _, ws := range cfg.Workspaces {
 		result := RunWorkspace(ctx, deps, cfg, ws, dryRun)
 		summary.Results = append(summary.Results, result)
-		if deps.Notifier != nil {
-			_ = deps.Notifier.SendProjectResult(ctx, result)
-		}
 		if deps.Logger != nil {
 			_ = deps.Logger.Event("INFO", "project complete", map[string]string{
 				"project": result.Project, "status": result.Status, "reason": result.Reason,
@@ -283,8 +310,5 @@ func Run(ctx context.Context, deps Deps, cfg config.Config, lockPath string, dry
 		}
 	}
 	summary.Finished = deps.now()
-	if deps.Notifier != nil {
-		_ = deps.Notifier.SendRunSummary(ctx, summary)
-	}
 	return summary, nil
 }

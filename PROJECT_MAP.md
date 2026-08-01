@@ -19,6 +19,7 @@ app/
 ├── cmd/vuelta/          # one-snapshot CLI entrypoint
 ├── cmd/vuelta-gateway/  # minimal machine-owned blue/green HTTP gateway
 ├── cmd/vuelta-scheduler/ # external JSON orchestration helper
+├── cmd/vuelta-telegram-bridge/ # SQLite-backed Telegram interface
 ├── cmd/vuelta-corpus/   # manual real-world corpus harness
 ├── internal/            # ecosystem adapters, config, scanner, updater, toolchain,
 │                        # projectstate, updatesnapshot, vulnscan, sandbox, scheduler
@@ -48,8 +49,8 @@ vuelta deploy rollback PROJECT # restore recorded immutable prior digest
 scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
 scripts/corpus-scan.sh ROOT [MODE] # manual pinned corpus scan and reports
 scripts/corpus-refresh.sh ROOT # validated candidate pins without manifest mutation
-make build-mac                 # Docker cross-build both binaries for darwin/arm64
-make build-linux               # Docker cross-build both binaries for linux/amd64
+make build-mac                 # Docker cross-build three binaries for darwin/arm64
+make build-linux               # Docker cross-build three binaries for linux/amd64
 make build                     # both cross-build targets
 ```
 
@@ -58,6 +59,7 @@ make build                     # both cross-build targets
 - `cmd/vuelta-corpus/main.go` — `vuelta-corpus` binary entrypoint.
 - `cmd/vuelta-gateway/main.go` — `vuelta-gateway` binary entrypoint.
 - `cmd/vuelta-scheduler/main.go` — `vuelta-scheduler` binary entrypoint.
+- `cmd/vuelta-telegram-bridge/main.go` — `vuelta-telegram-bridge` binary entrypoint.
 - `cmd/vuelta/main.go` — `vuelta` binary entrypoint.
 
 ## Config Files
@@ -71,10 +73,10 @@ make build                     # both cross-build targets
 - `acceptance/` — environment-gated real-engine matrix plus the pinned stable corpus manifest.
 - `egress/` — local fail-closed proxy and its scratch-image Dockerfile.
 - `Dockerfile` — shared dev image for the test/race/tidy/build services.
-- `Makefile` — Docker-only cross-build targets for the CLI and scheduler.
+- `Makefile` — Docker-only cross-build targets for the CLI, scheduler, and Telegram bridge.
 - `.golangci.yml` — lint rules.
 - `.github/workflows/` — pinned reusable update workflow and central zero-edit release engine.
-- `deploy/` — external scheduling, central release script, systemd deploy synchronization, and digest-pinned gateway image.
+- `deploy/` — external scheduling, central release script, systemd deploy/bridge units, and digest-pinned gateway image.
 - `scripts/update-project-map.sh` — updates this repo map generated block.
 
 ## Notable Directories
@@ -96,10 +98,9 @@ make build                     # both cross-build targets
 - `internal/githubalerts/` — is a read-only client for GitHub Dependabot and Security Advisories APIs.  The client sends the configured token only to the single approved HTTPS origin derived from the validated API base URL. Pagination must stay on that origin, redirects are never followed, and response size, page count, and decoded alert count are hard-bounded.
 - `internal/gitops/` — commits, pushes, and tags changes produced by an update run.
 - `internal/gitpath/` — defines platform-independent matching for Git repository paths.
-- `internal/history/` — owns Vuelta's machine-local durable SQLite state.  The database contains structured, bounded metadata only. Project contents, command output, environment values, credentials, and transport-specific notification state do not belong in this package.
+- `internal/history/` — owns Vuelta's machine-local durable SQLite state.  The database contains structured, bounded metadata only. Project contents, command output, environment values, credentials, and message bodies do not belong in this package. Narrow delivery IDs and cursors are persisted so an external bridge can recover idempotently without owning operation state.
 - `internal/logging/` — writes local, structured operational and audit logs without accepting configuration secrets or forwarding log content to notifiers.
-- `internal/notify/` — sends run results via webhook and/or Telegram.
-- `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, commit, push, and notification. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
+- `internal/pipeline/` — applies one selected workspace snapshot through preflight, sandbox, security gates, update, diff/allowlist checks, tests, commit, and push. The runner uses the hardened isolation provided by sandbox, updater, and testrunner.
 - `internal/projectstate/` — resolves one exact canonical target and owns its hardened private .vuelta directories plus bounded atomic scan reports.
 - `internal/repopolicy/` — TODO: describe this package.
 - `internal/runlease/` — labels and reclaims Docker resources owned by one Vuelta invocation, including cleanup after abrupt parent-process termination.
@@ -109,6 +110,7 @@ make build                     # both cross-build targets
 - `internal/scaninput/` — validates and archives only exact files declared by an ecosystem adapter or a core Docker/policy stage. It never discovers files and denies secret-like inputs unless a reviewed adapter config explicitly opts in.
 - `internal/scanner/` — validates the explicitly configured project paths and determines each project's stack. It never walks parent directories or discovers projects on its own; only workspaces[] from the config are ever considered.
 - `internal/scheduler/` — orchestrates the public scan and update CLI contract. It intentionally remains outside the vuelta command tree: each update receives one exact target directory and its reviewed snapshot ID.
+- `internal/telegrambridge/` — presents Vuelta's bounded SQLite operation contract through one exactly authorized private Telegram chat. It owns transport delivery, update cursors, and presentation, but no operation execution.
 - `internal/testfixture/` — provides deterministic, network-free project fixtures and external-service stand-ins for integration and acceptance tests.
 - `internal/testrunner/` — runs a project's docker compose test service against the sandboxed working copy.
 - `internal/toolchain/` — resolves declarative project constraints to an operator override or embedded scan default and builds defaults without executing project code.
@@ -121,7 +123,9 @@ make build                     # both cross-build targets
 <!-- manual:start -->
 ## Architecture Notes
 
-- One-shot CLI, no resident daemon; scheduling is external (launchd/systemd timer).
+- Vuelta core is a one-shot CLI with external scheduling. The optional
+  `vuelta-telegram-bridge` is a separate resident SQLite/Telegram interface
+  with no operation execution or Docker/GitHub authority.
 - The normal top-level `scan` → `update PROJECT` workflow records durable
   history in machine-owned SQLite and dispatches one exact GitHub Actions run;
   it never mutates the server checkout. The separately named `update local`

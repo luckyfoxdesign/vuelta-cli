@@ -41,7 +41,7 @@ type Result struct {
 	// Output is the combined stdout+stderr tail of the test command,
 	// bounded to outputTailBytes and marked when truncated. It is
 	// intended for a local 0600 log file only — never forward it to
-	// notify as-is (part C §15: no raw logs in webhook/Telegram summaries).
+	// expose as-is (part C §15: no raw logs in external summaries).
 	Output string
 }
 

@@ -221,6 +221,31 @@ func TestSchemaMigrationRemovesOnlyRetiredSnapshotStateField(t *testing.T) {
 	}
 }
 
+func TestSchemaMigrationRemovesRetiredNotifyBlock(t *testing.T) {
+	cfg := NewConfig()
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withNotify := strings.Replace(
+		string(data),
+		"schema_version: 1\n",
+		"schema_version: 1\nnotify:\n  telegram:\n    bot_token_env: VUELTA_NOTIFY_TELEGRAM_BOT_TOKEN\n    chat_id: \"42\"\n",
+		1,
+	)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(withNotify), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanSchemaMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Changed || !strings.Contains(strings.Join(plan.Review, "\n"), "notify") || strings.Contains(string(plan.Updated), "notify:") {
+		t.Fatalf("notify migration = review %v\n%s", plan.Review, plan.Updated)
+	}
+}
+
 func TestWorkspaceEditPreservesCommentsPermissionsAndIsIdempotent(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := Write(NewConfig(), configPath, false); err != nil {
@@ -231,7 +256,7 @@ func TestWorkspaceEditPreservesCommentsPermissionsAndIsIdempotent(t *testing.T) 
 		t.Fatal(err)
 	}
 	commented := append([]byte("# keep this header\n"), original...)
-	commented = []byte(strings.Replace(string(commented), "notify:\n", "notify: # keep this inline comment\n", 1))
+	commented = []byte(strings.Replace(string(commented), "state: {}\n", "state: {} # keep this inline comment\n", 1))
 	if err := os.WriteFile(configPath, commented, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +279,7 @@ func TestWorkspaceEditPreservesCommentsPermissionsAndIsIdempotent(t *testing.T) 
 	if !strings.Contains(string(updated), "# keep this header") || !strings.Contains(string(updated), "# keep this inline comment") {
 		t.Fatalf("comments were not preserved:\n%s", updated)
 	}
-	if strings.Index(string(updated), "notify:") > strings.Index(string(updated), "vuln_scan:") {
+	if strings.Index(string(updated), "state:") > strings.Index(string(updated), "vuln_scan:") {
 		t.Fatal("unrelated top-level key order changed")
 	}
 	info, err := os.Stat(configPath)

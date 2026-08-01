@@ -100,6 +100,20 @@ func (s *Store) CreateApprovalRequest(
 	if err := insertOperationEvent(ctx, tx, request.OperationID, event, request.CreatedAt); err != nil {
 		return ApprovalRequest{}, err
 	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_outbox SET approval_id=?
+		WHERE event_id=(SELECT id FROM operation_events
+			WHERE operation_id=? AND idempotency_key=?)`,
+		request.ID, request.OperationID, event.IdempotencyKey,
+	)
+	if err != nil {
+		return ApprovalRequest{}, fmt.Errorf("bind approval notification: %w", err)
+	}
+	if event.Notify {
+		changed, changedErr := result.RowsAffected()
+		if changedErr != nil || changed != 1 {
+			return ApprovalRequest{}, errors.New("approval notification was not created exactly once")
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return ApprovalRequest{}, fmt.Errorf("commit approval request: %w", err)
 	}
@@ -162,32 +176,4 @@ func (s *Store) ApprovalByFingerprint(
 		request.DecidedAt = &parsed
 	}
 	return &request, nil
-}
-
-// DecideApproval records one authenticated exact decision. The bridge passes
-// an already validated identity; it cannot alter the bound subject.
-func (s *Store) DecideApproval(
-	ctx context.Context,
-	id, decision, identity string,
-	now time.Time,
-) error {
-	if decision != "approved" && decision != "rejected" {
-		return errors.New("approval decision must be approved or rejected")
-	}
-	if err := validateText("approval identity", identity, maxNameBytes, true); err != nil {
-		return err
-	}
-	result, err := s.db.ExecContext(ctx, `UPDATE approval_requests
-		SET status=?, decided_at=?, decision_identity=?
-		WHERE id=? AND status='pending' AND expires_at>?`,
-		decision, formatTime(now), identity, id, formatTime(now),
-	)
-	if err != nil {
-		return fmt.Errorf("record approval decision: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil || changed != 1 {
-		return errors.New("approval decision did not match one pending unexpired request")
-	}
-	return nil
 }

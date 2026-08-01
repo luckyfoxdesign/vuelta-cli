@@ -48,7 +48,8 @@ func TestOpenCreatesProtectedMigratedDatabase(t *testing.T) {
 		"projects", "scan_runs", "dependency_state", "dependency_version_events",
 		"update_jobs", "operations", "operation_events", "notification_outbox",
 		"approval_requests", "operator_commands", "schema_migrations",
-		"deployment_contracts", "deployment_releases",
+		"deployment_contracts", "deployment_releases", "notification_deliveries",
+		"bridge_cursors",
 	} {
 		var count int
 		if err := store.db.QueryRow(
@@ -191,10 +192,17 @@ func TestApprovalIsExactExpiringAndOneTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DecideApproval(ctx, request.ID, "approved", "operator:1", now.Add(time.Minute)); err != nil {
+	item, err := store.LeaseNotification(ctx, "approval-test", now, time.Minute)
+	if err != nil || item == nil {
+		t.Fatalf("approval lease = %#v, %v", item, err)
+	}
+	if err := store.CompleteNotification(ctx, item.ID, "approval-test", "telegram", "42", 100, "send", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DecideApproval(ctx, request.ID, "approved", "operator:1", now.Add(2*time.Minute)); err == nil {
+	if err := store.DecideApprovalFromDelivery(ctx, request.ID, "approved", "operator:1", "telegram", "42", 100, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideApprovalFromDelivery(ctx, request.ID, "approved", "operator:1", "telegram", "42", 100, now.Add(2*time.Minute)); err == nil {
 		t.Fatal("approval decision was accepted twice")
 	}
 	approved, err := store.ApprovalByFingerprint(
@@ -287,6 +295,158 @@ func TestOperationEventAndOutboxAreAtomicAndIdempotent(t *testing.T) {
 	}
 	if events != 1 || outbox != 1 {
 		t.Fatalf("events=%d outbox=%d, want 1/1", events, outbox)
+	}
+}
+
+func TestNotificationLeaseRecoversAndDeliveryDoesNotChangeOperation(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 8, 0, 0, 0, time.UTC)
+	operationID, err := store.RecordOperation(ctx, Operation{
+		ID: "lease-operation", ProjectName: "api", ProjectRoot: "/projects/api",
+		Kind: "deploy", Status: "starting", At: now,
+		Event: OperationEvent{Type: "deploy_started", Summary: "api deploy started",
+			IdempotencyKey: "started", Notify: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.LeaseNotification(ctx, "bridge-one", now, time.Minute)
+	if err != nil || first == nil || first.Attempts != 1 || first.OperationID != operationID {
+		t.Fatalf("first lease = %#v, %v", first, err)
+	}
+	blocked, err := store.LeaseNotification(ctx, "bridge-two", now.Add(30*time.Second), time.Minute)
+	if err != nil || blocked != nil {
+		t.Fatalf("active lease was reclaimed: %#v, %v", blocked, err)
+	}
+	recovered, err := store.LeaseNotification(ctx, "bridge-two", now.Add(2*time.Minute), time.Minute)
+	if err != nil || recovered == nil || recovered.ID != first.ID || recovered.Attempts != 2 {
+		t.Fatalf("recovered lease = %#v, %v", recovered, err)
+	}
+	if err := store.CompleteNotification(ctx, recovered.ID, "bridge-two", "telegram", "42", 99, "send", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	messageID, found, err := store.LastOperationMessage(ctx, operationID, "telegram", "42")
+	if err != nil || !found || messageID != 99 {
+		t.Fatalf("operation message = %d/%t, %v", messageID, found, err)
+	}
+	var status string
+	if err := store.db.QueryRow("SELECT status FROM operations WHERE id=?", operationID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "starting" {
+		t.Fatalf("delivery changed operation status to %q", status)
+	}
+}
+
+func TestNotificationRetryAndCursorAreBoundedAndIdempotent(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	if _, err := store.RecordOperation(ctx, Operation{
+		ID: "retry-operation", Kind: "update", Status: "failed", At: now,
+		Event: OperationEvent{Type: "update_failed", Summary: "update failed",
+			IdempotencyKey: "failed", Notify: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, err := store.LeaseNotification(ctx, "bridge", now, time.Minute)
+	if err != nil || item == nil {
+		t.Fatalf("lease = %#v, %v", item, err)
+	}
+	if err := store.RetryNotification(ctx, item.ID, "bridge", "telegram_http_429", now.Add(time.Minute), false); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := store.LeaseNotification(ctx, "bridge", now.Add(30*time.Second), time.Minute); err != nil || due != nil {
+		t.Fatalf("retry became due early: %#v, %v", due, err)
+	}
+	if err := store.AdvanceBridgeCursor(ctx, "telegram-primary", 20, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceBridgeCursor(ctx, "telegram-primary", 10, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := store.BridgeCursor(ctx, "telegram-primary")
+	if err != nil || cursor != 20 {
+		t.Fatalf("cursor = %d, %v", cursor, err)
+	}
+}
+
+func TestApprovalDecisionMustMatchDeliveredPrompt(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 10, 0, 0, 0, time.UTC)
+	operationID, err := store.RecordOperation(ctx, Operation{
+		ID: "bound-approval-operation", Kind: "deploy", Status: "blocked", At: now,
+		Event: OperationEvent{Type: "deploy_blocked", Summary: "deploy blocked", IdempotencyKey: "blocked"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := store.CreateApprovalRequest(ctx, ApprovalRequest{
+		ID: "approval-one", OperationID: operationID, Type: "migration",
+		SubjectFingerprint: "fingerprint", SubjectSummary: `{"project":"api"}`,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}, OperationEvent{Type: "migration_approval_required", Summary: "approval required",
+		IdempotencyKey: "approval", Notify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := store.LeaseNotification(ctx, "bridge", now, time.Minute)
+	if err != nil || item == nil || item.ApprovalID != approval.ID {
+		t.Fatalf("approval lease = %#v, %v", item, err)
+	}
+	if err := store.CompleteNotification(ctx, item.ID, "bridge", "telegram", "42", 77, "send", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideApprovalFromDelivery(ctx, approval.ID, "approved", "telegram:user:1", "telegram", "42", 78, now.Add(time.Minute)); err == nil {
+		t.Fatal("approval accepted from the wrong message")
+	}
+	if err := store.DecideApprovalFromDelivery(ctx, approval.ID, "approved", "telegram:user:1", "telegram", "42", 77, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideApprovalFromDelivery(ctx, approval.ID, "approved", "telegram:user:1", "telegram", "42", 77, now.Add(2*time.Minute)); err == nil {
+		t.Fatal("approval accepted twice")
+	}
+}
+
+func TestSafeOperationQueriesAndRetentionKeepDurableEvents(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC)
+	if _, err := store.RecordOperation(ctx, Operation{
+		ID: "details-operation", ProjectName: "api", ProjectRoot: "/projects/api",
+		Kind: "scan", Status: "completed", At: now,
+		Event: OperationEvent{Type: "scan_completed", Summary: "api scan completed",
+			IdempotencyKey: "completed", Notify: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.OperationSummaries(ctx, "api", 10)
+	if err != nil || len(rows) != 1 || rows[0].Summary != "api scan completed" {
+		t.Fatalf("summaries = %#v, %v", rows, err)
+	}
+	detail, err := store.OperationDetails(ctx, "details-operation", 10)
+	if err != nil || detail == nil || len(detail.Events) != 1 {
+		t.Fatalf("details = %#v, %v", detail, err)
+	}
+	item, err := store.LeaseNotification(ctx, "bridge", now, time.Minute)
+	if err != nil || item == nil {
+		t.Fatalf("lease = %#v, %v", item, err)
+	}
+	if err := store.CompleteNotification(ctx, item.ID, "bridge", "telegram", "42", 88, "send", now); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.PruneNotificationDeliveries(ctx, now.Add(time.Hour), 10)
+	if err != nil || removed != 1 {
+		t.Fatalf("retention removed %d, %v", removed, err)
+	}
+	var events int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM operation_events WHERE operation_id='details-operation'").Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("retention removed durable events: %d", events)
 	}
 }
 

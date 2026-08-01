@@ -553,6 +553,13 @@ func executeCommandConsume(args []string) error {
 	}
 	var dispatchErr error
 	switch command.Type {
+	case "request_scan":
+		dispatchArgs := []string{"--project", command.Project, "--internal-no-input", "--internal-no-color"}
+		if jsonOutput {
+			dispatchArgs = append(dispatchArgs, "--json")
+		}
+		dispatchArgs = append(dispatchArgs, selectedConfig)
+		dispatchErr = executeScan(dispatchArgs)
 	case "request_update":
 		dispatchArgs := []string{"--yes", "--non-interactive", "--internal-config", selectedConfig}
 		if jsonOutput {

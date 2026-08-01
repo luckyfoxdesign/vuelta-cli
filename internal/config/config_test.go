@@ -88,24 +88,6 @@ func TestLoadSchemaVersionErrorNamesSelectedConfig(t *testing.T) {
 	}
 }
 
-func TestValidateNotifyConfigRequiresFixedEnvironmentReferences(t *testing.T) {
-	valid := NotifyConfig{
-		WebhookURLEnv: NotifyWebhookURLEnv,
-		Telegram:      TelegramConfig{BotTokenEnv: NotifyTelegramBotTokenEnv, ChatID: "42"},
-	}
-	if errs := validateNotifyConfig(valid); len(errs) != 0 {
-		t.Fatalf("valid notification config errors = %v", errs)
-	}
-	valid.WebhookURLEnv = "AWS_SECRET_ACCESS_KEY"
-	valid.Telegram.BotTokenEnv = "DATABASE_PASSWORD"
-	if errs := validateNotifyConfig(valid); len(errs) != 2 {
-		t.Fatalf("arbitrary environment references errors = %v", errs)
-	}
-	if errs := validateNotifyConfig(NotifyConfig{Telegram: TelegramConfig{ChatID: "42"}}); len(errs) != 1 {
-		t.Fatalf("incomplete Telegram config errors = %v", errs)
-	}
-}
-
 func TestValidateEgressBindsProxyURLToManagedContainer(t *testing.T) {
 	valid := EgressConfig{Network: "vuelta-update-egress", ProxyContainer: "vuelta-egress-proxy", ProxyURL: "http://vuelta-egress-proxy:3128"}
 	if errs := validateEgress(valid); len(errs) != 0 {
@@ -117,24 +99,6 @@ func TestValidateEgressBindsProxyURLToManagedContainer(t *testing.T) {
 		if errs := validateEgress(candidate); len(errs) != 1 {
 			t.Fatalf("proxy URL %q errors = %v", proxyURL, errs)
 		}
-	}
-}
-
-func TestNotificationReferencesDoNotAffectSnapshotPolicyHash(t *testing.T) {
-	workspace := Workspace{Name: "api", Path: "/projects/api"}
-	withoutNotify, err := (Config{}).SnapshotPolicyHash(workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	withNotify, err := (Config{Notify: NotifyConfig{
-		WebhookURLEnv: NotifyWebhookURLEnv,
-		Telegram:      TelegramConfig{BotTokenEnv: NotifyTelegramBotTokenEnv, ChatID: "42"},
-	}}).SnapshotPolicyHash(workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if withNotify != withoutNotify {
-		t.Fatal("notification references changed the snapshot policy hash")
 	}
 }
 
@@ -447,7 +411,7 @@ func TestUnnamedWorkspaceUsesFallbackWithoutMutation(t *testing.T) {
 
 func TestRetiredMachineConfigFieldsAreExplicit(t *testing.T) {
 	fields := RetiredMachineConfigFields()
-	if len(fields) != 1 || fields[0] != "update.snapshot_state_dir" {
+	if len(fields) != 2 || fields[0] != "update.snapshot_state_dir" || fields[1] != "notify" {
 		t.Fatalf("retired fields = %v", fields)
 	}
 	fields[0] = "changed"
