@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
+	"github.com/luckyfoxdesign/vuelta/internal/logging"
 	"github.com/luckyfoxdesign/vuelta/internal/testfixture"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 )
@@ -104,7 +107,7 @@ fi
 	case passOnCall == 0:
 		script = "#!/bin/sh\n" + identity + "exit 0\n"
 	case passOnCall < 0:
-		script = "#!/bin/sh\n" + identity + "for arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\nexit 1\n"
+		script = "#!/bin/sh\n" + identity + "for arg in \"$@\"; do [ \"$arg\" = down ] && exit 0; done\necho 'token=verification-private verification failed' >&2\nexit 1\n"
 	default:
 		counter := filepath.Join(dir, "calls")
 		if err := os.WriteFile(counter, []byte("0"), 0o644); err != nil {
@@ -162,6 +165,12 @@ func (f fakeUpdater) Update(_ context.Context, projectPath string) (bool, error)
 		return false, nil
 	}
 	return true, os.WriteFile(filepath.Join(projectPath, "requirements.txt"), []byte("flask==2.0.1\n"), 0o644)
+}
+
+type failingUpdater struct{ err error }
+
+func (f failingUpdater) Update(context.Context, string) (bool, error) {
+	return false, f.err
 }
 
 func fixedNow() time.Time { return time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC) }
@@ -245,6 +254,49 @@ func TestRunWorkspaceFailsClosedOnSecurityBaselineError(t *testing.T) {
 	}
 }
 
+func TestRunWorkspaceKeepsFailureDetailOutOfPublicResultAndConsole(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	work := newRepoWithRemote(t)
+	ws := baseWorkspace(work)
+	cfg := baseConfig()
+	deps := baseDeps(true, docker)
+	privateValue := "private-update-value"
+	detail := "token=" + privateValue + " " + strings.Repeat("x", 5000) + " password=private-tail"
+	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
+		return failingUpdater{err: fmt.Errorf("update container failed: %s", detail)}, nil
+	}
+	var console bytes.Buffer
+	logPath := filepath.Join(t.TempDir(), "vuelta.log")
+	logger, err := logging.NewAt(logPath, 1<<20, false, &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.Logger = logger
+
+	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
+	if result.Status != "failed" || result.Reason != "update" {
+		t.Fatalf("public result = %+v", result)
+	}
+	public, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(public), privateValue) || strings.Contains(console.String(), privateValue) {
+		t.Fatalf("private detail escaped to public output: json=%s console=%q", public, console.String())
+	}
+	privateLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(privateLog)
+	if !strings.Contains(logText, "project stage failed") || !strings.Contains(logText, "<redacted>") || !strings.Contains(logText, "[vuelta: excerpt]") {
+		t.Fatalf("private log omitted bounded diagnostics: %q", logText)
+	}
+	if strings.Contains(logText, privateValue) || strings.Contains(logText, "private-tail") || len(logText) > 4096 {
+		t.Fatalf("private detail was not bounded and redacted: %q", logText)
+	}
+}
+
 func TestRunWorkspaceRejectsDisallowedChange(t *testing.T) {
 	docker := installFakeDocker(t, 0)
 	work := newRepoWithRemote(t)
@@ -290,10 +342,33 @@ func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
 	ws := baseWorkspace(work)
 	cfg := baseConfig()
 	deps := baseDeps(true, docker)
+	var console bytes.Buffer
+	logPath := filepath.Join(t.TempDir(), "vuelta.log")
+	logger, err := logging.NewAt(logPath, 1<<20, false, &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.Logger = logger
 
 	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
 	if result.Status != "failed" || result.Reason != "verification failed" {
 		t.Fatalf("expected failed/verification failed, got %+v", result)
+	}
+	public, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(privateLog), "verification failed") || !strings.Contains(string(privateLog), "<redacted>") {
+		t.Fatalf("private log omitted verification diagnostics: %q", privateLog)
+	}
+	for name, output := range map[string]string{"json": string(public), "console": console.String(), "private log": string(privateLog)} {
+		if strings.Contains(output, "verification-private") {
+			t.Fatalf("verification detail leaked through %s: %q", name, output)
+		}
 	}
 }
 

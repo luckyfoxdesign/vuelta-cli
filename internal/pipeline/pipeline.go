@@ -17,6 +17,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitops"
 	"github.com/luckyfoxdesign/vuelta/internal/logging"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
@@ -129,17 +130,17 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 
 	// Step 1: preflight.
 	if ws.Verification.State != config.VerificationReady {
-		return failResult(label, "verification preflight", errors.New("project is scan-only; configure a ready verification profile before update or update --dry-run"))
+		return failResultWithLogger(deps.Logger, label, "verification preflight", errors.New("project is scan-only; configure a ready verification profile before update or update --dry-run"))
 	}
 	if err := testrunner.ValidateProfile(ws.Path, ws.Verification); err != nil {
-		return failResult(label, "verification preflight", err)
+		return failResultWithLogger(deps.Logger, label, "verification preflight", err)
 	}
 	if err := scanner.CheckToolsWithDocker(deps.docker()); err != nil {
-		return failResult(label, "preflight", err)
+		return failResultWithLogger(deps.Logger, label, "preflight", err)
 	}
 	pre, err := scanner.Preflight(ctx, ws)
 	if err != nil {
-		return failResult(label, "preflight", err)
+		return failResultWithLogger(deps.Logger, label, "preflight", err)
 	}
 	project := label
 	audit := logging.AuditRecord{Project: project}
@@ -157,37 +158,37 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 
 	baseSHA, err := gitops.FetchAndBaseSHA(ctx, pre.CanonicalPath, ws.Remote, ws.Branch)
 	if err != nil {
-		return failResult(project, "preflight fetch", err)
+		return failResultWithLogger(deps.Logger, project, "preflight fetch", err)
 	}
 	audit.BaseSHA = baseSHA
 
 	sandboxDir, sandboxCleanup, err := deps.Sandbox.Prepare(ctx, pre.CanonicalPath, baseSHA)
 	if err != nil {
-		return failResult(project, "sandbox prepare", err)
+		return failResultWithLogger(deps.Logger, project, "sandbox prepare", err)
 	}
 	defer func() { warnCleanupFailure(fmt.Sprintf("sandbox cleanup for %s", project), sandboxCleanup()) }()
 
 	landingDir, landingCleanup, err := gitops.NewLandingCopy(ctx, pre.CanonicalPath, baseSHA)
 	if err != nil {
-		return failResult(project, "landing copy", err)
+		return failResultWithLogger(deps.Logger, project, "landing copy", err)
 	}
 	defer func() { warnCleanupFailure(fmt.Sprintf("landing copy cleanup for %s", project), landingCleanup()) }()
 
 	// Step 2: security baseline.
 	baseline, err := deps.Security.Baseline(ctx, ws, cfg)
 	if err != nil {
-		return failResult(project, "security baseline", err)
+		return failResultWithLogger(deps.Logger, project, "security baseline", err)
 	}
 	audit.PreSecurity = baseline.Findings
 
 	// Step 3: update versions.
 	upd, err := deps.resolveUpdater(ws, cfg)
 	if err != nil {
-		return failResult(project, "resolve updater", err)
+		return failResultWithLogger(deps.Logger, project, "resolve updater", err)
 	}
 	changed, err := upd.Update(ctx, sandboxDir)
 	if err != nil {
-		return failResult(project, "update", err)
+		return failResultWithLogger(deps.Logger, project, "update", err)
 	}
 	if !changed {
 		return ProjectResult{Project: project, Status: "skipped", Reason: "no dependency changes", CVERefs: baseline.Findings}
@@ -195,13 +196,13 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 
 	// Step 4: verify the change touches only allowlisted paths.
 	if err := gitops.SyncTree(sandboxDir, landingDir); err != nil {
-		return failResult(project, "sync sandbox to landing copy", err)
+		return failResultWithLogger(deps.Logger, project, "sync sandbox to landing copy", err)
 	}
 	if err := gitops.DiffCheck(ctx, landingDir, cfg.AllowedChangedPaths(ws)); err != nil {
-		return failResult(project, "diff policy", err)
+		return failResultWithLogger(deps.Logger, project, "diff policy", err)
 	}
 	if changedPaths, err := gitops.ChangedPaths(ctx, landingDir); err != nil {
-		return failResult(project, "audit changed paths", err)
+		return failResultWithLogger(deps.Logger, project, "audit changed paths", err)
 	} else {
 		audit.ChangedPaths = changedPaths
 	}
@@ -209,15 +210,21 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	// Step 5: security post-check.
 	post, err := deps.Security.PostCheck(ctx, landingDir, ws, cfg, baseline)
 	if err != nil {
-		return failResult(project, "security post-check", err)
+		return failResultWithLogger(deps.Logger, project, "security post-check", err)
 	}
 
 	// Step 6: explicit verification.
 	result, err := testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
 	if err != nil {
-		return failResult(project, "verification run", err)
+		return failResultWithLogger(deps.Logger, project, "verification run", err)
 	}
 	if !result.Passed {
+		if deps.Logger != nil {
+			_ = deps.Logger.PrivateEvent("ERROR", "verification failed", map[string]string{
+				"project": project,
+				"detail":  safeerr.Excerpt([]byte(result.Output), 2048),
+			})
+		}
 		return ProjectResult{Project: project, Status: "failed", Reason: "verification failed", CVERefs: post.Findings}
 	}
 
@@ -227,14 +234,14 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 
 	// Step 8: commit.
 	if err := gitops.VerifyBaseSHAUnchanged(ctx, pre.CanonicalPath, ws.Remote, ws.Branch, baseSHA); err != nil {
-		return failResult(project, "base SHA changed", err)
+		return failResultWithLogger(deps.Logger, project, "base SHA changed", err)
 	}
 	summary := gitops.CommitSummary{Date: now, CVERefs: post.Findings}
 	if err := gitops.Commit(ctx, landingDir, cfg.AllowedChangedPaths(ws), summary); err != nil {
-		return failResult(project, "commit", err)
+		return failResultWithLogger(deps.Logger, project, "commit", err)
 	}
 	if commitSHA, err := gitops.HeadSHA(ctx, landingDir); err != nil {
-		return failResult(project, "resolve commit SHA", err)
+		return failResultWithLogger(deps.Logger, project, "resolve commit SHA", err)
 	} else {
 		audit.CommitSHA = commitSHA
 	}
@@ -242,7 +249,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	// Step 9: push.
 	branch, err := gitops.Push(ctx, landingDir, ws, cfg.Git, project, now)
 	if err != nil {
-		return failResult(project, "push", err)
+		return failResultWithLogger(deps.Logger, project, "push", err)
 	}
 
 	return ProjectResult{Project: project, Status: "updated", Branch: branch, CVERefs: post.Findings}
@@ -266,6 +273,17 @@ func failResult(project, stage string, err error) ProjectResult {
 		status = "blocked"
 	}
 	return ProjectResult{Project: project, Status: status, Reason: stage}
+}
+
+func failResultWithLogger(logger *logging.Logger, project, stage string, err error) ProjectResult {
+	if logger != nil {
+		_ = logger.PrivateEvent("ERROR", "project stage failed", map[string]string{
+			"project": project,
+			"stage":   stage,
+			"detail":  safeerr.Excerpt([]byte(err.Error()), 2048),
+		})
+	}
+	return failResult(project, stage, err)
 }
 
 // warnCleanupFailure reports a best-effort cleanup failure to stderr rather

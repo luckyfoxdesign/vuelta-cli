@@ -1,5 +1,6 @@
 {
   "name": "fixture-node-npm-ok",
   "version": "0.1.0",
+  "scripts": { "test": "node --version" },
   "dependencies": { "lodash": "4.17.20" }
 }

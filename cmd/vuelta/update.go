@@ -26,6 +26,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatepolicy"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
@@ -442,8 +443,18 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
+	executionProfile, err := toolchain.ResolveSnapshotProfile(workspace, cfg, snapshot.Toolchain)
+	if err != nil {
+		return updateResult{}, fail(exitEnv, "resolve snapshot toolchain: %v", err)
+	}
+	if snapshot.Toolchain.Source == toolchain.SourceDefault {
+		imageID, inspectErr := toolchain.InspectImageID(ctx, dockerexec.Default(), snapshot.Toolchain.ImageID)
+		if inspectErr != nil || imageID != snapshot.Toolchain.ImageID {
+			return updateResult{}, fail(exitEnv, "snapshot toolchain image is unavailable; run vuelta scan again")
+		}
+	}
 	recheck, err := updater.ResolveCandidateScannerWithOptions(workspace, cfg, updater.CandidateScannerOptions{
-		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: true,
+		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: true, ToolchainProfile: &executionProfile,
 	})
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
@@ -452,9 +463,15 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}},
 		Logger: logger,
 	}
+	executionWorkspace := workspace
+	executionWorkspace.ToolchainProfile = executionProfile.ID
+	executionConfig := cfg
+	if snapshot.Toolchain.Source == toolchain.SourceDefault {
+		executionConfig.Update.ToolchainProfiles = append(append([]config.ToolchainProfile(nil), cfg.Update.ToolchainProfiles...), executionProfile)
+	}
 	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
 		return updater.PlannedUpdater{
-			Candidates: snapshot.Candidates, Workspace: workspace, Config: cfg, AllowScripts: options.allowScripts, Recheck: recheck,
+			Candidates: snapshot.Candidates, Workspace: executionWorkspace, Config: executionConfig, AllowScripts: options.allowScripts, Recheck: recheck,
 			Validate: func(validationContext context.Context) error {
 				if err := updatesnapshot.ValidateForWorkspace(validationContext, snapshot, cfg, workspace, time.Now()); err != nil {
 					return err

@@ -393,3 +393,35 @@ func TestIdentityBindsAdapterAndAcceptsOnlyLegacyUnboundCompatibility(t *testing
 		t.Fatal("changed adapter version was accepted")
 	}
 }
+
+func TestResolveSnapshotProfileRestoresEmbeddedImageAcrossProcesses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	write(t, root, "package.json", `{"engines":{"node":"22.x"},"packageManager":"npm@10.9.2"}`)
+	write(t, root, "package-lock.json", `{"lockfileVersion":3}`)
+	workspace := config.Workspace{Path: root, Stack: config.StackNode, PackageManager: "npm", Platform: "linux/amd64"}
+	selection, err := Select(workspace, config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageID := "sha256:" + strings.Repeat("b", 64)
+	preparedProfile := selection.Profile
+	preparedProfile.Image = imageID
+	persisted, err := IdentityForResolvedProfile(preparedProfile, SourceDefault, imageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := ResolveSnapshotProfile(workspace, config.Config{}, persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Image != imageID || restored.ID != persisted.ProfileID {
+		t.Fatalf("restored profile = %#v", restored)
+	}
+	tampered := persisted
+	tampered.ScannerVersion = "999.0.0"
+	if _, err := ResolveSnapshotProfile(workspace, config.Config{}, tampered); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("tampered snapshot error = %v", err)
+	}
+}

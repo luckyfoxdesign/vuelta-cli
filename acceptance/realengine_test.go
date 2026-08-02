@@ -216,6 +216,108 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 	conflicts.assertPresent(t, ctx)
 }
 
+// TestCLIOnlyLocalUpdateDryRun exercises the complete first-run local update
+// path through the installed production CLI. Vuelta project policy is never
+// assembled through Go helpers: every Vuelta-owned write and approval goes
+// through a public, non-interactive command.
+func TestCLIOnlyLocalUpdateDryRun(t *testing.T) {
+	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
+	if root == "" {
+		t.Skip("manual/networked suite: use scripts/local-update-smoke.sh")
+	}
+	if !filepath.IsAbs(root) {
+		t.Fatal("[infrastructure] VUELTA_ACCEPTANCE_ROOT must be absolute")
+	}
+	_ = checkEngine(t, "")
+	binary := buildProductionBinary(t, root)
+	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
+	defer cancel()
+	caseRoot, err := os.MkdirTemp(root, "vuelta-cli-local-update-")
+	if err != nil {
+		t.Fatalf("[infrastructure] create case directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(caseRoot) })
+	project := filepath.Join(caseRoot, "project")
+	if err := testfixture.SetupProject(ctx, "/src/testdata/fixtures/projects", "node-npm-ok", project); err != nil {
+		t.Fatalf("[infrastructure] prepare fixture: %v", err)
+	}
+	attachFixtureRemote(t, ctx, caseRoot, project)
+
+	configRoot := filepath.Join(caseRoot, "xdg-config")
+	configPath := filepath.Join(configRoot, "vuelta", "config.yaml")
+	env := append(os.Environ(), "XDG_CONFIG_HOME="+configRoot, "HOME="+filepath.Join(caseRoot, "home"))
+	runTextInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"--no-input", "config", "init")
+	bootstrap := runJSONInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"--no-input", "environment", "bootstrap", "--socket", "/var/run/docker.sock", "--yes", "--json")
+	if len(bootstrap.Results) != 1 || bootstrap.Results[0].Status != "trusted" {
+		t.Fatalf("[compatibility] bootstrap result = %#v", bootstrap.Results)
+	}
+
+	firstScan := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
+		"--no-input", "scan", "--directory", project, "--only", "packages", "--json")
+	if len(firstScan.Results) != 1 || firstScan.Results[0].Error != nil || firstScan.Results[0].Status != config.VerificationScanOnly || len(firstScan.Results[0].Candidates) == 0 {
+		t.Fatalf("[scanner] first CLI-only scan = %#v", firstScan.Results)
+	}
+	runTextInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"--config", configPath, "project", "verify", "init", "--directory", project)
+	runTextInDir(t, ctx, env, caseRoot, "compatibility", binary,
+		"--no-input", "project", "verify", "approve", "--directory", project, "--yes")
+	commitFixtureFiles(t, ctx, project, "fixture: approve CLI verification", ".gitignore", ".vuelta.yaml", "compose.verify.yml")
+	pushFixture(t, ctx, project)
+
+	readyScan := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
+		"--no-input", "scan", "--directory", project, "--only", "packages", "--json")
+	if len(readyScan.Results) != 1 || readyScan.Results[0].Error != nil || readyScan.Results[0].Status != "ready" || readyScan.Results[0].SnapshotID == "" {
+		t.Fatalf("[scanner] ready CLI-only scan = %#v", readyScan.Results)
+	}
+	updated := runJSONInDirWithPrivateLog(t, ctx, env, caseRoot, "compatibility", binary,
+		"--no-input", "update", "local", "--directory", project,
+		"--snapshot", readyScan.Results[0].SnapshotID, "--dry-run", "--yes", "--json")
+	if len(updated.Results) != 1 || updated.Results[0].Status != "dry_run" || updated.Results[0].Error != nil {
+		t.Fatalf("[compatibility] CLI-only local dry-run = %#v", updated.Results)
+	}
+	assertClean(t, ctx, project, "after CLI-only update local --dry-run")
+}
+
+func runJSONInDirWithPrivateLog(t *testing.T, ctx context.Context, env []string, dir, category, binary string, args ...string) commandEnvelope {
+	t.Helper()
+	command := exec.CommandContext(ctx, binary, args...)
+	command.Env = env
+	command.Dir = dir
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		privateLog := filepath.Join(environmentValue(env, "HOME"), ".local", "state", "vuelta", "vuelta.log")
+		diagnostics, _ := os.ReadFile(privateLog)
+		t.Fatalf("[%s] command failed: %s\nprivate diagnostics:\n%s", category,
+			failureMessage(stdout.Bytes(), stderr.String(), err), boundedAcceptanceText(diagnostics, 4096))
+	}
+	var envelope commandEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("[parsing] decode command JSON: %v", err)
+	}
+	return envelope
+}
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for index := len(env) - 1; index >= 0; index-- {
+		value := env[index]
+		if strings.HasPrefix(value, prefix) {
+			return strings.TrimPrefix(value, prefix)
+		}
+	}
+	return ""
+}
+
+func boundedAcceptanceText(data []byte, limit int) string {
+	if len(data) <= limit {
+		return string(data)
+	}
+	return "[vuelta: earlier private diagnostics omitted]\n" + string(data[len(data)-limit:])
+}
+
 func TestRealEngineStandaloneRequirementsVulnerabilityScan(t *testing.T) {
 	matrixPath := os.Getenv("VUELTA_ACCEPTANCE_MATRIX")
 	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
@@ -576,12 +678,29 @@ func writeVerificationFixture(t *testing.T, ctx context.Context, project, image,
 
 func commitProjectOnboarding(t *testing.T, ctx context.Context, project string) {
 	t.Helper()
-	for _, args := range [][]string{{"add", ".gitignore", ".vuelta.yaml"}, {"commit", "-q", "-m", "fixture: accept vuelta onboarding"}} {
+	commitFixtureFiles(t, ctx, project, "fixture: accept vuelta onboarding", ".gitignore", ".vuelta.yaml")
+}
+
+func commitFixtureFiles(t *testing.T, ctx context.Context, project, message string, files ...string) {
+	t.Helper()
+	commands := [][]string{{"add"}}
+	commands[0] = append(commands[0], files...)
+	commands = append(commands, []string{"commit", "-q", "-m", message})
+	for _, args := range commands {
 		command := exec.CommandContext(ctx, "git", args...)
 		command.Dir = project
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("[infrastructure] commit Vuelta onboarding: %v: %s", err, output)
 		}
+	}
+}
+
+func pushFixture(t *testing.T, ctx context.Context, project string) {
+	t.Helper()
+	command := exec.CommandContext(ctx, "git", "push", "-q", "origin", "main")
+	command.Dir = project
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("[infrastructure] push fixture update: %v: %s", err, output)
 	}
 }
 

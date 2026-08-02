@@ -807,3 +807,22 @@ func TestParseManifestDigestList(t *testing.T) {
 		t.Fatalf("unexpected digest: %q", digest)
 	}
 }
+
+func TestParseManifestDigestForPlatformDoesNotUseFirstDescriptor(t *testing.T) {
+	amd64 := "sha256:" + strings.Repeat("a", 64)
+	arm64 := "sha256:" + strings.Repeat("b", 64)
+	data := []byte(`[
+{"Descriptor":{"digest":"` + amd64 + `","platform":{"os":"linux","architecture":"amd64"}}},
+{"Descriptor":{"digest":"` + arm64 + `","platform":{"os":"linux","architecture":"arm64"}}}
+]`)
+	digest, err := parseManifestDigestForPlatform(data, "linux/arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != arm64 {
+		t.Fatalf("platform digest = %q, want %q", digest, arm64)
+	}
+	if _, err := parseManifestDigestForPlatform(data, "linux/s390x"); err == nil {
+		t.Fatal("missing platform descriptor was accepted")
+	}
+}

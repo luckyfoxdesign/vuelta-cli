@@ -74,6 +74,7 @@ trap 'rm -f "$tmp"' EXIT
 	printf 'vuelta deploy status [PROJECT] # durable contract and release state\n'
 	printf 'vuelta deploy rollback PROJECT # restore recorded immutable prior digest\n'
 	printf 'scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite\n'
+	printf 'scripts/local-update-smoke.sh # non-interactive CLI-only local update dry-run\n'
 	printf 'scripts/corpus-scan.sh ROOT [MODE] # manual pinned corpus scan and reports\n'
 	printf 'scripts/corpus-refresh.sh ROOT # validated candidate pins without manifest mutation\n'
 	printf 'make build-mac                 # Docker cross-build three binaries for darwin/arm64\n'

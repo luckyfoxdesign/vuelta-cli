@@ -36,6 +36,7 @@ const (
 type VerifyImagePin struct {
 	Reference string
 	Digest    string
+	Platform  string
 }
 
 // VerifyImageRefresh reports the explicit refresh operation's outcome.
@@ -88,7 +89,7 @@ type verifyComposeNetwork struct {
 // manager, resolves its digest-pinned base image, selects a safe package
 // script, and renders a hardened compose.verify.yml document. It performs no
 // writes: WriteVerifyCompose validates and persists the result.
-func GenerateVerifyCompose(ctx context.Context, root, scriptOverride string, resolve updater.DigestResolver) ([]byte, string, error) {
+func GenerateVerifyCompose(ctx context.Context, root, scriptOverride string, resolve updater.PlatformDigestResolver) ([]byte, string, error) {
 	discovery, err := Detect(root)
 	if err != nil {
 		return nil, "", err
@@ -116,7 +117,7 @@ func GenerateVerifyCompose(ctx context.Context, root, scriptOverride string, res
 	if baseImage == "" {
 		return nil, "", fmt.Errorf("adapter %s has no verify base image", adapter.Key().String())
 	}
-	digest, err := resolve(ctx, baseImage)
+	digest, err := resolve(ctx, baseImage, spec.Platform)
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve digest for %s: %w", baseImage, err)
 	}
@@ -158,7 +159,7 @@ func GenerateVerifyCompose(ctx context.Context, root, scriptOverride string, res
 // policy path used before a real verification run, and atomically writes
 // compose.verify.yml. It refuses to overwrite an existing file and leaves no
 // file on disk when generation or validation fails.
-func WriteVerifyCompose(ctx context.Context, root, scriptOverride string, resolve updater.DigestResolver) (path, scriptName string, err error) {
+func WriteVerifyCompose(ctx context.Context, root, scriptOverride string, resolve updater.PlatformDigestResolver) (path, scriptName string, err error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve project path: %w", err)
@@ -191,7 +192,7 @@ func WriteVerifyCompose(ctx context.Context, root, scriptOverride string, resolv
 // testrunner's validated Compose model rather than independently parsing the
 // repository YAML.
 func ReadVerifyImagePin(root string) (VerifyImagePin, error) {
-	image, err := testrunner.ValidatedComposeServiceImage(root, verifyComposeFilename, verifyComposeServiceName)
+	image, platform, err := testrunner.ValidatedComposeServiceImagePlatform(root, verifyComposeFilename, verifyComposeServiceName)
 	if err != nil {
 		return VerifyImagePin{}, err
 	}
@@ -199,13 +200,13 @@ func ReadVerifyImagePin(root string) (VerifyImagePin, error) {
 	if separator <= 0 {
 		return VerifyImagePin{}, fmt.Errorf("verification image is not pinned by digest")
 	}
-	return VerifyImagePin{Reference: image[:separator], Digest: image[separator+1:]}, nil
+	return VerifyImagePin{Reference: image[:separator], Digest: image[separator+1:], Platform: platform}, nil
 }
 
 // RefreshVerifyComposeImage resolves the current digest for the validated
 // verification image tag and atomically changes only that exact image scalar.
 // It never regenerates the Compose document or changes project configuration.
-func RefreshVerifyComposeImage(ctx context.Context, root string, resolve updater.DigestResolver) (VerifyImageRefresh, error) {
+func RefreshVerifyComposeImage(ctx context.Context, root string, resolve updater.PlatformDigestResolver) (VerifyImageRefresh, error) {
 	if resolve == nil {
 		return VerifyImageRefresh{}, errors.New("verification image digest resolver is required")
 	}
@@ -221,7 +222,7 @@ func RefreshVerifyComposeImage(ctx context.Context, root string, resolve updater
 	if err != nil {
 		return VerifyImageRefresh{}, err
 	}
-	current, err := resolve(ctx, pin.Reference)
+	current, err := resolve(ctx, pin.Reference, pin.Platform)
 	if err != nil {
 		return VerifyImageRefresh{}, fmt.Errorf("resolve digest for %s: %w", pin.Reference, err)
 	}

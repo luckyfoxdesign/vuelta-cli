@@ -933,7 +933,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 			progress.stop()
 			return prepared, err
 		},
-		resolveVerifyDigest: updater.ResolveDigestViaManifest,
+		resolveVerifyDigest: updater.ResolveDigestForPlatformViaManifest,
 	})
 }
 
@@ -942,11 +942,11 @@ type scanStageRunners struct {
 	alerts              func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 	packages            func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
 	prepareToolchain    func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
-	resolveVerifyDigest updater.DigestResolver
+	resolveVerifyDigest updater.PlatformDigestResolver
 	candidateTimeout    time.Duration
 }
 
-func checkVerificationImage(ctx context.Context, root, refreshCommand string, resolve updater.DigestResolver) *verificationImageWarning {
+func checkVerificationImage(ctx context.Context, root, refreshCommand string, resolve updater.PlatformDigestResolver) *verificationImageWarning {
 	if resolve == nil {
 		return nil
 	}
@@ -956,7 +956,7 @@ func checkVerificationImage(ctx context.Context, root, refreshCommand string, re
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, verifyDigestCheckTimeout)
 	defer cancel()
-	current, err := resolve(checkCtx, pin.Reference)
+	current, err := resolve(checkCtx, pin.Reference, pin.Platform)
 	if err != nil || !verifyDigestPattern.MatchString(current) || current == pin.Digest {
 		return nil
 	}

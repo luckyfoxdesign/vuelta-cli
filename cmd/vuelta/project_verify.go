@@ -15,7 +15,7 @@ import (
 
 // resolveVerifyDigest is overridden in tests so they never need a real
 // Docker daemon or registry.
-var resolveVerifyDigest updater.DigestResolver = updater.ResolveDigestViaManifest
+var resolveVerifyDigest updater.PlatformDigestResolver = updater.ResolveDigestForPlatformViaManifest
 
 // runProjectVerifyInit generates and writes only compose.verify.yml. It never
 // touches .vuelta.yaml or the machine config: promotion to a ready
@@ -30,11 +30,25 @@ func runProjectVerifyInit(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fail(exitConfig, "%v", err)
 	}
-	if len(fs.Args()) != 0 {
-		return fail(exitConfig, "usage: vuelta project verify init [--directory PATH] [--script NAME] [--refresh-image]")
+	if len(fs.Args()) > 1 {
+		return fail(exitConfig, "usage: vuelta project verify init [--directory PATH] [--script NAME] [--refresh-image] [config-path]")
 	}
 	if *refreshImage && *scriptName != "" {
 		return fail(exitConfig, "--refresh-image and --script are mutually exclusive")
+	}
+	configFile, err := configPath(fs.Args())
+	if err != nil {
+		return err
+	}
+	cfg, err := loadMachineConfig(configFile, false)
+	if err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fail(exitConfig, "%v", err)
+	}
+	if err := configureDeveloperDocker(*cfg); err != nil {
+		return fail(exitEnv, "%v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

@@ -12,9 +12,12 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 )
 
-func fakeDigestResolver(t *testing.T) func(context.Context, string) (string, error) {
+func fakeDigestResolver(t *testing.T) func(context.Context, string, string) (string, error) {
 	t.Helper()
-	return func(_ context.Context, ref string) (string, error) {
+	return func(_ context.Context, ref, platform string) (string, error) {
+		if platform != "linux/amd64" && platform != "linux/arm64" {
+			t.Fatalf("unexpected platform %q for %s", platform, ref)
+		}
 		return "sha256:" + strings.Repeat("1", 64), nil
 	}
 }
@@ -185,7 +188,7 @@ func TestGenerateVerifyComposeFailsClosedForUnsupportedStack(t *testing.T) {
 
 func TestWriteVerifyComposeDigestFailureLeavesNoFile(t *testing.T) {
 	project := npmVerifyProject(t, "", `{"build":"tsc"}`)
-	failing := func(context.Context, string) (string, error) { return "", errors.New("registry unreachable") }
+	failing := func(context.Context, string, string) (string, error) { return "", errors.New("registry unreachable") }
 	_, _, err := WriteVerifyCompose(context.Background(), project, "", failing)
 	if err == nil || !strings.Contains(err.Error(), "registry unreachable") {
 		t.Fatalf("expected digest resolution error, got %v", err)
@@ -268,9 +271,12 @@ func TestRefreshVerifyComposeImageChangesOnlyPinnedDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	current := "sha256:" + strings.Repeat("2", 64)
-	result, err := RefreshVerifyComposeImage(context.Background(), project, func(_ context.Context, ref string) (string, error) {
+	result, err := RefreshVerifyComposeImage(context.Background(), project, func(_ context.Context, ref, platform string) (string, error) {
 		if ref != "node:24-bookworm-slim" {
 			t.Fatalf("resolved reference = %q", ref)
+		}
+		if platform != "linux/amd64" && platform != "linux/arm64" {
+			t.Fatalf("resolved platform = %q", platform)
 		}
 		return current, nil
 	})
@@ -307,7 +313,7 @@ func TestRefreshVerifyComposeImageFailureWritesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = RefreshVerifyComposeImage(context.Background(), project, func(context.Context, string) (string, error) {
+	_, err = RefreshVerifyComposeImage(context.Background(), project, func(context.Context, string, string) (string, error) {
 		return "", errors.New("registry unavailable")
 	})
 	if err == nil {

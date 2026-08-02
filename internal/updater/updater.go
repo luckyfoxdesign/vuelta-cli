@@ -14,6 +14,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scancontainer"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 )
@@ -188,6 +189,10 @@ func runDockerWithProfile(ctx context.Context, docker dockerexec.Runner, image s
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return string(result.Combined), ctxErr
+		}
+		detail := safeerr.Excerpt(result.Combined, 1024)
+		if detail != "" {
+			return string(result.Combined), fmt.Errorf("docker run %s %s: %w: %s", image, strings.Join(args, " "), err, detail)
 		}
 		return string(result.Combined), fmt.Errorf("docker run %s %s: %w", image, strings.Join(args, " "), err)
 	}

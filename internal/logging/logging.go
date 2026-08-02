@@ -76,7 +76,15 @@ func NewAt(path string, maxBytes int64, jsonLogs bool, stdout io.Writer) (*Logge
 // Event writes an INFO, WARN, or ERROR record. Keys are sorted for stable,
 // readable logs; values must be secret-free summaries.
 func (l *Logger) Event(level, message string, fields map[string]string) error {
-	return l.write(level, message, fields)
+	return l.write(level, message, fields, true)
+}
+
+// PrivateEvent writes bounded local diagnostic context to the protected log
+// without copying it to the command's console stream. Callers use it for
+// details that must remain available to the local operator but must not enter
+// JSON results, notifications, or scheduler output.
+func (l *Logger) PrivateEvent(level, message string, fields map[string]string) error {
+	return l.write(level, message, fields, false)
 }
 
 // Audit writes an explicit audit record for a project pipeline outcome.
@@ -89,7 +97,7 @@ func (l *Logger) Audit(record AuditRecord) error {
 		"alert_ids":     strings.Join(record.AlertIDs, ","),
 		"image_digest":  record.ImageDigest, "deploy_candidate_id": record.DeployCandidateID,
 	}
-	return l.write("INFO", "audit", fields)
+	return l.write("INFO", "audit", fields, true)
 }
 
 // AuditRecord is deliberately limited to identifiers and digests; it must
@@ -106,7 +114,7 @@ type AuditRecord struct {
 	DeployCandidateID string
 }
 
-func (l *Logger) write(level, message string, fields map[string]string) error {
+func (l *Logger) write(level, message string, fields map[string]string, console bool) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	stamp := l.now().UTC()
@@ -114,8 +122,10 @@ func (l *Logger) write(level, message string, fields map[string]string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.WriteString(l.stdout, line); err != nil {
-		return fmt.Errorf("write stdout log: %w", err)
+	if console {
+		if _, err := io.WriteString(l.stdout, line); err != nil {
+			return fmt.Errorf("write stdout log: %w", err)
+		}
 	}
 	if err := l.rotateIfNeeded(int64(len(line))); err != nil {
 		return err

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 )
 
 func TestNewAtRestrictsPathsAndWritesAudit(t *testing.T) {
@@ -69,5 +71,33 @@ func TestLoggerRedactsSecretLikeFieldNames(t *testing.T) {
 	}
 	if strings.Contains(string(data), "https://example/secret") || strings.Contains(string(data), "token\"") {
 		t.Fatalf("secret value leaked into log: %s", data)
+	}
+}
+
+func TestPrivateEventWritesBoundedRedactedDetailOnlyToLocalLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vuelta.log")
+	var console bytes.Buffer
+	logger, err := NewAt(path, 1<<20, false, &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "token=private-value " + strings.Repeat("x", 4096) + " password=also-private"
+	detail := safeerr.Excerpt([]byte(raw), 256)
+	if err := logger.PrivateEvent("ERROR", "private failure", map[string]string{"detail": detail}); err != nil {
+		t.Fatal(err)
+	}
+	if console.Len() != 0 {
+		t.Fatalf("private event reached console: %q", console.String())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "private failure") || !strings.Contains(text, "<redacted>") || !strings.Contains(text, "[vuelta: excerpt]") {
+		t.Fatalf("private log omitted bounded diagnostics: %q", text)
+	}
+	if strings.Contains(text, "private-value") || strings.Contains(text, "also-private") || len(text) > 512 {
+		t.Fatalf("private log detail was not bounded and redacted: %q", text)
 	}
 }

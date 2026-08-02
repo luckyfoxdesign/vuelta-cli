@@ -253,15 +253,23 @@ func ValidateComposeService(root, composeFile, service string) error {
 // same fail-closed model used for verification execution. Callers never need
 // to parse repository-controlled Compose YAML a second time.
 func ValidatedComposeServiceImage(root, composeFile, service string) (string, error) {
+	image, _, err := ValidatedComposeServiceImagePlatform(root, composeFile, service)
+	return image, err
+}
+
+// ValidatedComposeServiceImagePlatform returns the selected service's image
+// and exact platform from the same fail-closed model used for execution.
+func ValidatedComposeServiceImagePlatform(root, composeFile, service string) (string, string, error) {
 	sandboxRoot, composePath, err := resolveComposeFile(root, composeFile)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	model, err := validatedComposeModel(sandboxRoot, composePath, service)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return model.Services[service].Image, nil
+	selected := model.Services[service]
+	return selected.Image, selected.Platform, nil
 }
 
 // validateCompose parses the compose file under the strict allowlist and

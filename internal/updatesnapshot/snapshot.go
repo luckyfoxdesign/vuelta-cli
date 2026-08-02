@@ -518,12 +518,9 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 		return fmt.Errorf("%w: verification profile changed", ErrStale)
 	}
 	if snapshot.Toolchain.ProfileID != "" {
-		profile, actual, _, resolveErr := toolchain.Resolve(ws, cfg)
+		_, resolveErr := toolchain.ResolveSnapshotProfile(ws, cfg, snapshot.Toolchain)
 		if resolveErr != nil {
 			return fmt.Errorf("%w: toolchain profile is no longer compatible: %v", ErrStale, resolveErr)
-		}
-		if !toolchain.MatchesResolvedIdentity(snapshot.Toolchain, profile, actual) {
-			return fmt.Errorf("%w: toolchain profile changed", ErrStale)
 		}
 	} else if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
 		return fmt.Errorf("%w: snapshot has no toolchain profile identity", ErrStale)

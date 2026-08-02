@@ -50,6 +50,7 @@ vuelta deploy sync             # build/release/switch every ready workspace
 vuelta deploy status [PROJECT] # durable contract and release state
 vuelta deploy rollback PROJECT # restore recorded immutable prior digest
 scripts/real-engine-acceptance.sh MATRIX # manual/networked real-engine suite
+scripts/local-update-smoke.sh # non-interactive CLI-only local update dry-run
 scripts/corpus-scan.sh ROOT [MODE] # manual pinned corpus scan and reports
 scripts/corpus-refresh.sh ROOT # validated candidate pins without manifest mutation
 make build-mac                 # Docker cross-build three binaries for darwin/arm64

@@ -1812,6 +1812,7 @@ func writeScanVerifyCompose(t *testing.T, root, digest string) string {
 	content := fmt.Sprintf(`services:
   verify:
     image: node:24-bookworm-slim@%s
+    platform: linux/arm64
     user: "1000:1000"
     read_only: true
     cap_drop: ["ALL"]
@@ -1836,10 +1837,13 @@ func TestCheckVerificationImageMatchingDigestHasNoWarning(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("1", 64)
 	writeScanVerifyCompose(t, root, digest)
 	calls := 0
-	warning := checkVerificationImage(context.Background(), root, "refresh command", func(_ context.Context, ref string) (string, error) {
+	warning := checkVerificationImage(context.Background(), root, "refresh command", func(_ context.Context, ref, platform string) (string, error) {
 		calls++
 		if ref != "node:24-bookworm-slim" {
 			t.Fatalf("reference = %q", ref)
+		}
+		if platform != "linux/arm64" {
+			t.Fatalf("platform = %q", platform)
 		}
 		return digest, nil
 	})
@@ -1858,7 +1862,7 @@ func TestCheckVerificationImageDriftIsStructuredVisibleAndReadOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	command := "vuelta project verify init --directory " + root + " --refresh-image"
-	warning := checkVerificationImage(context.Background(), root, command, func(context.Context, string) (string, error) {
+	warning := checkVerificationImage(context.Background(), root, command, func(context.Context, string, string) (string, error) {
 		return current, nil
 	})
 	if warning == nil || warning.Code != "verification_base_image_stale" || warning.RefreshCommand != command {
@@ -1895,14 +1899,14 @@ func TestCheckVerificationImageDriftIsStructuredVisibleAndReadOnly(t *testing.T)
 func TestCheckVerificationImageUnavailableRegistryAndMissingFileAreQuiet(t *testing.T) {
 	root := t.TempDir()
 	called := false
-	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string) (string, error) {
+	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string, string) (string, error) {
 		called = true
 		return "", errors.New("registry unavailable")
 	}); warning != nil || called {
 		t.Fatalf("missing profile warning = %#v, resolver called = %v", warning, called)
 	}
 	writeScanVerifyCompose(t, root, "sha256:"+strings.Repeat("1", 64))
-	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string) (string, error) {
+	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string, string) (string, error) {
 		return "", errors.New("registry unavailable")
 	}); warning != nil {
 		t.Fatalf("registry failure warning = %#v", warning)

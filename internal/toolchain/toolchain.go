@@ -3,6 +3,7 @@ package toolchain
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -138,6 +139,36 @@ func MatchesResolvedIdentity(persisted Identity, profile config.ToolchainProfile
 	}
 	legacy, err := identityForResolvedProfile(profile, actual.Source, actual.ImageID, false)
 	return err == nil && reflect.DeepEqual(persisted, legacy)
+}
+
+// ResolveSnapshotProfile reconstructs the exact executable profile recorded
+// by scan while revalidating all of its declarative metadata against the
+// current adapter catalog, project constraints, and operator overrides.
+// Embedded defaults intentionally recover their content-addressed local image
+// from the snapshot: side-effect-free Resolve cannot discover that Docker
+// image ID in a later CLI process.
+func ResolveSnapshotProfile(ws config.Workspace, cfg config.Config, persisted Identity) (config.ToolchainProfile, error) {
+	selection, err := Select(ws, cfg)
+	if err != nil {
+		return config.ToolchainProfile{}, err
+	}
+	profile := selection.Profile
+	imageID := profile.Image
+	if selection.Source == SourceDefault {
+		if persisted.Image == "" || persisted.Image != persisted.ImageID || !localImageIDPattern.MatchString(persisted.ImageID) {
+			return config.ToolchainProfile{}, errors.New("embedded toolchain snapshot has no valid local image identity")
+		}
+		profile.Image = persisted.ImageID
+		imageID = persisted.ImageID
+	}
+	actual, err := IdentityForResolvedProfile(profile, selection.Source, imageID)
+	if err != nil {
+		return config.ToolchainProfile{}, err
+	}
+	if !MatchesResolvedIdentity(persisted, profile, actual) {
+		return config.ToolchainProfile{}, errors.New("toolchain profile changed")
+	}
+	return profile, nil
 }
 
 // Detect reads only the selected workspace's supported root manifest and lock

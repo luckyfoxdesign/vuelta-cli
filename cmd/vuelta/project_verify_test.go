@@ -24,15 +24,33 @@ func writeVerifyFixtureProject(t *testing.T) string {
 	return project
 }
 
+func writeVerifyMachineConfig(t *testing.T) string {
+	t.Helper()
+	cfg := configinit.NewConfig()
+	cfg.Docker = &config.DockerConfig{Developer: &config.DockerEndpointConfig{
+		Socket: "/approved/docker.sock",
+		ExpectedDaemon: config.DockerDaemonIdentity{
+			ID: "daemon-reviewed", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		},
+	}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(cfg, path, false); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestProjectVerifyInitWritesComposeFile(t *testing.T) {
 	previous := resolveVerifyDigest
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "sha256:" + strings.Repeat("1", 64), nil
 	}
 	t.Cleanup(func() { resolveVerifyDigest = previous })
 
 	project := writeVerifyFixtureProject(t)
-	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+	configPath := writeVerifyMachineConfig(t)
+	if err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project}); err != nil {
 		t.Fatalf("project verify init: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(project, "compose.verify.yml"))
@@ -46,17 +64,18 @@ func TestProjectVerifyInitWritesComposeFile(t *testing.T) {
 
 func TestProjectVerifyInitNeverOverwrites(t *testing.T) {
 	previous := resolveVerifyDigest
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "sha256:" + strings.Repeat("1", 64), nil
 	}
 	t.Cleanup(func() { resolveVerifyDigest = previous })
 
 	project := writeVerifyFixtureProject(t)
+	configPath := writeVerifyMachineConfig(t)
 	existing := filepath.Join(project, "compose.verify.yml")
 	if err := os.WriteFile(existing, []byte("hand-written"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := run([]string{"project", "verify", "init", "--directory", project})
+	err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project})
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("expected already-exists error, got %v", err)
 	}
@@ -71,13 +90,14 @@ func TestProjectVerifyInitNeverOverwrites(t *testing.T) {
 
 func TestProjectVerifyInitDigestFailureLeavesNoFile(t *testing.T) {
 	previous := resolveVerifyDigest
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "", errors.New("registry unreachable")
 	}
 	t.Cleanup(func() { resolveVerifyDigest = previous })
 
 	project := writeVerifyFixtureProject(t)
-	err := run([]string{"project", "verify", "init", "--directory", project})
+	configPath := writeVerifyMachineConfig(t)
+	err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project})
 	if err == nil || !strings.Contains(err.Error(), "registry unreachable") {
 		t.Fatalf("expected digest resolution error, got %v", err)
 	}
@@ -89,17 +109,18 @@ func TestProjectVerifyInitDigestFailureLeavesNoFile(t *testing.T) {
 func TestProjectVerifyInitRefreshImageUpdatesExistingPin(t *testing.T) {
 	previous := resolveVerifyDigest
 	t.Cleanup(func() { resolveVerifyDigest = previous })
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "sha256:" + strings.Repeat("1", 64), nil
 	}
 	project := writeVerifyFixtureProject(t)
-	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+	configPath := writeVerifyMachineConfig(t)
+	if err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project}); err != nil {
 		t.Fatal(err)
 	}
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "sha256:" + strings.Repeat("2", 64), nil
 	}
-	if err := run([]string{"project", "verify", "init", "--directory", project, "--refresh-image"}); err != nil {
+	if err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project, "--refresh-image"}); err != nil {
 		t.Fatalf("refresh image: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(project, "compose.verify.yml"))
@@ -135,11 +156,12 @@ func onboardVerifyProject(t *testing.T) (string, string) {
 func writeGeneratedVerifyCompose(t *testing.T, project string) {
 	t.Helper()
 	previous := resolveVerifyDigest
-	resolveVerifyDigest = func(context.Context, string) (string, error) {
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
 		return "sha256:" + strings.Repeat("1", 64), nil
 	}
 	t.Cleanup(func() { resolveVerifyDigest = previous })
-	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+	configPath := writeVerifyMachineConfig(t)
+	if err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project}); err != nil {
 		t.Fatalf("project verify init: %v", err)
 	}
 }
