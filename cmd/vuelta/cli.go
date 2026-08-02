@@ -158,8 +158,8 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		path: []string{"project", "verify"}, usage: "vuelta project verify <command>",
-		description: "generate a hardened verification Compose service",
-		examples: []string{"vuelta project verify init"},
+		description: "generate and approve project-local verification",
+		examples:    []string{"vuelta project verify init", "vuelta project verify approve --yes"},
 	},
 	{
 		path: []string{"project", "verify", "init"}, usage: "vuelta project verify init [--directory PATH] [--script NAME]",
@@ -171,6 +171,19 @@ var commandDefinitions = []commandDefinition{
 		},
 		security: []string{"Writes only compose.verify.yml; it never touches .vuelta.yaml or the machine config, and never overwrites an existing file. The rendered service is re-validated through the same fail-closed Compose policy used before a real verification run, and the base image is always digest-pinned."},
 		handler:  "project verify init",
+	},
+	{
+		path: []string{"project", "verify", "approve"}, usage: "vuelta project verify approve [--directory PATH] [--verification NAME] [--yes]",
+		description: "promote a project-local scan-only profile after review",
+		examples:    []string{"vuelta project verify approve", "vuelta project verify approve --verification build-compose-verify --yes"},
+		options: []optionDefinition{
+			{names: []string{"--directory"}, valueName: "PATH", description: "project root containing .vuelta.yaml (default: .)"},
+			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},
+			{names: []string{"--yes"}, description: "confirm the displayed verification config diff"},
+			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
+		},
+		security: []string{"Requires an existing scan_only .vuelta.yaml, validates the ready profile through the update Compose policy, prints the exact steps and diff, and atomically rewrites only workspace.verification after confirmation."},
+		handler:  "project verify approve",
 	},
 	{
 		path: []string{"project", "list"}, usage: "vuelta project list [--json] [config-path]",
@@ -328,7 +341,7 @@ func (c *cli) run(args []string) error {
 	if definition.handler == "" {
 		return c.writeCommandHelp(definition)
 	}
-	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
+	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "project verify approve" || definition.handler == "environment bootstrap") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
 	if globals.config != "" && definition.takesConfig && definition.handler != "update" && definition.handler != "update local" {
@@ -624,6 +637,8 @@ func dispatchCommand(handler string, args []string) error {
 		return runProjectAdd(args)
 	case "project verify init":
 		return runProjectVerifyInit(args)
+	case "project verify approve":
+		return runProjectVerifyApprove(args)
 	default:
 		return fail(exitConfig, "command %q is not executable", handler)
 	}

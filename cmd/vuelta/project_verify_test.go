@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/configinit"
 )
 
 func writeVerifyFixtureProject(t *testing.T) string {
@@ -80,5 +83,170 @@ func TestProjectVerifyInitDigestFailureLeavesNoFile(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(project, "compose.verify.yml")); !os.IsNotExist(statErr) {
 		t.Fatal("compose.verify.yml must not exist after digest resolution failure")
+	}
+}
+
+func onboardVerifyProject(t *testing.T) (string, string) {
+	t.Helper()
+	project := writeVerifyFixtureProject(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	cfg, selection, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err != nil {
+		t.Fatalf("onboard project: %v", err)
+	}
+	if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Verification.State != config.VerificationScanOnly {
+		t.Fatalf("onboarded verification = %#v", cfg.Workspaces)
+	}
+	return project, selection.Path
+}
+
+func writeGeneratedVerifyCompose(t *testing.T, project string) {
+	t.Helper()
+	previous := resolveVerifyDigest
+	resolveVerifyDigest = func(context.Context, string) (string, error) {
+		return "sha256:" + strings.Repeat("1", 64), nil
+	}
+	t.Cleanup(func() { resolveVerifyDigest = previous })
+	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+		t.Fatalf("project verify init: %v", err)
+	}
+}
+
+func TestProjectVerifyApprovePromotesExistingComposeAndPrintsExactPlan(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	writeGeneratedVerifyCompose(t, project)
+	composePath := filepath.Join(project, "compose.verify.yml")
+	generated, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handWritten := append([]byte("# retained hand-written compose\n"), generated...)
+	if err := os.WriteFile(composePath, handWritten, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var runErr error
+	_, stderr := captureScanOutput(t, func() {
+		runErr = run([]string{"project", "verify", "approve", "--directory", project, "--yes"})
+	})
+	if runErr != nil {
+		t.Fatalf("project verify approve: %v", runErr)
+	}
+	for _, wanted := range []string{"verification plan: build-compose-verify:", `argv=["npm" "run" "build"]`, "state: ready", projectPath} {
+		if !strings.Contains(stderr, wanted) {
+			t.Fatalf("approval output is missing %q:\n%s", wanted, stderr)
+		}
+	}
+	promoted, err := config.LoadProject(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Workspace.Verification.State != config.VerificationReady || len(promoted.Workspace.Verification.Steps) != 1 {
+		t.Fatalf("promoted verification = %#v", promoted.Workspace.Verification)
+	}
+	afterCompose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterCompose) != string(handWritten) {
+		t.Fatal("approval rewrote the existing Compose file")
+	}
+}
+
+func TestProjectVerifyApproveRequiresConfirmationAndWritesNothing(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	writeGeneratedVerifyCompose(t, project)
+	before, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"--no-input", "project", "verify", "approve", "--directory", project})
+	if err == nil || !strings.Contains(err.Error(), "requires confirmation") {
+		t.Fatalf("non-interactive approval error = %v", err)
+	}
+	after, readErr := os.ReadFile(projectPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(before) {
+		t.Fatal("unconfirmed approval modified .vuelta.yaml")
+	}
+}
+
+func TestProjectVerifyApproveWithoutServicePointsToInit(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	before, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"project", "verify", "approve", "--directory", project, "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "project verify init") {
+		t.Fatalf("missing-service approval error = %v", err)
+	}
+	after, readErr := os.ReadFile(projectPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(before) {
+		t.Fatal("missing-service rejection modified .vuelta.yaml")
+	}
+}
+
+func TestProjectVerifyApproveRejectsInvalidProfileBeforeWrite(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	invalidCompose := "services:\n  verify:\n    command: [npm, run, build]\n"
+	if err := os.WriteFile(filepath.Join(project, "compose.verify.yml"), []byte(invalidCompose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"project", "verify", "approve", "--directory", project, "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "Compose policy") {
+		t.Fatalf("invalid-profile approval error = %v", err)
+	}
+	after, readErr := os.ReadFile(projectPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(before) {
+		t.Fatal("invalid-profile rejection modified .vuelta.yaml")
+	}
+}
+
+func TestProjectVerifyApproveRejectsAlreadyReadyProfile(t *testing.T) {
+	project, _ := onboardVerifyProject(t)
+	writeGeneratedVerifyCompose(t, project)
+	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "already ready") {
+		t.Fatalf("second approval error = %v", err)
+	}
+}
+
+func TestBuildReadyVerificationUsesExistingSelectionRules(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	writeGeneratedVerifyCompose(t, project)
+	loaded, err := config.LoadProject(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := loaded.ResolvedWorkspace(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := configinit.Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := discovery.BuildReadyVerification(workspace, []string{"build-compose-verify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.State != config.VerificationReady || len(profile.Steps) != 1 || profile.Steps[0].Name != "build-compose-verify" {
+		t.Fatalf("selected profile = %#v", profile)
 	}
 }

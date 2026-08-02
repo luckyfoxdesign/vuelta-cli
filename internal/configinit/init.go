@@ -521,6 +521,34 @@ func (d Discovery) buildVerification(input Input, stack, manager string) (config
 	return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: selected}, nil
 }
 
+// BuildReadyVerification selects and validates an explicit ready profile for
+// an existing project workspace. It uses the same declarative candidates and
+// selection rules as onboarding, but fails instead of returning scan_only
+// when the project has no verification service to approve.
+func (d Discovery) BuildReadyVerification(workspace config.Workspace, names []string) (config.VerificationProfile, error) {
+	if workspace.Verification.State != config.VerificationScanOnly {
+		return config.VerificationProfile{}, errors.New("project verification profile is already ready")
+	}
+	if d.Root != workspace.Path {
+		return config.VerificationProfile{}, errors.New("verification discovery root does not match the project config root")
+	}
+	profile, err := d.buildVerification(Input{VerificationNames: names}, workspace.Stack, workspace.PackageManager)
+	if err != nil {
+		return config.VerificationProfile{}, err
+	}
+	if profile.State != config.VerificationReady {
+		return config.VerificationProfile{}, errors.New("no Compose file declares a verification service; run 'vuelta project verify init' first")
+	}
+	workspace.Verification = profile
+	if err := config.ValidateWorkspace(workspace); err != nil {
+		return config.VerificationProfile{}, fmt.Errorf("validate approved project workspace: %w", err)
+	}
+	if err := testrunner.ValidateProfile(workspace.Path, profile); err != nil {
+		return config.VerificationProfile{}, fmt.Errorf("verification profile is not allowed by the Compose policy: %w", err)
+	}
+	return profile, nil
+}
+
 func (d Discovery) verificationCandidatesForManager(stack, manager string) []config.VerificationStep {
 	candidates := make([]config.VerificationStep, 0, len(d.VerificationCandidates))
 	for _, candidate := range d.VerificationCandidates {

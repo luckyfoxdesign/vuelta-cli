@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"gopkg.in/yaml.v3"
 )
 
@@ -257,6 +258,76 @@ func PlanProjectConfigWrite(project *config.ProjectConfig, path string) (EditPla
 		return EditPlan{}, fmt.Errorf("config %s already exists", path)
 	}
 	return EditPlan{Original: original, Updated: updated, Mode: mode, Exists: false, Changed: true}, nil
+}
+
+// PlanProjectVerificationUpdate prepares the one supported in-place edit of a
+// project-local config. It replaces only workspace.verification, preserving
+// every byte outside that YAML node, and retains the atomic source check used
+// by other reviewed config edits.
+func PlanProjectVerificationUpdate(path string, profile config.VerificationProfile) (EditPlan, error) {
+	original, mode, exists, err := readEditSource(path, true)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if !exists {
+		return EditPlan{}, fmt.Errorf("project config %s does not exist; run 'vuelta scan --directory .' first", path)
+	}
+	project, err := config.ParseProject(original, path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if project.Workspace.Verification.State != config.VerificationScanOnly {
+		return EditPlan{}, errors.New("project verification profile is already ready")
+	}
+	project.Workspace.Verification = profile
+	workspace, err := project.ResolvedWorkspace(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if err := config.ValidateWorkspace(workspace); err != nil {
+		return EditPlan{}, fmt.Errorf("validate approved project config: %w", err)
+	}
+	if err := testrunner.ValidateProfile(workspace.Path, profile); err != nil {
+		return EditPlan{}, fmt.Errorf("verification profile is not allowed by the Compose policy: %w", err)
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(original, &document); err != nil {
+		return EditPlan{}, fmt.Errorf("parse project config YAML tree: %w", err)
+	}
+	root, err := documentMapping(&document)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	workspaceNode := mappingValue(root, "workspace")
+	if workspaceNode == nil || workspaceNode.Kind != yaml.MappingNode {
+		return EditPlan{}, errors.New("workspace must be a YAML mapping")
+	}
+	start, end, indent, err := mappingFieldByteRange(original, workspaceNode, "verification")
+	if err != nil {
+		return EditPlan{}, err
+	}
+	replacement, err := renderVerificationField(profile, indent, detectIndent(original), usesCRLF(original))
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if end == len(original) && !bytes.HasSuffix(original, []byte("\n")) {
+		replacement = bytes.TrimSuffix(replacement, []byte("\n"))
+		if bytes.HasSuffix(replacement, []byte("\r")) {
+			replacement = bytes.TrimSuffix(replacement, []byte("\r"))
+		}
+	}
+	updated := make([]byte, 0, len(original)-(end-start)+len(replacement))
+	updated = append(updated, original[:start]...)
+	updated = append(updated, replacement...)
+	updated = append(updated, original[end:]...)
+	if _, err := config.ParseProject(updated, path); err != nil {
+		return EditPlan{}, fmt.Errorf("validate edited project config: %w", err)
+	}
+	return EditPlan{
+		Original: original, Updated: updated, Mode: mode, Exists: true, Changed: !bytes.Equal(original, updated),
+		Review: []string{"replace workspace.verification scan_only profile with reviewed ready profile"}, RepositoryFile: true,
+	}, nil
 }
 
 // PlanDockerBootstrap creates a default config when none exists or updates
@@ -605,6 +676,108 @@ func encodeDocument(document *yaml.Node, original []byte) ([]byte, error) {
 		return nil, fmt.Errorf("close YAML encoder: %w", err)
 	}
 	return output.Bytes(), nil
+}
+
+func mappingFieldByteRange(data []byte, mapping *yaml.Node, key string) (int, int, int, error) {
+	var keyNode, valueNode *yaml.Node
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			keyNode, valueNode = mapping.Content[index], mapping.Content[index+1]
+			break
+		}
+	}
+	if keyNode == nil {
+		return 0, 0, 0, fmt.Errorf("workspace.%s is missing", key)
+	}
+	lineOffsets := []int{0}
+	for index, b := range data {
+		if b == '\n' {
+			lineOffsets = append(lineOffsets, index+1)
+		}
+	}
+	if keyNode.Line < 1 || keyNode.Line > len(lineOffsets) || keyNode.Column < 1 {
+		return 0, 0, 0, fmt.Errorf("workspace.%s has invalid YAML source coordinates", key)
+	}
+	start := lineOffsets[keyNode.Line-1]
+	lineEnd := len(data)
+	if keyNode.Line < len(lineOffsets) {
+		lineEnd = lineOffsets[keyNode.Line]
+	}
+	keyOffset := start + keyNode.Column - 1
+	if keyOffset > lineEnd || !onlySpaces(data[start:keyOffset]) {
+		return 0, 0, 0, fmt.Errorf("workspace.%s must use a block-style YAML key", key)
+	}
+	keyText := []byte(key + ":")
+	if keyOffset+len(keyText) > lineEnd || !bytes.Equal(data[keyOffset:keyOffset+len(keyText)], keyText) {
+		return 0, 0, 0, fmt.Errorf("workspace.%s must use an unquoted block-style YAML key", key)
+	}
+	lastLine := maxNodeLine(valueNode)
+	if lastLine < keyNode.Line || lastLine > len(lineOffsets) {
+		return 0, 0, 0, fmt.Errorf("workspace.%s has invalid YAML node boundaries", key)
+	}
+	end := len(data)
+	if lastLine < len(lineOffsets) {
+		end = lineOffsets[lastLine]
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		sibling := mapping.Content[index]
+		if sibling != keyNode && sibling.Line >= keyNode.Line && sibling.Line <= lastLine {
+			return 0, 0, 0, fmt.Errorf("workspace.%s must not share a line with another workspace field", key)
+		}
+	}
+	return start, end, keyNode.Column - 1, nil
+}
+
+func maxNodeLine(node *yaml.Node) int {
+	maximum := node.Line
+	for _, child := range node.Content {
+		if line := maxNodeLine(child); line > maximum {
+			maximum = line
+		}
+	}
+	return maximum
+}
+
+func onlySpaces(data []byte) bool {
+	for _, b := range data {
+		if b != ' ' {
+			return false
+		}
+	}
+	return true
+}
+
+func renderVerificationField(profile config.VerificationProfile, indent, width int, crlf bool) ([]byte, error) {
+	wrapper := struct {
+		Verification config.VerificationProfile `yaml:"verification"`
+	}{Verification: profile}
+	var encoded bytes.Buffer
+	encoder := yaml.NewEncoder(&encoded)
+	encoder.SetIndent(width)
+	if err := encoder.Encode(wrapper); err != nil {
+		return nil, fmt.Errorf("serialize verification profile: %w", err)
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, fmt.Errorf("close verification profile encoder: %w", err)
+	}
+	prefix := bytes.Repeat([]byte(" "), indent)
+	var output bytes.Buffer
+	for _, line := range bytes.SplitAfter(encoded.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		output.Write(prefix)
+		output.Write(line)
+	}
+	result := output.Bytes()
+	if crlf {
+		result = bytes.ReplaceAll(result, []byte("\n"), []byte("\r\n"))
+	}
+	return result, nil
+}
+
+func usesCRLF(data []byte) bool {
+	return bytes.Contains(data, []byte("\r\n")) && !bytes.Contains(bytes.ReplaceAll(data, []byte("\r\n"), nil), []byte("\n"))
 }
 
 func detectIndent(data []byte) int {

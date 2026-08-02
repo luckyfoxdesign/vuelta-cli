@@ -52,10 +52,10 @@ func NewClient(token string) (*Client, error) {
 
 func newClient(baseURL, token string, client *http.Client) (*Client, error) {
 	if !validBotToken(token) {
-		return nil, errors.New("Telegram bot token format is invalid")
+		return nil, errors.New("telegram bot token format is invalid")
 	}
 	if baseURL == "" || client == nil {
-		return nil, errors.New("Telegram API client configuration is incomplete")
+		return nil, errors.New("telegram API client configuration is incomplete")
 	}
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), token: token, http: client}, nil
 }
@@ -65,8 +65,9 @@ func validBotToken(token string) bool {
 		return false
 	}
 	for _, character := range token {
-		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' || character == ':' || character == '_' || character == '-') {
+		valid := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == ':' || character == '_' || character == '-'
+		if !valid {
 			return false
 		}
 	}
@@ -205,7 +206,7 @@ func (c *Client) SendMessage(
 		return 0, err
 	}
 	if message.ID <= 0 {
-		return 0, errors.New("Telegram returned an invalid message ID")
+		return 0, errors.New("telegram returned an invalid message ID")
 	}
 	return message.ID, nil
 }
@@ -266,11 +267,11 @@ func (c *Client) call(ctx context.Context, method string, payload, result any) e
 		return &APIError{Transport: true}
 	}
 	if len(data) > maxResponseBytes {
-		return errors.New("Telegram response exceeded the size limit")
+		return errors.New("telegram response exceeded the size limit")
 	}
 	var envelope apiResponse[json.RawMessage]
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return errors.New("Telegram returned malformed JSON")
+		return errors.New("telegram returned malformed JSON")
 	}
 	if response.StatusCode >= 300 || !envelope.OK {
 		code := envelope.ErrorCode
@@ -283,7 +284,7 @@ func (c *Client) call(ctx context.Context, method string, payload, result any) e
 		return nil
 	}
 	if err := json.Unmarshal(envelope.Result, result); err != nil {
-		return errors.New("Telegram returned an invalid result")
+		return errors.New("telegram returned an invalid result")
 	}
 	return nil
 }

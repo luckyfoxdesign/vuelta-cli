@@ -25,6 +25,9 @@ func TestSelectScanConfigurationCreatesAndReusesManifestOnlyNPMProjectConfig(t *
 	if selection.Status != "created" || selection.Scope != "project" || !selection.OnboardingChanged || len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Path != project {
 		t.Fatalf("selection/config = %#v %#v", selection, cfg)
 	}
+	if cfg.Workspaces[0].Verification.State != config.VerificationScanOnly {
+		t.Fatalf("onboarding verification state = %q, want scan_only", cfg.Workspaces[0].Verification.State)
+	}
 	if strings.Join(selection.DetectedStacks, ",") != config.StackNode {
 		t.Fatalf("created detected stacks = %#v, want [%s]", selection.DetectedStacks, config.StackNode)
 	}

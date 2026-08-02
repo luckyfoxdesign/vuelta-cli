@@ -91,16 +91,16 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 func (b *Bridge) validate() error {
 	if b.Store == nil || b.Client == nil {
-		return errors.New("Telegram bridge dependencies are incomplete")
+		return errors.New("telegram bridge dependencies are incomplete")
 	}
 	if b.Config.ChatID == 0 || b.Config.UserID <= 0 {
-		return errors.New("Telegram bridge requires exact chat and user IDs")
+		return errors.New("telegram bridge requires exact chat and user IDs")
 	}
 	if b.Config.Consumer == "" {
 		b.Config.Consumer = "telegram-primary"
 	}
 	if b.Config.LeaseOwner == "" {
-		return errors.New("Telegram bridge lease owner is required")
+		return errors.New("telegram bridge lease owner is required")
 	}
 	if b.Config.PollTimeout <= 0 || b.Config.PollTimeout > 25*time.Second {
 		b.Config.PollTimeout = 10 * time.Second
@@ -465,8 +465,9 @@ func validOpaqueID(value string) bool {
 		return false
 	}
 	for _, character := range value {
-		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' || character == '-' || character == '_') {
+		valid := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '-' || character == '_'
+		if !valid {
 			return false
 		}
 	}

@@ -40,6 +40,13 @@ func LoadProject(path string) (*ProjectConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseProject(data, path)
+}
+
+// ParseProject decodes and validates project policy bytes as if they were
+// loaded from path. Callers that plan an atomic edit use this to validate the
+// exact source bytes captured by the edit plan.
+func ParseProject(data []byte, path string) (*ProjectConfig, error) {
 	var project ProjectConfig
 	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
 	decoder.KnownFields(true)
