@@ -86,6 +86,38 @@ func TestProjectVerifyInitDigestFailureLeavesNoFile(t *testing.T) {
 	}
 }
 
+func TestProjectVerifyInitRefreshImageUpdatesExistingPin(t *testing.T) {
+	previous := resolveVerifyDigest
+	t.Cleanup(func() { resolveVerifyDigest = previous })
+	resolveVerifyDigest = func(context.Context, string) (string, error) {
+		return "sha256:" + strings.Repeat("1", 64), nil
+	}
+	project := writeVerifyFixtureProject(t)
+	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+		t.Fatal(err)
+	}
+	resolveVerifyDigest = func(context.Context, string) (string, error) {
+		return "sha256:" + strings.Repeat("2", 64), nil
+	}
+	if err := run([]string{"project", "verify", "init", "--directory", project, "--refresh-image"}); err != nil {
+		t.Fatalf("refresh image: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(project, "compose.verify.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "sha256:"+strings.Repeat("1", 64)) || !strings.Contains(string(data), "sha256:"+strings.Repeat("2", 64)) {
+		t.Fatalf("refreshed compose has the wrong digest:\n%s", data)
+	}
+}
+
+func TestProjectVerifyInitRefreshImageRejectsScript(t *testing.T) {
+	err := run([]string{"project", "verify", "init", "--refresh-image", "--script", "build"})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("refresh/script error = %v", err)
+	}
+}
+
 func onboardVerifyProject(t *testing.T) (string, string) {
 	t.Helper()
 	project := writeVerifyFixtureProject(t)

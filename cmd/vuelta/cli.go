@@ -162,14 +162,15 @@ var commandDefinitions = []commandDefinition{
 		examples:    []string{"vuelta project verify init", "vuelta project verify approve --yes"},
 	},
 	{
-		path: []string{"project", "verify", "init"}, usage: "vuelta project verify init [--directory PATH] [--script NAME]",
-		description: "generate compose.verify.yml from detected project metadata",
-		examples:    []string{"vuelta project verify init", "vuelta project verify init --script build"},
+		path: []string{"project", "verify", "init"}, usage: "vuelta project verify init [--directory PATH] [--script NAME] [--refresh-image]",
+		description: "generate compose.verify.yml or explicitly refresh its base image digest",
+		examples:    []string{"vuelta project verify init", "vuelta project verify init --script build", "vuelta project verify init --refresh-image"},
 		options: []optionDefinition{
 			{names: []string{"--directory"}, valueName: "PATH", description: "project root to generate compose.verify.yml for (default: .)"},
 			{names: []string{"--script"}, valueName: "NAME", description: "explicit package.json script name (overrides automatic detection)"},
+			{names: []string{"--refresh-image"}, description: "atomically refresh only the existing validated verification image digest"},
 		},
-		security: []string{"Writes only compose.verify.yml; it never touches .vuelta.yaml or the machine config, and never overwrites an existing file. The rendered service is re-validated through the same fail-closed Compose policy used before a real verification run, and the base image is always digest-pinned."},
+		security: []string{"Writes only compose.verify.yml; it never touches .vuelta.yaml or the machine config. Normal initialization never overwrites an existing file. --refresh-image changes only the uniquely identified image digest after validating both the existing and resulting Compose models. The base image is always digest-pinned."},
 		handler:  "project verify init",
 	},
 	{

@@ -47,6 +47,7 @@ const (
 
 	defaultProjectScanTimeout = 4 * time.Minute
 	maxProjectScanTimeout     = time.Hour
+	verifyDigestCheckTimeout  = 30 * time.Second
 )
 
 const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gitignore; review and commit the versioned files, then repeat the scan before updating"
@@ -54,6 +55,8 @@ const onboardingChangedWarning = "project onboarding changed .vuelta.yaml or .gi
 var startScanCleanupGuardian = runlease.StartGuardian
 
 var errProjectScanDeadline = errors.New("project scan deadline exceeded")
+
+var verifyDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type scanTarget struct {
 	workspace         *config.Workspace
@@ -109,6 +112,17 @@ type imageScanRecord struct {
 	BaseImageOnly       bool        `json:"base_image_only,omitempty"`
 	OSPackagesInstalled bool        `json:"os_packages_installed,omitempty"`
 	Drift               *imageDrift `json:"drift,omitempty"`
+}
+
+// verificationImageWarning is a non-fatal, actionable scan finding for the
+// digest-pinned base image used by compose.verify.yml.
+type verificationImageWarning struct {
+	Code           string `json:"code"`
+	Reference      string `json:"reference"`
+	PinnedDigest   string `json:"pinned_digest"`
+	CurrentDigest  string `json:"current_digest"`
+	RefreshCommand string `json:"refresh_command"`
+	Message        string `json:"message"`
 }
 
 // stageStatus is the outcome of one independent, observable scan stage.
@@ -179,6 +193,7 @@ type scanResult struct {
 	Diagnostics           []updater.ScanDiagnostic   `json:"diagnostics"`
 	Capabilities          []scanCapability           `json:"capabilities"`
 	ImageScans            []imageScanRecord          `json:"image_scans"`
+	VerificationImage     *verificationImageWarning  `json:"verification_image_warning,omitempty"`
 	Error                 *jsonCommandError          `json:"error,omitempty"`
 	StartedAt             time.Time                  `json:"-"`
 	CompletedAt           time.Time                  `json:"-"`
@@ -918,15 +933,42 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 			progress.stop()
 			return prepared, err
 		},
+		resolveVerifyDigest: updater.ResolveDigestViaManifest,
 	})
 }
 
 type scanStageRunners struct {
-	vulnerabilities  func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
-	alerts           func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
-	packages         func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
-	prepareToolchain func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
-	candidateTimeout time.Duration
+	vulnerabilities     func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
+	alerts              func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
+	packages            func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error)
+	prepareToolchain    func(context.Context, config.Config, config.Workspace) (toolchain.Prepared, error)
+	resolveVerifyDigest updater.DigestResolver
+	candidateTimeout    time.Duration
+}
+
+func checkVerificationImage(ctx context.Context, root, refreshCommand string, resolve updater.DigestResolver) *verificationImageWarning {
+	if resolve == nil {
+		return nil
+	}
+	pin, err := configinit.ReadVerifyImagePin(root)
+	if err != nil {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, verifyDigestCheckTimeout)
+	defer cancel()
+	current, err := resolve(checkCtx, pin.Reference)
+	if err != nil || !verifyDigestPattern.MatchString(current) || current == pin.Digest {
+		return nil
+	}
+	message := fmt.Sprintf(
+		"verification base image %s is stale: pinned %s, current tag digest %s; refresh it with %s",
+		pin.Reference, pin.Digest, current, refreshCommand,
+	)
+	return &verificationImageWarning{
+		Code: "verification_base_image_stale", Reference: pin.Reference,
+		PinnedDigest: pin.Digest, CurrentDigest: current,
+		RefreshCommand: refreshCommand, Message: message,
+	}
 }
 
 func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions, policy config.LocalPackagePolicy, policyIdentity updatesnapshot.PolicyIdentity, minAge time.Duration, runners scanStageRunners) scanResult {
@@ -970,6 +1012,13 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 				Status: config.VerificationScanOnly, Reason: "verification_profile_scan_only",
 			}
 			result.Warnings = append(result.Warnings, "updates and update --dry-run are disabled until a ready verification profile is configured")
+		}
+	}
+	if target.dockerErr == nil {
+		refreshCommand := displayCommand("project", "verify", "init", "--directory", target.path, "--refresh-image")
+		result.VerificationImage = checkVerificationImage(ctx, target.path, refreshCommand, runners.resolveVerifyDigest)
+		if result.VerificationImage != nil {
+			result.Warnings = appendUniqueStrings(result.Warnings, result.VerificationImage.Message)
 		}
 	}
 	gitAvailable := projectHasGitMetadata(target.path)
@@ -2260,6 +2309,10 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 			if imageScan.Drift != nil {
 				fmt.Printf("Note: base image drift for %s: previously %s, now %s.\n", imageScan.Reference, imageScan.Drift.PreviousDigest, imageScan.Drift.CurrentDigest)
 			}
+		}
+		if result.VerificationImage != nil && !warned[result.VerificationImage.Message] {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", result.VerificationImage.Message)
+			warned[result.VerificationImage.Message] = true
 		}
 		for _, diagnostic := range result.Diagnostics {
 			fmt.Fprintf(os.Stderr, "Issue: %s:%d [%s] %s\n", diagnostic.File, diagnostic.Line, diagnostic.Code, diagnostic.Message)

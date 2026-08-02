@@ -1,7 +1,9 @@
 package configinit
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,7 +26,26 @@ const (
 	VerifyCPUs      = "1"
 	VerifyMemLimit  = "1g"
 	VerifyPidsLimit = 256
+
+	verifyComposeFilename    = "compose.verify.yml"
+	verifyComposeServiceName = "verify"
 )
+
+// VerifyImagePin is the validated tag and digest pair used by the generated
+// verification service.
+type VerifyImagePin struct {
+	Reference string
+	Digest    string
+}
+
+// VerifyImageRefresh reports the explicit refresh operation's outcome.
+type VerifyImageRefresh struct {
+	Path           string
+	Reference      string
+	PreviousDigest string
+	CurrentDigest  string
+	Changed        bool
+}
 
 // verifyComposeDoc is the plain Compose document written to disk. It is a
 // distinct, minimal type from testrunner's validated model: the generator
@@ -36,21 +57,21 @@ type verifyComposeDoc struct {
 }
 
 type verifyComposeService struct {
-	Image       string                 `yaml:"image"`
-	Platform    string                 `yaml:"platform,omitempty"`
-	User        string                 `yaml:"user"`
-	ReadOnly    bool                   `yaml:"read_only"`
-	WorkingDir  string                 `yaml:"working_dir"`
-	Environment map[string]string      `yaml:"environment"`
-	Volumes     []verifyComposeVolume  `yaml:"volumes"`
-	Tmpfs       []string               `yaml:"tmpfs"`
-	CapDrop     []string               `yaml:"cap_drop"`
-	SecurityOpt []string               `yaml:"security_opt"`
-	CPUs        string                 `yaml:"cpus"`
-	MemLimit    string                 `yaml:"mem_limit"`
-	PidsLimit   int                    `yaml:"pids_limit"`
-	Networks    []string               `yaml:"networks"`
-	Command     []string               `yaml:"command"`
+	Image       string                `yaml:"image"`
+	Platform    string                `yaml:"platform,omitempty"`
+	User        string                `yaml:"user"`
+	ReadOnly    bool                  `yaml:"read_only"`
+	WorkingDir  string                `yaml:"working_dir"`
+	Environment map[string]string     `yaml:"environment"`
+	Volumes     []verifyComposeVolume `yaml:"volumes"`
+	Tmpfs       []string              `yaml:"tmpfs"`
+	CapDrop     []string              `yaml:"cap_drop"`
+	SecurityOpt []string              `yaml:"security_opt"`
+	CPUs        string                `yaml:"cpus"`
+	MemLimit    string                `yaml:"mem_limit"`
+	PidsLimit   int                   `yaml:"pids_limit"`
+	Networks    []string              `yaml:"networks"`
+	Command     []string              `yaml:"command"`
 }
 
 type verifyComposeVolume struct {
@@ -112,7 +133,7 @@ func GenerateVerifyCompose(ctx context.Context, root, scriptOverride string, res
 
 	doc := verifyComposeDoc{
 		Services: map[string]verifyComposeService{
-			"verify": {
+			verifyComposeServiceName: {
 				Image: baseImage + "@" + digest, Platform: spec.Platform, User: spec.User, ReadOnly: true,
 				WorkingDir:  "/workspace",
 				Environment: envProvider.VerificationEnvironment(),
@@ -146,7 +167,7 @@ func WriteVerifyCompose(ctx context.Context, root, scriptOverride string, resolv
 	if err != nil {
 		return "", "", fmt.Errorf("resolve project path: %w", err)
 	}
-	target := filepath.Join(absRoot, "compose.verify.yml")
+	target := filepath.Join(absRoot, verifyComposeFilename)
 	if _, statErr := os.Lstat(target); statErr == nil {
 		return "", "", fmt.Errorf("%s already exists; refusing to overwrite", target)
 	} else if !os.IsNotExist(statErr) {
@@ -164,6 +185,74 @@ func WriteVerifyCompose(ctx context.Context, root, scriptOverride string, resolv
 		return "", "", err
 	}
 	return target, scriptName, nil
+}
+
+// ReadVerifyImagePin extracts the verification service image from
+// testrunner's validated Compose model rather than independently parsing the
+// repository YAML.
+func ReadVerifyImagePin(root string) (VerifyImagePin, error) {
+	image, err := testrunner.ValidatedComposeServiceImage(root, verifyComposeFilename, verifyComposeServiceName)
+	if err != nil {
+		return VerifyImagePin{}, err
+	}
+	separator := strings.LastIndex(image, "@sha256:")
+	if separator <= 0 {
+		return VerifyImagePin{}, fmt.Errorf("verification image is not pinned by digest")
+	}
+	return VerifyImagePin{Reference: image[:separator], Digest: image[separator+1:]}, nil
+}
+
+// RefreshVerifyComposeImage resolves the current digest for the validated
+// verification image tag and atomically changes only that exact image scalar.
+// It never regenerates the Compose document or changes project configuration.
+func RefreshVerifyComposeImage(ctx context.Context, root string, resolve updater.DigestResolver) (VerifyImageRefresh, error) {
+	if resolve == nil {
+		return VerifyImageRefresh{}, errors.New("verification image digest resolver is required")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("resolve project path: %w", err)
+	}
+	absRoot, err = filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("resolve project path: %w", err)
+	}
+	pin, err := ReadVerifyImagePin(absRoot)
+	if err != nil {
+		return VerifyImageRefresh{}, err
+	}
+	current, err := resolve(ctx, pin.Reference)
+	if err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("resolve digest for %s: %w", pin.Reference, err)
+	}
+	target := filepath.Join(absRoot, verifyComposeFilename)
+	result := VerifyImageRefresh{
+		Path: target, Reference: pin.Reference, PreviousDigest: pin.Digest, CurrentDigest: current,
+	}
+	if current == pin.Digest {
+		return result, nil
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("read %s: %w", target, err)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("inspect %s: %w", target, err)
+	}
+	oldImage := []byte(pin.Reference + "@" + pin.Digest)
+	if bytes.Count(data, oldImage) != 1 {
+		return VerifyImageRefresh{}, errors.New("verification image scalar is not uniquely identifiable; no file was changed")
+	}
+	updated := bytes.Replace(data, oldImage, []byte(pin.Reference+"@"+current), 1)
+	if err := validateGeneratedCompose(absRoot, updated); err != nil {
+		return VerifyImageRefresh{}, fmt.Errorf("refreshed compose.verify.yml failed policy validation: %w", err)
+	}
+	if err := replaceAtomic(target, updated, info.Mode().Perm()); err != nil {
+		return VerifyImageRefresh{}, err
+	}
+	result.Changed = true
+	return result, nil
 }
 
 // validateGeneratedCompose re-parses the rendered document through the exact

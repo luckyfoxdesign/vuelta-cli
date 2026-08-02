@@ -1,6 +1,7 @@
 package configinit
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -246,5 +247,77 @@ func TestWriteVerifyComposeRoundTripsThroughValidator(t *testing.T) {
 		if strings.HasPrefix(name, ".compose.verify.yml.check-") {
 			t.Fatalf("validation temp file %q was not cleaned up", name)
 		}
+	}
+}
+
+func TestRefreshVerifyComposeImageChangesOnlyPinnedDigest(t *testing.T) {
+	project := npmVerifyProject(t, "24", `{"build":"tsc"}`)
+	path, _, err := WriteVerifyCompose(context.Background(), project, "", fakeDigestResolver(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte("# retained comment\n"), generated...)
+	if err := os.WriteFile(path, before, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	current := "sha256:" + strings.Repeat("2", 64)
+	result, err := RefreshVerifyComposeImage(context.Background(), project, func(_ context.Context, ref string) (string, error) {
+		if ref != "node:24-bookworm-slim" {
+			t.Fatalf("resolved reference = %q", ref)
+		}
+		return current, nil
+	})
+	if err != nil {
+		t.Fatalf("RefreshVerifyComposeImage: %v", err)
+	}
+	if !result.Changed || result.PreviousDigest == result.CurrentDigest || result.CurrentDigest != current {
+		t.Fatalf("refresh result = %#v", result)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(string(before), "sha256:"+strings.Repeat("1", 64), current, 1)
+	if string(after) != want {
+		t.Fatalf("refresh changed more than the digest:\n%s", after)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("mode = %o, want 640", info.Mode().Perm())
+	}
+}
+
+func TestRefreshVerifyComposeImageFailureWritesNothing(t *testing.T) {
+	project := npmVerifyProject(t, "24", `{"build":"tsc"}`)
+	path, _, err := WriteVerifyCompose(context.Background(), project, "", fakeDigestResolver(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RefreshVerifyComposeImage(context.Background(), project, func(context.Context, string) (string, error) {
+		return "", errors.New("registry unavailable")
+	})
+	if err == nil {
+		t.Fatal("expected registry failure")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("failed refresh modified compose.verify.yml")
 	}
 }

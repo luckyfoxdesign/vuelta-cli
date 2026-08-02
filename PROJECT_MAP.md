@@ -43,6 +43,7 @@ docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
 vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint
 vuelta project verify init       # generate hardened compose.verify.yml
+vuelta project verify init --refresh-image # refresh only its pinned base image digest
 vuelta project verify approve    # promote reviewed project verification
 vuelta deploy plan PROJECT     # discover without project writes
 vuelta deploy sync             # build/release/switch every ready workspace

@@ -67,6 +67,7 @@ trap 'rm -f "$tmp"' EXIT
 	printf 'docker compose run --rm build  # go build ./...\n'
 	printf 'vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint\n'
 	printf 'vuelta project verify init       # generate hardened compose.verify.yml\n'
+	printf 'vuelta project verify init --refresh-image # refresh only its pinned base image digest\n'
 	printf 'vuelta project verify approve    # promote reviewed project verification\n'
 	printf 'vuelta deploy plan PROJECT     # discover without project writes\n'
 	printf 'vuelta deploy sync             # build/release/switch every ready workspace\n'

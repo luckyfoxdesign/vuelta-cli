@@ -26,15 +26,31 @@ func runProjectVerifyInit(args []string) error {
 	fs.SetOutput(os.Stderr)
 	directory := fs.String("directory", ".", "project root to generate compose.verify.yml for")
 	scriptName := fs.String("script", "", "explicit package.json script name (overrides automatic detection)")
+	refreshImage := fs.Bool("refresh-image", false, "refresh only the existing verification base image digest")
 	if err := fs.Parse(args); err != nil {
 		return fail(exitConfig, "%v", err)
 	}
 	if len(fs.Args()) != 0 {
-		return fail(exitConfig, "usage: vuelta project verify init [--directory PATH] [--script NAME]")
+		return fail(exitConfig, "usage: vuelta project verify init [--directory PATH] [--script NAME] [--refresh-image]")
+	}
+	if *refreshImage && *scriptName != "" {
+		return fail(exitConfig, "--refresh-image and --script are mutually exclusive")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	if *refreshImage {
+		result, err := configinit.RefreshVerifyComposeImage(ctx, *directory, resolveVerifyDigest)
+		if err != nil {
+			return fail(exitConfig, "%v", err)
+		}
+		if result.Changed {
+			fmt.Printf("refreshed verification image in %s (%s -> %s)\n", result.Path, result.PreviousDigest, result.CurrentDigest)
+		} else {
+			fmt.Printf("verification image is current in %s (%s)\n", result.Path, result.CurrentDigest)
+		}
+		return nil
+	}
 	path, selected, err := configinit.WriteVerifyCompose(ctx, *directory, *scriptName, resolveVerifyDigest)
 	if err != nil {
 		return fail(exitConfig, "%v", err)

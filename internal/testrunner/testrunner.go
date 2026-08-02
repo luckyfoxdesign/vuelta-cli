@@ -246,10 +246,37 @@ func ValidateComposeService(root, composeFile, service string) error {
 	return err
 }
 
+// ValidatedComposeServiceImage returns the selected service image from the
+// same fail-closed model used for verification execution. Callers never need
+// to parse repository-controlled Compose YAML a second time.
+func ValidatedComposeServiceImage(root, composeFile, service string) (string, error) {
+	sandboxRoot, composePath, err := resolveComposeFile(root, composeFile)
+	if err != nil {
+		return "", err
+	}
+	model, err := validatedComposeModel(sandboxRoot, composePath, service)
+	if err != nil {
+		return "", err
+	}
+	return model.Services[service].Image, nil
+}
+
 // validateCompose parses the compose file under the strict allowlist and
 // returns the YAML serialization of the validated model. Everything Docker
 // Compose will execute comes from this serialization.
 func validateCompose(root, composePath, service string) ([]byte, error) {
+	model, err := validatedComposeModel(root, composePath, service)
+	if err != nil {
+		return nil, err
+	}
+	out, err := yaml.Marshal(model)
+	if err != nil {
+		return nil, fmt.Errorf("serialize validated compose model: %w", err)
+	}
+	return out, nil
+}
+
+func validatedComposeModel(root, composePath, service string) (*normalizedFile, error) {
 	if err := checkNoImplicitEnvFile(root); err != nil {
 		return nil, err
 	}
@@ -284,11 +311,7 @@ func validateCompose(root, composePath, service string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := yaml.Marshal(model)
-	if err != nil {
-		return nil, fmt.Errorf("serialize validated compose model: %w", err)
-	}
-	return out, nil
+	return model, nil
 }
 
 // checkNodeSafety rejects YAML features the allowlist cannot reason about:

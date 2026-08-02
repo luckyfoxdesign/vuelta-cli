@@ -162,6 +162,20 @@ func TestValidateComposeAcceptsDigestPinnedMinimalService(t *testing.T) {
 	}
 }
 
+func TestValidatedComposeServiceImageUsesValidatedModel(t *testing.T) {
+	dir := t.TempDir()
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+
+	image, err := ValidatedComposeServiceImage(dir, "docker-compose.test.yml", "test")
+	if err != nil {
+		t.Fatalf("ValidatedComposeServiceImage: %v", err)
+	}
+	want := "golang:1.26-alpine@sha256:" + strings.Repeat("1", 64)
+	if image != want {
+		t.Fatalf("image = %q, want %q", image, want)
+	}
+}
+
 func TestValidateComposePreservesAllowlistedPlatform(t *testing.T) {
 	dir := t.TempDir()
 	compose := strings.Replace(validCompose, "    user:", "    platform: linux/arm64\n    user:", 1)

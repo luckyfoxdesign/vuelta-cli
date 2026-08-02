@@ -1805,3 +1805,106 @@ func TestLoadScanPolicyRecordsCanonicalPathAndHash(t *testing.T) {
 		t.Fatalf("policy = %#v, identity = %#v", policy, identity)
 	}
 }
+
+func writeScanVerifyCompose(t *testing.T, root, digest string) string {
+	t.Helper()
+	path := filepath.Join(root, "compose.verify.yml")
+	content := fmt.Sprintf(`services:
+  verify:
+    image: node:24-bookworm-slim@%s
+    user: "1000:1000"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "1"
+    mem_limit: 1g
+    pids_limit: 256
+    networks: [verification]
+    command: ["npm", "run", "build"]
+networks:
+  verification:
+    internal: true
+`, digest)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCheckVerificationImageMatchingDigestHasNoWarning(t *testing.T) {
+	root := t.TempDir()
+	digest := "sha256:" + strings.Repeat("1", 64)
+	writeScanVerifyCompose(t, root, digest)
+	calls := 0
+	warning := checkVerificationImage(context.Background(), root, "refresh command", func(_ context.Context, ref string) (string, error) {
+		calls++
+		if ref != "node:24-bookworm-slim" {
+			t.Fatalf("reference = %q", ref)
+		}
+		return digest, nil
+	})
+	if warning != nil || calls != 1 {
+		t.Fatalf("warning = %#v, resolver calls = %d", warning, calls)
+	}
+}
+
+func TestCheckVerificationImageDriftIsStructuredVisibleAndReadOnly(t *testing.T) {
+	root := t.TempDir()
+	pinned := "sha256:" + strings.Repeat("1", 64)
+	current := "sha256:" + strings.Repeat("2", 64)
+	path := writeScanVerifyCompose(t, root, pinned)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := "vuelta project verify init --directory " + root + " --refresh-image"
+	warning := checkVerificationImage(context.Background(), root, command, func(context.Context, string) (string, error) {
+		return current, nil
+	})
+	if warning == nil || warning.Code != "verification_base_image_stale" || warning.RefreshCommand != command {
+		t.Fatalf("warning = %#v", warning)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("staleness check modified compose.verify.yml")
+	}
+	result := scanResult{
+		Directory: root, Status: "clean", Timeout: time.Minute.String(),
+		Warnings: []string{warning.Message}, VerificationImage: warning,
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []string{"verification_image_warning", "verification_base_image_stale", "refresh_command", warning.Message} {
+		if !strings.Contains(string(encoded), wanted) {
+			t.Fatalf("JSON result is missing %q: %s", wanted, encoded)
+		}
+	}
+	_, stderr := captureScanOutput(t, func() {
+		writeHumanScanResults([]scanResult{result}, "", false, nil)
+	})
+	if strings.Count(stderr, warning.Message) != 1 {
+		t.Fatalf("text warning count = %d, stderr = %q", strings.Count(stderr, warning.Message), stderr)
+	}
+}
+
+func TestCheckVerificationImageUnavailableRegistryAndMissingFileAreQuiet(t *testing.T) {
+	root := t.TempDir()
+	called := false
+	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string) (string, error) {
+		called = true
+		return "", errors.New("registry unavailable")
+	}); warning != nil || called {
+		t.Fatalf("missing profile warning = %#v, resolver called = %v", warning, called)
+	}
+	writeScanVerifyCompose(t, root, "sha256:"+strings.Repeat("1", 64))
+	if warning := checkVerificationImage(context.Background(), root, "refresh", func(context.Context, string) (string, error) {
+		return "", errors.New("registry unavailable")
+	}); warning != nil {
+		t.Fatalf("registry failure warning = %#v", warning)
+	}
+}
