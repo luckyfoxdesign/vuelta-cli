@@ -156,6 +156,11 @@ workspaces:
     #       compose_file: compose.verify.yml
     #       service: verify
     #       command: ["npm", "test"]
+    #       # Added by `vuelta project verify approve`; exact decoded script
+    #       # whitespace is significant, while package.json formatting is not.
+    #       # A mismatch is reported by scan without creating an update
+    #       # snapshot, and update/test execution remains fail-closed.
+    #       script_body_hash: "sha256:<64-lowercase-hex>"
     #       timeout_seconds: 900
     #       required: true
     #       success_exit_codes: [0]
@@ -163,6 +168,7 @@ workspaces:
     #       compose_file: compose.verify.yml
     #       service: verify
     #       command: ["npm", "run", "build"]
+    #       script_body_hash: "sha256:<64-lowercase-hex>"
     #       timeout_seconds: 1200
     #       required: true
     #       success_exit_codes: [0]

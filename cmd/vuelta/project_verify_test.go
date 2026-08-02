@@ -176,6 +176,9 @@ func TestProjectVerifyApprovePromotesExistingComposeAndPrintsExactPlan(t *testin
 	if promoted.Workspace.Verification.State != config.VerificationReady || len(promoted.Workspace.Verification.Steps) != 1 {
 		t.Fatalf("promoted verification = %#v", promoted.Workspace.Verification)
 	}
+	if !strings.HasPrefix(promoted.Workspace.Verification.Steps[0].ScriptBodyHash, "sha256:") {
+		t.Fatalf("script body was not pinned: %#v", promoted.Workspace.Verification.Steps[0])
+	}
 	afterCompose, err := os.ReadFile(composePath)
 	if err != nil {
 		t.Fatal(err)
@@ -247,15 +250,32 @@ func TestProjectVerifyApproveRejectsInvalidProfileBeforeWrite(t *testing.T) {
 	}
 }
 
-func TestProjectVerifyApproveRejectsAlreadyReadyProfile(t *testing.T) {
-	project, _ := onboardVerifyProject(t)
+func TestProjectVerifyApproveRefreshesReadyProfileAfterSafeScriptDrift(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
 	writeGeneratedVerifyCompose(t, project)
 	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
 		t.Fatal(err)
 	}
-	err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"})
-	if err == nil || !strings.Contains(err.Error(), "already ready") {
-		t.Fatalf("second approval error = %v", err)
+	approved, err := config.LoadProject(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHash := approved.Workspace.Verification.Steps[0].ScriptBodyHash
+	if err := os.WriteFile(filepath.Join(project, "package.json"), []byte(`{"scripts":{"build":"tsc --pretty false"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadProject(projectPath); err == nil || !strings.Contains(err.Error(), "re-approve") {
+		t.Fatalf("ordinary load accepted drift: %v", err)
+	}
+	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
+		t.Fatalf("re-approval failed: %v", err)
+	}
+	refreshed, err := config.LoadProject(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Workspace.Verification.Steps[0].ScriptBodyHash == firstHash {
+		t.Fatal("re-approval did not refresh the script body hash")
 	}
 }
 

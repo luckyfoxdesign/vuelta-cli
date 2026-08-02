@@ -414,6 +414,12 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 	if err != nil {
 		return config.Workspace{}, err
 	}
+	if verification.State == config.VerificationReady {
+		verification, err = config.PinVerificationScriptBodies(d.Root, verification)
+		if err != nil {
+			return config.Workspace{}, fmt.Errorf("pin verification package scripts: %w", err)
+		}
+	}
 	branch, err := chooseOptional("--branch", input.Branch, d.Branches)
 	if err != nil {
 		return config.Workspace{}, err
@@ -526,19 +532,28 @@ func (d Discovery) buildVerification(input Input, stack, manager string) (config
 // selection rules as onboarding, but fails instead of returning scan_only
 // when the project has no verification service to approve.
 func (d Discovery) BuildReadyVerification(workspace config.Workspace, names []string) (config.VerificationProfile, error) {
-	if workspace.Verification.State != config.VerificationScanOnly {
-		return config.VerificationProfile{}, errors.New("project verification profile is already ready")
+	if workspace.Verification.State != config.VerificationScanOnly && workspace.Verification.State != config.VerificationReady {
+		return config.VerificationProfile{}, errors.New("project verification profile must be scan_only or ready")
 	}
 	if d.Root != workspace.Path {
 		return config.VerificationProfile{}, errors.New("verification discovery root does not match the project config root")
 	}
-	profile, err := d.buildVerification(Input{VerificationNames: names}, workspace.Stack, workspace.PackageManager)
-	if err != nil {
-		return config.VerificationProfile{}, err
+	profile := workspace.Verification
+	if workspace.Verification.State == config.VerificationScanOnly || len(names) != 0 {
+		var err error
+		profile, err = d.buildVerification(Input{VerificationNames: names}, workspace.Stack, workspace.PackageManager)
+		if err != nil {
+			return config.VerificationProfile{}, err
+		}
 	}
 	if profile.State != config.VerificationReady {
 		return config.VerificationProfile{}, errors.New("no Compose file declares a verification service; run 'vuelta project verify init' first")
 	}
+	pinned, err := config.PinVerificationScriptBodies(workspace.Path, profile)
+	if err != nil {
+		return config.VerificationProfile{}, fmt.Errorf("pin verification package scripts: %w", err)
+	}
+	profile = pinned
 	workspace.Verification = profile
 	if err := config.ValidateWorkspace(workspace); err != nil {
 		return config.VerificationProfile{}, fmt.Errorf("validate approved project workspace: %w", err)

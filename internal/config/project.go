@@ -43,10 +43,31 @@ func LoadProject(path string) (*ProjectConfig, error) {
 	return ParseProject(data, path)
 }
 
+// LoadProjectForVerificationApproval applies every project-policy check except
+// the script-body equality check which the approval flow exists to refresh.
+// Unsafe, missing, or malformed scripts and malformed stored hashes still fail.
+func LoadProjectForVerificationApproval(path string) (*ProjectConfig, error) {
+	data, err := ReadProjectFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseProjectForVerificationApproval(data, path)
+}
+
 // ParseProject decodes and validates project policy bytes as if they were
 // loaded from path. Callers that plan an atomic edit use this to validate the
 // exact source bytes captured by the edit plan.
 func ParseProject(data []byte, path string) (*ProjectConfig, error) {
+	return parseProject(data, path, false)
+}
+
+// ParseProjectForVerificationApproval is the byte-oriented counterpart of
+// LoadProjectForVerificationApproval for atomic edit planning.
+func ParseProjectForVerificationApproval(data []byte, path string) (*ProjectConfig, error) {
+	return parseProject(data, path, true)
+}
+
+func parseProject(data []byte, path string, allowScriptDrift bool) (*ProjectConfig, error) {
 	var project ProjectConfig
 	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
 	decoder.KnownFields(true)
@@ -66,7 +87,7 @@ func ParseProject(data []byte, path string) (*ProjectConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateWorkspace(resolved); err != nil {
+	if err := errors.Join(validateWorkspaceWithOptions(0, resolved, allowScriptDrift)...); err != nil {
 		return nil, fmt.Errorf("validate project config %s: %w", path, err)
 	}
 	return &project, nil

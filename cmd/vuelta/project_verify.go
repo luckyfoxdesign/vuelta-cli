@@ -78,16 +78,13 @@ func runProjectVerifyApprove(args []string) error {
 	}
 
 	projectPath := filepath.Join(*directory, projectConfigName)
-	project, err := config.LoadProject(projectPath)
+	project, err := config.LoadProjectForVerificationApproval(projectPath)
 	if err != nil {
 		return fail(exitConfig, "%v", err)
 	}
 	workspace, err := project.ResolvedWorkspace(projectPath)
 	if err != nil {
 		return fail(exitConfig, "%v", err)
-	}
-	if workspace.Verification.State != config.VerificationScanOnly {
-		return fail(exitConfig, "project verification profile is already ready")
 	}
 	discovery, err := configinit.Detect(workspace.Path)
 	if err != nil {

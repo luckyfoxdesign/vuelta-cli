@@ -291,6 +291,52 @@ func TestRunProfileExecutesMultipleRequiredSteps(t *testing.T) {
 	}
 }
 
+func TestRunProfileRejectsScriptDriftBeforeDocker(t *testing.T) {
+	dir := t.TempDir()
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+	packagePath := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	step := verificationStep("docker-compose.test.yml", "test")
+	step.Command = []string{"npm", "test"}
+	profile, err := config.PinVerificationScriptBodies(dir, config.VerificationProfile{
+		Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{step},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"test":"node verify-project.js"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "docker-invoked")
+	docker := installDockerInvocationMarker(t, marker)
+	_, err = RunProfileWithDocker(context.Background(), docker, dir, profile)
+	if err == nil || !strings.Contains(err.Error(), "re-approve") {
+		t.Fatalf("script drift error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatal("Docker was invoked before script drift was rejected")
+	}
+}
+
+func TestRunProfileAllowsLegacyPackageScriptWithoutHash(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	dir := t.TempDir()
+	writeCompose(t, dir, "docker-compose.test.yml", validCompose)
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	step := verificationStep("docker-compose.test.yml", "test")
+	step.Command = []string{"npm", "test"}
+	result, err := RunProfileWithDocker(context.Background(), docker, dir, config.VerificationProfile{
+		Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{step},
+	})
+	if err != nil || !result.Passed {
+		t.Fatalf("legacy package profile failed: result=%+v err=%v", result, err)
+	}
+}
+
 func TestRunRejectsPrivileged(t *testing.T) {
 	dir := t.TempDir()
 	writeCompose(t, dir, "docker-compose.test.yml", `

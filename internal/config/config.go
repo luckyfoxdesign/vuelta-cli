@@ -232,6 +232,7 @@ type VerificationStep struct {
 	ComposeFile      string   `yaml:"compose_file"`
 	Service          string   `yaml:"service"`
 	Command          []string `yaml:"command"`
+	ScriptBodyHash   string   `yaml:"script_body_hash,omitempty"`
 	TimeoutSeconds   int      `yaml:"timeout_seconds"`
 	Required         bool     `yaml:"required"`
 	SuccessExitCodes []int    `yaml:"success_exit_codes"`
@@ -407,6 +408,14 @@ func (c *Config) WorkspaceWarnings() []string {
 		}
 		if ws.Verification.State == VerificationScanOnly {
 			warnings = append(warnings, fmt.Sprintf("project %q is scan-only; configure verification.steps before running update or update --dry-run", WorkspaceName(ws)))
+		}
+		for _, step := range ws.Verification.Steps {
+			if step.ScriptBodyHash != "" {
+				continue
+			}
+			if _, ok, err := packageVerificationScriptName(step.Command); err == nil && ok {
+				warnings = append(warnings, fmt.Sprintf("project %q verification step %q has no script_body_hash; legacy profile remains allowed, run `vuelta project verify approve --directory PATH --yes` to pin it", WorkspaceName(ws), step.Name))
+			}
 		}
 	}
 	return warnings
@@ -827,6 +836,10 @@ func severityRank(value string) int {
 }
 
 func validateWorkspace(i int, ws Workspace) []error {
+	return validateWorkspaceWithOptions(i, ws, false)
+}
+
+func validateWorkspaceWithOptions(i int, ws Workspace, allowScriptDrift bool) []error {
 	var errs []error
 	label := fmt.Sprintf("workspaces[%d]", i)
 	if ws.Name != "" && !projectNamePattern.MatchString(ws.Name) {
@@ -887,7 +900,7 @@ func validateWorkspace(i int, ws Workspace) []error {
 		}
 	}
 
-	errs = append(errs, validateVerificationProfile(label, ws)...)
+	errs = append(errs, validateVerificationProfileWithOptions(label, ws, allowScriptDrift)...)
 
 	if ws.Stack == StackDocker && ws.DockerImages == nil {
 		errs = append(errs, fmt.Errorf("%s.docker_images: required for docker stack CVE scanning", label))
@@ -907,7 +920,7 @@ func validateWorkspace(i int, ws Workspace) []error {
 	return errs
 }
 
-func validateVerificationProfile(label string, ws Workspace) []error {
+func validateVerificationProfileWithOptions(label string, ws Workspace, allowScriptDrift bool) []error {
 	profile := ws.Verification
 	var errs []error
 	if profile.Version != VerificationVersion {
@@ -948,8 +961,8 @@ func validateVerificationProfile(label string, ws Workspace) []error {
 				errs = append(errs, fmt.Errorf("%s.command: package factory %q does not match workspace package_manager %q", stepLabel, step.Command[0], ws.PackageManager))
 			}
 		}
-		if err := validatePackageVerificationCommand(ws.Path, step.Command); err != nil {
-			errs = append(errs, fmt.Errorf("%s.command: %w", stepLabel, err))
+		if err := validatePackageVerificationStep(ws.Path, step, allowScriptDrift); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", stepLabel, err))
 		}
 		if step.TimeoutSeconds <= 0 || step.TimeoutSeconds > int((2*time.Hour)/time.Second) {
 			errs = append(errs, fmt.Errorf("%s.timeout_seconds: must be between 1 and 7200", stepLabel))
@@ -1000,13 +1013,26 @@ func ValidateVerificationCommand(command []string) error {
 }
 
 func validatePackageVerificationCommand(root string, command []string) error {
+	_, _, err := resolvePackageVerificationScript(root, command)
+	return err
+}
+
+const verificationScriptHashPrefix = "sha256:"
+
+var verificationScriptHashPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+type resolvedPackageVerificationScript struct {
+	Body string
+}
+
+func packageVerificationScriptName(command []string) (string, bool, error) {
 	if len(command) == 0 {
-		return nil
+		return "", false, nil
 	}
 	script := ""
 	registry, err := catalog.New()
 	if err != nil {
-		return fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+		return "", false, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
 	}
 	for _, adapter := range registry.Adapters() {
 		provider, ok := adapter.(ecosystem.VerificationProvider)
@@ -1015,35 +1041,102 @@ func validatePackageVerificationCommand(root string, command []string) error {
 		}
 		if detected, ok := provider.VerificationScript(command); ok {
 			if script != "" {
-				return errors.New("package verification factory is ambiguous")
+				return "", false, errors.New("package verification factory is ambiguous")
 			}
 			script = detected
 		}
 	}
 	if script == "" {
-		return nil
+		return "", false, nil
+	}
+	return script, true, nil
+}
+
+func resolvePackageVerificationScript(root string, command []string) (resolvedPackageVerificationScript, bool, error) {
+	script, mapped, err := packageVerificationScriptName(command)
+	if err != nil || !mapped {
+		return resolvedPackageVerificationScript{}, false, err
 	}
 	path := filepath.Join(root, "package.json")
 	info, err := os.Lstat(path)
 	if err != nil {
-		return errors.New("package.json is required for the selected package verification factory")
+		return resolvedPackageVerificationScript{}, false, errors.New("package.json is required for the selected package verification factory")
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("package.json must be a non-symlink regular file")
+		return resolvedPackageVerificationScript{}, false, errors.New("package.json must be a non-symlink regular file")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read package verification metadata: %w", err)
+		return resolvedPackageVerificationScript{}, false, fmt.Errorf("read package verification metadata: %w", err)
 	}
 	var document struct {
 		Scripts map[string]string `json:"scripts"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
-		return fmt.Errorf("parse package verification metadata: %w", err)
+		return resolvedPackageVerificationScript{}, false, fmt.Errorf("parse package verification metadata: %w", err)
 	}
 	body, ok := document.Scripts[script]
 	if !ok || !safePackageVerificationScript(body) {
-		return fmt.Errorf("package script %q is missing or contains shell, dev, preview, watch, or interactive behavior", script)
+		return resolvedPackageVerificationScript{}, false, fmt.Errorf("package script %q is missing or contains shell, dev, preview, watch, or interactive behavior", script)
+	}
+	return resolvedPackageVerificationScript{Body: body}, true, nil
+}
+
+func verificationScriptBodyHash(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return verificationScriptHashPrefix + fmt.Sprintf("%x", sum)
+}
+
+func validatePackageVerificationStep(root string, step VerificationStep, allowScriptDrift bool) error {
+	resolved, mapped, err := resolvePackageVerificationScript(root, step.Command)
+	if err != nil {
+		return fmt.Errorf("command: %w", err)
+	}
+	if !mapped {
+		if step.ScriptBodyHash != "" {
+			return errors.New("script_body_hash: only package manifest scripts may have a body hash")
+		}
+		return nil
+	}
+	if step.ScriptBodyHash == "" {
+		return nil
+	}
+	if !verificationScriptHashPattern.MatchString(step.ScriptBodyHash) {
+		return errors.New("script_body_hash: must use sha256:<64 lowercase hex> format")
+	}
+	if !allowScriptDrift && step.ScriptBodyHash != verificationScriptBodyHash(resolved.Body) {
+		return fmt.Errorf("script_body_hash: approved package script changed for verification step %q; run `vuelta project verify approve --directory PATH --yes` to re-approve it", step.Name)
+	}
+	return nil
+}
+
+// PinVerificationScriptBodies records the exact decoded package.json script
+// string for each manifest-backed verification step. JSON formatting outside
+// the string is ignored; every byte inside the decoded script is significant.
+func PinVerificationScriptBodies(root string, profile VerificationProfile) (VerificationProfile, error) {
+	pinned := profile
+	pinned.Steps = append([]VerificationStep(nil), profile.Steps...)
+	for index := range pinned.Steps {
+		resolved, mapped, err := resolvePackageVerificationScript(root, pinned.Steps[index].Command)
+		if err != nil {
+			return VerificationProfile{}, fmt.Errorf("verification step %q: %w", pinned.Steps[index].Name, err)
+		}
+		if !mapped {
+			pinned.Steps[index].ScriptBodyHash = ""
+			continue
+		}
+		pinned.Steps[index].ScriptBodyHash = verificationScriptBodyHash(resolved.Body)
+	}
+	return pinned, nil
+}
+
+// ValidateVerificationScriptBodies rejects a changed approved package script.
+// Legacy steps without a hash and steps not backed by a manifest remain valid.
+func ValidateVerificationScriptBodies(root string, profile VerificationProfile) error {
+	for _, step := range profile.Steps {
+		if err := validatePackageVerificationStep(root, step, false); err != nil {
+			return fmt.Errorf("verification step %q: %w", step.Name, err)
+		}
 	}
 	return nil
 }

@@ -51,6 +51,9 @@ func ValidateProfile(workDir string, profile config.VerificationProfile) error {
 	if profile.Version != config.VerificationVersion || profile.State != config.VerificationReady || len(profile.Steps) == 0 || len(profile.Steps) > 16 {
 		return errors.New("verification profile is not ready for update")
 	}
+	if err := config.ValidateVerificationScriptBodies(workDir, profile); err != nil {
+		return err
+	}
 	for _, step := range profile.Steps {
 		if step.TimeoutSeconds <= 0 || step.TimeoutSeconds > 7200 {
 			return fmt.Errorf("verification step %q: timeout must be between 1 and 7200 seconds", step.Name)

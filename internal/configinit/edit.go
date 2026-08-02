@@ -272,12 +272,12 @@ func PlanProjectVerificationUpdate(path string, profile config.VerificationProfi
 	if !exists {
 		return EditPlan{}, fmt.Errorf("project config %s does not exist; run 'vuelta scan --directory .' first", path)
 	}
-	project, err := config.ParseProject(original, path)
+	project, err := config.ParseProjectForVerificationApproval(original, path)
 	if err != nil {
 		return EditPlan{}, err
 	}
-	if project.Workspace.Verification.State != config.VerificationScanOnly {
-		return EditPlan{}, errors.New("project verification profile is already ready")
+	if project.Workspace.Verification.State != config.VerificationScanOnly && project.Workspace.Verification.State != config.VerificationReady {
+		return EditPlan{}, errors.New("project verification profile must be scan_only or ready")
 	}
 	project.Workspace.Verification = profile
 	workspace, err := project.ResolvedWorkspace(path)

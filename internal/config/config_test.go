@@ -270,6 +270,116 @@ func TestPackageVerificationCommandRejectsScriptDriftToWatch(t *testing.T) {
 	}
 }
 
+func TestVerificationScriptBodyPinRejectsSafeDriftWithoutDisclosingBody(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	approvedBody := "vitest run"
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"`+approvedBody+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
+		Name: "test", Command: []string{"npm", "test"},
+	}}}
+	pinned, err := PinVerificationScriptBodies(dir, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verificationScriptHashPattern.MatchString(pinned.Steps[0].ScriptBodyHash) {
+		t.Fatalf("script body hash = %q", pinned.Steps[0].ScriptBodyHash)
+	}
+	if err := ValidateVerificationScriptBodies(dir, pinned); err != nil {
+		t.Fatalf("unchanged script rejected: %v", err)
+	}
+
+	replacementBody := "node verify-project.js"
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"`+replacementBody+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = ValidateVerificationScriptBodies(dir, pinned)
+	if err == nil || !strings.Contains(err.Error(), `verification step "test"`) || !strings.Contains(err.Error(), "re-approve") {
+		t.Fatalf("safe script drift error = %v", err)
+	}
+	if strings.Contains(err.Error(), approvedBody) || strings.Contains(err.Error(), replacementBody) {
+		t.Fatalf("script body leaked in drift error: %v", err)
+	}
+}
+
+func TestVerificationScriptBodyPinClassifiesWhitespaceDeliberately(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := PinVerificationScriptBodies(dir, VerificationProfile{Steps: []VerificationStep{{
+		Name: "test", Command: []string{"npm", "test"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{\n  \"scripts\": { \"test\": \"vitest run\" }\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateVerificationScriptBodies(dir, profile); err != nil {
+		t.Fatalf("package.json formatting-only change rejected: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"vitest  run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateVerificationScriptBodies(dir, profile); err == nil {
+		t.Fatal("whitespace inside the decoded script body did not cause drift")
+	}
+}
+
+func TestVerificationScriptBodyPinLegacyAndNonPackageStepsRemainValid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
+		Name: "test", Command: []string{"npm", "test"},
+	}}}
+	if err := ValidateVerificationScriptBodies(dir, legacy); err != nil {
+		t.Fatalf("legacy profile rejected: %v", err)
+	}
+	warnings := (&Config{Workspaces: []Workspace{{Name: "example", Verification: legacy}}}).WorkspaceWarnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "legacy profile remains allowed") {
+		t.Fatalf("legacy warnings = %v", warnings)
+	}
+
+	nonPackage := VerificationProfile{Steps: []VerificationStep{{Name: "go-test", Command: []string{"go", "test", "./..."}}}}
+	pinned, err := PinVerificationScriptBodies(dir, nonPackage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned.Steps[0].ScriptBodyHash != "" {
+		t.Fatalf("non-package step received hash %q", pinned.Steps[0].ScriptBodyHash)
+	}
+	if err := ValidateVerificationScriptBodies(dir, pinned); err != nil {
+		t.Fatalf("non-package step rejected: %v", err)
+	}
+}
+
+func TestVerificationScriptBodyPinReportsMissingScriptBeforeHashDrift(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(path, []byte(`{"scripts":{"test":"vitest run"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := PinVerificationScriptBodies(dir, VerificationProfile{Steps: []VerificationStep{{
+		Name: "test", Command: []string{"npm", "test"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"scripts":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = ValidateVerificationScriptBodies(dir, pinned)
+	if err == nil || !strings.Contains(err.Error(), "is missing") || strings.Contains(err.Error(), "script_body_hash") {
+		t.Fatalf("missing script error = %v", err)
+	}
+}
+
 func TestVerificationProfileIdentityChangesWithCommandAndTimeout(t *testing.T) {
 	workspace := Workspace{Verification: VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
 		Name: "test", ComposeFile: "compose.yml", Service: "verify", Command: []string{"go", "test", "./..."},
