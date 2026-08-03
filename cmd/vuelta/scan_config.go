@@ -59,7 +59,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 		if projectFile {
 			return loadSelectedProjectConfig(parsedConfigPath, "reused", allowMigrationPrompt, options.stack)
 		}
-		cfg, err := loadMachineConfig(parsedConfigPath, allowMigrationPrompt)
+		cfg, err := loadMachineConfig(parsedConfigPath, false)
 		if err != nil {
 			return nil, scanConfigSelection{}, err
 		}
@@ -118,7 +118,7 @@ func selectScanConfiguration(options scanOptions, parsedConfigPath string) (*con
 	if err := configinit.ApplyProjectOnboarding(&plan, localPath, ignorePlan, ignorePath); err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	cfg, selection, err := mergeProjectWithMachine(project, localPath, "created", allowMigrationPrompt)
+	cfg, selection, err := mergeProjectWithMachine(project, localPath, "created")
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
@@ -161,7 +161,7 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 	if err := configinit.ApplyProjectOnboarding(nil, "", ignorePlan, filepath.Join(root, ".gitignore")); err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	cfg, selection, err := mergeProjectWithMachine(project, path, status, allowMigrationPrompt)
+	cfg, selection, err := mergeProjectWithMachine(project, path, status)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
@@ -224,7 +224,7 @@ func ambiguousStackError(err error, root string) error {
 	return fmt.Errorf("project detection is ambiguous: %w", err)
 }
 
-func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
+func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status string) (*config.Config, scanConfigSelection, error) {
 	absoluteProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
@@ -234,28 +234,32 @@ func mergeProjectWithMachine(project *config.ProjectConfig, projectPath, status 
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	return mergeProjectWithMachinePath(project, projectPath, status, machinePath, allowMigrationPrompt)
+	return mergeProjectWithMachinePath(project, projectPath, status, machinePath)
 }
 
-func mergeProjectWithMachinePath(project *config.ProjectConfig, projectPath, status, machinePath string, allowMigrationPrompt bool) (*config.Config, scanConfigSelection, error) {
+// mergeProjectWithMachinePath builds the effective configuration for one
+// exact project. Repository-owned workspace policy comes only from project;
+// the machine file contributes global authority and, from a same-path legacy
+// workspace entry, only the machine-owned toolchain selection. The machine
+// file is loaded without migration prompts so project-local commands never
+// rewrite it as a side effect.
+func mergeProjectWithMachinePath(project *config.ProjectConfig, projectPath, status, machinePath string) (*config.Config, scanConfigSelection, error) {
 	absoluteProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, scanConfigSelection{}, fmt.Errorf("resolve project config path: %w", err)
 	}
 	projectPath = filepath.Clean(absoluteProjectPath)
-	machine := configinit.NewConfig()
-	if _, statErr := os.Lstat(machinePath); statErr == nil {
-		machine, err = loadMachineConfig(machinePath, allowMigrationPrompt)
-		if err != nil {
-			return nil, scanConfigSelection{}, fmt.Errorf("load machine config %s: %w", machinePath, err)
-		}
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return nil, scanConfigSelection{}, fmt.Errorf("inspect machine config %s: %w", machinePath, statErr)
+	machine, machinePath, err := loadMachineAuthorityConfig(machinePath)
+	if err != nil {
+		return nil, scanConfigSelection{}, err
 	}
 	workspace, err := project.ResolvedWorkspace(projectPath)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
+	// Legacy machine workspaces are lookup records for machine-owned
+	// toolchain overrides only. None of their repository policy or warnings
+	// enter the effective project-local configuration.
 	for _, registered := range machine.Workspaces {
 		canonical, canonicalErr := canonicalDirectory(registered.Path)
 		if canonicalErr == nil && canonical == workspace.Path {
@@ -263,6 +267,10 @@ func mergeProjectWithMachinePath(project *config.ProjectConfig, projectPath, sta
 			break
 		}
 	}
+	// The config-wide allowlist is a legacy workspace-policy fallback. Local
+	// projects must carry their own allowlist in .vuelta.yaml; push mode stays
+	// machine-owned.
+	machine.Git.AllowedChangedPaths = nil
 	machine.Workspaces = []config.Workspace{workspace}
 	if err := machine.Validate(); err != nil {
 		return nil, scanConfigSelection{}, fmt.Errorf("validate combined project and machine policy: %w", err)
@@ -270,6 +278,24 @@ func mergeProjectWithMachinePath(project *config.ProjectConfig, projectPath, sta
 	return machine, scanConfigSelection{
 		Path: projectPath, Scope: "project", Status: status, MachineConfig: machinePath,
 	}, nil
+}
+
+func loadMachineAuthorityConfig(machinePath string) (*config.Config, string, error) {
+	absoluteMachinePath, err := filepath.Abs(machinePath)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve machine config path: %w", err)
+	}
+	machinePath = filepath.Clean(absoluteMachinePath)
+	machine := configinit.NewConfig()
+	if _, statErr := os.Lstat(machinePath); statErr == nil {
+		machine, err = loadMachineConfig(machinePath, false)
+		if err != nil {
+			return nil, "", fmt.Errorf("load machine config %s: %w", machinePath, err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, "", fmt.Errorf("inspect machine config %s: %w", machinePath, statErr)
+	}
+	return machine, machinePath, nil
 }
 
 func unsupportedProjectError(root string) error {

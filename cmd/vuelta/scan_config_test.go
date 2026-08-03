@@ -350,6 +350,160 @@ func TestScanConfigSelectionJSONAddsDetectedStacksWithoutChangingExistingFields(
 	}
 }
 
+func TestProjectMachineMergeKeepsProjectPolicyAndMachineFileUnchanged(t *testing.T) {
+	project, projectPath := onboardVerifyProject(t)
+	writeGeneratedVerifyCompose(t, project)
+	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
+		t.Fatalf("approve project verification: %v", err)
+	}
+
+	machine := configinit.NewConfig()
+	machine.Update.ToolchainProfiles = []config.ToolchainProfile{{
+		Version: config.ToolchainProfileVersion, ID: "operator-node-npm", Stack: config.StackNode, PackageManager: "npm",
+		Runtime: "24", PackageManagerVersion: "11.4.2", Scanner: "ncu", ScannerVersion: "22.2.9",
+		Image: "registry.example/scanner@sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64", User: "10001:10001",
+		LockFormats: []string{"npm-v3"}, Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: true, ReleaseAge: true},
+	}}
+	machine.Workspaces = []config.Workspace{{
+		Name: "stale-machine-entry", Path: project, Stack: config.StackNode, PackageManager: "npm",
+		ToolchainProfile:    "operator-node-npm",
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+	}}
+	machinePath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(machine, machinePath, false); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPolicy, err := config.LoadProject(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	effective, selection, err := mergeProjectWithMachinePath(projectPolicy, projectPath, "reused", machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effective.Workspaces) != 1 {
+		t.Fatalf("effective workspaces = %#v", effective.Workspaces)
+	}
+	workspace := effective.Workspaces[0]
+	if workspace.Path != project || workspace.Name == "stale-machine-entry" || workspace.Verification.State != config.VerificationReady ||
+		workspace.ToolchainProfile != "operator-node-npm" {
+		t.Fatalf("machine workspace policy leaked into effective project policy: %#v", workspace)
+	}
+	for _, warning := range configWarnings(effective) {
+		if strings.Contains(warning, "scan-only") || strings.Contains(warning, "stale-machine-entry") {
+			t.Fatalf("stale machine warning leaked into project selection: %q", warning)
+		}
+	}
+	if selection.Path != projectPath || selection.MachineConfig != machinePath || selection.Scope != "project" {
+		t.Fatalf("selection = %#v", selection)
+	}
+	after, err := os.ReadFile(machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("project-local resolution rewrote the machine config")
+	}
+
+	updateConfig, err := loadUpdateConfiguration(project, machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updateConfig.Workspaces) != 1 || updateConfig.Workspaces[0].Verification.State != config.VerificationReady ||
+		updateConfig.Workspaces[0].Name == "stale-machine-entry" {
+		t.Fatalf("update selected different effective policy: %#v", updateConfig.Workspaces)
+	}
+}
+
+func TestSelectScanConfigurationCWDAndDirectoryMatch(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+
+	byDirectory, directorySelection, err := selectScanConfiguration(scanOptions{directory: project}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousCurrentDirectory := currentDirectory
+	currentDirectory = func() (string, error) { return project, nil }
+	t.Cleanup(func() { currentDirectory = previousCurrentDirectory })
+	byCWD, cwdSelection, err := selectScanConfiguration(scanOptions{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directorySelection.Path != cwdSelection.Path || directorySelection.MachineConfig != cwdSelection.MachineConfig ||
+		directorySelection.Scope != cwdSelection.Scope {
+		t.Fatalf("directory selection = %#v, cwd selection = %#v", directorySelection, cwdSelection)
+	}
+	if len(byDirectory.Workspaces) != 1 || len(byCWD.Workspaces) != 1 ||
+		byDirectory.Workspaces[0].Path != byCWD.Workspaces[0].Path ||
+		byDirectory.Workspaces[0].Verification.State != byCWD.Workspaces[0].Verification.State {
+		t.Fatalf("directory config = %#v, cwd config = %#v", byDirectory.Workspaces, byCWD.Workspaces)
+	}
+}
+
+func TestProjectMachineMergeNeverMigratesMachineConfig(t *testing.T) {
+	project := t.TempDir()
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+	projectPolicy := &config.ProjectConfig{
+		SchemaVersion: config.CurrentSchemaVersion,
+		Workspace: config.Workspace{
+			Path: ".", Stack: config.StackNode, PackageManager: "npm",
+			Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+			AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+		},
+	}
+	machinePath := filepath.Join(t.TempDir(), "legacy.yaml")
+	before := []byte("workspaces: []\n")
+	if err := os.WriteFile(machinePath, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := mergeProjectWithMachinePath(projectPolicy, filepath.Join(project, projectConfigName), "reused", machinePath)
+	if err == nil || !strings.Contains(err.Error(), "vuelta config migrate") {
+		t.Fatalf("legacy machine config error = %v", err)
+	}
+	after, readErr := os.ReadFile(machinePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("project-local resolution migrated the machine config")
+	}
+}
+
+func TestProjectMachineMergeRejectsMachineGitAllowlistFallback(t *testing.T) {
+	project := t.TempDir()
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+	projectPolicy := &config.ProjectConfig{
+		SchemaVersion: config.CurrentSchemaVersion,
+		Workspace: config.Workspace{
+			Path: ".", Stack: config.StackNode, PackageManager: "npm",
+			Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+		},
+	}
+	machine := configinit.NewConfig()
+	machine.Git.AllowedChangedPaths = []string{"package.json", "package-lock.json"}
+	machinePath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := configinit.Write(machine, machinePath, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := mergeProjectWithMachinePath(projectPolicy, filepath.Join(project, projectConfigName), "reused", machinePath)
+	if err == nil || !strings.Contains(err.Error(), "git.allowed_changed_paths: allowlist is required") {
+		t.Fatalf("machine Git allowlist unexpectedly authorized project policy: %v", err)
+	}
+}
+
 func writeScanProjectFile(t *testing.T, root, name, contents string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o600); err != nil {

@@ -91,7 +91,7 @@ func TestLoadUpdateConfigurationDoesNotWalkToParentProjectPolicy(t *testing.T) {
 	if err := configinit.Write(configinit.NewConfig(), machinePath, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := loadUpdateConfiguration(child, machinePath, false)
+	cfg, err := loadUpdateConfiguration(child, machinePath)
 	if err != nil {
 		t.Fatal(err)
 	}

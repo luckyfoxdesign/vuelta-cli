@@ -40,10 +40,20 @@ func runProjectVerifyInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := loadMachineConfig(configFile, false)
+	projectRoot, rootErr := canonicalDirectory(*directory)
+	if rootErr != nil {
+		return fail(exitConfig, "%v", rootErr)
+	}
+	projectPath := filepath.Join(projectRoot, projectConfigName)
+	project, projectErr := config.LoadProject(projectPath)
+	if projectErr != nil {
+		return fail(exitConfig, "load project policy: %v; run vuelta scan --directory %s first", projectErr, projectRoot)
+	}
+	cfg, _, err := mergeProjectWithMachinePath(project, projectPath, "reused", configFile)
 	if err != nil {
 		return fail(exitConfig, "%v", err)
 	}
+	*directory = projectRoot
 	if err := cfg.Validate(); err != nil {
 		return fail(exitConfig, "%v", err)
 	}

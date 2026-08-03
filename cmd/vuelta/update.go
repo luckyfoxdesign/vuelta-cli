@@ -102,12 +102,12 @@ func executeLocalUpdate(args []string) error {
 	if configFile == "" {
 		configFile, err = defaultConfigPath()
 		if err != nil {
-			return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Select a valid config with --config")
+			return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Fix the operating-system user config directory")
 		}
 	}
-	cfg, err := loadUpdateConfiguration(target.Root, configFile, !options.nonInteractive && !options.jsonOutput && configinit.IsTerminal(os.Stdin))
+	cfg, err := loadUpdateConfiguration(target.Root, configFile)
 	if err != nil {
-		return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Select a valid config with --config")
+		return updateTopLevelFailure(options.jsonOutput, "config_unreadable", fail(exitConfig, "%v", err), "Review the selected .vuelta.yaml and machine config; migrate a legacy machine schema explicitly")
 	}
 	warnings := configWarnings(cfg)
 	if err := cfg.Validate(); err != nil {
@@ -287,33 +287,22 @@ func routineSnapshotCandidates(candidates []updatesnapshot.Candidate, includeMaj
 	return selected
 }
 
-func loadUpdateConfiguration(targetRoot, machinePath string, allowMigrationPrompt bool) (*config.Config, error) {
-	machine, err := loadMachineConfig(machinePath, allowMigrationPrompt)
-	if err != nil {
-		return nil, err
-	}
+func loadUpdateConfiguration(targetRoot, machinePath string) (*config.Config, error) {
 	projectPath := filepath.Join(targetRoot, projectConfigName)
 	project, projectErr := config.LoadProject(projectPath)
 	if errors.Is(projectErr, os.ErrNotExist) {
+		machine, _, err := loadMachineAuthorityConfig(machinePath)
+		if err != nil {
+			return nil, err
+		}
 		machine.Workspaces = nil
 		return machine, nil
 	}
 	if projectErr != nil {
 		return nil, projectErr
 	}
-	workspace, err := project.ResolvedWorkspace(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	for _, registered := range machine.Workspaces {
-		canonical, canonicalErr := canonicalDirectory(registered.Path)
-		if canonicalErr == nil && canonical == targetRoot {
-			workspace.ToolchainProfile = registered.ToolchainProfile
-			break
-		}
-	}
-	machine.Workspaces = []config.Workspace{workspace}
-	return machine, nil
+	cfg, _, err := mergeProjectWithMachinePath(project, projectPath, "reused", machinePath)
+	return cfg, err
 }
 
 func updateJSONRequested(args []string) bool {

@@ -21,6 +21,21 @@ func writeVerifyFixtureProject(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(project, "package-lock.json"), []byte(`{"lockfileVersion":3}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	projectConfig := &config.ProjectConfig{
+		SchemaVersion: config.CurrentSchemaVersion,
+		Workspace: config.Workspace{
+			Path: ".", Stack: config.StackNode, PackageManager: "npm",
+			Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+			AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+		},
+	}
+	plan, err := configinit.PlanProjectConfigWrite(projectConfig, filepath.Join(project, projectConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Apply(filepath.Join(project, projectConfigName)); err != nil {
+		t.Fatal(err)
+	}
 	return project
 }
 
@@ -59,6 +74,73 @@ func TestProjectVerifyInitWritesComposeFile(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "read_only: true") {
 		t.Fatalf("generated compose is missing read_only: true:\n%s", data)
+	}
+}
+
+func TestProjectVerifyInitUsesProjectPolicyWithDefaultMachineAuthority(t *testing.T) {
+	previous := resolveVerifyDigest
+	resolveVerifyDigest = func(context.Context, string, string) (string, error) {
+		return "sha256:" + strings.Repeat("1", 64), nil
+	}
+	t.Cleanup(func() { resolveVerifyDigest = previous })
+
+	project := writeVerifyFixtureProject(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	if _, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, ""); err != nil {
+		t.Fatalf("onboard project: %v", err)
+	}
+	machine := configinit.NewConfig()
+	machine.Docker = &config.DockerConfig{Developer: &config.DockerEndpointConfig{
+		Socket: "/approved/docker.sock",
+		ExpectedDaemon: config.DockerDaemonIdentity{
+			ID: "daemon-reviewed", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+			MinimumAPIVersion: "1.49", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		},
+	}}
+	machine.Workspaces = []config.Workspace{{
+		Name: "stale-machine-entry", Path: project, Stack: config.StackNode, PackageManager: "npm",
+		Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+		AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+	}}
+	machinePath, err := defaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configinit.Write(machine, machinePath, false); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"project", "verify", "init", "--directory", project}); err != nil {
+		t.Fatalf("project verify init: %v", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(project, "compose.verify.yml")); err != nil {
+		t.Fatalf("read generated compose.verify.yml: %v", err)
+	}
+	after, err := os.ReadFile(machinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("project verify init rewrote the machine config")
+	}
+}
+
+func TestProjectVerifyInitRequiresPolicyInSelectedProject(t *testing.T) {
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "package.json"), []byte(`{"scripts":{"build":"tsc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeVerifyMachineConfig(t)
+	err := run([]string{"--config", configPath, "project", "verify", "init", "--directory", project})
+	if err == nil || !strings.Contains(err.Error(), "run vuelta scan --directory") {
+		t.Fatalf("missing project policy error = %v", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(project, "compose.verify.yml")); !os.IsNotExist(statErr) {
+		t.Fatalf("missing project policy created compose.verify.yml: %v", statErr)
 	}
 }
 
