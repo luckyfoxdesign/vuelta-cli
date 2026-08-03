@@ -825,6 +825,16 @@ func applyCandidatePolicy(
 	if project == "" {
 		project = filepath.Base(target.path)
 	}
+	normalized := make([]updatesnapshot.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate.Current = ecosystem.NormalizeCandidateVersion(candidate.Current)
+		candidate.Target = ecosystem.NormalizeCandidateVersion(candidate.Target)
+		if ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target) {
+			continue
+		}
+		normalized = append(normalized, candidate)
+	}
+	candidates = normalized
 	var lookupErrors []error
 	for index := range candidates {
 		candidate := &candidates[index]

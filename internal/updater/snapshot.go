@@ -671,6 +671,9 @@ func resolvePlannedMutationSpec(
 		AllowScripts: allowScripts, MinReleaseAgeDays: cfg.Update.MinReleaseAgeDays,
 	}
 	for index, candidate := range candidates {
+		if ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target) {
+			return ecosystem.PlannedMutationSpec{}, errors.New("snapshot candidate has no version change")
+		}
 		if !validCandidate(candidate) {
 			return ecosystem.PlannedMutationSpec{}, errors.New("invalid snapshot candidate")
 		}

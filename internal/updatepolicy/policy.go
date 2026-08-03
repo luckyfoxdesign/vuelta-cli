@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 )
 
 const (
@@ -51,6 +53,8 @@ type Decision struct {
 // still in cooldown never enter the routine set.
 func Evaluate(now time.Time, cooldown time.Duration, candidate Candidate) Decision {
 	now = now.UTC()
+	candidate.Current = ecosystem.NormalizeCandidateVersion(candidate.Current)
+	candidate.Target = ecosystem.NormalizeCandidateVersion(candidate.Target)
 	if cooldown < MinimumCooldown {
 		cooldown = MinimumCooldown
 	}
@@ -75,6 +79,8 @@ func Evaluate(now time.Time, cooldown time.Duration, candidate Candidate) Decisi
 		EligibleAt: eligibleAt, Disposition: DispositionDeferred,
 	}
 	switch {
+	case ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target):
+		decision.Disposition, decision.Reason = DispositionExcluded, "no_version_change"
 	case candidate.Yanked:
 		decision.Disposition, decision.Reason = DispositionExcluded, "yanked"
 	case !stable:

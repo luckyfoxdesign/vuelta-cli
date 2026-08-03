@@ -325,6 +325,11 @@ func TestProfileScannerUsesInstalledNCUAndExactProfileImage(t *testing.T) {
 	if err != nil || len(spec.Mutations) != 1 || !reflect.DeepEqual(spec.Mutations[0].Commands, [][]string{{"ncu", "--filter", "example", "--cooldown", "168", "-u"}}) {
 		t.Fatalf("planned adapter mutation = %#v, %v", spec, err)
 	}
+	if _, err := resolvePlannedMutationSpec(ws, cfg, &profile, []updatesnapshot.Candidate{{
+		Kind: "npm", Name: "example", Current: "v2.0.0", Target: "2.0.0",
+	}}, false); err == nil || !strings.Contains(err.Error(), "no version change") {
+		t.Fatalf("no-op mutation error = %v", err)
+	}
 }
 
 func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {

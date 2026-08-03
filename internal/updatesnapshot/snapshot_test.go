@@ -433,6 +433,10 @@ func TestValidateCandidatesFailsClosedOneGatePerCase(t *testing.T) {
 		{"scan-only requirements kind", func(snapshot *Snapshot) { snapshot.Candidates[0].Kind = "requirements" }},
 		{"flag injection", func(snapshot *Snapshot) { snapshot.Candidates[0].Name = "--registry" }},
 		{"duplicate", func(snapshot *Snapshot) { snapshot.Candidates = append(snapshot.Candidates, snapshot.Candidates[0]) }},
+		{"no version change", func(snapshot *Snapshot) {
+			snapshot.Candidates[0].Current = "v1.2.3"
+			snapshot.Candidates[0].Target = "1.2.3"
+		}},
 		{"unverified age", func(snapshot *Snapshot) { snapshot.Candidates[0].ReleaseAgeVerified = false }},
 		{"scan-only provenance", func(snapshot *Snapshot) {
 			snapshot.Candidates[0].Line = 1

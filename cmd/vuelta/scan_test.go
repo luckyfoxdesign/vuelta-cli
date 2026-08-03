@@ -369,6 +369,43 @@ func TestReleaseAgeStageHasExplicitSemantics(t *testing.T) {
 	}
 }
 
+func TestNoOpOnlyPackageScanIsCleanAndPublishesNoSnapshot(t *testing.T) {
+	root := t.TempDir()
+	manifest := []byte(`{"name":"example","dependencies":{"canvg":"4.0.3"}}`)
+	lock := []byte(`{"lockfileVersion":3,"packages":{"node_modules/canvg":{"version":"4.0.3"}}}`)
+	if err := os.WriteFile(filepath.Join(root, "package.json"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), lock, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := config.Workspace{
+		Name: "example", Path: root, Stack: config.StackNode, PackageManager: "npm",
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady},
+	}
+	runners := scanStageRunners{
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{
+				Kind: "npm", Name: "canvg", Current: "4.0.3", Target: "4.0.3", Ownership: "direct",
+			}}, "npm", true, nil
+		},
+	}
+	result := scanOneTargetWith(
+		context.Background(), config.Config{},
+		scanTarget{workspace: &workspace, name: workspace.Name, path: root, origin: updatesnapshot.OriginWorkspace},
+		scanOptions{only: "packages"}, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners,
+	)
+	if result.Status != "clean" || len(result.Candidates) != 0 || result.SnapshotID != "" {
+		t.Fatalf("no-op scan = %#v", result)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "package.json")); err != nil || string(got) != string(manifest) {
+		t.Fatalf("package.json changed: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "package-lock.json")); err != nil || string(got) != string(lock) {
+		t.Fatalf("package-lock.json changed: %q, %v", got, err)
+	}
+}
+
 func TestScanExitPriorityPrefersFailedResultOverFindings(t *testing.T) {
 	err := scanResultError(scanSummary{Failed: 1, Vulnerabilities: 3}, "vulnerabilities", false)
 	var coded commandError

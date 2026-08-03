@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/projectstate"
 	"github.com/luckyfoxdesign/vuelta/internal/scaninput"
 	"github.com/luckyfoxdesign/vuelta/internal/scanner"
@@ -608,6 +609,9 @@ func ValidateCandidates(snapshot Snapshot, allowUnverifiedReleaseAge bool) error
 			candidate.Line != 0 || candidate.Disposition != "" {
 			return fmt.Errorf("%w: inadmissible candidate %s/%s", ErrInvalid, candidate.Kind, candidate.Name)
 		}
+		if ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target) {
+			return fmt.Errorf("%w: candidate %s/%s has no version change", ErrInvalid, candidate.Kind, candidate.Name)
+		}
 		if (candidate.Kind == "docker") != (candidate.File != "") {
 			return fmt.Errorf("%w: candidate %s has an invalid file binding", ErrInvalid, candidate.Name)
 		}
@@ -746,6 +750,9 @@ func validateSnapshot(snapshot Snapshot) error {
 	for _, candidate := range snapshot.Candidates {
 		if candidate.Kind == "" || candidate.Name == "" || candidate.Target == "" {
 			return fmt.Errorf("%w: malformed candidate", ErrInvalid)
+		}
+		if ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target) {
+			return fmt.Errorf("%w: candidate %s/%s has no version change", ErrInvalid, candidate.Kind, candidate.Name)
 		}
 		if filepath.IsAbs(candidate.File) || candidate.File == ".." || strings.HasPrefix(filepath.Clean(candidate.File), ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: candidate file escapes the workspace", ErrInvalid)

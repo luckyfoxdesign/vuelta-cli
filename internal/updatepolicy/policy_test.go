@@ -90,3 +90,14 @@ func TestEvaluateProjectCannotShortenCooldown(t *testing.T) {
 		t.Fatalf("short cooldown was accepted: %#v", decision)
 	}
 }
+
+func TestEvaluateExcludesNormalizedNoVersionChange(t *testing.T) {
+	now := time.Now().UTC()
+	decision := Evaluate(now, MinimumCooldown, Candidate{
+		Current: "v4.0.3", Target: "4.0.3", Direct: true,
+		FirstObservedAt: now.Add(-MinimumCooldown),
+	})
+	if decision.Disposition != DispositionExcluded || decision.Reason != "no_version_change" {
+		t.Fatalf("decision = %#v, want excluded no_version_change", decision)
+	}
+}

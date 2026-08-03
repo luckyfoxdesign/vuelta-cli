@@ -123,3 +123,32 @@ func TestNPMManifestOnlyRejectsEveryMutationContract(t *testing.T) {
 		t.Fatalf("PlannedMutation() error = %v", err)
 	}
 }
+
+func TestNPMDecoderDropsNormalizedNoOpsAndPreservesRealCandidates(t *testing.T) {
+	t.Parallel()
+	inputs := map[string][]byte{
+		npmManifest: []byte(`{"name":"demo"}`),
+		npmPackageLock: []byte(`{
+			"lockfileVersion": 3,
+			"packages": {
+				"node_modules/canvg": {"version":"4.0.3"},
+				"node_modules/normalized": {"version":"v3.0.0"},
+				"node_modules/real": {"version":"1.0.0"}
+			}
+		}`),
+	}
+	report, err := NPM().(ecosystem.CandidateDecoder).DecodeCandidates(
+		[]byte(`{"canvg":"4.0.3","normalized":"3.0.0","real":"v2.0.0"}`),
+		inputs,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Candidates) != 1 {
+		t.Fatalf("candidates = %#v, want only the real update", report.Candidates)
+	}
+	candidate := report.Candidates[0]
+	if candidate.Name != "real" || candidate.Current != "1.0.0" || candidate.Target != "2.0.0" {
+		t.Fatalf("real candidate = %#v", candidate)
+	}
+}

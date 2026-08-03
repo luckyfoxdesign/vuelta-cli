@@ -20,7 +20,11 @@ type decoderCapability struct {
 
 func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]byte) (ecosystem.CandidateReport, error) {
 	if c.kind == "pnpm" {
-		return decodePNPMReport(output, inputs)
+		report, err := decodePNPMReport(output, inputs)
+		if err != nil {
+			return ecosystem.CandidateReport{}, err
+		}
+		return normalizeCandidateReport(report), nil
 	}
 	report, err := decodePackageReport(c.kind, output, inputs)
 	if err != nil {
@@ -44,7 +48,21 @@ func (c decoderCapability) DecodeCandidates(output []byte, inputs map[string][]b
 			return ecosystem.CandidateReport{}, err
 		}
 	}
-	return report, nil
+	return normalizeCandidateReport(report), nil
+}
+
+func normalizeCandidateReport(report ecosystem.CandidateReport) ecosystem.CandidateReport {
+	candidates := make([]ecosystem.Candidate, 0, len(report.Candidates))
+	for _, candidate := range report.Candidates {
+		candidate.Current = ecosystem.NormalizeCandidateVersion(candidate.Current)
+		candidate.Target = ecosystem.NormalizeCandidateVersion(candidate.Target)
+		if ecosystem.CandidateVersionsEqual(candidate.Current, candidate.Target) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	report.Candidates = candidates
+	return report
 }
 
 func decodePackageReport(kind string, data []byte, inputs map[string][]byte) (ecosystem.CandidateReport, error) {
