@@ -84,11 +84,18 @@ func newRepoWithRemote(t *testing.T) string {
 	return work
 }
 
-func TestFetchAndBaseSHA(t *testing.T) {
+func TestHeadSHAIsLocalOnlyBaseline(t *testing.T) {
 	work := newRepoWithRemote(t)
-	sha, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	// Commit locally without pushing, so HEAD is ahead of origin/main. The
+	// baseline `update local` trusts must come from this local HEAD, not
+	// from a remote-tracking ref that requires the commit to be pushed.
+	writeFile(t, work, "requirements.txt", "flask==2.0.1\n")
+	run(t, work, "add", "-A")
+	run(t, work, "commit", "-q", "-m", "local only")
+
+	sha, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 	if sha == "" {
 		t.Fatal("expected non-empty SHA")
@@ -96,6 +103,10 @@ func TestFetchAndBaseSHA(t *testing.T) {
 	head := strings.TrimSpace(run(t, work, "rev-parse", "HEAD"))
 	if sha != head {
 		t.Fatalf("expected base SHA %s to equal local HEAD %s", sha, head)
+	}
+	originHead := strings.TrimSpace(run(t, work, "rev-parse", "origin/main"))
+	if sha == originHead {
+		t.Fatal("expected local HEAD to be ahead of origin/main")
 	}
 }
 
@@ -111,7 +122,7 @@ func TestRunGitHonorsCanceledContext(t *testing.T) {
 
 func TestLandingCleanupUsesBoundedContextAfterParentCancellation(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,38 +140,35 @@ func TestLandingCleanupUsesBoundedContextAfterParentCancellation(t *testing.T) {
 	}
 }
 
-func TestVerifyBaseSHAUnchangedDetectsDrift(t *testing.T) {
+func TestVerifyLocalBaseUnchangedDetectsDrift(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 
-	if err := VerifyBaseSHAUnchanged(context.Background(), work, "origin", "main", baseSHA); err != nil {
+	if err := VerifyLocalBaseUnchanged(context.Background(), work, baseSHA); err != nil {
 		t.Fatalf("expected no drift yet: %v", err)
 	}
 
-	// A second clone pushes a new commit to the same remote branch.
-	remoteURL := strings.TrimSpace(run(t, work, "remote", "get-url", "origin"))
-	other := t.TempDir()
-	run(t, other, "clone", "-q", remoteURL, ".")
-	run(t, other, "config", "user.email", "test@example.com")
-	run(t, other, "config", "user.name", "test")
-	writeFile(t, other, "requirements.txt", "flask==2.0.1\n")
-	run(t, other, "add", "-A")
-	run(t, other, "commit", "-q", "-m", "concurrent update")
-	run(t, other, "push", "-q", "origin", "main")
+	// A concurrent local commit moves HEAD out from under the captured
+	// baseline. A competing push to the shared remote is deliberately not
+	// checked here: update local's baseline is this developer's own
+	// checkout, not the remote branch.
+	writeFile(t, work, "requirements.txt", "flask==2.0.1\n")
+	run(t, work, "add", "-A")
+	run(t, work, "commit", "-q", "-m", "concurrent local update")
 
-	if err := VerifyBaseSHAUnchanged(context.Background(), work, "origin", "main", baseSHA); err == nil {
+	if err := VerifyLocalBaseUnchanged(context.Background(), work, baseSHA); err == nil {
 		t.Fatal("expected drift to be detected")
 	}
 }
 
 func TestLandingCopySyncAndDiffCheck(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 
 	landing, cleanup, err := NewLandingCopy(context.Background(), work, baseSHA)
@@ -188,9 +196,9 @@ func TestLandingCopySyncAndDiffCheck(t *testing.T) {
 
 func TestDiffCheckRejectsDisallowedPath(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 	landing, cleanup, err := NewLandingCopy(context.Background(), work, baseSHA)
 	if err != nil {
@@ -262,9 +270,9 @@ func TestNULDelimitedPathParsingPreservesQuotedAndNewlinePath(t *testing.T) {
 
 func TestDiffCheckRejectsSymlink(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 	landing, cleanup, err := NewLandingCopy(context.Background(), work, baseSHA)
 	if err != nil {
@@ -337,9 +345,9 @@ func TestSyncTreeRejectsTrackedNodeModules(t *testing.T) {
 
 func TestCommitAndPushReviewBranch(t *testing.T) {
 	work := newRepoWithRemote(t)
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
+	baseSHA, err := HeadSHA(context.Background(), work)
 	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
+		t.Fatalf("HeadSHA: %v", err)
 	}
 	landing, cleanup, err := NewLandingCopy(context.Background(), work, baseSHA)
 	if err != nil {
@@ -526,11 +534,9 @@ func TestPushDirectBranchRequiresFastForward(t *testing.T) {
 	run(t, other, "commit", "-q", "-m", "someone else's change")
 	run(t, other, "push", "-q", "origin", "main")
 
-	baseSHA, err := FetchAndBaseSHA(context.Background(), work, "origin", "main")
-	if err != nil {
-		t.Fatalf("FetchAndBaseSHA: %v", err)
-	}
-	_ = baseSHA
+	// verifyFastForward compares HEAD against the local remote-tracking ref,
+	// which only Git's own fetch populates.
+	run(t, work, "fetch", "-q", "origin")
 
 	run(t, work, "config", "user.email", "test@example.com")
 	run(t, work, "config", "user.name", "test")

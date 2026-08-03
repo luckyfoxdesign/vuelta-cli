@@ -219,7 +219,11 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 // TestCLIOnlyLocalUpdateDryRun exercises the complete first-run local update
 // path through the installed production CLI. Vuelta project policy is never
 // assembled through Go helpers: every Vuelta-owned write and approval goes
-// through a public, non-interactive command.
+// through a public, non-interactive command. The approved verification
+// commit is deliberately never pushed, so the ready scan and dry-run run
+// against a clean local HEAD that is ahead of origin/main: update local must
+// trust that local HEAD directly rather than requiring it to already be
+// pushed (see internal/gitops.VerifyLocalBaseUnchanged).
 func TestCLIOnlyLocalUpdateDryRun(t *testing.T) {
 	root := os.Getenv("VUELTA_ACCEPTANCE_ROOT")
 	if root == "" {
@@ -264,7 +268,7 @@ func TestCLIOnlyLocalUpdateDryRun(t *testing.T) {
 	runTextInDir(t, ctx, env, caseRoot, "compatibility", binary,
 		"--no-input", "project", "verify", "approve", "--directory", project, "--yes")
 	commitFixtureFiles(t, ctx, project, "fixture: approve CLI verification", ".gitignore", ".vuelta.yaml", "compose.verify.yml")
-	pushFixture(t, ctx, project)
+	assertLocalHeadAheadOfOrigin(t, ctx, project)
 
 	readyScan := runJSONInDir(t, ctx, env, caseRoot, "scanner", binary,
 		"--no-input", "scan", "--directory", project, "--only", "packages", "--json")
@@ -695,13 +699,39 @@ func commitFixtureFiles(t *testing.T, ctx context.Context, project, message stri
 	}
 }
 
-func pushFixture(t *testing.T, ctx context.Context, project string) {
+// assertLocalHeadAheadOfOrigin fails the test unless project's local HEAD is
+// a strict descendant of origin/main that was never pushed. It documents and
+// enforces the exact regression scenario TestCLIOnlyLocalUpdateDryRun
+// guards: a clean local HEAD ahead of origin must still complete
+// scan -> update local --dry-run using only the Vuelta binary.
+func assertLocalHeadAheadOfOrigin(t *testing.T, ctx context.Context, project string) {
 	t.Helper()
-	command := exec.CommandContext(ctx, "git", "push", "-q", "origin", "main")
-	command.Dir = project
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("[infrastructure] push fixture update: %v: %s", err, output)
+	fetch := exec.CommandContext(ctx, "git", "fetch", "-q", "origin", "main")
+	fetch.Dir = project
+	if output, err := fetch.CombinedOutput(); err != nil {
+		t.Fatalf("[infrastructure] fetch origin for ahead-of-origin assertion: %v: %s", err, output)
 	}
+	head := runGitOutput(t, ctx, project, "rev-parse", "HEAD")
+	originHead := runGitOutput(t, ctx, project, "rev-parse", "origin/main")
+	if head == originHead {
+		t.Fatal("[infrastructure] local HEAD unexpectedly matches origin/main; test no longer exercises an ahead-of-origin local checkout")
+	}
+	ancestor := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", "origin/main", "HEAD")
+	ancestor.Dir = project
+	if output, err := ancestor.CombinedOutput(); err != nil {
+		t.Fatalf("[infrastructure] local HEAD is not a descendant of origin/main: %v: %s", err, output)
+	}
+}
+
+func runGitOutput(t *testing.T, ctx context.Context, dir string, args ...string) string {
+	t.Helper()
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = dir
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("[infrastructure] git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func writeProjectVerificationPolicy(t *testing.T, project string, verification config.VerificationProfile) {

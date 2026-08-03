@@ -336,6 +336,48 @@ func TestRunWorkspaceDryRunSkipsCommitAndPush(t *testing.T) {
 	}
 }
 
+// TestRunWorkspaceDryRunSucceedsWhenLocalHeadAheadOfOrigin guards the exact
+// workstation scenario update local must support: a clean local HEAD that
+// contains an unpushed commit. The baseline pipeline.RunWorkspace resolves
+// must come from that local HEAD, not from a remote-tracking ref that only
+// exists after an explicit push.
+func TestRunWorkspaceDryRunSucceedsWhenLocalHeadAheadOfOrigin(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	work := newRepoWithRemote(t)
+	writeFile(t, work, "README.md", "local edit\n")
+	run(t, work, "add", "-A")
+	run(t, work, "commit", "-q", "-m", "local only, never pushed")
+
+	ws := baseWorkspace(work)
+	cfg := baseConfig()
+	deps := baseDeps(true, docker)
+
+	result := RunWorkspace(context.Background(), deps, cfg, ws, true)
+	if result.Status != "dry_run" {
+		t.Fatalf("expected status dry_run, got %+v", result)
+	}
+}
+
+// TestRunWorkspaceMutationSucceedsWhenLocalHeadAheadOfOrigin is the
+// non-dry-run counterpart: local mutation must not require the local HEAD to
+// already be pushed either.
+func TestRunWorkspaceMutationSucceedsWhenLocalHeadAheadOfOrigin(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	work := newRepoWithRemote(t)
+	writeFile(t, work, "README.md", "local edit\n")
+	run(t, work, "add", "-A")
+	run(t, work, "commit", "-q", "-m", "local only, never pushed")
+
+	ws := baseWorkspace(work)
+	cfg := baseConfig()
+	deps := baseDeps(true, docker)
+
+	result := RunWorkspace(context.Background(), deps, cfg, ws, false)
+	if result.Status != "updated" {
+		t.Fatalf("expected status updated, got %+v", result)
+	}
+}
+
 func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
 	docker := installFakeDocker(t, -1) // never passes
 	work := newRepoWithRemote(t)

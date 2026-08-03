@@ -156,9 +156,14 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return ProjectResult{Project: project, Status: "skipped", Reason: string(pre.Skip)}
 	}
 
-	baseSHA, err := gitops.FetchAndBaseSHA(ctx, pre.CanonicalPath, ws.Remote, ws.Branch)
+	// update local trusts the exact clean local HEAD as its baseline: scan
+	// already bound this same commit into the snapshot and
+	// updatesnapshot.ValidateForWorkspace already revalidated it before this
+	// run started, so re-deriving a baseline from a remote-tracking ref here
+	// would only make an ahead-of-origin local checkout falsely stale.
+	baseSHA, err := gitops.HeadSHA(ctx, pre.CanonicalPath)
 	if err != nil {
-		return failResultWithLogger(deps.Logger, project, "preflight fetch", err)
+		return failResultWithLogger(deps.Logger, project, "resolve local baseline", err)
 	}
 	audit.BaseSHA = baseSHA
 
@@ -233,7 +238,7 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 	}
 
 	// Step 8: commit.
-	if err := gitops.VerifyBaseSHAUnchanged(ctx, pre.CanonicalPath, ws.Remote, ws.Branch, baseSHA); err != nil {
+	if err := gitops.VerifyLocalBaseUnchanged(ctx, pre.CanonicalPath, baseSHA); err != nil {
 		return failResultWithLogger(deps.Logger, project, "base SHA changed", err)
 	}
 	summary := gitops.CommitSummary{Date: now, CVERefs: post.Findings}

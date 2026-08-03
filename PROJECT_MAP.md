@@ -135,6 +135,14 @@ make build                     # both cross-build targets
   it never mutates the server checkout. The separately named `update local`
   compatibility path retains format-7 project snapshots and container-only
   mutation.
+- `update local`'s trusted baseline is the exact clean local HEAD captured at
+  scan time (`scanner.IdentityForSnapshotWithOptions`, bound into
+  `Snapshot.Workspace.BaseRevision`) and revalidated immediately before
+  execution (`updatesnapshot.ValidateForWorkspace`, then
+  `gitops.VerifyLocalBaseUnchanged` right before commit). It never fetches or
+  compares against a remote-tracking ref, so a clean local HEAD ahead of
+  `origin` runs without first being pushed. `internal/gitops.Push` is the only
+  step that still touches the configured remote/branch.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - Package ecosystem behavior is selected through one explicit built-in catalog; core orchestration has no manager-name registry tables or switches.
 - `deploy/` contains scheduler units, the central release engine, and the

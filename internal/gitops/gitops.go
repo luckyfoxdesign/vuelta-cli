@@ -40,49 +40,26 @@ func runGitEnv(ctx context.Context, dir string, env []string, args ...string) (s
 	return string(out), nil
 }
 
-// FetchAndBaseSHA runs `git fetch --prune` against remote and returns the
-// exact SHA of remote/branch at that moment. Callers keep this SHA and pass
-// it to VerifyBaseSHAUnchanged right before committing, so a push that
-// landed on the remote while this run was updating is never silently
-// overwritten.
-func FetchAndBaseSHA(ctx context.Context, repoPath, remote, branch string) (string, error) {
-	if err := validateRemoteBranch(remote, branch); err != nil {
-		return "", err
-	}
-	if _, err := runGit(ctx, repoPath, "fetch", "--prune", remote); err != nil {
-		return "", err
-	}
-	return remoteSHA(ctx, repoPath, remote, branch)
-}
-
-// VerifyBaseSHAUnchanged re-fetches remote and fails if remote/branch has
-// moved past baseSHA.
-func VerifyBaseSHAUnchanged(ctx context.Context, repoPath, remote, branch, baseSHA string) error {
-	if err := validateRemoteBranch(remote, branch); err != nil {
-		return err
-	}
+// VerifyLocalBaseUnchanged re-resolves repoPath's local HEAD and fails if it
+// no longer matches baseSHA. `update local` trusts the exact clean local
+// HEAD captured at scan time (see updatesnapshot.ValidateForWorkspace,
+// which already revalidates that same HEAD before a run starts) as its
+// baseline; this is the immediate-pre-commit recheck that nothing moved
+// that checkout out from under a run in progress. It never touches a
+// remote: a competing push to a shared branch is not a race this local,
+// developer-owned checkout needs to guard against.
+func VerifyLocalBaseUnchanged(ctx context.Context, repoPath, baseSHA string) error {
 	if err := gitexec.ValidateCommitSHA(baseSHA); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repoPath, "fetch", "--prune", remote); err != nil {
-		return err
-	}
-	current, err := remoteSHA(ctx, repoPath, remote, branch)
+	current, err := HeadSHA(ctx, repoPath)
 	if err != nil {
 		return err
 	}
 	if current != baseSHA {
-		return fmt.Errorf("base SHA changed since fetch: was %s, now %s", baseSHA, current)
+		return fmt.Errorf("local HEAD changed since scan: was %s, now %s", baseSHA, current)
 	}
 	return nil
-}
-
-func remoteSHA(ctx context.Context, repoPath, remote, branch string) (string, error) {
-	out, err := runGit(ctx, repoPath, "rev-parse", "--verify", "--end-of-options", fmt.Sprintf("refs/remotes/%s/%s", remote, branch))
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
 }
 
 // NewLandingCopy creates a git worktree of repoPath detached at baseSHA in a
