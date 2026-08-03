@@ -48,7 +48,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
 			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
 			{names: []string{"--all"}, description: "scan every configured project"},
-			{names: []string{"--stack"}, valueName: "STACK", description: "resolve first-run ambiguous stack detection: python, node, or docker"},
+			{names: []string{"--stack"}, valueName: "STACK", description: "select a detected stack during onboarding or repair genuine stack drift"},
 			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (machine floor 14d)"},
@@ -59,7 +59,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers. A Docker image is scanned by exact digest when config or a compose file pins one; otherwise a tag is resolved to a digest through the same registry egress path, labelled by resolution tier, and never written back into .vuelta.yaml. An image that cannot be resolved is a loud, structured skip, not a hidden failure."},
+		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule; an explicit freshly detected --stack may later atomically repair genuine stack drift and regenerate only stack-dependent project policy. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers. A Docker image is scanned by exact digest when config or a compose file pins one; otherwise a tag is resolved to a digest through the same registry egress path, labelled by resolution tier, and never written back into .vuelta.yaml. An image that cannot be resolved is a loud, structured skip, not a hidden failure."},
 		takesConfig: true, handler: "scan",
 	},
 	{

@@ -514,7 +514,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.StringVar(&options.directory, "directory", "", "scan an explicit directory")
 	fs.StringVar(&options.directory, "d", "", "scan an explicit directory")
 	fs.BoolVar(&options.all, "all", false, "scan every configured project")
-	fs.StringVar(&options.stack, "stack", "", "resolve first-run ambiguous stack detection: python, node, or docker")
+	fs.StringVar(&options.stack, "stack", "", "select a detected stack during onboarding or repair genuine stack drift")
 	fs.StringVar(&options.only, "only", "", "scan only vulnerabilities or packages")
 	fs.StringVar(&options.policyPath, "policy", "", "standalone package policy")
 	fs.StringVar(&options.minReleaseAge, "min-release-age", "", "minimum release age")

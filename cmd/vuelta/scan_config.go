@@ -144,13 +144,47 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	if explicitStack != "" && explicitStack != project.Workspace.Stack {
-		return nil, scanConfigSelection{}, fmt.Errorf(
-			"project at %s is already configured with workspace.stack %q; --stack only resolves first-run ambiguity\n\nTo change it: remove %s and re-run vuelta scan --stack %s, or edit workspace.stack directly in %s",
-			root, project.Workspace.Stack, projectConfigName, explicitStack, path,
-		)
+	discovery, err := configinit.Detect(root)
+	if err != nil {
+		return nil, scanConfigSelection{}, fmt.Errorf("re-detect project stack signals for drift check: %w", err)
 	}
-	driftWarning, detectedStacks, err := detectStackDrift(project.Workspace, root, allowMigrationPrompt)
+	configUpdated := false
+	if explicitStack != "" && explicitStack != project.Workspace.Stack {
+		if containsStack(discovery.Stacks, project.Workspace.Stack) {
+			return nil, scanConfigSelection{}, fmt.Errorf(
+				"project at %s is already configured with workspace.stack %q, which remains freshly detected; --stack repairs genuine drift only",
+				root, project.Workspace.Stack,
+			)
+		}
+		if !containsStack(discovery.Stacks, explicitStack) {
+			return nil, scanConfigSelection{}, fmt.Errorf(
+				"--stack %q was not freshly detected in project %s\n\n%s",
+				explicitStack, root, stackRepairGuidance(root, discovery.Stacks),
+			)
+		}
+		repaired, repairErr := discovery.BuildWorkspace(configinit.Input{
+			Name: project.Workspace.Name, Stack: explicitStack,
+			Branch: project.Workspace.Branch, Remote: project.Workspace.Remote,
+			ScanOnly: true,
+		})
+		if repairErr != nil {
+			return nil, scanConfigSelection{}, fmt.Errorf("build freshly detected workspace for stack repair: %w", repairErr)
+		}
+		repaired.Path = "."
+		repaired.Platform = project.Workspace.Platform
+		repaired.Github = project.Workspace.Github
+		plan, planErr := configinit.PlanProjectStackUpdate(path, repaired)
+		if planErr != nil {
+			return nil, scanConfigSelection{}, planErr
+		}
+		if applyErr := plan.Apply(path); applyErr != nil {
+			return nil, scanConfigSelection{}, fmt.Errorf("persist repaired project stack: %w", applyErr)
+		}
+		project = &config.ProjectConfig{SchemaVersion: config.CurrentSchemaVersion, Workspace: repaired}
+		status = "updated"
+		configUpdated = plan.Changed
+	}
+	driftWarning, detectedStacks, err := detectStackDriftFromSignals(project.Workspace, root, discovery.Stacks, allowMigrationPrompt)
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
@@ -165,9 +199,12 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 	if err != nil {
 		return nil, scanConfigSelection{}, err
 	}
-	selection.OnboardingChanged = ignorePlan.Changed
+	selection.OnboardingChanged = configUpdated || ignorePlan.Changed
+	if configUpdated {
+		selection.ChangedFiles = append(selection.ChangedFiles, projectConfigName)
+	}
 	if ignorePlan.Changed {
-		selection.ChangedFiles = []string{".gitignore"}
+		selection.ChangedFiles = append(selection.ChangedFiles, ".gitignore")
 	}
 	selection.DriftWarning = driftWarning
 	selection.DetectedStacks = detectedStacks
@@ -175,33 +212,62 @@ func loadSelectedProjectConfig(path, status string, allowMigrationPrompt bool, e
 }
 
 // detectStackDrift re-detects stack signals in root and compares them against
-// the persisted workspace.Stack. Any disagreement — the persisted stack no
-// longer detected, or a newly ambiguous set of candidate stacks — is reported:
-// as a non-fatal warning when interactive, or as a fail-closed error otherwise.
+// the persisted workspace.Stack. Additional signals are not drift while the
+// selected stack remains present.
 func detectStackDrift(workspace config.Workspace, root string, interactive bool) (string, []string, error) {
 	discovery, err := configinit.Detect(root)
 	if err != nil {
 		return "", nil, fmt.Errorf("re-detect project stack signals for drift check: %w", err)
 	}
-	detectedStacks := append([]string(nil), discovery.Stacks...)
-	if len(discovery.Stacks) == 1 && discovery.Stacks[0] == workspace.Stack {
+	return detectStackDriftFromSignals(workspace, root, discovery.Stacks, interactive)
+}
+
+func detectStackDriftFromSignals(workspace config.Workspace, root string, stacks []string, interactive bool) (string, []string, error) {
+	detectedStacks := append([]string(nil), stacks...)
+	if containsStack(detectedStacks, workspace.Stack) {
 		return "", detectedStacks, nil
 	}
 	detected := "none"
-	if len(discovery.Stacks) > 0 {
-		detected = strings.Join(discovery.Stacks, ", ")
+	if len(detectedStacks) > 0 {
+		detected = strings.Join(detectedStacks, ", ")
 	}
 	message := fmt.Sprintf(
-		"persisted workspace.stack %q no longer matches freshly detected project signals (detected: %s)",
-		workspace.Stack, detected,
+		"persisted workspace.stack %q is no longer among freshly detected project signals (detected: %s)\n\n%s",
+		workspace.Stack, detected, stackRepairGuidance(root, detectedStacks),
 	)
 	if !interactive {
-		return "", nil, fmt.Errorf(
-			"%s\n\nResolve: remove %s and re-run vuelta scan --stack <value>, or edit workspace.stack directly in %s",
-			message, projectConfigName, root,
+		return "", detectedStacks, errors.New(message)
+	}
+	return message, detectedStacks, nil
+}
+
+func containsStack(stacks []string, selected string) bool {
+	for _, stack := range stacks {
+		if stack == selected {
+			return true
+		}
+	}
+	return false
+}
+
+func stackRepairGuidance(root string, detectedStacks []string) string {
+	if len(detectedStacks) == 0 {
+		return "No supported replacement stack was detected. Restore a supported project manifest, lockfile, Dockerfile, or Compose file, then run vuelta scan again."
+	}
+	var guidance strings.Builder
+	guidance.WriteString("Repair with a freshly detected stack (this atomically regenerates stack-dependent project policy):")
+	for _, stack := range detectedStacks {
+		fmt.Fprintf(
+			&guidance,
+			"\n  vuelta scan --directory %s --stack %s --no-input",
+			quoteShellArgument(root), stack,
 		)
 	}
-	return message + "; remove " + projectConfigName + " and re-run vuelta scan --stack <value>, or edit workspace.stack directly to update", detectedStacks, nil
+	return guidance.String()
+}
+
+func quoteShellArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // ambiguousStackError names the concrete non-interactive fix for a --stack

@@ -260,6 +260,82 @@ func PlanProjectConfigWrite(project *config.ProjectConfig, path string) (EditPla
 	return EditPlan{Original: original, Updated: updated, Mode: mode, Exists: false, Changed: true}, nil
 }
 
+// PlanProjectStackUpdate prepares an atomic repair of the stack-dependent
+// fields in an existing project-local config. Callers must supply a complete,
+// freshly detected workspace; unrelated project policy remains untouched.
+func PlanProjectStackUpdate(path string, desired config.Workspace) (EditPlan, error) {
+	original, mode, exists, err := readEditSource(path, true)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if !exists {
+		return EditPlan{}, fmt.Errorf("project config %s does not exist; run 'vuelta scan --directory .' first", path)
+	}
+	if _, err := config.ParseProject(original, path); err != nil {
+		return EditPlan{}, err
+	}
+
+	desired.Path = "."
+	repaired := &config.ProjectConfig{SchemaVersion: config.CurrentSchemaVersion, Workspace: desired}
+	resolved, err := repaired.ResolvedWorkspace(path)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if err := config.ValidateWorkspace(resolved); err != nil {
+		return EditPlan{}, fmt.Errorf("validate repaired project workspace: %w", err)
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(original, &document); err != nil {
+		return EditPlan{}, fmt.Errorf("parse project config YAML tree: %w", err)
+	}
+	root, err := documentMapping(&document)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	workspaceNode := mappingValue(root, "workspace")
+	if workspaceNode == nil || workspaceNode.Kind != yaml.MappingNode {
+		return EditPlan{}, errors.New("workspace must be a YAML mapping")
+	}
+	setMappingString(workspaceNode, "stack", desired.Stack)
+	setMappingString(workspaceNode, "package_manager", desired.PackageManager)
+	verification, err := encodeNode(desired.Verification)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("encode repaired verification profile: %w", err)
+	}
+	setMappingNode(workspaceNode, "verification", verification)
+	allowed, err := encodeNode(desired.AllowedChangedPaths)
+	if err != nil {
+		return EditPlan{}, fmt.Errorf("encode repaired changed-path allowlist: %w", err)
+	}
+	setMappingNode(workspaceNode, "allowed_changed_paths", allowed)
+	if desired.DockerImages == nil {
+		deleteMappingNode(workspaceNode, "docker_images")
+	} else {
+		dockerImages, encodeErr := encodeNode(desired.DockerImages)
+		if encodeErr != nil {
+			return EditPlan{}, fmt.Errorf("encode repaired Docker image policy: %w", encodeErr)
+		}
+		setMappingNode(workspaceNode, "docker_images", dockerImages)
+	}
+
+	updated, err := encodeDocument(&document, original)
+	if err != nil {
+		return EditPlan{}, err
+	}
+	if _, err := config.ParseProject(updated, path); err != nil {
+		return EditPlan{}, fmt.Errorf("validate repaired project config: %w", err)
+	}
+	return EditPlan{
+		Original: original, Updated: updated, Mode: mode, Exists: true, Changed: !bytes.Equal(original, updated),
+		Review: []string{
+			fmt.Sprintf("replace workspace.stack with freshly detected %s", desired.Stack),
+			"regenerate stack-dependent package manager, verification, changed-path, and Docker image policy",
+		},
+		RepositoryFile: true,
+	}, nil
+}
+
 // PlanProjectVerificationUpdate prepares the one supported in-place edit of a
 // project-local config. It replaces only workspace.verification, preserving
 // every byte outside that YAML node, and retains the atomic source check used

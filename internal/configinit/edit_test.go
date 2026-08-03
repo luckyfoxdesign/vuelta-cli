@@ -1,6 +1,7 @@
 package configinit
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -491,6 +492,77 @@ func TestProjectVerificationUpdatePreservesEveryOtherByte(t *testing.T) {
 	}
 	if promoted.Workspace.Verification.State != config.VerificationReady {
 		t.Fatalf("verification = %#v", promoted.Workspace.Verification)
+	}
+}
+
+func TestProjectStackUpdateAtomicallyRepairsDependentPolicy(t *testing.T) {
+	project := t.TempDir()
+	writeProjectFile(t, project, "package.json", "{}\n")
+	writeProjectFile(t, project, "package-lock.json", "{}\n")
+	writeProjectFile(t, project, "requirements.txt", "requests==2.0.0\n")
+	path := filepath.Join(project, ".vuelta.yaml")
+	originalProject := &config.ProjectConfig{
+		SchemaVersion: config.CurrentSchemaVersion,
+		Workspace: config.Workspace{
+			Name: "api", Path: ".", Stack: config.StackNode, PackageManager: "npm",
+			Verification:        config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly},
+			Branch:              "main",
+			Remote:              "origin",
+			AllowedChangedPaths: []string{"package.json", "package-lock.json"},
+		},
+	}
+	create, err := PlanProjectConfigWrite(originalProject, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := create.Apply(path); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desired := originalProject.Workspace
+	desired.Path = project
+	desired.Stack = config.StackPython
+	desired.PackageManager = "requirements"
+	desired.AllowedChangedPaths = []string{"requirements.txt"}
+	plan, err := PlanProjectStackUpdate(path, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Changed || !strings.Contains(plan.Diff(path), "+    stack: python") {
+		t.Fatalf("unexpected stack repair diff:\n%s", plan.Diff(path))
+	}
+
+	previousRename := atomicRename
+	atomicRename = func(_, _ string) error { return errors.New("injected stack repair failure") }
+	applyErr := plan.Apply(path)
+	atomicRename = previousRename
+	if applyErr == nil || !strings.Contains(applyErr.Error(), "injected stack repair failure") {
+		t.Fatalf("Apply error = %v", applyErr)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current, original) {
+		t.Fatal("failed atomic stack repair modified the original config")
+	}
+
+	if err := plan.Apply(path); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := config.LoadProject(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.Workspace.Stack != config.StackPython || repaired.Workspace.PackageManager != "requirements" {
+		t.Fatalf("repaired workspace = %#v", repaired.Workspace)
+	}
+	if strings.Join(repaired.Workspace.AllowedChangedPaths, ",") != "requirements.txt" || repaired.Workspace.Branch != "main" || repaired.Workspace.Remote != "origin" {
+		t.Fatalf("repaired policy = %#v", repaired.Workspace)
 	}
 }
 

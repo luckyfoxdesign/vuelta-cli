@@ -268,8 +268,84 @@ func TestSelectScanConfigurationExplicitStackConflictsWithPersistedValue(t *test
 	}
 
 	_, _, err := selectScanConfiguration(scanOptions{directory: project, stack: "docker"}, "")
-	if err == nil || !strings.Contains(err.Error(), "already configured with workspace.stack") {
+	if err == nil || !strings.Contains(err.Error(), "remains freshly detected") {
 		t.Fatalf("conflicting --stack error = %v", err)
+	}
+}
+
+func TestSelectScanConfigurationKeepsPersistedNodeWhenGeneratedComposeAddsDockerSignal(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+
+	_, created, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeScanProjectFile(t, project, "compose.verify.yml", "services:\n  verify:\n    image: node:24-alpine\n")
+	writeScanProjectFile(t, project, "Dockerfile", "FROM node:24-alpine\n")
+
+	cfg, reused, err := selectScanConfiguration(scanOptions{
+		directory: project, stack: config.StackNode, nonInteractive: true,
+	}, "")
+	if err != nil {
+		t.Fatalf("persisted node must remain valid among docker,node signals: %v", err)
+	}
+	after, err := os.ReadFile(created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workspaces[0].Stack != config.StackNode || strings.Join(reused.DetectedStacks, ",") != "docker,node" {
+		t.Fatalf("selection/config = %#v %#v", reused, cfg.Workspaces[0])
+	}
+	if reused.Status != "reused" || reused.OnboardingChanged || !bytes.Equal(before, after) {
+		t.Fatal("valid persisted stack was unexpectedly rewritten")
+	}
+}
+
+func TestSelectScanConfigurationExplicitStackRepairsGenuineDrift(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+	writeScanProjectFile(t, project, "package.json", "{}\n")
+	writeScanProjectFile(t, project, "package-lock.json", "{}\n")
+	if _, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(project, "package.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(project, "package-lock.json")); err != nil {
+		t.Fatal(err)
+	}
+	writeScanProjectFile(t, project, "requirements.txt", "requests==2.0.0\n")
+
+	cfg, selection, err := selectScanConfiguration(scanOptions{
+		directory: project, stack: config.StackPython, nonInteractive: true,
+	}, "")
+	if err != nil {
+		t.Fatalf("repair genuine drift: %v", err)
+	}
+	if selection.Status != "updated" || !selection.OnboardingChanged || strings.Join(selection.ChangedFiles, ",") != projectConfigName {
+		t.Fatalf("selection = %#v", selection)
+	}
+	workspace := cfg.Workspaces[0]
+	if workspace.Stack != config.StackPython || workspace.PackageManager != "requirements" || workspace.Verification.State != config.VerificationScanOnly {
+		t.Fatalf("repaired workspace = %#v", workspace)
+	}
+	persisted, err := config.LoadProject(filepath.Join(project, projectConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Workspace.Stack != config.StackPython || persisted.Workspace.PackageManager != "requirements" {
+		t.Fatalf("persisted workspace = %#v", persisted.Workspace)
+	}
+	if _, reused, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, ""); err != nil || reused.Status != "reused" {
+		t.Fatalf("reuse repaired config: selection=%#v err=%v", reused, err)
 	}
 }
 
@@ -291,7 +367,7 @@ func TestSelectScanConfigurationDriftFailsClosedNonInteractive(t *testing.T) {
 	writeScanProjectFile(t, project, "requirements.txt", "requests==2.0.0\n")
 
 	_, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
-	if err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
+	if err == nil || !strings.Contains(err.Error(), "no longer among freshly detected") {
 		t.Fatalf("drift error = %v", err)
 	}
 }
@@ -305,15 +381,22 @@ func TestDetectStackDriftWarnsWhenInteractiveFailsClosedOtherwise(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(warning, "no longer matches freshly detected") {
+	if !strings.Contains(warning, "no longer among freshly detected") {
 		t.Fatalf("warning = %q", warning)
 	}
 	if strings.Join(detected, ",") != config.StackPython {
 		t.Fatalf("detected stacks = %#v, want [%s]", detected, config.StackPython)
 	}
 
-	if _, _, err := detectStackDrift(workspace, root, false); err == nil || !strings.Contains(err.Error(), "no longer matches freshly detected") {
-		t.Fatalf("non-interactive drift error = %v", err)
+	_, _, nonInteractiveErr := detectStackDrift(workspace, root, false)
+	if nonInteractiveErr == nil || nonInteractiveErr.Error() != warning {
+		t.Fatalf("non-interactive drift error = %v, want same diagnostic as interactive warning %q", nonInteractiveErr, warning)
+	}
+	if !strings.Contains(warning, "vuelta scan --directory") || !strings.Contains(warning, "--stack python --no-input") {
+		t.Fatalf("drift diagnostic does not contain an exact CLI repair: %q", warning)
+	}
+	if strings.Contains(warning, "edit workspace.stack") || strings.Contains(warning, "remove .vuelta.yaml") {
+		t.Fatalf("drift diagnostic still requires manual config repair: %q", warning)
 	}
 }
 
@@ -326,6 +409,41 @@ func TestDetectStackDriftNoDisagreement(t *testing.T) {
 	warning, detected, err := detectStackDrift(workspace, root, false)
 	if err != nil || warning != "" || strings.Join(detected, ",") != config.StackNode {
 		t.Fatalf("warning = %q, detected = %#v, err = %v", warning, detected, err)
+	}
+}
+
+func TestDetectStackDriftAcceptsPersistedStackWithinMultipleSignals(t *testing.T) {
+	root := t.TempDir()
+	writeScanProjectFile(t, root, "package.json", "{}\n")
+	writeScanProjectFile(t, root, "package-lock.json", "{}\n")
+	writeScanProjectFile(t, root, "compose.verify.yml", "services:\n  verify:\n    image: node:24-alpine\n")
+	writeScanProjectFile(t, root, "Dockerfile", "FROM node:24-alpine\n")
+	workspace := config.Workspace{Stack: config.StackNode}
+
+	warning, detected, err := detectStackDrift(workspace, root, false)
+	if err != nil || warning != "" || strings.Join(detected, ",") != "docker,node" {
+		t.Fatalf("warning = %q, detected = %#v, err = %v", warning, detected, err)
+	}
+}
+
+func TestDetectStackDriftWithoutSignalsNamesRecoveryInsteadOfConfigEditing(t *testing.T) {
+	root := t.TempDir()
+	workspace := config.Workspace{Stack: config.StackNode}
+
+	_, detected, err := detectStackDrift(workspace, root, false)
+	if err == nil || len(detected) != 0 || !strings.Contains(err.Error(), "Restore a supported project manifest") {
+		t.Fatalf("detected = %#v, err = %v", detected, err)
+	}
+	if strings.Contains(err.Error(), "edit workspace.stack") || strings.Contains(err.Error(), "remove .vuelta.yaml") {
+		t.Fatalf("missing-signal diagnostic requires manual config repair: %v", err)
+	}
+}
+
+func TestStackRepairGuidanceQuotesDirectoryForShell(t *testing.T) {
+	guidance := stackRepairGuidance("/tmp/project's files", []string{config.StackPython})
+	want := "--directory '/tmp/project'\"'\"'s files' --stack python --no-input"
+	if !strings.Contains(guidance, want) {
+		t.Fatalf("guidance = %q, want command containing %q", guidance, want)
 	}
 }
 
