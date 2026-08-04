@@ -10,6 +10,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/adhoc"
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
+	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 )
 
@@ -124,5 +125,17 @@ func TestBuildUpdatePlanIsDeterministicAndShowsAllGates(t *testing.T) {
 	}
 	if len(plan.Tests) != 1 || !strings.Contains(plan.Tests[0], "disabled") || plan.Commit || plan.Push != "disabled" {
 		t.Fatalf("adhoc action plan = %#v", plan)
+	}
+}
+
+func TestDockerWorkspaceUpdateDoesNotResolvePackageToolchain(t *testing.T) {
+	profile, err := resolveWorkspaceExecutionProfile(config.Workspace{
+		Stack: config.StackDocker,
+	}, config.Config{}, toolchain.Identity{})
+	if err != nil {
+		t.Fatalf("docker execution profile: %v", err)
+	}
+	if profile != nil {
+		t.Fatalf("docker execution profile = %#v, want nil", profile)
 	}
 }

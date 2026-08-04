@@ -432,18 +432,18 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
 	}
-	executionProfile, err := toolchain.ResolveSnapshotProfile(workspace, cfg, snapshot.Toolchain)
+	executionProfile, err := resolveWorkspaceExecutionProfile(workspace, cfg, snapshot.Toolchain)
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "resolve snapshot toolchain: %v", err)
 	}
-	if snapshot.Toolchain.Source == toolchain.SourceDefault {
+	if executionProfile != nil && snapshot.Toolchain.Source == toolchain.SourceDefault {
 		imageID, inspectErr := toolchain.InspectImageID(ctx, dockerexec.Default(), snapshot.Toolchain.ImageID)
 		if inspectErr != nil || imageID != snapshot.Toolchain.ImageID {
 			return updateResult{}, fail(exitEnv, "snapshot toolchain image is unavailable; run vuelta scan again")
 		}
 	}
 	recheck, err := updater.ResolveCandidateScannerWithOptions(workspace, cfg, updater.CandidateScannerOptions{
-		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: true, ToolchainProfile: &executionProfile,
+		AllowProjectConfig: snapshot.Gates.AllowProjectConfig, RequireTracked: true, ToolchainProfile: executionProfile,
 	})
 	if err != nil {
 		return updateResult{}, fail(exitEnv, "%v", err)
@@ -453,10 +453,12 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		Logger: logger,
 	}
 	executionWorkspace := workspace
-	executionWorkspace.ToolchainProfile = executionProfile.ID
 	executionConfig := cfg
-	if snapshot.Toolchain.Source == toolchain.SourceDefault {
-		executionConfig.Update.ToolchainProfiles = append(append([]config.ToolchainProfile(nil), cfg.Update.ToolchainProfiles...), executionProfile)
+	if executionProfile != nil {
+		executionWorkspace.ToolchainProfile = executionProfile.ID
+	}
+	if executionProfile != nil && snapshot.Toolchain.Source == toolchain.SourceDefault {
+		executionConfig.Update.ToolchainProfiles = append(append([]config.ToolchainProfile(nil), cfg.Update.ToolchainProfiles...), *executionProfile)
 	}
 	deps.ResolveUpdater = func(config.Workspace, config.Config) (updater.Updater, error) {
 		return updater.PlannedUpdater{
@@ -514,6 +516,17 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		return result, fail(exitFailure, "workspace update failed: %s", pipelineResult.Reason)
 	}
 	return result, nil
+}
+
+func resolveWorkspaceExecutionProfile(workspace config.Workspace, cfg config.Config, identity toolchain.Identity) (*config.ToolchainProfile, error) {
+	if workspace.PackageManager == "" {
+		return nil, nil
+	}
+	profile, err := toolchain.ResolveSnapshotProfile(workspace, cfg, identity)
+	if err != nil {
+		return nil, err
+	}
+	return &profile, nil
 }
 
 func executeContainerAdhocUpdate(ctx context.Context, snapshot updatesnapshot.Snapshot, cfg config.Config, project adhoc.Project, plan updatePlan, options updateOptions) (updateResult, error) {

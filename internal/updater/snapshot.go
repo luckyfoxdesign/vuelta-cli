@@ -501,13 +501,18 @@ type imageReference struct{ ref, digest string }
 
 func imageReferences(content string) []imageReference {
 	var refs []imageReference
+	seen := make(map[imageReference]bool)
 	for _, line := range strings.Split(content, "\n") {
 		match := fromLinePattern.FindStringSubmatch(line)
 		if match == nil {
 			match = imageLinePattern.FindStringSubmatch(line)
 		}
 		if match != nil && match[3] != "" {
-			refs = append(refs, imageReference{ref: match[2], digest: strings.TrimPrefix(match[3], "@")})
+			ref := imageReference{ref: match[2], digest: strings.TrimPrefix(match[3], "@")}
+			if !seen[ref] {
+				refs = append(refs, ref)
+				seen[ref] = true
+			}
 		}
 	}
 	return refs

@@ -54,6 +54,31 @@ func TestDetectRecordsTagIntentAndExcludesStageAliasesAndScratch(t *testing.T) {
 	}
 }
 
+func TestDetectPreservesExactDockerfileNamesFromProjectRoot(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		files    []string
+		expected string
+	}{
+		{name: "canonical", files: []string{"Dockerfile"}, expected: "Dockerfile"},
+		{name: "lowercase", files: []string{"dockerfile"}, expected: "dockerfile"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			project := t.TempDir()
+			for _, name := range testCase.files {
+				writeProjectFile(t, project, name, "FROM node:22-alpine\n")
+			}
+			discovery, err := Detect(project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(discovery.DockerFiles, ","); got != testCase.expected {
+				t.Fatalf("DockerFiles = %q, want exact root entries %q", got, testCase.expected)
+			}
+		})
+	}
+}
+
 func TestBuildValidNodeConfigAndWritePermissions(t *testing.T) {
 	project := nodeProject(t)
 	discovery, err := Detect(project)

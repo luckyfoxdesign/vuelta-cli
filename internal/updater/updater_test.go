@@ -377,6 +377,39 @@ func TestResolveCandidateScannerSupportsDockerOnlyWorkspace(t *testing.T) {
 	}
 }
 
+func TestDockerCandidateScannerDeduplicatesRepeatedImageReferenceInOneFile(t *testing.T) {
+	root := t.TempDir()
+	oldDigest := "sha256:" + strings.Repeat("a", 64)
+	newDigest := "sha256:" + strings.Repeat("b", 64)
+	writeFile(t, root, "Dockerfile", strings.Join([]string{
+		"FROM node:22-alpine@" + oldDigest + " AS build",
+		"FROM node:22-alpine@" + oldDigest + " AS runtime",
+		"",
+	}, "\n"))
+	resolveCalls := 0
+	scanner := dockerCandidateScanner{
+		Files: []string{"Dockerfile"},
+		Resolve: func(_ context.Context, ref string) (string, error) {
+			resolveCalls++
+			if ref != "node:22-alpine" {
+				t.Fatalf("digest reference = %q", ref)
+			}
+			return newDigest, nil
+		},
+		Contract: scaninput.Contract{Stage: scaninput.StageDockerManifest, Files: []scaninput.File{{
+			Path: "Dockerfile", Category: scaninput.CategoryDockerManifest,
+		}}},
+		RepositoryRoot: root,
+	}
+	candidates, err := scanner.Scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolveCalls != 1 || len(candidates) != 1 {
+		t.Fatalf("resolve calls = %d, candidates = %#v; want one candidate for repeated reference", resolveCalls, candidates)
+	}
+}
+
 func TestResolveCandidateScannerDockerOnlyWithoutImagesIsEmpty(t *testing.T) {
 	resolved, err := ResolveCandidateScannerWithOptions(
 		config.Workspace{Stack: config.StackDocker},

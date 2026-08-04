@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,80 @@ func TestLoadProjectAllowsRepositoryReadablePermissions(t *testing.T) {
 	}
 	if _, err := LoadProject(path); err != nil {
 		t.Fatalf("LoadProject mode 0644: %v", err)
+	}
+}
+
+func TestLoadProjectNormalizesLegacyDockerfileCaseAliasesInMemory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM node:22-alpine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, ".vuelta.yaml")
+	data := []byte(`schema_version: 1
+workspace:
+  name: legacy-docker
+  path: .
+  stack: docker
+  package_manager: ""
+  verification:
+    version: 1
+    state: scan_only
+  branch: main
+  remote: origin
+  allowed_changed_paths:
+    - Dockerfile
+    - dockerfile
+  docker_images:
+    files:
+      - Dockerfile
+      - dockerfile
+    runtime_images:
+      - node:22-alpine
+    platforms:
+      - linux/amd64
+`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	project, err := LoadProject(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(project.Workspace.DockerImages.Files, ","); got != "Dockerfile" {
+		t.Fatalf("docker files = %q, want exact on-disk spelling", got)
+	}
+	if got := strings.Join(project.Workspace.AllowedChangedPaths, ","); got != "Dockerfile" {
+		t.Fatalf("allowed paths = %q, want exact on-disk spelling", got)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatal("loading legacy policy rewrote the project config")
+	}
+}
+
+func TestLegacyDockerfileCaseNormalizationPreservesTwoPhysicalFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"Dockerfile", "dockerfile"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("FROM node:22-alpine\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace := Workspace{
+		AllowedChangedPaths: []string{"Dockerfile", "dockerfile"},
+		DockerImages:        &DockerImagesSpec{Files: []string{"Dockerfile", "dockerfile"}},
+	}
+	if err := normalizeLegacyDockerfileCaseAliases(&workspace, root); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(workspace.DockerImages.Files, ","); got != "Dockerfile,dockerfile" {
+		t.Fatalf("docker files = %q, want both physical files", got)
+	}
+	if got := strings.Join(workspace.AllowedChangedPaths, ","); got != "Dockerfile,dockerfile" {
+		t.Fatalf("allowed paths = %q, want both physical files", got)
 	}
 }
 

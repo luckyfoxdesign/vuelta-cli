@@ -86,6 +86,10 @@ func Detect(selectedRoot string) (Discovery, error) {
 	if err != nil || !info.IsDir() {
 		return Discovery{}, fmt.Errorf("project path %s is not a directory", root)
 	}
+	rootFiles, err := regularRootFiles(root, dockerNames, composeNames)
+	if err != nil {
+		return Discovery{}, err
+	}
 	d := Discovery{Root: root, PackageManagers: make(map[string][]string), Services: make(map[string][]string)}
 	detectedAdapters, err := catalog.Discover(root)
 	if err != nil {
@@ -95,7 +99,7 @@ func Detect(selectedRoot string) (Discovery, error) {
 		d.addManager(adapter.Key().Stack, adapter.Key().PackageManager)
 	}
 	for _, name := range dockerNames {
-		if regular(root, name) {
+		if rootFiles[name] {
 			d.DockerFiles = append(d.DockerFiles, name)
 			images, err := dockerRuntimeImages(filepath.Join(root, name))
 			if err != nil {
@@ -106,7 +110,7 @@ func Detect(selectedRoot string) (Discovery, error) {
 	}
 	hasDockerfile := len(d.DockerFiles) > 0
 	for _, name := range composeNames {
-		if !regular(root, name) {
+		if !rootFiles[name] {
 			continue
 		}
 		d.ComposeFiles = append(d.ComposeFiles, name)
@@ -139,6 +143,37 @@ func Detect(selectedRoot string) (Discovery, error) {
 	}
 	d.RuntimeImages = uniqueSorted(d.RuntimeImages)
 	return d, nil
+}
+
+// regularRootFiles enumerates the directory once and records only allowlisted
+// regular files under their exact stored names. Probing multiple case variants
+// with Lstat makes one Dockerfile appear under every variant on
+// case-insensitive systems.
+func regularRootFiles(root string, allowlists ...[]string) (map[string]bool, error) {
+	allowed := make(map[string]bool)
+	for _, names := range allowlists {
+		for _, name := range names {
+			allowed[name] = true
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read project root: %w", err)
+	}
+	files := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		if !allowed[entry.Name()] {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("inspect project root entry %s: %w", entry.Name(), err)
+		}
+		if info.Mode().IsRegular() {
+			files[entry.Name()] = true
+		}
+	}
+	return files, nil
 }
 
 func (d *Discovery) addManager(stack, manager string) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -403,6 +404,75 @@ func TestNoOpOnlyPackageScanIsCleanAndPublishesNoSnapshot(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "package-lock.json")); err != nil || string(got) != string(lock) {
 		t.Fatalf("package-lock.json changed: %q, %v", got, err)
+	}
+}
+
+func TestHybridNodeApprovalRepeatedScanCreatesUpdateSnapshot(t *testing.T) {
+	project, _ := onboardVerifyProject(t)
+	writeScanProjectFile(t, project, "Dockerfile", "FROM node:22-alpine@sha256:"+strings.Repeat("a", 64)+"\n")
+	writeGeneratedVerifyCompose(t, project)
+	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
+		t.Fatalf("approve hybrid project verification: %v", err)
+	}
+
+	cfg, selection, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err != nil {
+		t.Fatalf("repeat hybrid project selection: %v", err)
+	}
+	if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Stack != config.StackNode ||
+		cfg.Workspaces[0].Verification.State != config.VerificationReady ||
+		strings.Join(selection.DetectedStacks, ",") != "docker,node" {
+		t.Fatalf("hybrid selection/config = %#v %#v", selection, cfg.Workspaces)
+	}
+	cfg.Workspaces[0].Name = "hybrid-node-docker"
+	initAndCommitScanProject(t, project)
+
+	workspace := cfg.Workspaces[0]
+	target := scanTarget{workspace: &workspace, name: workspace.Name, path: project, origin: updatesnapshot.OriginWorkspace}
+	runners := scanStageRunners{
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{
+				Kind: "npm", Name: "example", Current: "1.0.0", Target: "2.0.0", Ownership: "direct",
+				PublicationTime: time.Now().Add(-30 * 24 * time.Hour),
+			}}, "npm", true, nil
+		},
+	}
+	policyIdentity := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
+	result := scanOneTargetWith(
+		context.Background(), *cfg, target, scanOptions{only: "packages"},
+		config.LocalPackagePolicy{}, policyIdentity, 14*24*time.Hour, runners,
+	)
+	if result.Status != "ready" || result.SnapshotID == "" || hasFailedStage(result, stageSnapshot) {
+		t.Fatalf("hybrid repeated scan did not create snapshot: %#v", result)
+	}
+	store, err := updatesnapshot.ProjectStore(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Load(result.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Candidates) != 1 || snapshot.Candidates[0].Name != "example" ||
+		snapshot.Workspace.BaseRevision == "" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func initAndCommitScanProject(t *testing.T, project string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"init", "-q", "--initial-branch=main"},
+		{"config", "user.email", "fixture@example.invalid"},
+		{"config", "user.name", "Vuelta fixture"},
+		{"add", "-A"},
+		{"commit", "-q", "-m", "fixture: hybrid node docker"},
+	} {
+		command := exec.Command("git", args...)
+		command.Dir = project
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
 	}
 }
 

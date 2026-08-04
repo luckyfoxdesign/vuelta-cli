@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -87,10 +88,69 @@ func parseProject(data []byte, path string, allowScriptDrift bool) (*ProjectConf
 	if err != nil {
 		return nil, err
 	}
+	root := resolved.Path
+	if err := normalizeLegacyDockerfileCaseAliases(&project.Workspace, root); err != nil {
+		return nil, fmt.Errorf("normalize project config %s: %w", path, err)
+	}
+	resolved = project.Workspace
+	resolved.Path = root
 	if err := errors.Join(validateWorkspaceWithOptions(0, resolved, allowScriptDrift)...); err != nil {
 		return nil, fmt.Errorf("validate project config %s: %w", path, err)
 	}
 	return &project, nil
+}
+
+// normalizeLegacyDockerfileCaseAliases repairs the in-memory policy emitted by
+// older Vuelta builds on case-insensitive filesystems. Those builds probed both
+// supported spellings and could persist one physical Dockerfile twice. The
+// source file is intentionally left unchanged: every loader derives the same
+// effective policy while Git remains the authority for repository changes.
+func normalizeLegacyDockerfileCaseAliases(workspace *Workspace, root string) error {
+	if workspace.DockerImages == nil {
+		return nil
+	}
+	configuredAlias := false
+	for _, name := range workspace.DockerImages.Files {
+		if name == "Dockerfile" || name == "dockerfile" {
+			configuredAlias = true
+			break
+		}
+	}
+	if !configuredAlias {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("read project root: %w", err)
+	}
+	var exact []string
+	for _, entry := range entries {
+		if (entry.Name() == "Dockerfile" || entry.Name() == "dockerfile") && entry.Type().IsRegular() {
+			exact = append(exact, entry.Name())
+		}
+	}
+	if len(exact) != 1 {
+		return nil
+	}
+	actual := exact[0]
+	workspace.DockerImages.Files = replaceDockerfileAliases(workspace.DockerImages.Files, actual)
+	workspace.AllowedChangedPaths = replaceDockerfileAliases(workspace.AllowedChangedPaths, actual)
+	return nil
+}
+
+func replaceDockerfileAliases(paths []string, actual string) []string {
+	normalized := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path == "Dockerfile" || path == "dockerfile" {
+			path = actual
+		}
+		if !seen[path] {
+			normalized = append(normalized, path)
+			seen[path] = true
+		}
+	}
+	return normalized
 }
 
 // ResolvedWorkspace returns the project workspace with "." bound to the
