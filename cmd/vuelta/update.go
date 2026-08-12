@@ -30,6 +30,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/updatepolicy"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
+	"github.com/luckyfoxdesign/vuelta/internal/verificationprep"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
@@ -220,19 +221,31 @@ func executeLocalUpdate(args []string) error {
 		if result.Status == "" {
 			result = updateResult{SnapshotID: id, Status: "failed", Plan: plan, ChangedFiles: []string{}, Tests: "not_completed", Commit: "not_created", Push: "not_run"}
 		}
-		code := "execution_failed"
-		var command commandError
-		if errors.As(err, &command) && command.code == exitEnv {
-			code = "environment_unavailable"
-		} else if result.Tests == "failed" {
-			code = "test_failed"
-		} else if result.Commit == "created" && result.Push == "failed" {
-			code = "partial_post_action"
-		}
+		code := updateExecutionErrorCode(err, result)
 		result.Error = &jsonCommandError{Code: code, Message: err.Error()}
 		return writeUpdateOutcome(options.jsonOutput, warnings, result, err)
 	}
 	return writeUpdateOutcome(options.jsonOutput, warnings, result, nil)
+}
+
+func updateExecutionErrorCode(err error, result updateResult) string {
+	var command commandError
+	if errors.As(err, &command) && command.code == exitEnv {
+		return "environment_unavailable"
+	}
+	if result.Commit == "created" && result.Push == "failed" {
+		return "partial_post_action"
+	}
+	switch result.Tests {
+	case "preparation_failed":
+		return "verification_dependency_preparation_failed"
+	case "timed_out":
+		return "verification_timeout"
+	case "failed":
+		return "verification_failed"
+	default:
+		return "execution_failed"
+	}
 }
 
 func parseUpdateOptions(args []string) (updateOptions, string, error) {
@@ -452,6 +465,22 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		Sandbox: pipeline.BasicSandbox{}, Security: pipeline.DefaultSecurityGate{Scanner: vulnscan.Scanner{}, GitHub: githubalerts.Client{}},
 		Logger: logger,
 	}
+	dependencyWorkspace, dependencyPreparationRequired, dependencyErr := config.VerificationDependencyWorkspace(workspace)
+	if dependencyErr != nil {
+		return updateResult{}, fail(exitEnv, "resolve verification dependency profile: %v", dependencyErr)
+	}
+	if dependencyPreparationRequired {
+		if executionProfile == nil {
+			return updateResult{}, fail(exitEnv, "snapshot has no verification dependency toolchain")
+		}
+		preparer, prepareErr := verificationprep.New(
+			dependencyWorkspace, *executionProfile, cfg.Update.Egress, snapshot.Gates.AllowProjectConfig, dockerexec.Default(),
+		)
+		if prepareErr != nil {
+			return updateResult{}, fail(exitEnv, "configure verification dependency preparation: %v", prepareErr)
+		}
+		deps.VerificationPreparer = preparer
+	}
 	executionWorkspace := workspace
 	executionConfig := cfg
 	if executionProfile != nil {
@@ -495,7 +524,12 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 		result.Push = pipelineResult.Branch
 	}
 	if pipelineResult.Status == "failed" || pipelineResult.Status == "blocked" {
-		if pipelineResult.Reason == "verification failed" || strings.HasPrefix(pipelineResult.Reason, "verification run") {
+		switch pipelineResult.Reason {
+		case "verification dependency preparation":
+			result.Tests = "preparation_failed"
+		case "verification timeout":
+			result.Tests = "timed_out"
+		case "verification failed", "verification run":
 			result.Tests = "failed"
 		}
 		switch pipelineResult.Reason {
@@ -519,10 +553,17 @@ func executeWorkspaceUpdate(ctx context.Context, snapshot updatesnapshot.Snapsho
 }
 
 func resolveWorkspaceExecutionProfile(workspace config.Workspace, cfg config.Config, identity toolchain.Identity) (*config.ToolchainProfile, error) {
-	if workspace.PackageManager == "" {
+	toolchainWorkspace, verificationDependencies, err := config.VerificationDependencyWorkspace(workspace)
+	if err != nil {
+		return nil, err
+	}
+	if !verificationDependencies {
+		toolchainWorkspace = workspace
+	}
+	if toolchainWorkspace.PackageManager == "" {
 		return nil, nil
 	}
-	profile, err := toolchain.ResolveSnapshotProfile(workspace, cfg, identity)
+	profile, err := toolchain.ResolveSnapshotProfile(toolchainWorkspace, cfg, identity)
 	if err != nil {
 		return nil, err
 	}

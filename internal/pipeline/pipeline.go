@@ -32,6 +32,13 @@ type Sandbox interface {
 	Prepare(ctx context.Context, repoPath, baseSHA string) (dir string, cleanup func() error, err error)
 }
 
+// VerificationPreparer materializes only the dependency artifact needed by
+// an approved verification profile. Production binds it to the exact
+// snapshot-selected toolchain and managed egress policy.
+type VerificationPreparer interface {
+	Prepare(ctx context.Context, workDir string) error
+}
+
 // Report is a CVE/advisory scan result. Ran distinguishes "scanned, found
 // nothing" from "not run at all" so a stub SecurityGate can never be
 // mistaken for a clean scan.
@@ -86,10 +93,11 @@ type SecurityGate interface {
 
 // Deps wires the pipeline to its stage implementations.
 type Deps struct {
-	Sandbox  Sandbox
-	Security SecurityGate
-	Logger   *logging.Logger
-	Docker   dockerexec.Runner
+	Sandbox              Sandbox
+	Security             SecurityGate
+	VerificationPreparer VerificationPreparer
+	Logger               *logging.Logger
+	Docker               dockerexec.Runner
 	// Now returns the current time; defaults to time.Now when nil. Tests
 	// override it for deterministic branch names and commit messages.
 	Now func() time.Time
@@ -218,9 +226,28 @@ func RunWorkspace(ctx context.Context, deps Deps, cfg config.Config, ws config.W
 		return failResultWithLogger(deps.Logger, project, "security post-check", err)
 	}
 
-	// Step 6: explicit verification.
+	// Step 6: prepare lockfile-bound dependencies through the managed egress
+	// boundary, then run the approved verification command on an internal-only
+	// network. Preparation is explicit rather than a side effect of package
+	// mutation so Docker-only and package updates obey the same contract.
+	_, dependencyPreparationRequired, err := config.VerificationDependencyWorkspace(ws)
+	if err != nil {
+		return failResultWithLogger(deps.Logger, project, "verification dependency preparation", err)
+	}
+	if dependencyPreparationRequired && deps.VerificationPreparer == nil {
+		return failResultWithLogger(deps.Logger, project, "verification dependency preparation", errors.New("snapshot-bound preparer is not configured"))
+	}
+	if deps.VerificationPreparer != nil {
+		if err := deps.VerificationPreparer.Prepare(ctx, sandboxDir); err != nil {
+			return failResultWithLogger(deps.Logger, project, "verification dependency preparation", err)
+		}
+	}
 	result, err := testrunner.RunProfileWithDocker(ctx, deps.docker(), sandboxDir, ws.Verification)
 	if err != nil {
+		var timeoutErr *testrunner.TimeoutError
+		if errors.As(err, &timeoutErr) {
+			return failResultWithLogger(deps.Logger, project, "verification timeout", err)
+		}
 		return failResultWithLogger(deps.Logger, project, "verification run", err)
 	}
 	if !result.Passed {

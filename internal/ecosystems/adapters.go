@@ -206,6 +206,21 @@ type pnpmAdapter struct {
 	verifyEnvironmentCapability
 }
 
+func (npmAdapter) VerificationDependencies() ecosystem.VerificationDependencySpec {
+	return ecosystem.VerificationDependencySpec{
+		Command:            []string{"npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache=/project/.vuelta-verify-cache/npm"},
+		ManagerConfigFiles: []string{".npmrc"},
+	}
+}
+
+func (pnpmAdapter) VerificationDependencies() ecosystem.VerificationDependencySpec {
+	return ecosystem.VerificationDependencySpec{
+		Command:            []string{"pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--store-dir=/project/.vuelta-verify-cache/pnpm"},
+		ManagerConfigFiles: []string{".npmrc"},
+		UnsupportedFiles:   []string{"pnpm-workspace.yaml"},
+	}
+}
+
 type pipToolsAdapter struct {
 	mutableAdapter
 }

@@ -121,6 +121,7 @@ make build                     # both cross-build targets
 - `internal/updatepolicy/` — applies Vuelta's machine-owned delayed-latest policy to normalized, non-executable dependency metadata.
 - `internal/updater/` — executes adapter-provided reviewed scanner and mutation argv inside core-owned hardened containers, then applies validated dependency and Docker image plans inside a sandboxed working copy.
 - `internal/updatesnapshot/` — stores short-lived, project-local read-only package update plans. A snapshot deliberately contains only metadata and candidate versions; it never stores project file contents, command output, or configuration secrets.
+- `internal/verificationprep/` — materializes only lockfile-bound package dependencies needed by an approved verification command. Preparation runs in the snapshot-selected toolchain container with managed registry egress; the later verification container remains offline.
 - `internal/vulnscan/` — TODO: describe this package.
 <!-- generated:end -->
 
@@ -145,6 +146,12 @@ make build                     # both cross-build targets
   step that still touches the configured remote/branch.
 - Registered scan containers never mount a live repository. `internal/scaninput` builds an exact tracked allowlist in memory, while `internal/scancontainer` transfers it through a stopped loader into an ephemeral image and starts only the separately hardened read-only scanner container.
 - Package ecosystem behavior is selected through one explicit built-in catalog; core orchestration has no manager-name registry tables or switches.
+- Verification dependency ownership is split deliberately: `pipeline` decides
+  when preparation runs, `verificationprep` enforces the input and container
+  boundary, adapters supply frozen install argv, and `testrunner` remains an
+  offline executor. The preparer reuses the snapshot-selected toolchain and
+  egress policy, rejects unbound/local workspace inputs, always disables
+  lifecycle scripts, and proves admitted package inputs stayed unchanged.
 - `deploy/` contains scheduler units, the central release engine, and the
   machine-owned gateway image. Managed projects do not receive Vuelta files.
 

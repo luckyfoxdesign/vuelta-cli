@@ -407,6 +407,32 @@ func TestVerificationProfileIdentityChangesWithCommandAndTimeout(t *testing.T) {
 	}
 }
 
+func TestVerificationDependencyWorkspaceDerivesHybridPackageContractFromApprovedArgv(t *testing.T) {
+	workspace := Workspace{
+		Stack: StackDocker,
+		Verification: VerificationProfile{Version: VerificationVersion, State: VerificationReady, Steps: []VerificationStep{{
+			Name: "build", Command: []string{"npm", "run", "build"},
+		}}},
+	}
+	derived, required, err := VerificationDependencyWorkspace(workspace)
+	if err != nil || !required {
+		t.Fatalf("VerificationDependencyWorkspace() = %#v, %t, %v", derived, required, err)
+	}
+	if derived.Stack != StackNode || derived.PackageManager != "npm" {
+		t.Fatalf("derived workspace = %#v", derived)
+	}
+}
+
+func TestVerificationDependencyWorkspaceRejectsAmbiguousManagers(t *testing.T) {
+	workspace := Workspace{Verification: VerificationProfile{Steps: []VerificationStep{
+		{Name: "npm", Command: []string{"npm", "run", "build"}},
+		{Name: "pnpm", Command: []string{"pnpm", "run", "test"}},
+	}}}
+	if _, _, err := VerificationDependencyWorkspace(workspace); err == nil {
+		t.Fatal("ambiguous verification dependency managers were accepted")
+	}
+}
+
 func TestValidateRejectsInvalidChangedPathPattern(t *testing.T) {
 	t.Parallel()
 	cfg := Config{Git: GitConfig{AllowedChangedPaths: []string{`nested\package.json`}}}

@@ -221,6 +221,7 @@ func dockerRunArgsForProfile(image string, args []string, workDir, network, prox
 	}
 	dockerArgs = append(dockerArgs,
 		"--user", user,
+		"--read-only",
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL",
 		"--cpus", "1",

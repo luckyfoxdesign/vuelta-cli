@@ -1066,14 +1066,30 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result.PackageUpdates = &packageUpdateAvailability{Status: config.VerificationScanOnly, Reason: "manifest_has_no_safe_mutation_contract"}
 		result.Warnings = appendUniqueStrings(result.Warnings, fmt.Sprintf("%s candidates are scan-only; the manifest does not prove dependency ownership and no update snapshot will be created", scanOnlyAdapter.Key().String()))
 	}
-	identityOptions := workspaceIdentityOptions(identityWorkspace, identityConfig, options)
-	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, identityWorkspace, identityOptions)
+	snapshotInputWorkspace := identityWorkspace
+	if target.workspace != nil {
+		dependencyWorkspace, required, dependencyErr := config.VerificationDependencyWorkspace(*target.workspace)
+		if dependencyErr != nil {
+			result = recordScanStageFailure(result, stagePreflight, "verification_dependency_invalid", dependencyErr, "Approve one unambiguous package verification profile")
+			result = addStage(result, stageVulnerability, stageNotRequested, "verification dependency profile is invalid")
+			result = addStage(result, stageAlerts, stageNotRequested, "verification dependency profile is invalid")
+			result = addStage(result, stageCandidate, stageNotRequested, "verification dependency profile is invalid")
+			result = addStage(result, stageReleaseAge, stageNotRequested, "verification dependency profile is invalid")
+			result = addStage(result, stageSnapshot, stageNotRequested, "verification dependency profile is invalid")
+			return finalizeStageOutcomes(result)
+		}
+		if required {
+			snapshotInputWorkspace = dependencyWorkspace
+		}
+	}
+	identityOptions := workspaceIdentityOptions(snapshotInputWorkspace, identityConfig, options)
+	initialInput, inputCategories, initialInputErr := adhocInputIdentityAndCategories(ctx, snapshotInputWorkspace, identityOptions)
 	if initialInputErr == nil {
 		result.InputCategories = inputCategories
 	}
 	lockfileMissing := false
 	if initialInputErr == nil {
-		lockfileMissing, initialInputErr = mutationLockfileMissing(identityWorkspace)
+		lockfileMissing, initialInputErr = mutationLockfileMissing(snapshotInputWorkspace)
 	}
 	if lockfileMissing {
 		result.PackageUpdates = &packageUpdateAvailability{Status: "unavailable", Reason: reasonLockfileMissing}
@@ -1168,13 +1184,13 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		return finalizeStageOutcomes(result)
 	}
 
-	if identityWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
-		prepared, prepareErr := runners.prepareToolchain(ctx, cfg, identityWorkspace)
+	if snapshotInputWorkspace.PackageManager != "" && target.dockerErr == nil && runners.prepareToolchain != nil {
+		prepared, prepareErr := runners.prepareToolchain(ctx, cfg, snapshotInputWorkspace)
 		if ctx.Err() != nil {
 			return result
 		}
 		if prepareErr != nil {
-			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(identityWorkspace), Status: "failed", Reason: prepareErr.Error()})
+			result.Tools = append(result.Tools, scanToolResult{Name: packageToolName(snapshotInputWorkspace), Status: "failed", Reason: prepareErr.Error()})
 			result = recordScanStageFailure(result, stageCandidate, "toolchain_incompatible", prepareErr, "Adjust the detected runtime/manager constraint or add a compatible update.toolchain_profiles override")
 			result = addUnavailableReleaseAgeStage(result, minAge, "package candidates are unavailable")
 			result = addStage(result, stageSnapshot, stageNotRequested, "package candidates are unavailable")
@@ -1312,8 +1328,8 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			options.toolchainConstraint,
 			options.toolchainConstraintSource,
 		)
-	} else if identityWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
-		_, identity, constraints, resolveErr := toolchain.Resolve(identityWorkspace, cfg)
+	} else if snapshotInputWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+		_, identity, constraints, resolveErr := toolchain.Resolve(snapshotInputWorkspace, cfg)
 		if resolveErr != nil {
 			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", resolveErr, "Fix the selected toolchain profile before creating an update snapshot")
 			return finalizeStageOutcomes(result)
@@ -1352,7 +1368,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 	}
 	var snapshot updatesnapshot.Snapshot
 	if target.workspace != nil {
-		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, *target.workspace, identityOptions)
+		identity, identityErr := scanner.IdentityForSnapshotWithOptions(ctx, snapshotInputWorkspace, identityOptions)
 		if identityErr != nil {
 			result = recordScanStageFailure(result, stageSnapshot, "snapshot_failed", identityErr, "Commit or stash changes to create an update snapshot; scan findings above remain valid")
 			return finalizeStageOutcomes(result)

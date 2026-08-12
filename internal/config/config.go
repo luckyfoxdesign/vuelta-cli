@@ -433,6 +433,43 @@ func VerificationProfileHash(ws Workspace) (string, error) {
 	return fmt.Sprintf("%x", sum), nil
 }
 
+// VerificationDependencyWorkspace derives the one package-manager contract
+// actually invoked by approved verification argv. This keeps hybrid
+// Docker-owned workspaces tied to their Node manifest, lockfile, platform,
+// and toolchain without changing which ecosystem owns update candidates.
+func VerificationDependencyWorkspace(ws Workspace) (Workspace, bool, error) {
+	registry, err := catalog.New()
+	if err != nil {
+		return Workspace{}, false, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	var selected ecosystem.Adapter
+	for _, step := range ws.Verification.Steps {
+		for _, adapter := range registry.Adapters() {
+			verification, ok := adapter.(ecosystem.VerificationProvider)
+			if !ok {
+				continue
+			}
+			if _, ok := adapter.(ecosystem.VerificationDependencyProvider); !ok {
+				continue
+			}
+			if _, matched := verification.VerificationScript(step.Command); !matched {
+				continue
+			}
+			if selected != nil && selected.Key() != adapter.Key() {
+				return Workspace{}, false, errors.New("verification dependency package manager is ambiguous")
+			}
+			selected = adapter
+		}
+	}
+	if selected == nil {
+		return ws, false, nil
+	}
+	derived := ws
+	derived.Stack = selected.Key().Stack
+	derived.PackageManager = selected.Key().PackageManager
+	return derived, true, nil
+}
+
 // VerificationPlan returns a concise, non-shell rendering for CLI output.
 func VerificationPlan(ws Workspace) []string {
 	if ws.Verification.State == VerificationScanOnly {

@@ -96,25 +96,34 @@ func IdentityForResolvedProfile(profile config.ToolchainProfile, source, imageID
 func identityForResolvedProfile(profile config.ToolchainProfile, source, imageID string, bindAdapter bool) (Identity, error) {
 	adapterID := ""
 	adapterVersion := ""
+	registry, err := catalog.New()
+	if err != nil {
+		return Identity{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	adapter, err := registry.Lookup(profile.Stack, profile.PackageManager)
+	if err != nil {
+		return Identity{}, err
+	}
 	if bindAdapter {
-		registry, err := catalog.New()
-		if err != nil {
-			return Identity{}, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
-		}
-		adapter, err := registry.Lookup(profile.Stack, profile.PackageManager)
-		if err != nil {
-			return Identity{}, err
-		}
 		adapterID = adapter.Key().String()
 		adapterVersion = adapter.Metadata().Version
 	}
+	var verificationDependencies *ecosystem.VerificationDependencySpec
+	if provider, ok := adapter.(ecosystem.VerificationDependencyProvider); ok {
+		spec := provider.VerificationDependencies()
+		verificationDependencies = &spec
+	}
 	contract := struct {
-		Profile        config.ToolchainProfile `json:"profile"`
-		AdapterID      string                  `json:"adapter_id,omitempty"`
-		AdapterVersion string                  `json:"adapter_version,omitempty"`
-		Source         string                  `json:"source"`
-		ImageID        string                  `json:"image_id"`
-	}{Profile: profile, AdapterID: adapterID, AdapterVersion: adapterVersion, Source: source, ImageID: imageID}
+		Profile                  config.ToolchainProfile               `json:"profile"`
+		AdapterID                string                                `json:"adapter_id,omitempty"`
+		AdapterVersion           string                                `json:"adapter_version,omitempty"`
+		VerificationDependencies *ecosystem.VerificationDependencySpec `json:"verification_dependencies,omitempty"`
+		Source                   string                                `json:"source"`
+		ImageID                  string                                `json:"image_id"`
+	}{
+		Profile: profile, AdapterID: adapterID, AdapterVersion: adapterVersion,
+		VerificationDependencies: verificationDependencies, Source: source, ImageID: imageID,
+	}
 	data, err := json.Marshal(contract)
 	if err != nil {
 		return Identity{}, fmt.Errorf("encode toolchain profile: %w", err)

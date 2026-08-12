@@ -459,6 +459,79 @@ func TestHybridNodeApprovalRepeatedScanCreatesUpdateSnapshot(t *testing.T) {
 	}
 }
 
+func TestDockerOwnedHybridSnapshotBindsVerificationManifestLockAndToolchain(t *testing.T) {
+	project, _ := onboardVerifyProject(t)
+	writeScanProjectFile(t, project, "Dockerfile", "FROM node:22-alpine@sha256:"+strings.Repeat("a", 64)+"\n")
+	writeGeneratedVerifyCompose(t, project)
+	if err := run([]string{"project", "verify", "approve", "--directory", project, "--yes"}); err != nil {
+		t.Fatalf("approve hybrid project verification: %v", err)
+	}
+	cfg, _, err := selectScanConfiguration(scanOptions{directory: project, nonInteractive: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := cfg.Workspaces[0]
+	workspace.Name = "docker-owned-hybrid"
+	workspace.Stack = config.StackDocker
+	workspace.PackageManager = ""
+	workspace.DockerImages = &config.DockerImagesSpec{Files: []string{"Dockerfile"}, Platforms: []string{"linux/amd64"}}
+	cfg.Workspaces[0] = workspace
+	initAndCommitScanProject(t, project)
+
+	runners := scanStageRunners{
+		packages: func(context.Context, config.Config, scanTarget, scanOptions, config.LocalPackagePolicy, time.Duration) ([]updatesnapshot.Candidate, string, bool, error) {
+			return []updatesnapshot.Candidate{{
+				Kind: "docker", Name: "node:22-alpine", Current: "sha256:" + strings.Repeat("a", 64),
+				Target: "sha256:" + strings.Repeat("b", 64), File: "Dockerfile",
+			}}, "docker", true, nil
+		},
+		prepareToolchain: func(_ context.Context, scanConfig config.Config, derived config.Workspace) (toolchain.Prepared, error) {
+			if derived.Stack != config.StackNode || derived.PackageManager != "npm" {
+				t.Fatalf("verification toolchain workspace = %#v", derived)
+			}
+			selection, err := toolchain.Select(derived, scanConfig)
+			if err != nil {
+				return toolchain.Prepared{}, err
+			}
+			selection.Profile.Image = "sha256:" + strings.Repeat("c", 64)
+			identity, err := toolchain.IdentityForResolvedProfile(selection.Profile, selection.Source, selection.Profile.Image)
+			return toolchain.Prepared{Selection: selection, Identity: identity}, err
+		},
+	}
+	policy := updatesnapshot.PolicyIdentity{Path: updatesnapshot.PolicyNone, Hash: updatesnapshot.PolicyNone}
+	result := scanOneTargetWith(
+		context.Background(), *cfg,
+		scanTarget{workspace: &workspace, name: workspace.Name, path: project, origin: updatesnapshot.OriginWorkspace},
+		scanOptions{only: "packages"}, config.LocalPackagePolicy{}, policy, 0, runners,
+	)
+	if result.Status != "ready" || result.SnapshotID == "" {
+		t.Fatalf("Docker-owned hybrid scan = %#v", result)
+	}
+	store, err := updatesnapshot.ProjectStore(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Load(result.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"package.json", "package-lock.json", "Dockerfile"} {
+		if snapshot.Workspace.Input.Hashes[path] == "" {
+			t.Fatalf("snapshot omitted verification input %q: %#v", path, snapshot.Workspace.Input)
+		}
+	}
+	if snapshot.Toolchain.PackageManager != "npm" || snapshot.Toolchain.Platform == "" || snapshot.Toolchain.ImageID == "" {
+		t.Fatalf("snapshot omitted verification toolchain identity: %#v", snapshot.Toolchain)
+	}
+	if err := updatesnapshot.ValidateForWorkspace(context.Background(), snapshot, *cfg, workspace, time.Now()); err != nil {
+		t.Fatalf("fresh hybrid snapshot validation: %v", err)
+	}
+	writeScanProjectFile(t, project, "package-lock.json", `{"lockfileVersion":3,"packages":{}}`)
+	if err := updatesnapshot.ValidateForWorkspace(context.Background(), snapshot, *cfg, workspace, time.Now()); !errors.Is(err, updatesnapshot.ErrStale) {
+		t.Fatalf("changed verification lockfile error = %v, want stale", err)
+	}
+}
+
 func initAndCommitScanProject(t *testing.T, project string) {
 	t.Helper()
 	for _, args := range [][]string{

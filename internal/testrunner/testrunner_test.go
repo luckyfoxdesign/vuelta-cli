@@ -2,6 +2,7 @@ package testrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -718,7 +719,8 @@ func TestRunTimesOut(t *testing.T) {
 
 	profile := verificationStep("docker-compose.test.yml", "test")
 	_, err := RunWithDocker(context.Background(), docker, dir, profile, 50*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
+	var timeoutErr *TimeoutError
+	if !errors.As(err, &timeoutErr) || timeoutErr.Step != profile.Name {
 		t.Fatalf("expected timeout error, got %v", err)
 	}
 	if _, statErr := os.Stat(cleanupMarker); statErr != nil {

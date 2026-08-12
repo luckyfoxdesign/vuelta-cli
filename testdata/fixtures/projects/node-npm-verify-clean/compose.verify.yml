@@ -1,0 +1,26 @@
+services:
+  verify:
+    image: node:22-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    platform: linux/amd64
+    user: 10001:10001
+    read_only: true
+    working_dir: /workspace
+    environment:
+      HOME: /tmp
+      npm_config_cache: /tmp/npm
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: "1"
+    mem_limit: 1g
+    pids_limit: 256
+    networks: [verification]
+    command: [npm, run, build]
+networks:
+  verification:
+    internal: true

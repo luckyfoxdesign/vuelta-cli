@@ -136,6 +136,7 @@ func TestDockerRunArgsIncludeSecurityBaseline(t *testing.T) {
 	got := dockerRunArgs("node@sha256:x", []string{"npm", "install"}, "/sandbox/project", "vuelta-update-egress", "http://vuelta-egress-proxy:3128")
 	for _, want := range []string{
 		"--user", "65532:65532",
+		"--read-only",
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL",
 		"--cpus", "1",

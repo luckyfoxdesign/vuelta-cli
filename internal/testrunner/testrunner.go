@@ -45,6 +45,17 @@ type Result struct {
 	Output string
 }
 
+// TimeoutError distinguishes an exhausted verification deadline from a
+// command that completed with a non-success exit code.
+type TimeoutError struct {
+	Step    string
+	Timeout time.Duration
+}
+
+func (e *TimeoutError) Error() string {
+	return fmt.Sprintf("verification step %q timed out after %s", e.Step, e.Timeout)
+}
+
 // ValidateProfile performs the complete read-only Compose and command-policy
 // validation used before an update is allowed to create a sandbox.
 func ValidateProfile(workDir string, profile config.VerificationProfile) error {
@@ -194,7 +205,7 @@ func RunWithDocker(ctx context.Context, docker dockerexec.Runner, workDir string
 	}
 
 	if runCtx.Err() == context.DeadlineExceeded {
-		return result, fmt.Errorf("verification step %q timed out after %s", step.Name, timeout)
+		return result, &TimeoutError{Step: step.Name, Timeout: timeout}
 	}
 	if runErr != nil {
 		var exitError *exec.ExitError

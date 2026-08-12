@@ -68,6 +68,25 @@ type VerificationEnvironmentProvider interface {
 	VerificationEnvironment() map[string]string
 }
 
+// VerificationDependencySpec is the adapter-owned, data-only contract used
+// to materialize lockfile-pinned dependencies before an isolated verification
+// command runs. Command is fixed reviewed argv; repository data can never add
+// arguments or select an executable. ManagerConfigFiles are accepted only
+// when the scan snapshot explicitly bound project package-manager config.
+// UnsupportedFiles name otherwise recognized root inputs whose semantics
+// would make the package manager read additional, unbound project trees.
+type VerificationDependencySpec struct {
+	Command            []string
+	ManagerConfigFiles []string
+	UnsupportedFiles   []string
+}
+
+// VerificationDependencyProvider supplies the reviewed frozen-install
+// contract for package managers supported by generated verification profiles.
+type VerificationDependencyProvider interface {
+	VerificationDependencies() VerificationDependencySpec
+}
+
 // Constraints contains normalized, allowlisted project metadata.
 type Constraints struct {
 	Key                     Key

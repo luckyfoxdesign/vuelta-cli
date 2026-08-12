@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -47,13 +48,17 @@ func writeFile(t *testing.T, dir, name, content string) {
 // integration tests exercise the same deterministic project used by local
 // acceptance checks rather than an ad-hoc inline project.
 func newRepoWithRemote(t *testing.T) (work string) {
+	return newFixtureRepoWithRemote(t, "py-poetry-ok")
+}
+
+func newFixtureRepoWithRemote(t *testing.T, fixture string) (work string) {
 	t.Helper()
 	remote := t.TempDir()
 	run(t, remote, "init", "-q", "--bare", "--initial-branch=main")
 
 	work = t.TempDir()
 	fixtures := filepath.Join("..", "..", "testdata", "fixtures", "projects")
-	if err := testfixture.SetupProject(context.Background(), fixtures, "py-poetry-ok", work); err != nil {
+	if err := testfixture.SetupProject(context.Background(), fixtures, fixture, work); err != nil {
 		t.Fatal(err)
 	}
 	run(t, work, "remote", "add", "origin", remote)
@@ -80,6 +85,25 @@ func baseConfig() config.Config {
 	return config.Config{
 		Git: config.GitConfig{AllowedChangedPaths: []string{"requirements.txt"}},
 	}
+}
+
+func cleanNodeWorkspace(t *testing.T, path string) config.Workspace {
+	t.Helper()
+	workspace := config.Workspace{
+		Name: "clean-node", Path: path, Stack: config.StackDocker, Platform: "linux/amd64",
+		Remote: "origin", Branch: "main",
+		DockerImages: &config.DockerImagesSpec{Files: []string{"Dockerfile"}, Platforms: []string{"linux/amd64"}},
+		Verification: config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: []config.VerificationStep{{
+			Name: "build-compose-verify", ComposeFile: "compose.verify.yml", Service: "verify", Command: []string{"npm", "run", "build"},
+			TimeoutSeconds: 60, Required: true, SuccessExitCodes: []int{0},
+		}}},
+	}
+	pinned, err := config.PinVerificationScriptBodies(path, workspace.Verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace.Verification = pinned
+	return workspace
 }
 
 // installFakeDocker puts a fake `docker` binary on PATH so scanner.CheckTools
@@ -141,6 +165,75 @@ exit 0
 	})
 }
 
+func installDependencyCheckingDocker(t *testing.T) dockerexec.Runner {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker shell script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$3" = version ]; then
+  echo '{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"amd64"}'
+  exit 0
+fi
+if [ "$3" = info ]; then
+  echo '{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}'
+  exit 0
+fi
+for arg in "$@"; do
+  [ "$arg" = down ] && exit 0
+done
+[ -f node_modules/lodash/lodash.js ] || exit 1
+exit 0
+`
+	path := filepath.Join(dir, "docker")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dockerexec.New(dockerexec.Options{
+		Resolver: func(string) (string, error) { return path, nil },
+		Endpoint: dockerexec.Endpoint{SocketPath: "/approved/docker.sock", Expected: dockerexec.DaemonIdentity{
+			ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
+		EndpointValidator: func(dockerexec.Endpoint) (string, error) { return "/approved/docker.sock", nil },
+	})
+}
+
+func installTimeoutDocker(t *testing.T) dockerexec.Runner {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker shell script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$3" = version ]; then
+  echo '{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"amd64"}'
+  exit 0
+fi
+if [ "$3" = info ]; then
+  echo '{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}'
+  exit 0
+fi
+for arg in "$@"; do
+  [ "$arg" = down ] && exit 0
+done
+sleep 5
+`
+	path := filepath.Join(dir, "docker")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dockerexec.New(dockerexec.Options{
+		Resolver: func(string) (string, error) { return path, nil },
+		Endpoint: dockerexec.Endpoint{SocketPath: "/approved/docker.sock", Expected: dockerexec.DaemonIdentity{
+			ID: "daemon-approved", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "amd64",
+			MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+		}},
+		EndpointValidator: func(dockerexec.Endpoint) (string, error) { return "/approved/docker.sock", nil },
+	})
+}
+
 type fakeSecurityGate struct {
 	baselineErr error
 	postErr     error
@@ -171,6 +264,22 @@ type failingUpdater struct{ err error }
 
 func (f failingUpdater) Update(context.Context, string) (bool, error) {
 	return false, f.err
+}
+
+type dockerfileUpdater struct{}
+
+func (dockerfileUpdater) Update(_ context.Context, projectPath string) (bool, error) {
+	return true, os.WriteFile(
+		filepath.Join(projectPath, "Dockerfile"),
+		[]byte("FROM scratch@sha256:"+strings.Repeat("c", 64)+"\n"),
+		0o644,
+	)
+}
+
+type verificationPreparerFunc func(context.Context, string) error
+
+func (f verificationPreparerFunc) Prepare(ctx context.Context, workDir string) error {
+	return f(ctx, workDir)
 }
 
 func fixedNow() time.Time { return time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC) }
@@ -210,6 +319,94 @@ func TestRunWorkspaceUpdatesAndPushesReviewBranch(t *testing.T) {
 	}
 	if !strings.HasPrefix(filepath.Base(postPath), "vuelta-landing-") {
 		t.Fatalf("security post-check path = %q, want validated landing copy", postPath)
+	}
+}
+
+func TestRunWorkspacePreparesGeneratedNodeProfileFromCleanTrackedSandbox(t *testing.T) {
+	docker := installDependencyCheckingDocker(t)
+	work := newFixtureRepoWithRemote(t, "node-npm-verify-clean")
+	workspace := cleanNodeWorkspace(t, work)
+	cfg := config.Config{Git: config.GitConfig{AllowedChangedPaths: []string{"Dockerfile"}}}
+	prepared := false
+	deps := Deps{
+		Sandbox: BasicSandbox{}, Security: fakeSecurityGate{}, Docker: docker, Now: fixedNow,
+		VerificationPreparer: verificationPreparerFunc(func(_ context.Context, sandbox string) error {
+			if _, err := os.Stat(filepath.Join(sandbox, "node_modules")); !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("sandbox unexpectedly contained host dependencies: %w", err)
+			}
+			writeFile(t, sandbox, "node_modules/lodash/lodash.js", "module.exports = {}\n")
+			prepared = true
+			return nil
+		}),
+		ResolveUpdater: func(config.Workspace, config.Config) (updater.Updater, error) {
+			return dockerfileUpdater{}, nil
+		},
+	}
+
+	result := RunWorkspace(context.Background(), deps, cfg, workspace, true)
+	if result.Status != "dry_run" || !prepared {
+		t.Fatalf("clean generated-profile update = %+v, prepared=%t", result, prepared)
+	}
+	if _, err := os.Stat(filepath.Join(work, "node_modules")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("real checkout received sandbox dependencies: %v", err)
+	}
+	original, err := os.ReadFile(filepath.Join(work, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(original), strings.Repeat("c", 64)) {
+		t.Fatal("dry-run mutation escaped into the real checkout")
+	}
+}
+
+func TestRunWorkspacePreparationFailureIsDistinctAndCleansSandbox(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	work := newFixtureRepoWithRemote(t, "node-npm-verify-clean")
+	workspace := cleanNodeWorkspace(t, work)
+	cfg := config.Config{Git: config.GitConfig{AllowedChangedPaths: []string{"Dockerfile"}}}
+	var sandbox string
+	deps := Deps{
+		Sandbox: BasicSandbox{}, Security: fakeSecurityGate{}, Docker: docker, Now: fixedNow,
+		VerificationPreparer: verificationPreparerFunc(func(_ context.Context, path string) error {
+			sandbox = path
+			writeFile(t, path, "node_modules/partial/install", "partial\n")
+			return errors.New("registry policy denied dependency preparation")
+		}),
+		ResolveUpdater: func(config.Workspace, config.Config) (updater.Updater, error) {
+			return dockerfileUpdater{}, nil
+		},
+	}
+
+	result := RunWorkspace(context.Background(), deps, cfg, workspace, true)
+	if result.Status != "failed" || result.Reason != "verification dependency preparation" {
+		t.Fatalf("preparation failure = %+v", result)
+	}
+	if sandbox == "" {
+		t.Fatal("preparer was not invoked")
+	}
+	if _, err := os.Stat(sandbox); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed preparation sandbox was not cleaned: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "node_modules")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed preparation changed the real checkout: %v", err)
+	}
+}
+
+func TestRunWorkspaceFailsClosedWithoutNodeDependencyPreparer(t *testing.T) {
+	docker := installFakeDocker(t, 0)
+	work := newFixtureRepoWithRemote(t, "node-npm-verify-clean")
+	workspace := cleanNodeWorkspace(t, work)
+	cfg := config.Config{Git: config.GitConfig{AllowedChangedPaths: []string{"Dockerfile"}}}
+	deps := Deps{
+		Sandbox: BasicSandbox{}, Security: fakeSecurityGate{}, Docker: docker, Now: fixedNow,
+		ResolveUpdater: func(config.Workspace, config.Config) (updater.Updater, error) {
+			return dockerfileUpdater{}, nil
+		},
+	}
+
+	result := RunWorkspace(context.Background(), deps, cfg, workspace, true)
+	if result.Status != "failed" || result.Reason != "verification dependency preparation" {
+		t.Fatalf("missing node preparer did not fail closed: %+v", result)
 	}
 }
 
@@ -411,6 +608,19 @@ func TestRunWorkspaceTestFailureNoAutofix(t *testing.T) {
 		if strings.Contains(output, "verification-private") {
 			t.Fatalf("verification detail leaked through %s: %q", name, output)
 		}
+	}
+}
+
+func TestRunWorkspaceReportsVerificationTimeoutSeparately(t *testing.T) {
+	docker := installTimeoutDocker(t)
+	work := newRepoWithRemote(t)
+	workspace := baseWorkspace(work)
+	workspace.Verification.Steps[0].TimeoutSeconds = 1
+	deps := baseDeps(true, docker)
+
+	result := RunWorkspace(context.Background(), deps, baseConfig(), workspace, true)
+	if result.Status != "failed" || result.Reason != "verification timeout" {
+		t.Fatalf("verification timeout = %+v", result)
 	}
 }
 

@@ -518,12 +518,19 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 	if verificationHash != snapshot.VerificationHash {
 		return fmt.Errorf("%w: verification profile changed", ErrStale)
 	}
+	toolchainWorkspace, verificationDependencies, err := config.VerificationDependencyWorkspace(ws)
+	if err != nil {
+		return fmt.Errorf("%w: verification dependency profile changed", ErrStale)
+	}
+	if !verificationDependencies {
+		toolchainWorkspace = ws
+	}
 	if snapshot.Toolchain.ProfileID != "" {
-		_, resolveErr := toolchain.ResolveSnapshotProfile(ws, cfg, snapshot.Toolchain)
+		_, resolveErr := toolchain.ResolveSnapshotProfile(toolchainWorkspace, cfg, snapshot.Toolchain)
 		if resolveErr != nil {
 			return fmt.Errorf("%w: toolchain profile is no longer compatible: %v", ErrStale, resolveErr)
 		}
-	} else if ws.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0 {
+	} else if verificationDependencies || (toolchainWorkspace.PackageManager != "" && len(cfg.Update.ToolchainProfiles) > 0) {
 		return fmt.Errorf("%w: snapshot has no toolchain profile identity", ErrStale)
 	}
 	if err := validatePolicyIdentity(snapshot.Policy); err != nil {
@@ -537,7 +544,11 @@ func ValidateForWorkspace(ctx context.Context, snapshot Snapshot, cfg config.Con
 	if err != nil {
 		return fmt.Errorf("%w: malformed scan input stages", ErrStale)
 	}
-	identity, err := scanner.IdentityForSnapshotWithOptions(ctx, ws, scanner.IdentityOptions{
+	identityWorkspace := ws
+	if verificationDependencies {
+		identityWorkspace = toolchainWorkspace
+	}
+	identity, err := scanner.IdentityForSnapshotWithOptions(ctx, identityWorkspace, scanner.IdentityOptions{
 		Stages: stages, AllowProjectConfig: snapshot.Gates.AllowProjectConfig, PolicyFile: cfg.VulnScan.PolicyFile,
 	})
 	if err != nil {

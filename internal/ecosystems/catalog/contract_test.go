@@ -98,6 +98,17 @@ func TestBuiltInAdapterContracts(t *testing.T) {
 			if !testCase.scannable {
 				return
 			}
+			preparation, hasPreparation := adapter.(ecosystem.VerificationDependencyProvider)
+			wantPreparation := testCase.key == "node/npm" || testCase.key == "node/pnpm"
+			if hasPreparation != wantPreparation {
+				t.Fatalf("verification dependency capability = %t, want %t", hasPreparation, wantPreparation)
+			}
+			if hasPreparation {
+				spec := preparation.VerificationDependencies()
+				if len(spec.Command) == 0 || !contains(spec.Command, "--ignore-scripts") {
+					t.Fatalf("verification dependency spec does not block lifecycle scripts: %#v", spec)
+				}
+			}
 			policy := adapter.(ecosystem.ProfilePolicyProvider).ProfilePolicy()
 			spec, err := adapter.(ecosystem.ScannerProvider).Scanner(ecosystem.ScannerRequest{
 				ProfileScanner: policy.ExpectedScanner, InstalledTool: true,
@@ -121,6 +132,15 @@ func TestBuiltInAdapterContracts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func splitKey(t *testing.T, key string) (string, string) {
