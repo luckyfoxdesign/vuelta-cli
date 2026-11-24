@@ -112,3 +112,19 @@ func TestReadOnlyDetectsDockerWithoutOnboarding(t *testing.T) {
 		}
 	}
 }
+
+func TestStructuredFindingsRetainAllAffectedLocations(t *testing.T) {
+	findings := []vulnscan.Finding{
+		{ID: "CVE-1", Package: "a", Target: "lock", Source: "trivy"},
+		{ID: "CVE-1", Package: "b", Target: "lock", Source: "trivy"},
+		{ID: "CVE-1", Package: "a", Target: "alpine", Source: "trivy", Kind: "image", Image: "alpine:3.24"},
+		{ID: "CVE-1", Package: "a", Target: "alpine", Source: "trivy", Kind: "image", Image: "alpine:3.25"},
+	}
+	got := appendUniqueFindings(nil, append(findings, findings[0])...)
+	if len(got) != 4 {
+		t.Fatalf("affected locations collapsed: %+v", got)
+	}
+	if refs := findingRefs(got); len(refs) != 1 || refs[0] != "CVE-1" {
+		t.Fatalf("legacy references changed: %v", refs)
+	}
+}

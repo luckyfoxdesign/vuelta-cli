@@ -1969,12 +1969,12 @@ func findingRefs(findings []vulnscan.Finding) []string {
 func appendUniqueFindings(values []vulnscan.Finding, additions ...vulnscan.Finding) []vulnscan.Finding {
 	seen := make(map[string]bool, len(values)+len(additions))
 	for _, value := range values {
-		seen[value.Ref()] = true
+		seen[value.Key()] = true
 	}
 	for _, value := range additions {
-		if !seen[value.Ref()] {
+		if !seen[value.Key()] {
 			values = append(values, value)
-			seen[value.Ref()] = true
+			seen[value.Key()] = true
 		}
 	}
 	return values
