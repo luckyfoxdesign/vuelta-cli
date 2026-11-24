@@ -41,12 +41,90 @@ type Finding struct {
 	Severity         string
 	Target           string
 	Source           string
+	Kind             string
+	Image            string
+	Aliases          []string
+	Ecosystem        string
+	Dependency       string
+}
+
+// JSONFinding is the version-1 public finding contract. Empty fixed_versions
+// means the selected source supplied no known fix, not that the scan failed.
+type JSONFinding struct {
+	ID               string   `json:"id"`
+	Kind             string   `json:"kind"`
+	Package          string   `json:"package"`
+	InstalledVersion string   `json:"installed_version"`
+	FixedVersions    []string `json:"fixed_versions"`
+	Severity         string   `json:"severity"`
+	Target           string   `json:"target"`
+	Source           string   `json:"source"`
+	Aliases          []string `json:"aliases,omitempty"`
+	Ecosystem        string   `json:"ecosystem,omitempty"`
+	Dependency       string   `json:"dependency,omitempty"`
+	Image            string   `json:"image,omitempty"`
+}
+
+// NormalizeSeverity maps scanner labels to the public severity vocabulary.
+func NormalizeSeverity(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "critical":
+		return "critical"
+	case "high":
+		return "high"
+	case "medium", "moderate":
+		return "medium"
+	case "low":
+		return "low"
+	default:
+		return "unknown"
+	}
+}
+
+// StructuredFindings returns an independently owned, deterministically ordered
+// representation without changing the internal security gate's legacy fields.
+func StructuredFindings(findings []Finding) []JSONFinding {
+	result := make([]JSONFinding, 0, len(findings))
+	for _, finding := range findings {
+		kind := finding.Kind
+		if kind == "" {
+			kind = "package"
+		}
+		fixed := []string{}
+		for _, version := range strings.Split(finding.FixedVersion, ",") {
+			if version = strings.TrimSpace(version); version != "" {
+				fixed = append(fixed, version)
+			}
+		}
+		sort.Strings(fixed)
+		aliases := append([]string(nil), finding.Aliases...)
+		sort.Strings(aliases)
+		dependency := finding.Dependency
+		switch dependency {
+		case "", "direct", "transitive", "unknown":
+		default:
+			dependency = "unknown"
+		}
+		result = append(result, JSONFinding{
+			ID: finding.ID, Kind: kind, Package: finding.Package,
+			InstalledVersion: finding.InstalledVersion, FixedVersions: fixed,
+			Severity: NormalizeSeverity(finding.Severity), Target: finding.Target,
+			Source: finding.Source, Aliases: aliases, Ecosystem: finding.Ecosystem,
+			Dependency: dependency, Image: finding.Image,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left, _ := json.Marshal(result[i])
+		right, _ := json.Marshal(result[j])
+		return string(left) < string(right)
+	})
+	return result
 }
 
 // Key identifies the same affected package version across baseline and
 // post-update scans.
 func (f Finding) Key() string {
-	return strings.Join([]string{f.ID, f.Package, f.InstalledVersion, f.Target, f.Source}, "\x00")
+	return strings.Join([]string{f.ID, f.Package, f.InstalledVersion, f.Target, f.Source, f.Kind, f.Image}, "\x00")
 }
 
 // Ref is the safe, terse identifier suitable for a commit summary or
@@ -138,6 +216,12 @@ func WithImageProgress(progress ProgressFunc) ScannerOption {
 	}
 }
 
+// WithImageFailure reports skipped image failures to a caller-owned diagnostic
+// channel. Callers must redact diagnostics and keep them out of JSON stdout.
+func WithImageFailure(report func(error)) ScannerOption {
+	return func(scanner *Scanner) { scanner.imageFailure = report }
+}
+
 // Scanner invokes Trivy/OSV and validates their structured output.
 type Scanner struct {
 	Command Command
@@ -149,6 +233,7 @@ type Scanner struct {
 	allowUntrackedInputs bool
 	dependencyProgress   ProgressFunc
 	imageProgress        ProgressFunc
+	imageFailure         func(error)
 	database             *databaseSession
 	databaseCommand      databaseCommand
 }
@@ -173,6 +258,13 @@ func NewReadOnlyScanner(options ...ScannerOption) Scanner {
 	for _, option := range options {
 		option(&scanner)
 	}
+	return scanner
+}
+
+// NewTrackedScanner requires every admitted repository input to be tracked.
+func NewTrackedScanner(options ...ScannerOption) Scanner {
+	scanner := NewReadOnlyScanner(options...)
+	scanner.allowUntrackedInputs = false
 	return scanner
 }
 
@@ -499,7 +591,10 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	total := len(intents) * len(platforms)
 	step := 0
 	for _, intent := range intents {
-		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--format", "json"}
+		// Keep image analysis state ephemeral and inside the scanner's memory
+		// limit. Docker creates the parent of the nested DB volume as root, so
+		// its sibling filesystem cache is not writable by the scanner user.
+		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--cache-backend", "memory", "--format", "json"}
 		if scanConfig.ImageScan.VEX == "auto" {
 			args = append(args, "--vex", "repo")
 		}
@@ -508,9 +603,12 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 			if s.imageProgress != nil {
 				s.imageProgress(intent.Reference+" ("+platform+")", step, total)
 			}
-			imageArgs := append(append([]string{}, args...), "--image-src", "registry", "--platform", platform, intent.Reference)
+			imageArgs := append(append([]string{}, args...), "--image-src", "remote", "--platform", platform, trivyRegistryReference(intent.Reference))
 			out, cmdErr := s.trivyCommand(ctx, bundle, scanConfig.ImageScan.Image, cfg.Update.Egress, scanConfig.DatabaseMaxAgeHours, imageArgs...)
 			if cmdErr != nil {
+				if s.imageFailure != nil {
+					s.imageFailure(cmdErr)
+				}
 				if intent.Tier == TierExactDigest {
 					return nil, nil, nil, fmt.Errorf("trivy image scan %s (%s): %w", intent.Reference, platform, cmdErr)
 				}
@@ -526,6 +624,10 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 			}
 			if ageErr := checkDatabaseAge(freshDatabaseTimestamp(updated, s.now()), scanConfig.DatabaseMaxAgeHours, s.now()); ageErr != nil {
 				return nil, nil, nil, fmt.Errorf("trivy image scan %s: %w", intent.Reference, ageErr)
+			}
+			for index := range parsed {
+				parsed[index].Kind = "image"
+				parsed[index].Image = intent.Reference
 			}
 			findings = append(findings, parsed...)
 			digest, ok := extractRepoDigest(metadata.RepoDigests)
@@ -549,6 +651,28 @@ func imagePlatforms(ws config.Workspace, cfg config.VulnScanConfig) []string {
 		return cfg.ImageScan.Platforms
 	}
 	return []string{"linux/amd64"}
+}
+
+// trivyRegistryReference directs Docker Hub aliases to its allowlisted
+// registry endpoint. The finding/resolution retains the project's reference.
+// No new registry authority is granted by this transport-only normalization.
+func trivyRegistryReference(reference string) string {
+	parts := strings.SplitN(reference, "/", 2)
+	name := reference
+	if len(parts) == 2 {
+		switch parts[0] {
+		case "docker.io", "index.docker.io", "registry-1.docker.io":
+			name = parts[1]
+		default:
+			if strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost" {
+				return reference
+			}
+		}
+	}
+	if !strings.Contains(name, "/") {
+		name = "library/" + name
+	}
+	return "registry-1.docker.io/" + name
 }
 
 var (
@@ -711,8 +835,28 @@ func parseOSV(data []byte) ([]Finding, time.Time, error) {
 			} `json:"source"`
 			Packages []struct {
 				Package struct {
-					Name string `json:"name"`
+					Name      string `json:"name"`
+					Version   string `json:"version"`
+					Ecosystem string `json:"ecosystem"`
 				} `json:"package"`
+				Vulnerabilities []struct {
+					ID               string   `json:"id"`
+					Aliases          []string `json:"aliases"`
+					DatabaseSpecific struct {
+						Severity string `json:"severity"`
+					} `json:"database_specific"`
+					Affected []struct {
+						Package struct {
+							Name      string `json:"name"`
+							Ecosystem string `json:"ecosystem"`
+						} `json:"package"`
+						Ranges []struct {
+							Events []struct {
+								Fixed string `json:"fixed"`
+							} `json:"events"`
+						} `json:"ranges"`
+					} `json:"affected"`
+				} `json:"vulnerabilities"`
 				Groups []struct {
 					IDs      []string `json:"ids"`
 					Packages []struct {
@@ -732,6 +876,30 @@ func parseOSV(data []byte) ([]Finding, time.Time, error) {
 	var findings []Finding
 	for _, result := range doc.Results {
 		for _, pkg := range result.Packages {
+			for _, vulnerability := range pkg.Vulnerabilities {
+				if vulnerability.ID == "" || pkg.Package.Name == "" || pkg.Package.Version == "" {
+					return nil, time.Time{}, errors.New("scanner returned an incomplete vulnerability finding")
+				}
+				fixed := []string{}
+				for _, affected := range vulnerability.Affected {
+					if affected.Package.Name != pkg.Package.Name || affected.Package.Ecosystem != pkg.Package.Ecosystem {
+						continue
+					}
+					for _, affectedRange := range affected.Ranges {
+						for _, event := range affectedRange.Events {
+							if event.Fixed != "" {
+								fixed = append(fixed, event.Fixed)
+							}
+						}
+					}
+				}
+				findings = append(findings, Finding{ID: vulnerability.ID, Package: pkg.Package.Name, InstalledVersion: pkg.Package.Version,
+					FixedVersion: strings.Join(fixed, ","), Severity: strings.ToUpper(NormalizeSeverity(vulnerability.DatabaseSpecific.Severity)),
+					Target: result.Source.Path, Source: "osv-scanner", Aliases: vulnerability.Aliases, Ecosystem: pkg.Package.Ecosystem})
+			}
+			if len(pkg.Vulnerabilities) > 0 {
+				continue
+			}
 			for _, group := range pkg.Groups {
 				for _, id := range group.IDs {
 					for _, affected := range group.Packages {

@@ -2,6 +2,7 @@ package githubalerts
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
+	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
 // testToken is a fictitious credential; it must never surface in errors.
@@ -43,7 +45,7 @@ func TestScanReadsDependabotAndGlobalAdvisory(t *testing.T) {
 		methods = append(methods, r.Method)
 		switch r.URL.Path {
 		case "/repos/acme/widget/dependabot/alerts":
-			_, _ = fmt.Fprint(w, `[{"number":1,"dependency":{"package":{"name":"example"},"manifest_path":"go.mod","scope":"runtime"},"security_advisory":{"ghsa_id":"GHSA-1234-5678-9abc","severity":"high"}}]`)
+			_, _ = fmt.Fprint(w, `[{"number":1,"dependency":{"package":{"name":"example","ecosystem":"go"},"manifest_path":"go.mod","scope":"runtime","relationship":"direct"},"security_advisory":{"ghsa_id":"GHSA-1234-5678-9abc","cve_id":"CVE-2026-1234","severity":"high"},"security_vulnerability":{"first_patched_version":{"identifier":"1.2.3"}}}]`)
 		case "/advisories/GHSA-1234-5678-9abc":
 			_, _ = fmt.Fprint(w, `{"ghsa_id":"GHSA-1234-5678-9abc","severity":"high","first_patched_version":{"identifier":"1.2.3"}}`)
 		default:
@@ -58,6 +60,17 @@ func TestScanReadsDependabotAndGlobalAdvisory(t *testing.T) {
 	}
 	if findings[0].ID != "GHSA-1234-5678-9abc" || findings[0].FixedVersion != "1.2.3" {
 		t.Fatalf("unexpected finding: %+v", findings[0])
+	}
+	if findings[0].InstalledVersion != "" || findings[0].Dependency != "direct" || findings[0].Ecosystem != "go" || len(findings[0].Aliases) != 1 {
+		t.Fatalf("misrepresented Dependabot metadata: %+v", findings[0])
+	}
+	encoded, err := json.Marshal(vulnscan.StructuredFindings(findings))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const golden = `[{"id":"GHSA-1234-5678-9abc","kind":"package","package":"example","installed_version":"","fixed_versions":["1.2.3"],"severity":"high","target":"go.mod","source":"github-dependabot","aliases":["CVE-2026-1234"],"ecosystem":"go","dependency":"direct"}]`
+	if string(encoded) != golden {
+		t.Fatalf("Dependabot JSON contract changed: %s", encoded)
 	}
 	for _, method := range methods {
 		if method != http.MethodGet {

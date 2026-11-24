@@ -196,7 +196,7 @@ image are removed with an independent bounded cleanup context. Explicit local
 adhoc scanners receive the same minimal files in a same-user `0700` context
 with `0600` files.
 
-Trivy receives `--image-src registry`, so an image scan pulls only through the
+Trivy receives `--image-src remote`, so an image scan pulls only through the
 allowlisted registry rather than inspecting the host Docker daemon. Each scan
 uses a new tmpfs cache and refreshes its vulnerability database through the
 proxy for every scan. If a scanner reports a database timestamp, it must also
@@ -611,6 +611,58 @@ on macOS after replacing `REPLACE_ME`, or install the required binaries plus
 JSON document; child plans and diagnostics are kept on stderr. Adjust the
 example units to the intended unprivileged user, binary paths, and writable
 project paths.
+
+## Vulnerability scans in CI
+
+Build a Linux binary using the repository's Docker toolchain, with a checksum:
+
+```sh
+docker compose run --rm -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 build go build -trimpath -o /src/bin/vuelta-linux-amd64 ./cmd/vuelta
+cd bin
+sha256sum vuelta-linux-amd64 > vuelta-linux-amd64.sha256
+sha256sum -c vuelta-linux-amd64.sha256
+```
+
+On a Linux Docker Engine runner, select a machine configuration outside the
+projects. No YAML editing or project onboarding is required:
+
+```sh
+vuelta --no-input --config /tmp/vuelta-ci.yaml config init --yes
+vuelta --no-input --config /tmp/vuelta-ci.yaml environment bootstrap --socket /var/run/docker.sock --yes
+for directory in /work/api /work/web; do
+  vuelta --no-input --config /tmp/vuelta-ci.yaml scan --directory "$directory" --read-only --only vulnerabilities --json
+done
+```
+
+Each invocation writes one JSON document to stdout; diagnostics go to stderr.
+`--read-only` implies vulnerability-only scanning and disables prompts,
+onboarding, snapshot cleanup/creation, SQLite history and project reports.
+It requires tracked scanner inputs. Referenced Docker OS images are scanned
+with the pinned Trivy default unless an image override is configured.
+An ambiguous project needs an explicit `--stack` selection. The managed Docker
+cache/network may change; the scanned project does not.
+
+Scan envelopes include `schema_version: 1` and retain `format: 1`. Every project
+has `findings: []`, including clean and failed projects. Each finding contains
+`id`, `kind` (`package` or `image`), `package`, `installed_version`,
+`fixed_versions`, `severity`, `target` and `source`. Available source metadata
+adds `aliases`, `ecosystem`, `dependency` and the original `image` reference.
+Missing fixes are `[]`; unknown severity is `unknown`. Severity is always one
+of `critical`, `high`, `medium`, `low`, `unknown`. Ordering is deterministic,
+not a priority ranking. Dependabot supplies no installed version, so that
+field is empty for its findings; a vulnerable range is not an installed version.
+Legacy `vulnerabilities` remains during migration.
+
+Exit codes retain their existing meaning: `0` completed; `1` all targets
+failed; `2` invalid invocation/configuration; `4` top-level environment failure;
+`5` findings with `--fail-on vulnerabilities`; `6` partial results or a mixture
+of failed/completed targets; `7` unresolved image with `--require-image-scan`;
+`130` interrupted. Failures take precedence over findings. Inspect stages and
+image skips before treating an empty finding list as complete coverage.
+
+`.github/workflows/vulnerability-scan.yml` builds and uploads the Linux binary
+and checksum and runs `acceptance/readonly-smoke.sh` on Ubuntu. The smoke test
+uses temporary tracked projects and proves their trees remain unchanged.
 
 ## Status
 

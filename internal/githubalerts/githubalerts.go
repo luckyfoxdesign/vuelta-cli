@@ -109,14 +109,27 @@ func (c Client) Scan(ctx context.Context, ws config.Workspace, cfg config.Github
 		if id == "" || alert.Dependency.Package.Name == "" || alert.Dependency.ManifestPath == "" {
 			return nil, fmt.Errorf("required GitHub Dependabot security source unavailable: dependabot alert %d has incomplete advisory or dependency data", alert.Number)
 		}
+		aliases := []string{}
+		if alert.Advisory.CVEID != "" {
+			aliases = append(aliases, alert.Advisory.CVEID)
+		}
+		fixed := alert.Vulnerability.FirstPatchedVersion.Identifier
+		for _, candidate := range advisory.Vulnerabilities {
+			if candidate.Package.Name == alert.Dependency.Package.Name && candidate.Package.Ecosystem == alert.Dependency.Package.Ecosystem {
+				fixed = firstNonEmpty(fixed, candidate.FirstPatchedVersion.Identifier)
+			}
+		}
 		findings = append(findings, vulnscan.Finding{
-			ID:               id,
-			Package:          alert.Dependency.Package.Name,
-			InstalledVersion: alert.Dependency.Scope,
-			FixedVersion:     advisory.FirstPatchedVersion.Identifier,
+			ID:      id,
+			Package: alert.Dependency.Package.Name,
+			// The API supplies a vulnerable range, not the installed version.
+			InstalledVersion: "",
+			FixedVersion:     fixed,
 			Severity:         strings.ToUpper(firstNonEmpty(advisory.Severity, alert.Advisory.Severity)),
 			Target:           alert.Dependency.ManifestPath,
 			Source:           "github-dependabot",
+			Aliases:          aliases, Ecosystem: alert.Dependency.Package.Ecosystem,
+			Dependency: alert.Dependency.Relationship,
 		})
 	}
 	return findings, nil
@@ -126,12 +139,15 @@ type dependabotAlert struct {
 	Number     int `json:"number"`
 	Dependency struct {
 		Package struct {
-			Name string `json:"name"`
+			Name      string `json:"name"`
+			Ecosystem string `json:"ecosystem"`
 		} `json:"package"`
 		ManifestPath string `json:"manifest_path"`
 		Scope        string `json:"scope"`
+		Relationship string `json:"relationship"`
 	} `json:"dependency"`
-	Advisory struct {
+	Vulnerability advisoryVulnerability `json:"security_vulnerability"`
+	Advisory      struct {
 		GHSAID   string `json:"ghsa_id"`
 		CVEID    string `json:"cve_id"`
 		Severity string `json:"severity"`
@@ -141,6 +157,17 @@ type dependabotAlert struct {
 type globalAdvisory struct {
 	GHSAID              string `json:"ghsa_id"`
 	Severity            string `json:"severity"`
+	FirstPatchedVersion struct {
+		Identifier string `json:"identifier"`
+	} `json:"first_patched_version"`
+	Vulnerabilities []advisoryVulnerability `json:"vulnerabilities"`
+}
+
+type advisoryVulnerability struct {
+	Package struct {
+		Name      string `json:"name"`
+		Ecosystem string `json:"ecosystem"`
+	} `json:"package"`
 	FirstPatchedVersion struct {
 		Identifier string `json:"identifier"`
 	} `json:"first_patched_version"`

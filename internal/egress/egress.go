@@ -54,7 +54,7 @@ const allowRules = "https://pypi.org:443,https://files.pythonhosted.org:443," +
 	"https://objects.githubusercontent.com:443,https://ghcr.io:443," +
 	"https://pkg-containers.githubusercontent.com:443,https://api.osv.dev:443," +
 	"https://registry-1.docker.io:443,https://auth.docker.io:443," +
-	"https://production.cloudflare.docker.com:443"
+	"https://production.cloudflare.docker.com:443,https://production.cloudfront.docker.com:443"
 
 // ErrPolicyUnavailable means the required registry allowlist environment
 // could not be prepared or verified. Callers must never fall back to Docker's

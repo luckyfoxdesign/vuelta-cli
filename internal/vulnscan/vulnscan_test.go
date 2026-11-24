@@ -195,6 +195,19 @@ func TestScanImagesUsesOSPackagesOnlyWithoutDependencyScan(t *testing.T) {
 	if !contains(commands[0], "--pkg-types") || !contains(commands[0], "os") {
 		t.Fatalf("image scan must restrict packages to OS packages: %v", commands[0])
 	}
+	joined := strings.Join(commands[0], " ")
+	if !strings.Contains(joined, "--image-src remote") || !strings.Contains(joined, "--cache-backend memory") {
+		t.Fatalf("image scan must use supported remote source and ephemeral non-root cache: %v", commands[0])
+	}
+	if report.Findings[0].Kind != "image" || report.Findings[0].Image != digest {
+		t.Fatalf("image identity lost: %+v", report.Findings[0])
+	}
+	if !strings.Contains(strings.Join(commands[0], " "), "--image-src remote") {
+		t.Fatalf("Trivy registry-only source must use its supported remote value: %v", commands[0])
+	}
+	if report.Findings[0].Kind != "image" || report.Findings[0].Image != digest {
+		t.Fatalf("image identity lost: %+v", report.Findings[0])
+	}
 	if contains(commands[0], "fs") || contains(commands[0], "--include-dev-deps") {
 		t.Fatalf("image scan must not run a dependency filesystem scan: %v", commands[0])
 	}
@@ -296,8 +309,8 @@ func TestScanImagesResolvesBareTagAsBaseImageProxyAndRecordsDigest(t *testing.T)
 	}
 	digest := "node@sha256:" + strings.Repeat("b", 64)
 	scanner := NewAdhocScanner(func(_ context.Context, _ string, _ string, args ...string) ([]byte, error) {
-		if !contains(args, "node:20-alpine") {
-			t.Fatalf("expected trivy to be invoked with the bare tag, got %v", args)
+		if !contains(args, "registry-1.docker.io/library/node:20-alpine") {
+			t.Fatalf("expected trivy to use the Docker Hub transport alias while preserving the tag, got %v", args)
 		}
 		return []byte(trivyImageJSON(now.Format(time.RFC3339), digest)), nil
 	})

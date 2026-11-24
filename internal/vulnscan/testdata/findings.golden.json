@@ -1,0 +1,42 @@
+[
+  {
+    "id": "CVE-1",
+    "kind": "package",
+    "package": "example",
+    "installed_version": "1.0.0",
+    "fixed_versions": [
+      "1.0.1",
+      "2.0.0"
+    ],
+    "severity": "high",
+    "target": "pnpm-lock.yaml",
+    "source": "trivy"
+  },
+  {
+    "id": "CVE-3",
+    "kind": "image",
+    "package": "openssl",
+    "installed_version": "3.0",
+    "fixed_versions": [],
+    "severity": "unknown",
+    "target": "alpine",
+    "source": "trivy",
+    "image": "alpine:3.20"
+  },
+  {
+    "id": "GHSA-1",
+    "kind": "package",
+    "package": "demo",
+    "installed_version": "1.0",
+    "fixed_versions": [
+      "1.1"
+    ],
+    "severity": "medium",
+    "target": "uv.lock",
+    "source": "osv-scanner",
+    "aliases": [
+      "CVE-2"
+    ],
+    "ecosystem": "PyPI"
+  }
+]

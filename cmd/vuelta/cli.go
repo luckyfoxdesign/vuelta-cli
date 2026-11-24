@@ -50,6 +50,7 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--all"}, description: "scan every configured project"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select a detected stack during onboarding or repair genuine stack drift"},
 			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
+			{names: []string{"--read-only"}, description: "scan tracked vulnerability inputs without project writes or prompts"},
 			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
 			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (machine floor 14d)"},
 			{names: []string{"--timeout"}, valueName: "DURATION", description: "maximum duration per project (default 4m; maximum 1h)"},

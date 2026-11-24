@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -212,6 +213,28 @@ type scanSummary struct {
 	ImageScanSkipped int `json:"image_scan_skipped"`
 }
 
+// MarshalJSON keeps findings present even for clean or failed projects while
+// preserving the legacy vulnerabilities field through the migration.
+func (r scanResult) MarshalJSON() ([]byte, error) {
+	type resultAlias scanResult
+	return json.Marshal(struct {
+		resultAlias
+		Findings []vulnscan.JSONFinding `json:"findings"`
+	}{resultAlias(r), vulnscan.StructuredFindings(r.VulnerabilityFindings)})
+}
+
+type scanJSONEnvelope struct {
+	jsonCommandEnvelope
+	SchemaVersion int `json:"schema_version"`
+}
+
+func writeScanJSONEnvelope(envelope jsonCommandEnvelope) error {
+	if err := json.NewEncoder(os.Stdout).Encode(scanJSONEnvelope{envelope, 1}); err != nil {
+		return fail(exitFailure, "write JSON output: %v", err)
+	}
+	return nil
+}
+
 type scanOptions struct {
 	project                   string
 	directory                 string
@@ -225,6 +248,7 @@ type scanOptions struct {
 	requireImageScan          bool
 	verbose                   bool
 	jsonOutput                bool
+	readOnly                  bool
 	toolchainProfile          *config.ToolchainProfile
 	toolchainIdentity         *toolchain.Identity
 	toolchainConstraint       string
@@ -266,9 +290,22 @@ func executeScan(args []string) error {
 	if err != nil {
 		return scanTopLevelFailure(options.jsonOutput || scanJSONRequested(args), "invalid_invocation", err, "Run vuelta help scan for usage")
 	}
-	cfg, selection, loadErr := selectScanConfiguration(options, configFile)
+	selectConfig := selectScanConfiguration
+	if options.readOnly {
+		selectConfig = selectReadOnlyScanConfiguration
+	}
+	cfg, selection, loadErr := selectConfig(options, configFile)
 	if loadErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "project_config_unavailable", fail(exitConfig, "%v", loadErr), "Select a supported project with --directory or an explicit config with --config")
+	}
+	if options.readOnly {
+		// CI scans cover referenced OS images as well as dependencies, using
+		// the built-in pinned Trivy default when no image override is supplied.
+		cfg.VulnScan.ImageScan.Enabled = true
+		cfg.VulnScan.ImageScan.Tool = "trivy"
+		if cfg.VulnScan.ImageScan.Image == "" {
+			cfg.VulnScan.ImageScan.Image = configinit.NewConfig().VulnScan.Image
+		}
 	}
 	options.updateConfigPath = selection.Path
 	if selection.Scope == "project" {
@@ -288,8 +325,11 @@ func executeScan(args []string) error {
 	if targetErr != nil {
 		return scanTopLevelFailure(options.jsonOutput, "target_invalid", fail(exitConfig, "%v", targetErr), "Choose one of --project, --directory, or --all")
 	}
-	if selection.Scope == "machine" {
+	if selection.Scope == "machine" && !options.readOnly {
 		targets = onboardMachineScanTargets(targets)
+	}
+	if options.readOnly {
+		targets = prepareReadOnlyTargets(targets, options.stack)
 	}
 	if selection.OnboardingChanged && len(targets) == 1 {
 		targets[0].onboardingChanged = true
@@ -326,16 +366,18 @@ func executeScan(args []string) error {
 	if selection.Scope == "project" {
 		machineConfigPath = selection.MachineConfig
 	}
-	historyPath, historyPathErr := history.ResolvePath(machineConfigPath, cfg.State.DatabasePath)
-	if historyPathErr != nil {
-		warnings = appendUniqueStrings(warnings, "history database path is invalid: "+historyPathErr.Error())
-	} else {
-		historyStore, historyErr := history.Open(context.Background(), historyPath)
-		if historyErr != nil {
-			warnings = appendUniqueStrings(warnings, "history database is unavailable; this scan result will not be durable: "+historyErr.Error())
+	if !options.readOnly {
+		historyPath, historyPathErr := history.ResolvePath(machineConfigPath, cfg.State.DatabasePath)
+		if historyPathErr != nil {
+			warnings = appendUniqueStrings(warnings, "history database path is invalid: "+historyPathErr.Error())
 		} else {
-			defer func() { _ = historyStore.Close() }()
-			options.historyStore = historyStore
+			historyStore, historyErr := history.Open(context.Background(), historyPath)
+			if historyErr != nil {
+				warnings = appendUniqueStrings(warnings, "history database is unavailable; this scan result will not be durable: "+historyErr.Error())
+			} else {
+				defer func() { _ = historyStore.Close() }()
+				options.historyStore = historyStore
+			}
 		}
 	}
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -407,7 +449,7 @@ func executeScan(args []string) error {
 	}
 	summary := summarizeScan(results)
 	if options.jsonOutput {
-		if err := writeJSONEnvelope(jsonCommandEnvelope{
+		if err := writeScanJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "scan", Results: results, Summary: summary,
 			Warnings: warnings, Errors: []jsonCommandError{}, Config: &selection,
 		}); err != nil {
@@ -426,6 +468,117 @@ func executeScan(args []string) error {
 }
 
 type scanTargetRunner func(context.Context, scanTarget, scanOptions) scanResult
+
+// selectReadOnlyScanConfiguration never invokes onboarding or migration.
+// Machine authority remains separate from ephemeral or persisted project policy.
+func selectReadOnlyScanConfiguration(options scanOptions, configPath string) (*config.Config, scanConfigSelection, error) {
+	projectPath := ""
+	if options.explicitConfig || options.all || options.project != "" {
+		projectFile := filepath.Base(configPath) == projectConfigName
+		if options.explicitConfig && !projectFile {
+			var err error
+			projectFile, err = config.IsProjectConfigFile(configPath)
+			if err != nil {
+				return nil, scanConfigSelection{}, err
+			}
+		}
+		if !projectFile {
+			cfg, err := loadMachineConfig(configPath, false)
+			return cfg, scanConfigSelection{Path: configPath, Scope: "machine", Status: "reused"}, err
+		}
+		projectPath = configPath
+	} else {
+		root := options.directory
+		if root == "" {
+			var err error
+			root, err = currentDirectory()
+			if err != nil {
+				return nil, scanConfigSelection{}, err
+			}
+		}
+		canonical, err := canonicalDirectory(root)
+		if err != nil {
+			return nil, scanConfigSelection{}, err
+		}
+		projectPath = filepath.Join(canonical, projectConfigName)
+	}
+	project, err := config.LoadProject(projectPath)
+	status := "reused"
+	if errors.Is(err, os.ErrNotExist) && !options.explicitConfig {
+		discovery, detectErr := configinit.Detect(filepath.Dir(projectPath))
+		if detectErr != nil {
+			return nil, scanConfigSelection{}, detectErr
+		}
+		workspace, detectErr := discovery.BuildWorkspace(configinit.Input{Stack: options.stack, ScanOnly: true})
+		if detectErr != nil {
+			return nil, scanConfigSelection{}, detectErr
+		}
+		workspace.Path = "."
+		project = &config.ProjectConfig{SchemaVersion: config.CurrentSchemaVersion, Workspace: workspace}
+		status = "ephemeral"
+	} else if err != nil {
+		return nil, scanConfigSelection{}, err
+	}
+	if options.stack != "" && options.stack != project.Workspace.Stack {
+		return nil, scanConfigSelection{}, errors.New("--read-only cannot repair persisted stack policy; repair it explicitly before scanning")
+	}
+	return mergeProjectWithMachine(project, projectPath, status)
+}
+
+// prepareReadOnlyTargets detects unregistered Docker and package projects
+// without onboarding. Existing project policy is loaded without repairs.
+func prepareReadOnlyTargets(targets []scanTarget, stack string) []scanTarget {
+	for index := range targets {
+		target := &targets[index]
+		if target.err != nil {
+			continue
+		}
+		discovery, err := configinit.Detect(target.path)
+		if err != nil {
+			target.err = err
+			continue
+		}
+		workspace := config.Workspace{}
+		if target.workspace != nil {
+			workspace = *target.workspace
+		}
+		projectPath := filepath.Join(target.path, projectConfigName)
+		if _, statErr := os.Lstat(projectPath); statErr == nil {
+			project, loadErr := config.LoadProject(projectPath)
+			if loadErr != nil {
+				target.err = loadErr
+				continue
+			}
+			projectWorkspace, resolveErr := project.ResolvedWorkspace(projectPath)
+			if resolveErr != nil {
+				target.err = resolveErr
+				continue
+			}
+			projectWorkspace.ToolchainProfile = workspace.ToolchainProfile
+			workspace = projectWorkspace
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			target.err = statErr
+			continue
+		}
+		if workspace.Stack == "" {
+			workspace, err = discovery.BuildWorkspace(configinit.Input{Stack: stack, ScanOnly: true})
+			if err != nil {
+				target.err = err
+				continue
+			}
+		}
+		if _, _, err = detectStackDriftFromSignals(workspace, target.path, discovery.Stacks, false); err != nil {
+			target.err = err
+			continue
+		}
+		if workspace.DockerImages == nil && len(discovery.DockerFiles) > 0 {
+			workspace.DockerImages = &config.DockerImagesSpec{Files: append([]string(nil), discovery.DockerFiles...), RuntimeImages: append([]string(nil), discovery.RuntimeImages...), Platforms: []string{"linux/amd64"}}
+		}
+		workspace.Path = target.path
+		target.workspace = &workspace
+	}
+	return targets
+}
 
 func runScanTargets(ctx context.Context, targets []scanTarget, options scanOptions, runner scanTargetRunner) []scanResult {
 	timeout := options.timeout
@@ -523,6 +676,7 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	fs.BoolVar(&options.requireImageScan, "require-image-scan", false, "return 7 when an image scan could not resolve any digest (tier 4)")
 	fs.BoolVar(&options.verbose, "verbose", false, "show technical stages, inputs, warnings, and error details")
 	fs.BoolVar(&options.jsonOutput, "json", false, "write the versioned JSON envelope")
+	fs.BoolVar(&options.readOnly, "read-only", false, "scan tracked vulnerability inputs without writing into projects")
 	fs.BoolVar(&options.nonInteractive, "internal-no-input", false, "disable prompts")
 	fs.BoolVar(&options.noColor, "internal-no-color", false, "disable color and progress animation")
 	fs.DurationVar(&options.timeout, "timeout", defaultProjectScanTimeout, "maximum duration for each project scan")
@@ -546,6 +700,13 @@ func parseScanOptions(args []string) (scanOptions, string, error) {
 	}
 	if options.only != "" && options.only != "vulnerabilities" && options.only != "packages" {
 		return options, "", fail(exitConfig, "--only must be vulnerabilities or packages")
+	}
+	if options.readOnly {
+		if options.only == "packages" {
+			return options, "", fail(exitConfig, "--read-only requires a vulnerability scan")
+		}
+		options.only = "vulnerabilities"
+		options.nonInteractive = true
 	}
 	if options.failOn != "" && options.failOn != "vulnerabilities" {
 		return options, "", fail(exitConfig, "--fail-on must be vulnerabilities")
@@ -993,14 +1154,18 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		Status:  "clean", Candidates: []updatesnapshot.Candidate{}, Vulnerabilities: []string{}, VulnerabilityFindings: []vulnscan.Finding{}, Tools: []scanToolResult{}, Stages: []scanStageResult{}, InputCategories: []string{}, Warnings: []string{}, Verification: []string{}, Diagnostics: []updater.ScanDiagnostic{}, Capabilities: []scanCapability{}, ImageScans: []imageScanRecord{},
 		PackageUpdates: &packageUpdateAvailability{Status: "available"},
 	}
-	stateStore, stateErr := updatesnapshot.ProjectStore(target.path)
-	if stateErr == nil {
-		var cleanupDiagnostics []string
-		cleanupDiagnostics, stateErr = stateStore.CleanupExpired(time.Now())
-		result.Warnings = appendUniqueStrings(result.Warnings, cleanupDiagnostics...)
-	}
-	if stateErr != nil {
-		result.Warnings = appendUniqueStrings(result.Warnings, "project-local snapshot cleanup unavailable: "+stateErr.Error())
+	var stateStore updatesnapshot.Store
+	var stateErr error
+	if !options.readOnly {
+		stateStore, stateErr = updatesnapshot.ProjectStore(target.path)
+		if stateErr == nil {
+			var cleanupDiagnostics []string
+			cleanupDiagnostics, stateErr = stateStore.CleanupExpired(time.Now())
+			result.Warnings = appendUniqueStrings(result.Warnings, cleanupDiagnostics...)
+		}
+		if stateErr != nil {
+			result.Warnings = appendUniqueStrings(result.Warnings, "project-local snapshot cleanup unavailable: "+stateErr.Error())
+		}
 	}
 	if target.onboardingChanged {
 		result.Warnings = appendUniqueStrings(result.Warnings, onboardingChangedWarning)
@@ -1024,7 +1189,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Warnings = append(result.Warnings, "updates and update --dry-run are disabled until a ready verification profile is configured")
 		}
 	}
-	if target.dockerErr == nil {
+	if target.dockerErr == nil && !options.readOnly {
 		refreshCommand := displayCommand("project", "verify", "init", "--directory", target.path, "--refresh-image")
 		result.VerificationImage = checkVerificationImage(ctx, target.path, refreshCommand, runners.resolveVerifyDigest)
 		if result.VerificationImage != nil {
@@ -1160,7 +1325,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		})
 		result.Vulnerabilities = findingRefs(result.VulnerabilityFindings)
 	}
-	if options.only == "vulnerabilities" {
+	if options.only == "vulnerabilities" || options.readOnly {
 		result.Tools = append(result.Tools, scanToolResult{Name: "package-manager", Status: "skipped", Reason: "not requested"})
 		result = addStage(result, stageCandidate, stageNotRequested, "")
 		result = addStage(result, stageReleaseAge, stageNotRequested, "")
@@ -1626,10 +1791,24 @@ func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanT
 	if err != nil {
 		return nil, nil, nil, cfg.VulnScan.DependencySource, true, err
 	}
+	diagnostics := vulnscan.WithImageFailure(func(err error) {
+		if options.verbose {
+			category, code, detail := dockerexec.Classify(err)
+			fmt.Fprintf(os.Stderr, "Image scan failed: category=%s exit_code=%d detail=%s\n", category, code, detail)
+		}
+	})
 	scanner := vulnscan.NewReadOnlyScanner(
+		diagnostics,
 		vulnscan.WithDependencyProgress(options.dependencyProgress),
 		vulnscan.WithImageProgress(options.imageProgress),
 	)
+	if options.readOnly {
+		scanner = vulnscan.NewTrackedScanner(
+			diagnostics,
+			vulnscan.WithDependencyProgress(options.dependencyProgress),
+			vulnscan.WithImageProgress(options.imageProgress),
+		)
+	}
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
 			return nil, nil, nil, "trivy-images", false, nil
@@ -2407,6 +2586,12 @@ func writeHumanScanResults(results []scanResult, machineConfig string, verbose b
 }
 
 func writeProjectScanReports(results []scanResult, options scanOptions, completedAt time.Time) []scanResult {
+	if options.readOnly {
+		for index := range results {
+			results[index] = addStage(results[index], stageReport, stageNotRequested, "read-only scan")
+		}
+		return results
+	}
 	for index := range results {
 		result := results[index]
 		target, err := projectstate.FromCanonical(result.Directory)
@@ -2703,7 +2888,7 @@ func countPhrase(count int, singular, plural string) string {
 
 func scanTopLevelFailure(jsonOutput bool, code string, err error, hint string) error {
 	if jsonOutput {
-		if writeErr := writeJSONEnvelope(jsonCommandEnvelope{
+		if writeErr := writeScanJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "scan", Results: []scanResult{}, Summary: scanSummary{}, Warnings: []string{},
 			Errors: []jsonCommandError{{Code: code, Message: err.Error(), Hint: hint}},
 		}); writeErr != nil {

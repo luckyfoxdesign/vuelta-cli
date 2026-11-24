@@ -128,6 +128,11 @@ make build                     # both cross-build targets
 <!-- manual:start -->
 ## Architecture Notes
 
+- `scan --read-only` is the CI vulnerability path: tracked allowlisted inputs,
+  no project onboarding/state writes, schema-versioned structured findings.
+  `.github/workflows/vulnerability-scan.yml` builds the Linux binary/checksum
+  and runs `acceptance/readonly-smoke.sh` against isolated vulnerable inputs.
+
 - Vuelta core is a one-shot CLI with external scheduling. The optional
   `vuelta-telegram-bridge` is a separate resident SQLite/Telegram interface
   with no operation execution or Docker/GitHub authority.
