@@ -654,6 +654,10 @@ field is empty for its findings; a vulnerable range is not an installed version.
 For the same reason `vuelta fix` leaves Dependabot findings unchanged and
 reports them as skipped with `source_requires_local_verification`; applying
 them after a local lockfile check is a separate planned task.
+When the lowest fixed version is itself vulnerable, `vuelta fix` moves on to the
+next fixed version reported for the candidate's own findings, within the same
+major; `fixed` and `skipped` entries carry the written (or last tried)
+`target_version`. If no clean candidate exists, the files stay unchanged.
 Legacy `vulnerabilities` remains during migration.
 
 Exit codes retain their existing meaning: `0` completed; `1` all targets

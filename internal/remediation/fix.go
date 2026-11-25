@@ -46,14 +46,24 @@ type Repair struct {
 }
 
 // Skipped preserves the finding and a stable reason for not changing it.
+// TargetVersion is the last version a candidate was built for, empty when no
+// candidate was attempted.
 type Skipped struct {
-	Finding vulnscan.JSONFinding `json:"finding"`
-	Reason  string               `json:"reason"`
+	Finding       vulnscan.JSONFinding `json:"finding"`
+	Reason        string               `json:"reason"`
+	TargetVersion string               `json:"target_version,omitempty"`
+}
+
+// FixedFinding is a repaired finding with the dependency version written to
+// the project. TargetVersion is empty for repairs that do not pin a version.
+type FixedFinding struct {
+	vulnscan.JSONFinding
+	TargetVersion string `json:"target_version,omitempty"`
 }
 
 // Result distinguishes a complete clean rescan from unavailable coverage.
 type Result struct {
-	Fixed        []vulnscan.JSONFinding `json:"fixed"`
+	Fixed        []FixedFinding         `json:"fixed"`
 	Skipped      []Skipped              `json:"skipped"`
 	ChangedFiles []string               `json:"changed_files"`
 	Rescan       []vulnscan.JSONFinding `json:"rescan"`
@@ -286,6 +296,47 @@ func remains(f vulnscan.Finding, findings []vulnscan.Finding) bool {
 	return false
 }
 
+// introducedError reports a candidate that closed the original findings but
+// carries findings absent from the baseline scan.
+type introducedError struct{ findings []vulnscan.Finding }
+
+func (*introducedError) Error() string { return "candidate introduced a new vulnerability" }
+
+// nextTarget picks the lowest version above current, inside current's major,
+// that the scanner reports as fixed for the new findings. It fails closed when
+// any new finding belongs to another package or has no such version, because
+// moving this package cannot repair it. Every call returns a strictly higher
+// version, so a retry chain within one major always terminates.
+func nextTarget(name, current string, introduced []vulnscan.Finding) (string, bool) {
+	cur, ok := numericVersion(current)
+	if !ok || len(introduced) == 0 {
+		return "", false
+	}
+	var best [4]uint64
+	next, found := "", false
+	for _, f := range introduced {
+		if f.Package != name || f.Kind == "image" {
+			return "", false
+		}
+		fixable := false
+		for _, fixed := range strings.Split(f.FixedVersion, ",") {
+			fixed = strings.TrimSpace(fixed)
+			v, ok := numericVersion(fixed)
+			if !ok || v[0] != cur[0] || compare(v, cur) <= 0 {
+				continue
+			}
+			fixable = true
+			if !found || compare(v, best) < 0 {
+				best, next, found = v, fixed, true
+			}
+		}
+		if !fixable {
+			return "", false
+		}
+	}
+	return next, found
+}
+
 func rewriteJSON(root, manifest, name, version string) error {
 	data, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
 	if err != nil {
@@ -330,7 +381,7 @@ func rewriteJSON(root, manifest, name, version string) error {
 // Run scans, plans, repairs admitted files in private copies and rescans. Each
 // attempted package mutation is verified before any of its files return.
 func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config, options Options) (Result, error) {
-	result := Result{Fixed: []vulnscan.JSONFinding{}, Skipped: []Skipped{}, ChangedFiles: []string{}, Rescan: []vulnscan.JSONFinding{}}
+	result := Result{Fixed: []FixedFinding{}, Skipped: []Skipped{}, ChangedFiles: []string{}, Rescan: []vulnscan.JSONFinding{}}
 	if _, err := Plan(nil, nil, options); err != nil {
 		return result, err
 	}
@@ -461,64 +512,93 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 			reason = "invalid_repair_plan"
 			partial = true
 		}
+		attempted := false
 		if reason == "" {
-			var changed []string
-			changed, specErr = adhoc.InPrivateFiles(ws.Path, files, true, func(root string) error {
-				if err := preparePrivate(root, files); err != nil {
-					return err
-				}
-				before, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
-				if err != nil {
-					return err
-				}
-				if spec.RewriteJSON {
-					if err = rewriteJSON(root, manifest, name, target); err != nil {
+			// attempt builds one candidate for version in a fresh private copy of the
+			// untouched project. Files return to the host only when it succeeds.
+			attempt := func(version string, spec ecosystem.FixSpec) ([]string, error) {
+				return adhoc.InPrivateFiles(ws.Path, files, true, func(root string) error {
+					if err := preparePrivate(root, files); err != nil {
 						return err
 					}
-				}
-				for _, args := range spec.Commands {
-					if _, err = e.Command(ctx, profile, args, root); err != nil {
-						return err
-					}
-				}
-				output, err := e.Command(ctx, profile, provider.FixInspect(), root)
-				if err != nil {
-					return err
-				}
-				var installed map[string]ecosystem.FixDependency
-				if len(output) > 1<<20 || json.Unmarshal([]byte(output), &installed) != nil ||
-					!slices.Contains(installed[provider.FixName(name)].Versions, target) {
-					return errors.New("candidate lockfile does not contain the exact fix version")
-				}
-				if spec.LockOnly {
-					after, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
+					before, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
 					if err != nil {
 						return err
 					}
-					if !bytes.Equal(before, after) {
-						return errors.New("transitive repair changed the manifest")
+					if spec.RewriteJSON {
+						if err = rewriteJSON(root, manifest, name, version); err != nil {
+							return err
+						}
 					}
-				}
-				copyWS := ws
-				copyWS.Path = root
-				copyWS.DockerImages = nil
-				report, err := e.Scan(ctx, root, copyWS, cfg, false)
-				if err != nil {
-					return err
-				}
-				for _, i := range indexes {
-					if remains(plan[i].Finding, report.Findings) {
-						return errors.New("original finding remains after candidate mutation")
+					for _, args := range spec.Commands {
+						if _, err = e.Command(ctx, profile, args, root); err != nil {
+							return err
+						}
 					}
-				}
-				for _, newFinding := range report.Findings {
-					if !remains(newFinding, baseline.Findings) {
-						return errors.New("candidate introduced a new vulnerability")
+					output, err := e.Command(ctx, profile, provider.FixInspect(), root)
+					if err != nil {
+						return err
 					}
+					var installed map[string]ecosystem.FixDependency
+					if len(output) > 1<<20 || json.Unmarshal([]byte(output), &installed) != nil ||
+						!slices.Contains(installed[provider.FixName(name)].Versions, version) {
+						return errors.New("candidate lockfile does not contain the exact fix version")
+					}
+					if spec.LockOnly {
+						after, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
+						if err != nil {
+							return err
+						}
+						if !bytes.Equal(before, after) {
+							return errors.New("transitive repair changed the manifest")
+						}
+					}
+					copyWS := ws
+					copyWS.Path = root
+					copyWS.DockerImages = nil
+					report, err := e.Scan(ctx, root, copyWS, cfg, false)
+					if err != nil {
+						return err
+					}
+					for _, i := range indexes {
+						if remains(plan[i].Finding, report.Findings) {
+							return errors.New("original finding remains after candidate mutation")
+						}
+					}
+					var introduced []vulnscan.Finding
+					for _, newFinding := range report.Findings {
+						if !remains(newFinding, baseline.Findings) {
+							introduced = append(introduced, newFinding)
+						}
+					}
+					if len(introduced) > 0 {
+						return &introducedError{findings: introduced}
+					}
+					return ctx.Err()
+				})
+			}
+			var changed []string
+			for {
+				attempted = true
+				changed, specErr = attempt(target, spec)
+				var introduced *introducedError
+				if specErr == nil || !errors.As(specErr, &introduced) || ctx.Err() != nil {
+					break
 				}
-				return ctx.Err()
-			})
+				// The candidate fixed the original findings but is itself vulnerable:
+				// move to the next version its own findings report as fixed.
+				next, ok := nextTarget(name, target, introduced.findings)
+				if !ok {
+					break
+				}
+				nextSpec, nextErr := provider.Fix(ecosystem.FixRequest{Name: name, Version: next, Dependency: plan[indexes[0]].Dependency})
+				if nextErr != nil || nextSpec.Unsupported != "" {
+					break
+				}
+				target, spec = next, nextSpec
+			}
 			if specErr != nil {
+				specErr = fmt.Errorf("target %s: %w", target, specErr)
 				reason = "candidate_rejected"
 				partial = true
 			} else {
@@ -530,7 +610,11 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 		}
 		for _, i := range indexes {
 			plan[i].Reason = reason
-			plan[i].TargetVersion = target
+			if attempted {
+				plan[i].TargetVersion = target
+			} else {
+				plan[i].TargetVersion = ""
+			}
 		}
 	}
 	images := make([]string, 0, len(imageGroups))
@@ -579,13 +663,13 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 	for _, r := range plan {
 		finding := vulnscan.StructuredFindings([]vulnscan.Finding{r.Finding})[0]
 		if r.Reason == "" && (r.Finding.Kind != "image" || result.Complete) && !remains(r.Finding, post.Findings) {
-			result.Fixed = append(result.Fixed, finding)
+			result.Fixed = append(result.Fixed, FixedFinding{JSONFinding: finding, TargetVersion: r.TargetVersion})
 		} else {
 			reason := r.Reason
 			if reason == "" {
 				reason = "finding_remains"
 			}
-			result.Skipped = append(result.Skipped, Skipped{Finding: finding, Reason: reason})
+			result.Skipped = append(result.Skipped, Skipped{Finding: finding, Reason: reason, TargetVersion: r.TargetVersion})
 		}
 	}
 	sort.Strings(result.ChangedFiles)
