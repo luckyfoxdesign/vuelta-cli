@@ -3,6 +3,7 @@ package dockerexec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -338,5 +339,124 @@ func TestClassifyOutputLimitAndContextErrors(t *testing.T) {
 	}
 	if category, exitCode, _ := Classify(context.Canceled); category != "cancelled" || exitCode != -1 {
 		t.Fatalf("cancel classify = %q/%d", category, exitCode)
+	}
+}
+
+// TestMain lets the test binary double as a fake multi-call Docker CLI: when
+// it is started under the name "docker" it answers the daemon identity probe,
+// and under any other name it fails like OrbStack's docker-tools does.
+func TestMain(m *testing.M) {
+	if name := filepath.Base(os.Args[0]); name == "docker-tools" {
+		fmt.Fprintf(os.Stderr, "unsupported argv0 %q\n", name)
+		os.Exit(1)
+	}
+	if filepath.Base(os.Args[0]) == "docker" {
+		if len(os.Args) > 3 {
+			switch os.Args[3] {
+			case "version":
+				fmt.Println(`{"server_version":"28.3.2","api_version":"1.49","os":"linux","architecture":"arm64"}`)
+			case "info":
+				fmt.Println(`{"id":"daemon-approved","security_options":["name=seccomp,profile=builtin"]}`)
+			}
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func copyTestBinary(t *testing.T, dest string, mode os.FileMode) {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, data, mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dest, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// multiCallCLI mimics OrbStack: docker is a symlink to a differently named
+// multi-call binary that chooses its behavior from argv[0].
+func multiCallCLI(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "docker-tools")
+	copyTestBinary(t, target, mode)
+	link := filepath.Join(dir, "docker")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return link
+}
+
+func multiCallExecutor(t *testing.T, cli string) *Executor {
+	t.Helper()
+	return New(Options{
+		Resolver:  func(string) (string, error) { return cli, nil },
+		ConfigDir: filepath.Join(t.TempDir(), "docker-config"),
+		Endpoint:  testEndpoint(), EndpointValidator: testEndpointValidator,
+	})
+}
+
+func TestExecutorStartsMultiCallCLIUnderDockerName(t *testing.T) {
+	executor := multiCallExecutor(t, multiCallCLI(t, 0o755))
+	if _, err := executor.Run(context.Background(), Request{Args: []string{"ps"}}); err != nil {
+		t.Fatalf("multi-call CLI rejected: %v", err)
+	}
+	path, err := executor.Path()
+	if err != nil || filepath.Base(path) != "docker-tools" {
+		t.Fatalf("executed path = %q, %v; want the verified symlink target", path, err)
+	}
+}
+
+func TestExecutorStartsPlainBinaryUnderDockerName(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "docker")
+	copyTestBinary(t, plain, 0o755)
+	executor := multiCallExecutor(t, plain)
+	if err := executor.Verify(context.Background()); err != nil {
+		t.Fatalf("plain CLI rejected: %v", err)
+	}
+}
+
+func TestExecutorRejectsWritableSymlinkTarget(t *testing.T) {
+	executor := multiCallExecutor(t, multiCallCLI(t, 0o775))
+	if _, err := executor.Path(); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected writable symlink target rejection, got %v", err)
+	}
+}
+
+func TestExecutorRejectsNonExecutableSymlinkTarget(t *testing.T) {
+	executor := multiCallExecutor(t, multiCallCLI(t, 0o644))
+	if _, err := executor.Path(); err == nil || !strings.Contains(err.Error(), "executable") {
+		t.Fatalf("expected non-executable rejection, got %v", err)
+	}
+}
+
+func TestExecutorRejectsCLIReplacedAfterVerification(t *testing.T) {
+	cli := multiCallCLI(t, 0o755)
+	executor := multiCallExecutor(t, cli)
+	if _, err := executor.Path(); err != nil {
+		t.Fatal(err)
+	}
+	target, err := filepath.EvalSymlinks(cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.Run(context.Background(), Request{Args: []string{"ps"}})
+	if err == nil || !strings.Contains(err.Error(), "changed after verification") {
+		t.Fatalf("expected replaced CLI rejection, got %v", err)
 	}
 }

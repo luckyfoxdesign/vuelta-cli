@@ -26,6 +26,12 @@ import (
 
 const defaultWaitDelay = 10 * time.Second
 
+// dockerArgv0 is the process name the verified CLI is started under. Some
+// distributions (OrbStack's docker-tools) ship one multi-call binary that
+// selects its behavior from argv[0], so the symlink-resolved file name cannot
+// be used. The executed file is still the verified one; only the name differs.
+const dockerArgv0 = "docker"
+
 const daemonOutputLimit = 32 << 10
 
 var daemonProbeTimeout = 30 * time.Second
@@ -152,6 +158,7 @@ type Executor struct {
 	err       error
 	host      string
 	configDir string
+	info      os.FileInfo
 
 	verifyMu sync.Mutex
 	verified bool
@@ -233,6 +240,9 @@ func (e *Executor) Verify(ctx context.Context) error {
 	if e.err != nil {
 		return e.err
 	}
+	if err := e.recheckExecutable(); err != nil {
+		return err
+	}
 	run := e.options.CommandRunner
 	if run == nil {
 		run = runCommand
@@ -274,8 +284,26 @@ func (e *Executor) Run(ctx context.Context, request Request) (Result, error) {
 	if run == nil {
 		run = runCommand
 	}
+	if err := e.recheckExecutable(); err != nil {
+		return Result{}, err
+	}
 	request.Args = e.boundArgs(request.Args)
 	return run(ctx, e.path, request, environment)
+}
+
+// recheckExecutable narrows the window between verifying the Docker CLI and
+// starting it: the file must still be the same inode with the same mode, size,
+// and modification time that passed verification.
+func (e *Executor) recheckExecutable() error {
+	info, err := os.Stat(e.path)
+	if err != nil {
+		return fmt.Errorf("re-inspect approved Docker CLI: %w", err)
+	}
+	if !os.SameFile(e.info, info) || info.Mode() != e.info.Mode() ||
+		info.Size() != e.info.Size() || !info.ModTime().Equal(e.info.ModTime()) {
+		return errors.New("approved Docker CLI changed after verification")
+	}
+	return nil
 }
 
 func (e *Executor) initialize() {
@@ -333,6 +361,7 @@ func (e *Executor) initialize() {
 			return
 		}
 		e.path = path
+		e.info = info
 		// Docker Desktop's macOS CLI needs a home directory even when an
 		// explicit Unix socket and DOCKER_CONFIG are supplied. Without HOME it
 		// can hang while probing `docker info`. Keep both HOME and TMPDIR inside
@@ -683,6 +712,7 @@ func runCommand(ctx context.Context, path string, request Request, environment [
 	combined := newCollector(request.Combined, cancel)
 
 	cmd := exec.CommandContext(runCtx, path, request.Args...)
+	cmd.Args[0] = dockerArgv0
 	cmd.Dir = request.Dir
 	cmd.Env = environment
 	cmd.Stdin = request.Stdin
