@@ -30,6 +30,8 @@ import (
 // ErrPartial means a required scan or mutation could not be completed.
 var ErrPartial = errors.New("vulnerability repair returned partial results")
 
+var errNeedsParentUpgrade = errors.New("original transitive finding remains after candidate mutation")
+
 // Options selects findings without broadening the admitted input files.
 type Options struct {
 	FindingIDs  []string
@@ -525,8 +527,27 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 					if err != nil {
 						return err
 					}
+					manifestInfo, err := os.Stat(filepath.Join(root, manifest))
+					if err != nil {
+						return err
+					}
 					if spec.RewriteJSON {
 						if err = rewriteJSON(root, manifest, name, version); err != nil {
+							return err
+						}
+					}
+					if len(spec.PrepareCommands) > 0 {
+						for _, args := range spec.PrepareCommands {
+							if _, err = e.Command(ctx, profile, args, root); err != nil {
+								return err
+							}
+						}
+						// Validate the private manifest again before restoring it: a
+						// subprocess must not replace it with a symlink or special file.
+						if _, err = ecosystem.ReadRootFile(root, manifest, 16<<20); err != nil {
+							return err
+						}
+						if err = os.WriteFile(filepath.Join(root, manifest), before, 0600); err != nil {
 							return err
 						}
 					}
@@ -540,9 +561,8 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 						return err
 					}
 					var installed map[string]ecosystem.FixDependency
-					if len(output) > 1<<20 || json.Unmarshal([]byte(output), &installed) != nil ||
-						!slices.Contains(installed[provider.FixName(name)].Versions, version) {
-						return errors.New("candidate lockfile does not contain the exact fix version")
+					if len(output) > 1<<20 || json.Unmarshal([]byte(output), &installed) != nil {
+						return errors.New("invalid bounded dependency inspection JSON")
 					}
 					if spec.LockOnly {
 						after, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
@@ -551,6 +571,13 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 						}
 						if !bytes.Equal(before, after) {
 							return errors.New("transitive repair changed the manifest")
+						}
+						if len(spec.PrepareCommands) > 0 {
+							// npm may replace the temporary manifest with a new mode.
+							path := filepath.Join(root, manifest)
+							if err := os.Chmod(path, manifestInfo.Mode().Perm()); err != nil {
+								return err
+							}
 						}
 					}
 					copyWS := ws
@@ -562,8 +589,14 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 					}
 					for _, i := range indexes {
 						if remains(plan[i].Finding, report.Findings) {
+							if spec.LockOnly && !plan[i].Dependency.Direct {
+								return errNeedsParentUpgrade
+							}
 							return errors.New("original finding remains after candidate mutation")
 						}
+					}
+					if !slices.Contains(installed[provider.FixName(name)].Versions, version) {
+						return errors.New("candidate lockfile does not contain the exact fix version")
 					}
 					var introduced []vulnscan.Finding
 					for _, newFinding := range report.Findings {
@@ -600,7 +633,11 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 			if specErr != nil {
 				specErr = fmt.Errorf("target %s: %w", target, specErr)
 				reason = "candidate_rejected"
-				partial = true
+				if errors.Is(specErr, errNeedsParentUpgrade) {
+					reason = "needs_parent_upgrade"
+				} else {
+					partial = true
+				}
 			} else {
 				result.ChangedFiles = append(result.ChangedFiles, changed...)
 			}

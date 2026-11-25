@@ -539,7 +539,8 @@ func fixSpec(manager string, r ecosystem.FixRequest) (ecosystem.FixSpec, error) 
 			spec.Unsupported = "needs_parent_upgrade"
 			if manager == "npm" {
 				spec.Unsupported = ""
-				spec.Commands = [][]string{{"npm", "install", "--package-lock-only", "--ignore-scripts", "--no-save", r.Name + "@" + r.Version}, {"npm", "ls", "--package-lock-only", "--all", "--json"}}
+				spec.PrepareCommands = [][]string{{"npm", "install", "--package-lock-only", "--ignore-scripts", "--save-exact", r.Name + "@" + r.Version}}
+				spec.Commands = [][]string{{"npm", "install", "--package-lock-only", "--ignore-scripts"}}
 			}
 			return spec, nil
 		}

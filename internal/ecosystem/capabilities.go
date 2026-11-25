@@ -296,10 +296,13 @@ type FixRequest struct {
 // FixSpec contains reviewed argv and a closed optional manifest rewrite.
 // A lock-only repair must leave its manifest byte-for-byte unchanged.
 type FixSpec struct {
-	Commands    [][]string
-	RewriteJSON bool
-	LockOnly    bool
-	Unsupported string
+	// PrepareCommands temporarily change the manifest in the private copy.
+	// Core restores its original bytes before executing Commands.
+	PrepareCommands [][]string
+	Commands        [][]string
+	RewriteJSON     bool
+	LockOnly        bool
+	Unsupported     string
 }
 
 // FixProvider owns manager-specific repair and metadata inspection. Inspection

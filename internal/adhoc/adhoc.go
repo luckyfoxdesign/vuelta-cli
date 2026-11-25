@@ -245,7 +245,9 @@ func copyRegularFile(sourceRoot, destinationRoot, name string) error {
 func changedDependencyFiles(before, after state, project Project) []string {
 	var changed []string
 	for _, name := range projectFiles(project) {
-		if before[name] != after[name] {
+		// Package managers can rewrite identical bytes (or core can restore a
+		// temporary manifest). An mtime change alone must not copy a file back.
+		if before[name].digest != after[name].digest || before[name].mode != after[name].mode {
 			changed = append(changed, name)
 		}
 	}
