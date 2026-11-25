@@ -121,7 +121,9 @@ VUELTA_DOCKER_SOCKET=/absolute/path/to/docker.sock scripts/real-engine-acceptanc
 Real-engine acceptance is opt-in and networked: fresh private projects, real npm,
 Trivy and image candidates. The read-only fixture smoke is
 `bash acceptance/readonly-smoke.sh BINARY SOCKET` (requires jq). The Ubuntu workflow
-builds a Linux binary and checksum, runs the read-only smoke and uploads both.
+builds a Linux binary and checksum, runs read-only scan smoke, the compiled-CLI
+repair smoke and the real package/image repair suite, then uploads the binary
+and checksum only after every acceptance step succeeds.
 Refreshing pinned images requires review of the registry's multi-platform index
 digest and Docker verification; never substitute floating tags.
 
