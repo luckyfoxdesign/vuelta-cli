@@ -370,8 +370,3 @@ func unsupportedProjectError(root string) error {
 		root, projectConfigName,
 	)
 }
-
-func projectHasGitMetadata(root string) bool {
-	info, err := os.Lstat(filepath.Join(root, ".git"))
-	return err == nil && info.Mode()&os.ModeSymlink == 0 && (info.IsDir() || info.Mode().IsRegular())
-}

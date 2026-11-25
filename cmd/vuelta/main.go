@@ -1,5 +1,4 @@
-// Command vuelta is a one-shot CLI: scan explicit targets and apply one
-// reviewed snapshot inside a sandbox.
+// Command vuelta scans vulnerabilities and repairs verified findings.
 package main
 
 import (
@@ -15,10 +14,10 @@ import (
 )
 
 const (
-	exitOK       = 0
-	exitFailure  = 1
-	exitConfig   = 2
-	exitSnapshot = 3
+	exitOK          = 0
+	exitFailure     = 1
+	exitConfig      = 2
+	exitInterrupted = 130
 )
 
 // version is set at build time with -ldflags when a release is produced.

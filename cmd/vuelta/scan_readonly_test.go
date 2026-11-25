@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
-	"github.com/luckyfoxdesign/vuelta/internal/updatesnapshot"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
 
@@ -53,7 +52,7 @@ func TestReadOnlyScanLeavesProjectUnchanged(t *testing.T) {
 					return nil, false, nil
 				},
 			}
-			result := scanOneTargetWith(context.Background(), *cfg, scanTarget{path: root, workspace: &workspace}, options, config.LocalPackagePolicy{}, updatesnapshot.PolicyIdentity{}, 0, runners)
+			result := scanOneTargetWith(context.Background(), *cfg, scanTarget{path: root, workspace: &workspace}, options, runners)
 			results := writeProjectScanReports([]scanResult{result}, options, time.Now())
 			if len(results[0].VulnerabilityFindings) != 1 {
 				t.Fatalf("findings lost: %+v", results)
@@ -86,6 +85,17 @@ func TestScanJSONContractIncludesEmptyFindingsAndVersion(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatal(err)
+	}
+	var raw struct {
+		Results []map[string]json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, retired := range []string{"vulnerabilities", "candidates", "snapshot_id", "package_updates", "verification"} {
+		if _, exists := raw.Results[0][retired]; exists {
+			t.Fatalf("retired field %s was emitted", retired)
+		}
 	}
 	if decoded.SchemaVersion != 1 || len(decoded.Results) != 1 || decoded.Results[0].Findings == nil {
 		t.Fatalf("invalid envelope: %s", stdout)

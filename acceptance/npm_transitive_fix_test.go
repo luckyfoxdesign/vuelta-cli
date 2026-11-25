@@ -45,6 +45,7 @@ func TestRealEngineNPMTransitiveFix(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), caseTimeout)
 			defer cancel()
 			cfg := configinit.NewConfig()
+			isolatedRepairEgress(t, cfg)
 			cfg.VulnScan.DependencySource = "trivy"
 			session := egress.NewSession(cfg.Update.Egress, dockerexec.Default())
 			ctx = egress.WithSession(ctx, session)

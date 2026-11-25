@@ -369,7 +369,7 @@ func TestVerificationScriptBodyPinLegacyAndNonPackageStepsRemainValid(t *testing
 		t.Fatalf("legacy profile rejected: %v", err)
 	}
 	warnings := (&Config{Workspaces: []Workspace{{Name: "example", Verification: legacy}}}).WorkspaceWarnings()
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "legacy profile remains allowed") {
+	if len(warnings) != 0 {
 		t.Fatalf("legacy warnings = %v", warnings)
 	}
 

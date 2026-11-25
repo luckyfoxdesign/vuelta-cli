@@ -1,21 +1,11 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: scripts/real-engine-acceptance.sh /absolute/path/to/matrix.yaml" >&2
+if [ "$#" -ne 0 ]; then
+  echo "usage: scripts/real-engine-acceptance.sh" >&2
   exit 2
 fi
-
-matrix=$1
-case "$matrix" in
-  /*) ;;
-  *) echo "matrix path must be absolute" >&2; exit 2 ;;
-esac
-
-if [ ! -f "$matrix" ]; then
-  echo "matrix file does not exist" >&2
-  exit 2
-fi
+export COMPOSE_DISABLE_ENV_FILE=1
 
 socket=${VUELTA_DOCKER_SOCKET:-/var/run/docker.sock}
 case "$socket" in
@@ -28,12 +18,10 @@ cleanup() {
   rmdir "$acceptance_root" 2>/dev/null || true
 }
 trap cleanup EXIT
-docker compose --profile acceptance run --rm --build \
+docker --host "unix://$socket" compose --profile acceptance run --rm --build \
   --volume "$socket:/var/run/docker.sock" \
   --volume "$acceptance_root:$acceptance_root" \
-  --volume "$matrix:$matrix:ro" \
 	--env "TMPDIR=$acceptance_root" \
   --env "GOTMPDIR=/tmp" \
   --env "VUELTA_ACCEPTANCE_ROOT=$acceptance_root" \
-  --env "VUELTA_ACCEPTANCE_MATRIX=$matrix" \
   real-engine

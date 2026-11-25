@@ -1,4 +1,4 @@
-vuelta — checks and safely updates dependencies
+vuelta — finds and safely repairs vulnerabilities
 
 Examples:
   vuelta scan
@@ -7,18 +7,12 @@ Examples:
 
 Everyday commands:
   fix          repair verified vulnerability findings
-  scan         find vulnerabilities and package candidates; create snapshots only for safely mutable manifests
-  update       request a reviewed dependency update on GitHub Actions
-  status       show durable project and operation status
-  deploy       synchronize one automatically discovered project release
+  scan         find vulnerabilities in dependencies and referenced images
 
 Configuration:
   project      list or add configured projects
   config       create or validate configuration
   environment  trust local Docker environments
-
-Operations:
-  history      show installed dependency version changes
 
 Help:
   help         show top-level or command-specific help
@@ -31,4 +25,4 @@ Global options:
   --version                  show version and exit
 
 Run 'vuelta help <command>' for command details.
-Run 'vuelta help --all' to include CI and server commands.
+Run 'vuelta help --all' to show all command details.

@@ -59,8 +59,8 @@ type Config struct {
 	Git              GitConfig              `yaml:"git"`
 }
 
-// StateConfig selects the machine-owned SQLite file. Empty uses the protected
-// default adjacent to the selected machine config.
+// StateConfig retains the legacy schema-1 state selector for compatibility.
+// No SQLite store is opened by scan or fix.
 type StateConfig struct {
 	DatabasePath string `yaml:"database_path,omitempty"`
 }
@@ -228,7 +228,7 @@ const (
 	VerificationScanOnly = "scan_only"
 )
 
-// VerificationProfile is the versioned, explicit update gate for one
+// VerificationProfile retains the legacy declarative data schema for one
 // workspace. A scan-only workspace is intentionally unable to create an
 // update snapshot. Ready profiles contain only bounded argv commands; Compose
 // service commands are never inherited as verification commands.
@@ -420,17 +420,7 @@ func (c *Config) WorkspaceWarnings() []string {
 		if ws.Name == "" {
 			warnings = append(warnings, fmt.Sprintf("workspaces[%d] has no name; using %q from the path without rewriting the config", i, WorkspaceName(ws)))
 		}
-		if ws.Verification.State == VerificationScanOnly {
-			warnings = append(warnings, fmt.Sprintf("project %q is scan-only; configure verification.steps before running update or update --dry-run", WorkspaceName(ws)))
-		}
-		for _, step := range ws.Verification.Steps {
-			if step.ScriptBodyHash != "" {
-				continue
-			}
-			if _, ok, err := packageVerificationScriptName(step.Command); err == nil && ok {
-				warnings = append(warnings, fmt.Sprintf("project %q verification step %q has no script_body_hash; legacy profile remains allowed, run `vuelta project verify approve --directory PATH --yes` to pin it", WorkspaceName(ws), step.Name))
-			}
-		}
+
 	}
 	return warnings
 }

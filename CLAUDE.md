@@ -32,14 +32,13 @@ Use Docker for all runtime, test, lint, and dependency work. Git runs locally.
 
 ## Architecture
 
-`vuelta` is a one-shot Go CLI with no resident daemon. Each exact project root
-owns `.vuelta/last-scan.md` and `.vuelta/snapshots/`; `update` resolves the
-target from cwd or `--directory` before selecting its newest plan, while
-`--snapshot ID` pins automation to one exact project-local plan. The separate
-`vuelta-scheduler` binary owns optional multi-project automation by parsing
-`scan --all --json` and invoking one update with both exact directory and
-snapshot ID per ready result. See
-`cmd/vuelta/`, `cmd/vuelta-scheduler/`, and `internal/*`.
+`vuelta` is a one-shot vulnerability CLI: `scan` and `fix` plus config,
+project and Docker environment helpers. `scan --read-only` uses tracked
+allowlisted inputs without project writes. `fix` verifies candidates in private
+container-mutated copies and returns only admitted manifest/lock or image edits.
+Ordinary scans may onboard the exact root and save bounded reports.
+Historical deploy/gateway and corpus/update harness code is inert in `attic/`.
+See `../docs/product/architecture/vulnerability-focus.md`.
 
 ## Code Quality
 
@@ -48,6 +47,8 @@ docker compose run --rm lint
 docker compose run --rm test
 ```
 
-## Deploy
+## Distribution
 
-`vuelta` itself is a CLI binary, not a deployed service; it drives deploys of *other* projects (see part D/G of the spec). No deploy pipeline for this repo yet.
+`make build` cross-compiles only the CLI for darwin/arm64 and linux/amd64.
+`.github/workflows/vulnerability-scan.yml` builds/checksums the Linux binary
+and checks read-only scans on isolated fixtures. Publishing is a separate task.

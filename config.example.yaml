@@ -1,35 +1,12 @@
-# Copy to ~/.config/vuelta/config.yaml and chmod 0600 it. The file must be a
-# regular, non-symlink file owned by the process uid. Core operations write
-# only SQLite outbox intents; the separate bridge owns transport credentials
-# and delivery.
-# Adhoc container scans use scan-time gates and an optional standalone policy
-# supplied explicitly with `vuelta scan --policy`.
-# Docker execution is disabled until this reviewed endpoint is configured.
-# Use /var/run/docker.sock for Linux Engine. Docker Desktop macOS normally uses
-# /Users/YOU/.docker/run/docker.sock; keep the absolute path in this private
-# 0600 config rather than expanding HOME or reading an ambient Docker context.
-# Run `vuelta environment bootstrap --socket /absolute/path/to/docker.sock` to
-# display, confirm, normalize, and atomically persist these non-secret fields.
+# Generate a private machine config with `vuelta config init`, then attest Docker:
+# vuelta environment bootstrap --socket /absolute/path/to/docker.sock --yes
+# Never put token values in YAML. Schema 1 keeps legacy data compatibility;
+# verification/Git/history/deploy settings grant no execution authority.
 schema_version: 1
 
-# Machine-owned durable state. Omit database_path to use the protected
-# ~/.config/vuelta/state/history.db default. Never place it in a managed repo.
-state:
-  # database_path: "/var/lib/vuelta/history.db"
-
-# Endpoints are tried in this explicit order; repeat bootstrap for each socket.
-# Legacy docker.developer (one endpoint mapping) remains supported.
-# docker:
-#   developer_endpoints:
-#   - socket: "/Users/YOU/.docker/run/docker.sock"
-#     expected_daemon:
-#       id: "<exact-docker-info-id>"
-#       server_version: "<exact-server-version>"
-#       operating_system: "linux"
-#       architecture: "arm64"
-#       minimum_api_version: "1.44"
-#       required_security_options:
-#         - "name=seccomp,profile=builtin"
+# Bootstrap writes ordered docker.developer_endpoints with exact daemon identity.
+# Linux Engine: /var/run/docker.sock
+# Docker Desktop macOS: /Users/YOU/.docker/run/docker.sock
 vuln_scan:
   # Exactly one dependency/lock-file source: trivy | osv-scanner | github-dependabot.
   # This replaces vuln_scan.tool and github_advisories.enabled. Delete those
@@ -57,138 +34,12 @@ github_advisories:
   # Used only when dependency_source is github-dependabot. That selected source
   # is always fail-closed; private repositories need Dependabot alerts: read.
 
-github_actions:
-  api_url: "https://api.github.com"
-  # Fine-grained credential for only the configured repositories and Actions
-  # dispatch/read permissions. The value is read from this fixed environment
-  # variable and is never written to YAML or SQLite.
-  token_env: "VUELTA_GITHUB_TOKEN"
-  # Deploy uses one central Vuelta-owned workflow; managed projects do not add
-  # workflow files. Uncomment all four fields together when deploy.enabled is
-  # true. registry_user is an identifier, not a credential.
-  # release_repository: "luckyfoxdesign/vuelta"
-  # release_workflow: "vuelta-release-engine.yml"
-  # release_ref: "main"
-  # registry_user: "luckyfoxdesign"
-
-deploy:
-  # `vuelta deploy sync` derives contracts from existing workspaces, Compose,
-  # Git, and running Docker metadata. It never writes into project repos or
-  # their Nginx/Traefik configuration.
-  enabled: false
-  # Required as an immutable digest when enabled. This image contains only the
-  # minimal Vuelta HTTP gateway used behind existing fixed Docker upstreams.
-  # gateway_image: "ghcr.io/luckyfoxdesign/vuelta-gateway@sha256:<64-hex-digest>"
-  drain_seconds: 30
-  min_free_memory_mb: 512
-  min_free_disk_mb: 2048
-
+# Existing schema name retained for container repair policy.
 update:
-  min_release_age_days: 14 # machine safety floor; project config and CLI cannot silently shorten it
-  # `vuelta scan` saves a project-local read-only update plan for this period.
-  # `vuelta update` rejects expired snapshots before environment checks.
-  # The default is 24h; 1..168h is allowed.
-  snapshot_ttl_hours: 24
+  min_release_age_days: 14 # legacy schema field; no scheduled-update age gate runs
   egress:
-    network: "vuelta-cli-update-egress"
-    proxy_container: "vuelta-cli-egress-proxy"
-    proxy_url: "http://vuelta-cli-egress-proxy:3128"
-    # false (default): remove only resources created for this invocation.
-    # true: retain and reuse verified owned resources across invocations.
-    persistent: false
-    # The exact proxy source and registry allowlist are embedded in the binary.
-    # Occupied names are left untouched and get an isolated deterministic
-    # fallback. Every resource Vuelta actually uses must still pass the full
-    # ownership, identity, hardening, health, and attachment contract.
-  # Node 20/22/24 and supported Python scanner images are selected from project
-  # metadata, built locally from Dockerfiles embedded in the binary, and cached
-  # by content hash. No package-scanner image digest is required here.
-  # Add a full immutable profile only for an operator-reviewed exception. A
-  # compatible override wins over the embedded default and is reported by
-  # `vuelta config validate` as source=override.
-  # toolchain_profiles:
-  #   - version: 1
-  #     id: private-node24-npm11-arm64
-  #     stack: node
-  #     package_manager: npm
-  #     runtime: "24"
-  #     package_manager_version: "11.4.2"
-  #     scanner: ncu
-  #     scanner_version: "22.2.9"
-  #     image: "registry.example/vuelta/node24-npm@sha256:<64-hex-digest>"
-  #     platform: linux/arm64
-  #     user: "10001:10001"
-  #     lock_formats: [npm-v2, npm-v3]
-  #     capabilities:
-  #       read_only_discovery: true
-  #       release_age: true
-  #       project_config: false
-
-workspaces:
-  # A requirements.txt-only Python project uses package_manager: requirements
-  # and must remain verification.state: scan_only. Scan JSON returns candidates
-  # with reason manifest_has_no_safe_mutation_contract and no snapshot.
-  # This checked-in smoke configuration validates from the app/ directory.
-  # Replace it with explicit target repositories before a real update run.
-  - name: vuelta-app             # stable project name used by CLI selectors and output
-    path: .                      # canonicalized when added with `vuelta project add`
-    stack: docker
-    # Node/Python workspaces use the detected embedded default. Set this only
-    # to select one configured operator override explicitly.
-    # toolchain_profile: private-node24-npm11-arm64
-    # platform: linux/arm64
-    # This repository's development Compose file builds local images, so the
-    # example is deliberately scan-only. Updates and update --dry-run fail
-    # closed until a strict, digest-pinned verification Compose service exists.
-    verification:
-      version: 1
-      state: scan_only
-    # The checked-in .vuelta.yaml owns this exact repository/workflow identity.
-    # The workflow itself is copied from deploy/vuelta-update.example.yml.
-    # github:
-    #   repository: "luckyfoxdesign/vuelta"
-    #   workflow: "vuelta-update.yml"
-    # A ready multi-step profile uses explicit argv and never inherits a
-    # service command:
-    # verification:
-    #   version: 1
-    #   state: ready
-    #   steps:
-    #     - name: test
-    #       compose_file: compose.verify.yml
-    #       service: verify
-    #       command: ["npm", "test"]
-    #       # Added by `vuelta project verify approve`; exact decoded script
-    #       # whitespace is significant, while package.json formatting is not.
-    #       # A mismatch is reported by scan without creating an update
-    #       # snapshot, and update/test execution remains fail-closed.
-    #       script_body_hash: "sha256:<64-lowercase-hex>"
-    #       timeout_seconds: 900
-    #       required: true
-    #       success_exit_codes: [0]
-    #     - name: build
-    #       compose_file: compose.verify.yml
-    #       service: verify
-    #       command: ["npm", "run", "build"]
-    #       script_body_hash: "sha256:<64-lowercase-hex>"
-    #       timeout_seconds: 1200
-    #       required: true
-    #       success_exit_codes: [0]
-    branch: main
-    remote: origin
-    # Git-style repository-relative patterns. A root name is root-only; *, ?,
-    # and [] match within one slash-delimited segment. Recursive ** is unsupported.
-    allowed_changed_paths:       # project-scoped allowlist used for update diff checks
-      - "Dockerfile*"
-    docker_images:                 # only these project-relative files are analyzed/updated
-      files: ["Dockerfile"]
-      # A bare tag ("node:22") is intent, resolved to a digest at scan time
-      # and recorded in the scan result; an exact digest here is scanned as-is.
-      # Onboarding never writes a digest into this file itself.
-      runtime_images: ["node:22@sha256:e59e7e103c548864aa008d397b8487c96c539538ca8ec724330fd5cb35d609b3"]
-      platforms: ["linux/amd64"]
-
-git:
-  push_mode: review_branch         # review_branch (default) | direct_branch
-  # Legacy configs may keep one config-wide allowed_changed_paths list here.
-  # New projects persist a scoped allowlist in each workspaces[] entry.
+    network: vuelta-cli-update-egress
+    proxy_container: vuelta-cli-egress-proxy
+    proxy_url: http://vuelta-cli-egress-proxy:3128
+  # toolchain_profiles: [] # optional explicit digest-pinned operator overrides
+workspaces: [] # add exact projects with `vuelta project add PATH --yes`

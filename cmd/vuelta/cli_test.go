@@ -16,7 +16,7 @@ func TestTopLevelHelpGolden(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	assertGolden(t, "top-level-help.golden", stdout.String())
-	if !strings.Contains(stdout.String(), "\n  project ") || !strings.Contains(stdout.String(), "\n  update ") {
+	if !strings.Contains(stdout.String(), "\n  project ") || !strings.Contains(stdout.String(), "\n  fix ") {
 		t.Fatal("top-level help does not match the executable command surface")
 	}
 }
@@ -85,6 +85,7 @@ func TestUnknownOptionGolden(t *testing.T) {
 
 func TestRemovedCommandsAndFlagsAreRejected(t *testing.T) {
 	tests := [][]string{
+		{"update"}, {"update", "local"}, {"status"}, {"history"}, {"commands", "consume"}, {"project", "verify"}, {"scan", "--only", "packages"},
 		{"run"},
 		{"package", "scan"},
 		{"tasks", "list"},

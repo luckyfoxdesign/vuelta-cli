@@ -1,6 +1,4 @@
-// Package updater bumps dependency versions per stack (python/node/docker)
-// inside a sandboxed working copy. Each stack implements the Updater
-// interface; see part B of the spec for pipeline wiring.
+// Package updater provides hardened container runners and image resolution for repair.
 package updater
 
 import (
@@ -11,8 +9,6 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
-	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
-	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/egress"
 	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/scancontainer"
@@ -30,11 +26,6 @@ const (
 	applyOutputTailBytes    = 128 << 10
 	defaultDiscoveryMemory  = "1g"
 )
-
-// Updater updates dependency versions for a single project.
-type Updater interface {
-	Update(ctx context.Context, projectPath string) (changed bool, err error)
-}
 
 // DockerRunner executes a command inside image against workDir and returns
 // its combined output. Tests inject a fake to avoid needing a real Docker
@@ -240,144 +231,4 @@ func dockerRunArgsForProfile(image string, args []string, workDir, network, prox
 		image,
 	)
 	return append(dockerArgs, args...)
-}
-
-// NoopUpdater reports no change; used for workspaces with nothing to update
-// (e.g. stack=docker with no docker_images configured yet).
-type NoopUpdater struct{}
-
-func (NoopUpdater) Update(context.Context, string) (bool, error) { return false, nil }
-
-// CompositeUpdater runs each Updater in order and reports changed if any of
-// them changed something. Used to combine a stack's package-manager updater
-// with a docker_images updater on the same workspace (part A §6).
-type CompositeUpdater []Updater
-
-func (c CompositeUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	changed := false
-	for _, u := range c {
-		didChange, err := u.Update(ctx, projectPath)
-		if err != nil {
-			return changed, err
-		}
-		changed = changed || didChange
-	}
-	return changed, nil
-}
-
-// Resolve picks the Updater(s) for a workspace based on its
-// stack/package_manager and, if set, docker_images. config.Validate is
-// assumed to have already rejected unknown stack/package_manager pairs and
-// unpinned images; Resolve only fails on missing config.update entries that
-// a chosen updater needs (e.g. no pinned image for the stack).
-func Resolve(ws config.Workspace, cfg config.Config) (Updater, error) {
-	return ResolveWithDocker(ws, cfg, dockerexec.Default())
-}
-
-// ResolveWithDocker binds every updater command to the supplied Docker boundary.
-func ResolveWithDocker(ws config.Workspace, cfg config.Config, docker dockerexec.Runner) (Updater, error) {
-	var updaters []Updater
-	profile, _, err := ResolveToolchainProfile(ws, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("resolve toolchain profile: %w", err)
-	}
-	user := ""
-	platform := ""
-	if profile != nil {
-		user = profile.User
-		platform = profile.Platform
-	}
-	runner := NewDockerRunnerWithProfile(docker, cfg.Update.Egress, user, platform)
-	switch {
-	case ws.Stack == config.StackDocker:
-		// No package-manager updater; docker_images (below) is the only update source.
-	case ws.PackageManager != "":
-		registry, err := catalog.New()
-		if err != nil {
-			return nil, fmt.Errorf("construct built-in ecosystem catalog: %w", err)
-		}
-		adapter, err := registry.Lookup(ws.Stack, ws.PackageManager)
-		if err != nil {
-			return nil, err
-		}
-		mutator, ok := adapter.(ecosystem.MutationProvider)
-		if !ok {
-			return nil, &ecosystem.CapabilityError{
-				Key: adapter.Key(), Capability: "mutation", ScanOnly: adapter.Metadata().UnsupportedReason == "",
-				Reason: adapter.Metadata().UnsupportedReason,
-			}
-		}
-		request := ecosystem.MutationRequest{Root: ws.Path}
-		if profile != nil {
-			request.ProfileScanner = profile.Scanner
-			request.ScannerVersion = profile.ScannerVersion
-			request.InstalledTool = true
-		} else if policy, ok := adapter.(ecosystem.ProfilePolicyProvider); ok {
-			request.ProfileScanner = policy.ProfilePolicy().ExpectedScanner
-		}
-		spec, err := mutator.Mutation(request)
-		if err != nil {
-			return nil, err
-		}
-		if profile == nil && spec.LegacyToolKey != "" {
-			request.ScannerVersion, err = requireTool(cfg, spec.LegacyToolKey)
-			if err != nil {
-				return nil, err
-			}
-			spec, err = mutator.Mutation(request)
-			if err != nil {
-				return nil, err
-			}
-		}
-		image := ""
-		if profile != nil {
-			image = profile.Image
-		} else {
-			image, err = requireImage(cfg, spec.LegacyImageKey)
-			if err != nil {
-				return nil, err
-			}
-		}
-		packageUpdater, err := NewSpecUpdater(image, spec, runner)
-		if err != nil {
-			return nil, fmt.Errorf("validate %s mutation: %w", adapter.Key().String(), err)
-		}
-		updaters = append(updaters, packageUpdater)
-	default:
-		return nil, fmt.Errorf("no updater for stack=%q package_manager=%q", ws.Stack, ws.PackageManager)
-	}
-
-	if ws.DockerImages != nil {
-		updaters = append(updaters, DockerImageUpdater{Files: ws.DockerImages.Files, Resolve: DigestResolverWithDocker(docker)})
-	}
-
-	switch len(updaters) {
-	case 0:
-		return NoopUpdater{}, nil
-	case 1:
-		return updaters[0], nil
-	default:
-		return CompositeUpdater(updaters), nil
-	}
-}
-
-func requireImage(cfg config.Config, key string) (string, error) {
-	img, ok := cfg.Update.Images[key]
-	if !ok || img == "" {
-		return "", fmt.Errorf("update.images[%s] is required", key)
-	}
-	return img, nil
-}
-
-func requireTool(cfg config.Config, key string) (string, error) {
-	v, ok := cfg.Update.Tools[key]
-	if !ok || v == "" {
-		return "", fmt.Errorf("update.tools[%s] is required", key)
-	}
-	if key == "npm_check_updates" {
-		if err := validateNCUVersion(v); err != nil {
-			return "", fmt.Errorf("update.tools[%s]: %w", key, err)
-		}
-	}
-	return v, nil
 }

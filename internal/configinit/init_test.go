@@ -286,63 +286,6 @@ func TestDetectDoesNotOfferSingleDevServerAsVerification(t *testing.T) {
 	}
 }
 
-func TestDetectOffersDedicatedVerificationCompose(t *testing.T) {
-	project := nodeProject(t)
-	writeProjectFile(t, project, "package.json", `{"scripts":{"build":"vite build","dev":"vite dev"}}`+"\n")
-	writeProjectFile(t, project, "compose.yml", "services:\n  s_svelteapp:\n    command: npm i && npm run dev\n")
-	writeProjectFile(t, project, "compose.verify.yml", validVerificationCompose("verify"))
-
-	discovery, err := Detect(project)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(discovery.VerificationCandidates) != 1 || discovery.VerificationCandidates[0].ComposeFile != "compose.verify.yml" {
-		t.Fatalf("verification candidates = %#v, want dedicated compose file", discovery.VerificationCandidates)
-	}
-	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if workspace.Verification.State != "ready" || len(workspace.Verification.Steps) != 1 {
-		t.Fatalf("verification profile = %#v", workspace.Verification)
-	}
-}
-
-func TestBuildExplicitMultiStepVerificationFromDeclarativeMetadata(t *testing.T) {
-	project := nodeProject(t)
-	writeProjectFile(t, project, "package.json", `{"scripts":{"test":"vitest run","build":"vite build","dev":"vite dev"}}`+"\n")
-	writeProjectFile(t, project, "compose.yml", validVerificationCompose("verify"))
-	discovery, err := Detect(project)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(discovery.VerificationCandidates) != 2 {
-		t.Fatalf("verification candidates = %#v, want test and build only", discovery.VerificationCandidates)
-	}
-	names := []string{discovery.VerificationCandidates[0].Name, discovery.VerificationCandidates[1].Name}
-	workspace, err := discovery.BuildWorkspace(Input{Branch: "main", Remote: "origin", VerificationNames: names})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if workspace.Verification.State != "ready" || len(workspace.Verification.Steps) != 2 {
-		t.Fatalf("verification profile = %#v", workspace.Verification)
-	}
-	for _, step := range workspace.Verification.Steps {
-		if len(step.Command) == 0 || step.TimeoutSeconds <= 0 || !step.Required || len(step.SuccessExitCodes) != 1 {
-			t.Fatalf("unbounded or implicit verification step = %#v", step)
-		}
-	}
-}
-
-func validVerificationCompose(service string) string {
-	return "services:\n  " + service + ":\n" +
-		"    image: node:22@sha256:" + strings.Repeat("1", 64) + "\n" +
-		"    user: \"65532:65532\"\n    read_only: true\n    cap_drop: [\"ALL\"]\n" +
-		"    security_opt: [\"no-new-privileges:true\"]\n    cpus: \"1\"\n" +
-		"    mem_limit: 1g\n    pids_limit: 128\n    networks: [verify]\n" +
-		"networks:\n  verify:\n    internal: true\n"
-}
-
 func nodeProject(t *testing.T) string {
 	t.Helper()
 	project := t.TempDir()

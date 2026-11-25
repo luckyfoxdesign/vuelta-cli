@@ -4,9 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/luckyfoxdesign/vuelta/internal/dockerexec"
@@ -132,68 +129,4 @@ func parseManifestDigestForPlatform(data []byte, platform string) (string, error
 		return single.Descriptor.Digest, nil
 	}
 	return "", fmt.Errorf("no manifest digest found for platform %s", platform)
-}
-
-// DockerImageUpdater bumps only the digest of pinned FROM/image references
-// in the project-relative files listed by Files, keeping each reference's
-// tag unchanged. Files come from a workspace's already-validated
-// docker_images.files (config.Validate rejects paths outside the project,
-// symlinks, and non-regular files).
-type DockerImageUpdater struct {
-	Files   []string
-	Resolve DigestResolver
-}
-
-var (
-	fromLinePattern  = regexp.MustCompile(`(?i)^(\s*FROM\s+)(\S+?)(@sha256:[0-9a-f]{64})?(\s.*)?$`)
-	imageLinePattern = regexp.MustCompile(`^(\s*image:\s*)(\S+?)(@sha256:[0-9a-f]{64})?(\s*#.*)?$`)
-)
-
-func (u DockerImageUpdater) Update(ctx context.Context, projectPath string) (bool, error) {
-	changed := false
-	for _, rel := range u.Files {
-		path := filepath.Join(projectPath, rel)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return changed, fmt.Errorf("read %s: %w", rel, err)
-		}
-		updated, fileChanged, err := u.updateContent(ctx, string(data))
-		if err != nil {
-			return changed, fmt.Errorf("%s: %w", rel, err)
-		}
-		if fileChanged {
-			if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
-				return changed, fmt.Errorf("write %s: %w", rel, err)
-			}
-			changed = true
-		}
-	}
-	return changed, nil
-}
-
-func (u DockerImageUpdater) updateContent(ctx context.Context, content string) (string, bool, error) {
-	changed := false
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		m := fromLinePattern.FindStringSubmatch(line)
-		if m == nil {
-			m = imageLinePattern.FindStringSubmatch(line)
-		}
-		if m == nil {
-			continue
-		}
-
-		prefix, tag, suffix := m[1], m[2], m[4]
-		digest, err := u.Resolve(ctx, tag)
-		if err != nil {
-			return content, false, fmt.Errorf("resolve digest for %s: %w", tag, err)
-		}
-		newRef := tag + "@" + digest
-		oldRef := tag + m[3]
-		if newRef != oldRef {
-			lines[i] = prefix + newRef + suffix
-			changed = true
-		}
-	}
-	return strings.Join(lines, "\n"), changed, nil
 }

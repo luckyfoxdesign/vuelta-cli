@@ -10,7 +10,6 @@ import (
 
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/configinit"
-	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 )
 
@@ -64,9 +63,6 @@ func runConfigValidate(args []string) error {
 	if validateErr := cfg.Validate(); validateErr != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
 	}
-	if validateErr := validateVerificationPolicies(*cfg); validateErr != nil {
-		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
-	}
 	if validateErr := validateToolchainPolicies(*cfg); validateErr != nil {
 		return jsonCommandFailure(*jsonOutput, "config validate", "config_invalid", fail(exitConfig, "%v", validateErr), warnings)
 	}
@@ -74,13 +70,13 @@ func runConfigValidate(args []string) error {
 		plans := make([]map[string]any, 0, len(cfg.Workspaces))
 		for _, workspace := range cfg.Workspaces {
 			profileID, source := resolvedToolchain(workspace, *cfg)
-			plans = append(plans, map[string]any{"project": config.WorkspaceName(workspace), "verification": config.VerificationPlan(workspace), "toolchain": profileID, "toolchain_source": source})
+			plans = append(plans, map[string]any{"project": config.WorkspaceName(workspace), "toolchain": profileID, "toolchain_source": source})
 		}
 		return writeJSONEnvelope(jsonCommandEnvelope{
 			Format: 1, Command: "config validate",
 			Results: []any{map[string]any{
 				"path": path, "valid": true, "projects": len(cfg.Workspaces), "verification_plans": plans,
-				"next": displayCommand("scan", "--directory", ".", "--only", "packages", "--config", path),
+				"next": displayCommand("scan", "--directory", ".", "--only", "vulnerabilities", "--config", path),
 			}},
 			Summary:  map[string]any{"valid": true, "projects": len(cfg.Workspaces)},
 			Warnings: warnings, Errors: []jsonCommandError{},
@@ -91,14 +87,11 @@ func runConfigValidate(args []string) error {
 	}
 	fmt.Printf("ok: %s is valid (%d workspace(s))\n", path, len(cfg.Workspaces))
 	for _, workspace := range cfg.Workspaces {
-		for _, step := range config.VerificationPlan(workspace) {
-			fmt.Printf("verification %s: %s\n", config.WorkspaceName(workspace), step)
-		}
 		if profileID, source := resolvedToolchain(workspace, *cfg); profileID != "" {
 			fmt.Printf("toolchain %s: %s (source=%s)\n", config.WorkspaceName(workspace), profileID, source)
 		}
 	}
-	fmt.Printf("Next: %s\n", displayCommand("scan", "--directory", ".", "--only", "packages", "--config", path))
+	fmt.Printf("Next: %s\n", displayCommand("scan", "--directory", ".", "--only", "vulnerabilities", "--config", path))
 	return nil
 }
 
@@ -139,7 +132,7 @@ func runProjectList(args []string) error {
 			}
 			toolchainID, toolchainSource = selection.Profile.ID, selection.Source
 		}
-		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical, Verification: config.VerificationPlan(workspace), Toolchain: toolchainID, ToolchainSource: toolchainSource})
+		results = append(results, projectListResult{Name: config.WorkspaceName(workspace), Path: canonical, Verification: []string{}, Toolchain: toolchainID, ToolchainSource: toolchainSource})
 	}
 	if *jsonOutput {
 		return writeJSONEnvelope(jsonCommandEnvelope{
@@ -176,14 +169,12 @@ func runProjectAdd(args []string) error {
 	platform := fs.String("platform", "", "scanner platform: linux/amd64 or linux/arm64")
 	branch := fs.String("branch", "", "protected branch")
 	remote := fs.String("remote", "", "Git remote")
-	scanOnly := fs.Bool("scan-only", false, "register the project for read-only scans without update authority")
 	yes := fs.Bool("yes", false, "confirm the displayed config diff")
 	nonInteractive := fs.Bool("non-interactive", false, "fail instead of prompting")
-	var allowPaths, dockerFiles, runtimeImages, verificationNames repeatedFlag
+	var allowPaths, dockerFiles, runtimeImages repeatedFlag
 	fs.Var(&allowPaths, "allow-path", "allowed changed path (repeatable)")
 	fs.Var(&dockerFiles, "docker-file", "project-relative Dockerfile for docker stack (repeatable)")
 	fs.Var(&runtimeImages, "runtime-image", "immutable runtime image digest for docker stack (repeatable)")
-	fs.Var(&verificationNames, "verification", "declarative verification candidate (repeatable for a multi-step profile)")
 	if err := fs.Parse(args); err != nil {
 		return fail(exitConfig, "%v", err)
 	}
@@ -202,7 +193,6 @@ func runProjectAdd(args []string) error {
 	input := configinit.Input{
 		Name: *name, Stack: *stack, PackageManager: *manager, Branch: *branch, Remote: *remote,
 		AllowedPaths: allowPaths, DockerFiles: dockerFiles, RuntimeImages: runtimeImages,
-		VerificationNames: verificationNames, ScanOnly: *scanOnly,
 	}
 	interactive := !*nonInteractive && configinit.IsTerminal(os.Stdin)
 	workspace, err := resolveAmbiguousWorkspace(discovery, input, interactive, promptChoice)
@@ -234,9 +224,6 @@ func runProjectAdd(args []string) error {
 	if !plan.Changed {
 		fmt.Printf("project %s is already configured at %s\n", workspace.Name, workspace.Path)
 		return nil
-	}
-	for _, step := range config.VerificationPlan(workspace) {
-		fmt.Fprintf(os.Stderr, "verification plan: %s\n", step)
 	}
 	if selectedToolchain != "" {
 		fmt.Fprintf(os.Stderr, "toolchain profile: %s\n", selectedToolchain)
@@ -282,19 +269,6 @@ func configWarnings(cfg *config.Config) []string {
 	warnings := make([]string, 0)
 	warnings = append(warnings, cfg.WorkspaceWarnings()...)
 	return warnings
-}
-
-func validateVerificationPolicies(cfg config.Config) error {
-	var errs []error
-	for _, workspace := range cfg.Workspaces {
-		if workspace.Verification.State != config.VerificationReady {
-			continue
-		}
-		if err := testrunner.ValidateProfile(workspace.Path, workspace.Verification); err != nil {
-			errs = append(errs, fmt.Errorf("project %q verification policy: %w", config.WorkspaceName(workspace), err))
-		}
-	}
-	return errors.Join(errs...)
 }
 
 func validateToolchainPolicies(cfg config.Config) error {

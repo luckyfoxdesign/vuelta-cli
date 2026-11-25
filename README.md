@@ -1,693 +1,134 @@
-# vuelta
+# Vuelta
 
-A one-shot CLI that scans and deploys configured projects without changing
-their repositories. It records bounded history in machine-owned SQLite and
-dispatches builds to a central GitHub-hosted release engine. The production
-server never resolves lock files, runs project tests, or builds images during
-the normal update or deploy path. Vuelta core remains one-shot;
-launchd/systemd invokes synchronization and typed command consumption. The
-optional Telegram bridge is a separate resident process over SQLite.
+Vuelta finds known vulnerabilities in dependencies and referenced Docker images,
+and repairs selected findings with `fix`. It is a one-shot Go CLI. Scheduling,
+GitHub Issues, project tests, commits, push, PRs and deployment belong to its consumer.
 
-Node and Python scans resolve adaptive defaults from declarative runtime,
-manager, lock, and platform metadata. Scanner Dockerfiles are embedded in the
-binary, built locally on first use, and cached by content hash; an explicit
-`update.toolchain_profiles` entry is only an operator override. Snapshot format
-7 records the profile source, local image identity, runtime and tool versions,
-platform, non-root user, lock support, and security capabilities. See
-`scanner-images/` and the real-engine section of `../docs/runbook-local.md`.
+## Build and configure
 
-## Stack
-
-- Language: Go. Static `vuelta` and optional `vuelta-scheduler` binaries; no
-  language runtime is required on target machines.
-- Supported targets are Darwin and Linux. Windows is not a build target because
-  config-file ownership and no-symlink checks use Unix filesystem semantics.
-- Runtime dependencies (not vendored, must exist in the environment): `git`
-  and `docker`/`docker compose`. Trivy and OSV-Scanner always run from
-  configured digest-pinned containers, never from the host PATH.
-- Package managers (`poetry`/`uv`/`pip-tools`, `npm`/`pnpm`) run only inside
-  Docker containers, never on the host — their install scripts execute
-  arbitrary code and must stay isolated.
-- A root `requirements.txt` without `requirements.in` is detected as the
-  distinct `python/requirements` profile. Its container only parses exact
-  pins and requests bounded PyPI metadata; it never invokes pip or project
-  code and cannot produce an update snapshot.
-
-## Local Quick Start (macOS)
-
-From a fresh `app` checkout, build the Apple Silicon CLI in Docker, select the
-local npm or Python project to inspect, and follow the four commands below:
-
-```bash
-make build-mac
-VUELTA="$PWD/bin/vuelta-darwin-arm64"
-PROJECT="/absolute/path/to/your/npm-or-python-project"
-
-"$VUELTA" config init
-"$VUELTA" environment bootstrap --socket "$HOME/.docker/run/docker.sock"
-"$VUELTA" config validate
-"$VUELTA" scan --directory "$PROJECT" --only packages
-```
-
-`make build-mac` always writes the CLI to
-`bin/vuelta-darwin-arm64`; installation on `PATH` is not required. Docker
-Desktop must be running. The bootstrap command displays the exact socket and
-daemon identity and asks for confirmation before saving them. Each successful
-onboarding command prints the next command with the selected config path and
-the same invoked binary preserved.
-
-No YAML editing, Compose startup, Docker resource inspection, or cleanup is
-part of this flow. If another application already occupies the configured
-egress names, Vuelta leaves those resources unchanged and uses deterministic
-isolated names for its own invocation. The final scan prints one result per
-project as a compact `manager / package / current / latest / status` table. A
-standalone `requirements.txt` is explicitly reported as a read-only result
-because it has no safe automatic mutation contract. Add `--verbose` to the
-scan command only when technical stages, selected inputs, warnings, and Docker
-error details are needed; `--json` remains the stable automation interface.
-
-## Layout
-
-```text
-cmd/vuelta/       # main.go, CLI entrypoint
-cmd/vuelta-gateway/ # minimal machine-owned blue/green gateway
-cmd/vuelta-scheduler/ # external JSON orchestration helper
-internal/
-  config/         # config.yaml parsing and validation
-  scanner/        # validates only explicitly configured project paths, detects stack
-  updater/        # read-only candidate scan and per-stack updates (python/js/docker)
-  updatesnapshot/ # atomic, short-lived package-update plans
-  updatepolicy/   # delayed-latest direct dependency policy
-  history/        # machine-owned SQLite schema and repositories
-  telegrambridge/ # bounded Telegram delivery and command/approval adapter
-  githubactions/  # narrow workflow dispatch and known-run synchronization
-  deploy/         # zero-edit discovery and blue/green release runtime
-  gateway/        # atomic reverse-proxy configuration
-  vulnscan/       # trivy/osv-scanner integration
-  githubalerts/   # read-only GitHub Dependabot/Security Advisories client
-  sandbox/        # one-off sandboxed working copy for update/test
-  testrunner/     # runs docker compose test
-  gitops/         # commit, push, tags
-  scheduler/      # scan/update JSON orchestration and aggregate policy
-deploy/           # units, central release engine, and gateway image
-config.example.yaml
-```
-
-## Configuration
-
-For local scanning, create the protected default config with `vuelta config
-init`; no manual YAML edit is required. `config.example.yaml` is the reference
-for advanced server and notification settings. The config must be a regular,
-non-symlink file owned by the process uid, use mode `0600`, and declare the
-current top-level `schema_version`; loading fails closed if these checks do not
-pass. When an interactive command finds the recognized legacy format without
-`schema_version`, it offers to add the current version while preserving all
-compatible settings, comments, key order, ownership, and protected mode.
-Recognized retired fields are listed by name before confirmation; their values
-are never printed, and ambiguous conversions fail closed. The
-same reviewed operation is available explicitly as `vuelta config migrate`;
-scripts use `vuelta --no-input config migrate --yes`. Explicit unsupported
-versions and configs that do not validate under the current schema still fail
-closed without being changed. `state.database_path` selects the protected
-machine-owned SQLite database; when omitted it defaults beside the machine
-config under `state/history.db`. GitHub credentials remain environment-only
-through the fixed allowlisted `github_actions.token_env` reference. Legacy
-The retired `notify` block is removed by the reviewed `config migrate` flow.
-Core scan/update/deploy paths write structured SQLite events and outbox intents
-and never call Telegram or webhook APIs. Bridge credentials are not part of
-the Vuelta YAML schema. See `config.example.yaml` for the full core schema.
-
-`vuelta` never scans parent directories or auto-discovers projects: only
-paths listed under `workspaces[]` are ever touched.
-
-## Runner isolation
-
-Every Docker child is bound to the reviewed local Unix socket with an explicit
-`--host unix:///absolute/path`; Docker context discovery and inherited
-`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, TLS, proxy, and credential
-helper settings are never authority. Before the first caller command, Vuelta
-checks the socket type, ownership, and permissions, then attests the daemon ID,
-exact server version, OS/architecture, minimum API version, and required
-security options. A mismatch fails closed before a scanner, updater, or test
-command runs.
-
-Configure development under `docker.developer_endpoints` (an ordered list of
-`socket` / `expected_daemon` mappings). The legacy single `docker.developer`
-mapping remains supported; combining the two forms is rejected. Linux Docker Engine normally
-uses `/var/run/docker.sock`; Docker Desktop on macOS normally uses the
-per-user `/Users/YOU/.docker/run/docker.sock`. Do not create a system-wide
-socket symlink. Bootstrap the endpoint through Vuelta so the exact non-secret
-identity is displayed for review and atomically written to the protected
-config without reading ambient Docker configuration or credential helpers:
-
-```bash
-vuelta environment bootstrap --socket /absolute/path/to/docker.sock
-```
-
-For automation, both authority-bearing flags are mandatory:
-
-```bash
-vuelta --no-input environment bootstrap \
-  --socket /absolute/path/to/docker.sock --yes --json
-```
-
-Repeat bootstrap with each explicit socket to trust both Docker Desktop and
-OrbStack. It adds a new socket at the end or updates an existing socket in place,
-without erasing other entries. Adding a second endpoint to a legacy config
-migrates its existing entry into the ordered list. At most 16 entries are allowed.
-The first reachable trusted endpoint is selected once per invocation. Missing
-sockets and failed connection probes permit fallback; unsafe socket permissions,
-malformed identities, and attestation mismatches stop execution. If all trusted
-endpoints are unavailable, the error lists the configured attempts. Ambient
-contexts and unlisted socket paths are never candidates. Cleanup remains bound
-to the selected endpoint even if runtime availability changes.
-
-The command normalizes `aarch64` to `arm64` and `x86_64` to `amd64` before
-persisting and attesting image platforms. Re-review the identity after an
-intentional Engine or Docker Desktop upgrade.
-
-Each update starts from `git archive <base SHA>` in a fresh `0700` directory.
-Only tracked regular files are extracted; `.git`, ignored/untracked files,
-`.env*`, host credentials, sockets, and symlinks do not enter the runner. The
-original working tree is never mounted into an update or test container.
-
-Before the first networked scanner stage, Vuelta builds its exact-version proxy
-from source embedded in the installed binary, validates its local `sha256`
-image identity, and ensures the owned internal network and hardened healthy
-proxy. Scanner containers attach only to the invocation's verified internal
-egress network and receive the proxy through explicit `HTTP(S)_PROXY`
-variables; Docker's default bridge is never a scanner fallback. Names, labels,
-image identity, hardening, health, and network attachments are checked before
-reuse. Foreign name collisions are left untouched and routed to deterministic
-isolated Vuelta names. Every resource actually selected for a scan must pass
-the full ownership, identity, hardening, health, and attachment contract.
-Invocation-created resources are removed after the command;
-`update.egress.persistent: true` explicitly retains verified resources. No
-source checkout, Compose file, host proxy variable, or GitHub token is required
-or passed to a runner.
-
-Dependency vulnerability findings come from exactly one configured source:
-Trivy, OSV-Scanner, or GitHub Dependabot. Selecting Dependabot does not scan
-lock files locally and makes its GitHub API access fail closed. Image scanning
-is independent: it remains Trivy-only and checks OS packages only, so language
-dependencies are not reported again from an immutable image.
-
-Vulnerability and package-candidate scanners use exact per-stage input
-contracts. Registered projects contribute only tracked, non-ignored regular
-manifest, lock, Docker-manifest, and policy files; source trees, `.git`,
-`.env*`, credentials, symlinks, sockets, and unrelated files are never exposed.
-Package-manager configuration is excluded unless `--allow-project-config` was
-explicitly reviewed, and credential-bearing configuration still fails closed.
-
-Container scans do not bind-mount the repository or create a host-readable
-staging tree. Vuelta sends a bounded in-memory archive to a stopped loader,
-commits an ephemeral local input image, removes the loader, and starts a
-separate final container from the returned immutable image ID. The final
-container is read-only, runs as fixed non-root UID 65532 with all capabilities
-dropped, and never receives a Docker socket. Containers, loader, and ephemeral
-image are removed with an independent bounded cleanup context. Explicit local
-adhoc scanners receive the same minimal files in a same-user `0700` context
-with `0600` files.
-
-Trivy receives `--image-src remote`, so an image scan pulls only through the
-allowlisted registry rather than inspecting the host Docker daemon. Each scan
-uses a new tmpfs cache and refreshes its vulnerability database through the
-proxy for every scan. If a scanner reports a database timestamp, it must also
-satisfy `vuln_scan.database_max_age_hours`. The checked-in allowlist includes
-Trivy's GHCR database endpoint and OSV's API. Add an image registry
-deliberately to the egress proxy before configuring a workspace that scans
-images from it.
-
-Every `docker-compose.test.yml` selected by a workspace must use immutable
-image digests and an explicit internal test network. Each service reachable by
-the test service must set a non-root numeric `user`, `cap_drop: [ALL]`,
-`security_opt: [no-new-privileges:true]`, and positive `cpus`, `mem_limit`,
-and `pids_limit` values. `privileged`, host namespaces, devices, Docker socket
-or absolute host mounts, `env_file`, inherited/interpolated environment values,
-external networks, mutable image tags, configs, and secrets are rejected.
-
-Fixtures and credentials for tests must be synthetic, concrete values declared
-in that compose file or generated inside the sandbox. Do not reference a host
-`.env`, developer credentials, or production secret store. To add a project,
-first provision its registry allowlist in the egress-policy layer, pin all
-runner/test images to digests, add the restricted compose profile, then add the
-workspace path and dependency-file allowlist to `config.yaml`.
-
-## Acceptance fixtures
-
-Deterministic, offline fixture projects and mock boundaries live in
-`testdata/fixtures/`. They never contain a nested Git repository: test setup
-copies one fixture into a temporary directory and initializes a fresh Git
-repository for each scenario.
-
-- `projects/py-poetry-ok`, `node-pnpm-ok`, and `docker-app-ok` cover the
-  accepted Python, Node, and digest-pinned Docker update paths.
-- `projects/py-poetry-failtest`, `node-pnpm-cve`, and `docker-app-cve` cover
-  a failing test, a package CVE, and a runtime/base-image CVE respectively.
-- `projects/malicious-postinstall` and `projects/escape-symlink` are hostile
-  inputs: they are only used to verify tracked-files-only sandboxing and path
-  rejection. They must never be run against a host checkout.
-- `bad-compose-*` files each isolate one prohibited Compose field and must be
-  rejected before Docker is invoked.
-- `mock-claude/claude` has explicit `fix` and `fail` modes; the former creates
-  an untracked file deliberately so rollback behavior remains observable.
-
-The Go test suite starts in-memory GitHub-alert and registry stand-ins; it
-does not contact GitHub, a package registry, or an OCI registry. Deployment
-tests use bounded fake GitHub, Docker, resource, health, and gateway
-boundaries; production execution verifies exact OCI source/revision labels and
-immutable repository digests.
-
-## Real-world corpus scan
-
-The manual corpus harness runs production `vuelta scan` against exactly 20
-reviewed public GitHub commits and, unless disabled, attempts up to five
-non-blocking discovery cases. Only Docker Compose runs on the host. Choose an
-existing absolute storage directory outside this repository; it retains
-immutable source caches and timestamped reports:
-
-```bash
-scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus
-scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --stable-only
-scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --case axios-npm-v3
-scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus \
-  --case gperdomor-oss-pnpm-workspace --timeout 10m
-scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus \
-  --only-failed /absolute/path/to/vuelta-corpus/runs/RUN_ID/report.json \
-  --timeout 10m
-```
-
-On Docker Desktop, point the wrapper at the explicit per-user socket when it
-is not available at `/var/run/docker.sock`:
-
-```bash
-VUELTA_DOCKER_SOCKET=/Users/YOU/.docker/run/docker.sock \
-  scripts/corpus-scan.sh /absolute/path/to/vuelta-corpus --stable-only
-```
-
-Each run writes `runs/RUN_ID/report.json`, `report.md`, and bounded per-pass
-logs. The Markdown report separates stable failures from discovery findings
-and compares stable scenario/pass results with the previous completed report.
-Stable source failures, contract mismatches, unexpected partials, timeouts,
-and filesystem mutations make the command fail; discovery findings do not.
-Before fetching a project, the harness performs one Docker/scanner preflight
-so a broken engine or exhausted network pool produces one infrastructure
-failure.
-
-Each selected scenario pass has a five-minute deadline by default. Use
-`--timeout DURATION` for an intentionally large diagnostic run, up to
-`24h`; zero, negative, malformed, and larger values are rejected before
-preflight. The override applies separately to every corpus pass. It does not
-bound the whole harness and does not replace stage-level deadlines inside the
-production scanner. Reports record the effective per-pass timeout, and
-reproduction commands retain non-default overrides.
-
-The storage layout is append-only:
-
-```text
-vuelta-corpus/
-├── cache/          # immutable URL + commit source caches
-└── runs/
-    └── RUN_ID/
-        ├── report.json
-        ├── report.md
-        └── logs/
-```
-
-To review updated pins without changing the committed stable manifest:
-
-```bash
-scripts/corpus-refresh.sh /absolute/path/to/vuelta-corpus
-```
-
-Refresh writes a validated `candidate-manifest.yaml` and `candidate.diff`
-beside its reports. The full corpus and refresh workflows require GitHub,
-registries, and a trusted Docker endpoint, so they remain manual; ordinary
-Docker `test`, `race`, and `lint` use only offline harness fakes.
-
-## Development
-
-```bash
-docker compose run --rm test   # go test ./...
-docker compose run --rm lint   # golangci-lint run
-docker compose run --rm tidy   # go mod tidy
-docker compose run --rm build  # go build ./...
-make build-mac                 # darwin/arm64 CLI and scheduler via Docker
-make build-linux               # linux/amd64 CLI and scheduler via Docker
-make build                     # both targets
-```
-
-### Development image provenance
-
-Every service in the repository `compose.yml` that is not built locally must
-use a reviewable `<repository>:<tag>@sha256:<digest>` reference. The repository
-policy test parses the complete services map and rejects mutable tags, missing
-images, placeholder digests, and digests that are not 64 lowercase hex
-characters.
-
-The current lint pin was resolved from the official Docker Hub repository on
-2026-07-17. `golangci/golangci-lint:v2.12.2-alpine` published an OCI image
-index for `linux/amd64` and `linux/arm64` with digest
-`sha256:91b27804074a0bacea298707f016911e60cf0cdbc6c7bf5ccacb5f0606d18d60`.
-
-Refresh an external development image only as a controlled image upgrade:
-
-1. Inspect the intended tag with
-   `docker buildx imagetools inspect <repository>:<tag>` and confirm the
-   registry/repository, index media type, and required platforms.
-2. With shell pipe failure enabled, hash
-   `docker buildx imagetools inspect --raw <repository>:<tag>` using SHA-256
-   and confirm it matches the reported top-level index digest.
-3. Update the tag and digest together, run `docker compose run --rm test` and
-   `docker compose run --rm lint`, and review the reference change in the diff.
-
-This command is also the repeatable local verification of the fixture suite.
-`docs/runbook-local.md` maps every acceptance criterion to its fixture and
-notes the remaining prerequisites for a full manual end-to-end run.
-
-## Operations
-
-Inside a supported project, the primary scan flow is zero-setup:
-
-```bash
-cd /path/to/project
-vuelta scan
-```
-
-The first run atomically onboards a protected, versioned `.vuelta.yaml`
-containing only project policy with `workspace.path: .` and adds only the
-anchored `/.vuelta/` rule to the root `.gitignore`. The scan continues, but no
-snapshot is published until those versioned changes are reviewed, committed,
-and a clean scan is run again. Later runs reuse both entries byte-for-byte.
-`.` is always resolved relative to `.vuelta.yaml`, not the process CWD.
-
-Machine authority remains in `~/.config/vuelta/config.yaml`: the approved
-Docker endpoint and daemon identity, scanner/update defaults,
-and allowlisted credential-variable names. A project-controlled
-`.vuelta.yaml` cannot choose a socket, executable, credential source, or
-weaken machine security policy. If Docker trust is not configured, the
-project config remains saved and scan reports the existing explicit
-`environment bootstrap` flow.
-
-Global multi-project operations (`scan --all`, `scan --project`, scheduler,
-and administrative commands) continue to use machine authority while each
-target is onboarded and stores short-lived execution inputs in its own root.
-Select a specific machine config with the global `--config PATH` option. The
-normal server workflow is:
-
-Legacy scripts that intentionally use a machine-config workspace with
-`--directory` must now pass that machine config explicitly; local scan never
-silently falls back to an unrelated global workspace.
-
-```bash
-vuelta scan --all --timeout 10m
-vuelta status
-vuelta update api
-vuelta update status api
-```
-
-After onboarding, `scan` is read-only with respect to manifests and source:
-it never changes manifests, lock files, or source. It reports vulnerabilities
-and package candidates, atomically updates `.vuelta/last-scan.md`, and creates
-one short-lived `.vuelta/snapshots/<ID>.json` plan for each ready Git project.
-Gitless projects remain scannable and report
-`git_update_snapshot=unavailable` with reason `git_repository_not_found`;
-their findings and candidates remain visible while Git-bound snapshots and
-updates are disabled. Use `--project NAME` or `--all` for global configured
-workspaces, or `--directory PATH` to select an exact local root.
-Each project scan has an independent four-minute deadline by default. Use
-`--timeout DURATION` to override it up to one hour. With `scan --all`, every
-project receives a fresh deadline and a timed-out project does not prevent
-later projects from running. JSON and human output record the effective
-timeout and identify `scan_timeout` plus the active stage while retaining
-completed stage results. A timed-out project never publishes a ready update
-snapshot; its existing snapshots remain untouched and its bounded scan report
-is still written when safe.
-
-The deadline hierarchy is: stage-specific operation deadline, then project
-scan deadline, then the external corpus harness or scheduler deadline. The
-shorter stage deadlines remain in force; an intentionally smaller project
-override becomes the earlier backstop. Final result rendering and bounded
-cleanup of Vuelta-owned containers, networks, and child processes are outside
-the project deadline.
-Every per-project JSON result includes `package_updates` with status
-`available`, `scan_only`, or `unavailable`. Non-available states include a
-stable machine-readable reason code; corpus and automation contracts match
-that code exactly rather than parsing human diagnostics.
-Every completed scan also writes a short transaction to the machine database:
-the scan run, current dependency state, first observation and eligibility
-times, and an installed-version event only when the resolved version changes.
-Identical scans update `last_seen_at` without appending duplicate events. A
-database write failure is reported while the current in-memory and
-project-local scan report remain available.
-
-`update PROJECT` selects the newest valid snapshot for the exact configured
-project and base commit. It displays routine and deferred candidates, requires
-confirmation, dispatches the allowlisted GitHub workflow, records the returned
-run, and exits without changing the server checkout. Routine candidates are
-direct stable patch/minor releases that passed the machine-owned 14-day
-cooldown. Major and unknown changes are deferred; `--include-major` is an
-explicit reviewed exception and never admits prerelease, yanked, transitive,
-or unknown candidates.
-
-The GitHub wrapper rechecks the exact commit and candidates with the same
-pinned Vuelta engine, performs one package-manager resolution, validates
-changed paths, runs security and repository verification gates, pushes one
-review branch, and creates a pull request only after success. It has no deploy
-step or production credentials. See `deploy/github-update-workflow.md`.
-
-`status`, `history PROJECT`, and `update status [PROJECT]` read SQLite.
-Status commands synchronize only already-known unfinished GitHub run IDs.
-GitHub outages leave the last state visible as stale and never repeat a
-dispatch.
-
-### Zero-edit production deploy
-
-`vuelta deploy sync` is the complete unattended deploy entrypoint. For every
-existing `workspaces[]` root, it derives a deployment contract from the root
-Git repository, conventional Compose files, Docker health checks, and the
-running proxy network. There is no onboarding command and Vuelta never adds or
-changes a project workflow, Dockerfile, Compose file, `.env`, Nginx
-configuration, Traefik configuration, or repository ignore rule.
-
-```bash
-vuelta deploy plan api
-vuelta deploy sync
-vuelta deploy status api
-vuelta deploy rollback api
-```
-
-The central `.github/workflows/vuelta-release-engine.yml` requires a successful
-GitHub check suite for the exact remote project commit, then checks it out on a
-GitHub-hosted runner and publishes an OCI-labelled immutable image. The source
-read token is absent while project build code runs. The server pulls that exact
-release, starts a second slot from a machine-owned
-Compose overlay outside the project, checks health, switches the
-machine-owned gateway, smoke-checks the new route, drains the previous slot,
-and replaces private companion services sequentially.
-
-Existing Nginx deployments keep their fixed Docker DNS upstream; Vuelta
-adopts that name for its gateway without editing Nginx. Existing Traefik
-deployments get a machine-owned higher-priority gateway router assembled from
-an allowlist of already-running router labels; project labels remain
-unchanged. Ambiguous topology, an external companion without a health check,
-insufficient resources, unavailable immutable image identity, an incomplete
-source check suite, or detected migration changes blocks the release safely.
-Migration approval is recorded
-against the exact project, commit, digest, and changed paths, but execution
-stays blocked until a separately reviewed migration adapter exists.
-
-Machine config supplies only global authority: central release repository,
-workflow/ref, registry identity, digest-pinned gateway image, resource floors,
-and drain time. Credentials remain in the allowlisted
-`github_actions.token_env` environment variable. See
-`config.example.yaml` and `../docs/runbook-prod.md`.
-
-For a `requirements.txt`-only Python project, candidate discovery remains
-read-only and the result is `scan_only`. JSON includes
-`package_updates: {"status":"scan_only","reason":"manifest_has_no_safe_mutation_contract"}`
-plus bounded per-line `diagnostics`; `snapshot_id` and the human `Next: vuelta
-update ...` instruction are absent. Migrate to a reviewed Poetry, uv, or
-pip-tools source/lock contract before enabling package mutation.
-
-Project-local operational state is:
-
-```text
-.vuelta.yaml
-.vuelta/
-├── last-scan.md
-└── snapshots/
-    └── <SNAPSHOT_ID>.json
-```
-
-`.vuelta/` and its files use 0700/0600 modes, reject symlinks and foreign
-ownership, and are excluded from scan inputs and update sandboxes. Snapshots
-contain only identity metadata,
-the canonical stage set, exact input-manifest/content hashes, gates, and
-candidate versions—never file contents, credentials, or command logs. Format-7
-snapshots are invalidated when any scanned input changes; unrelated source
-changes do not alter the input manifest. A missing, older-format, malformed,
-expired, reconfigured, dirty, rebased, or changed-input snapshot exits with
-code 3 before any package manager runs; create a fresh scan instead.
-
-### Explicit adhoc container scans
-
-An unregistered directory can be scanned explicitly without adding it to the
-machine workspace list. Pass the machine config explicitly so local project
-policy onboarding is not selected, copy `local.example.yaml` to a private
-policy file, and restrict `allowed_packages`. The first invocation may add the
-exact root ignore rule; review/commit it and repeat the scan before updating:
-
-```bash
-vuelta scan --directory /path/to/project \
-  --policy ./vuelta-local.yaml --only packages \
-  --config ~/.config/vuelta/config.yaml
-```
-
-The separately named compatibility path can still apply an exact snapshot on
-a non-production workstation:
-
-```bash
-vuelta update local --directory /path/to/project --snapshot SNAPSHOT_ID --yes \
-  --config ~/.config/vuelta/config.yaml
-```
-
-Adhoc execution never creates a commit or push and does not run project tests.
-Manifests and locks must be regular root files and exactly one supported pair
-must exist: npm, pnpm, Bun, Poetry, uv, or pip-tools. Package-manager and
-scanner processes run only in hardened containers; host PATH is never used.
-
-Lifecycle/install scripts remain disabled unless update receives the explicit
-`--allow-scripts` gate. Project manager configuration is ignored unless scan
-records `--allow-project-config` in the snapshot. Updates run against a
-minimal private copy and atomically copy back only the recognized manifest and
-lock files after the changed-path check succeeds.
-
-Operational records are written to `~/.local/state/vuelta/vuelta.log` with a
-0700 state directory and 0600 files. A command's `--json` option controls only
-its single result envelope on stdout; plans, progress, and diagnostics remain
-on stderr. Do not put test logs, diffs, webhook URLs, or Telegram tokens in
-notification text or audit fields.
-
-### SQLite-backed Telegram bridge
-
-`vuelta-telegram-bridge` is an optional transport process. It opens the same
-protected SQLite database as Vuelta, leases committed outbox rows, and sends or
-edits concise plain-text messages using Telegram long polling. A Telegram
-outage delays only delivery; it cannot fail or repeat a scan, update, deploy,
-or rollback.
-
-The bridge accepts one exact private chat and one exact user. It rejects group,
-channel, forwarded, bot-authored, oversized, malformed, and unauthorized
-control input. These commands are available:
-
-```text
-/status [PROJECT]
-/scan PROJECT
-/update PROJECT
-/deploy PROJECT
-/rollback PROJECT
-/details OPERATION_ID
-```
-
-State-changing commands create only closed `operator_commands` rows. The
-existing `vuelta commands consume` boundary revalidates the configured project
-and invokes fixed Vuelta entrypoints; no Telegram text becomes argv or shell
-input. Duplicate Telegram update IDs reuse the same idempotency key.
-
-Migration buttons carry only an opaque approval ID and action. SQLite accepts
-a decision only from the Telegram message recorded for that same pending,
-unexpired approval. Free-form yes/no is accepted only as a reply to that exact
-prompt. Approval remains an audited decision and does not bypass the currently
-blocked migration workflow.
-
-Build and install `vuelta-telegram-bridge-linux-amd64`, then review
-`deploy/vuelta-telegram-bridge.service` and copy
-`deploy/vuelta-telegram-bridge.env.example` to the protected server-only
-environment file. The bridge unit deliberately receives no Docker group,
-cannot see project checkouts, and needs write access only to `/var/lib/vuelta`.
-The bot token is read only from `VUELTA_TELEGRAM_BOT_TOKEN` and is never stored
-in YAML, SQLite, messages, or logs.
-
-Scheduling is external. Production timers run sequential `scan --all` and
-`deploy sync`, and may run `commands consume` to process one typed
-`request_scan`, `request_update`, `request_deploy`, or `request_rollback` row. There is no
-update-all command. Queue records contain a closed command type and stable
-identifiers only; stale, duplicate, and unknown records never reach execution,
-and no queue value is interpreted as shell text. The older `vuelta-scheduler`
-helper remains a local compatibility surface and is not the production
-default.
-
-Templates live in `deploy/`: load `com.vuelta.schedule.plist` with `launchctl`
-on macOS after replacing `REPLACE_ME`, or install the required binaries plus
-`vuelta.service`, `vuelta.timer`, and optional Telegram bridge unit on Linux. Scheduler stdout is one aggregate
-JSON document; child plans and diagnostics are kept on stderr. Adjust the
-example units to the intended unprivileged user, binary paths, and writable
-project paths.
-
-## Vulnerability scans in CI
-
-Build a Linux binary using the repository's Docker toolchain, with a checksum:
+All Go tooling runs in Docker:
 
 ```sh
-docker compose run --rm -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 build go build -trimpath -o /src/bin/vuelta-linux-amd64 ./cmd/vuelta
-cd bin
-sha256sum vuelta-linux-amd64 > vuelta-linux-amd64.sha256
-sha256sum -c vuelta-linux-amd64.sha256
+COMPOSE_DISABLE_ENV_FILE=1 make build
+bin/vuelta-darwin-arm64 config init --no-input
+bin/vuelta-darwin-arm64 environment bootstrap --socket /absolute/path/to/docker.sock --yes --no-input
 ```
 
-On a Linux Docker Engine runner, select a machine configuration outside the
-projects. No YAML editing or project onboarding is required:
+Use `bin/vuelta-linux-amd64` and `/var/run/docker.sock` on Linux Engine.
+Docker Desktop macOS normally uses `/Users/YOU/.docker/run/docker.sock`.
+Bootstrap reviews and persists the exact socket plus daemon identity; Vuelta
+never takes ambient Docker context as execution authority. Repeat bootstrap
+for additional explicitly trusted endpoints. Use `--config PATH` consistently
+when choosing a separate machine configuration. The config must be a private,
+process-owned regular file. Never put token values in YAML.
+
+## Scan
 
 ```sh
-vuelta --no-input --config /tmp/vuelta-ci.yaml config init --yes
-vuelta --no-input --config /tmp/vuelta-ci.yaml environment bootstrap --socket /var/run/docker.sock --yes
-for directory in /work/api /work/web; do
-  vuelta --no-input --config /tmp/vuelta-ci.yaml scan --directory "$directory" --read-only --only vulnerabilities --json
-done
+vuelta --no-input scan --directory /path/to/project --read-only --json --fail-on vulnerabilities --require-image-scan
+vuelta scan --directory /path/to/project --timeout 8m
+vuelta scan --all --json
 ```
 
-Each invocation writes one JSON document to stdout; diagnostics go to stderr.
-`--read-only` implies vulnerability-only scanning and disables prompts,
-onboarding, snapshot cleanup/creation, SQLite history and project reports.
-It requires tracked scanner inputs. Referenced Docker OS images are scanned
-with the pinned Trivy default unless an image override is configured.
-An ambiguous project needs an explicit `--stack` selection. The managed Docker
-cache/network may change; the scanned project does not.
+`--read-only` neither onboards nor writes reports/configuration/state. Inputs
+must be tracked, allowed manifest/lock/Docker/policy files. Untracked files and
+project secrets are excluded. Ordinary scan may create `.vuelta.yaml`, add the
+exact `/.vuelta/` ignore rule and save bounded reports/image drift under the
+selected root. It never changes manifests, lockfiles or source.
 
-Scan envelopes include `schema_version: 1` and retain `format: 1`. Every project
-has `findings: []`, including clean and failed projects. Each finding contains
-`id`, `kind` (`package` or `image`), `package`, `installed_version`,
-`fixed_versions`, `severity`, `target` and `source`. Available source metadata
-adds `aliases`, `ecosystem`, `dependency` and the original `image` reference.
-Missing fixes are `[]`; unknown severity is `unknown`. Severity is always one
-of `critical`, `high`, `medium`, `low`, `unknown`. Ordering is deterministic,
-not a priority ranking. Dependabot supplies no installed version, so that
-field is empty for its findings; a vulnerable range is not an installed version.
-For the same reason `vuelta fix` leaves Dependabot findings unchanged and
-reports them as skipped with `source_requires_local_verification`; applying
-them after a local lockfile check is a separate planned task.
-When the lowest fixed version is itself vulnerable, `vuelta fix` moves on to the
-next fixed version reported for the candidate's own findings, within the same
-major; `fixed` and `skipped` entries carry the written (or last tried)
-`target_version`. If no clean candidate exists, the files stay unchanged.
-Legacy `vulnerabilities` remains during migration.
+`--only vulnerabilities` remains accepted; vulnerability scanning is the default.
+`--only packages`, release-age gates, package candidate plans and snapshots are removed.
+`--allow-project-config` is an explicit opt-in for reviewed manager configuration.
+Choose one of `--project NAME`, `--directory PATH`, or `--all`. No parent traversal
+or implicit scan of every workspace occurs. The timeout defaults to four minutes,
+with a one-hour maximum; an incomplete network scan is never proof of a clean result.
 
-Exit codes retain their existing meaning: `0` completed; `1` all targets
-failed; `2` invalid invocation/configuration; `4` top-level environment failure;
-`5` findings with `--fail-on vulnerabilities`; `6` partial results or a mixture
-of failed/completed targets; `7` unresolved image with `--require-image-scan`;
-`130` interrupted. Failures take precedence over findings. Inspect stages and
-image skips before treating an empty finding list as complete coverage.
+JSON has `schema_version: 1` and a `findings` array for every project, including
+clean and failed projects. Findings include `id`, `kind`, `package`,
+`installed_version`, `fixed_versions`, `severity`, `target`, `source`; available
+aliases, ecosystem, dependency ownership and image reference are included.
+Severity is critical/high/medium/low/unknown. The retired string findings field
+`vulnerabilities` and update candidate/snapshot fields are no longer emitted.
 
-`.github/workflows/vulnerability-scan.yml` builds and uploads the Linux binary
-and checksum and runs `acceptance/readonly-smoke.sh` on Ubuntu. The smoke test
-uses temporary tracked projects and proves their trees remain unchanged.
+| Exit | Meaning |
+|---|---|
+| 0 | Completed without the requested failure condition |
+| 1 | Operation/output failure |
+| 2 | Invalid configuration or invocation |
+| 4 | Environment unavailable |
+| 5 | Findings with `--fail-on vulnerabilities` |
+| 6 | Partial scan/repair; inspect structured errors |
+| 7 | Required image scan could not resolve a digest |
+| 130 | Interrupted |
 
-## Status
+Dependency sources: Trivy, OSV-Scanner or GitHub Dependabot (one selected source).
+Image scans use Trivy against immutable resolved references; this covers referenced
+base/runtime OS packages, not the application's built image layers. Unresolved
+references remain visible skips. Dependabot token configuration accepts only fixed
+environment-variable names and the approved HTTPS origin; values stay outside config.
 
-Implemented: configuration, read-only scanning, SQLite history/event/outbox
-state, delayed-latest policy, GitHub Actions update dispatch/synchronization,
-the explicit local compatibility pipeline, security gates, zero-edit
-GitHub-built blue/green deployment, and the separate SQLite-backed Telegram
-bridge.
+## Repair
+
+```sh
+vuelta --no-input fix --directory /path/to/project --json
+vuelta --no-input fix --directory /path/to/project --finding CVE-2022-0155 --min-severity high --json --verbose
+```
+
+Repair scans current tracked inputs, selects conservative same-major package
+versions, mutates a minimal private copy in hardened non-root containers with
+lifecycle scripts disabled, verifies the candidate, copies back only approved
+manifest/lock or image-reference changes and rescans. No snapshot, project test
+profile, commit, push or confirmation prompt is required. Use a fresh checkout
+when automation intends to commit the resulting changes.
+
+Transitive npm repairs change only the lockfile when the parent range allows it.
+`needs_parent_upgrade`, `needs_major`, `no_fix`, `filtered` and
+`source_requires_local_verification` explain skipped findings without granting
+broader mutation authority. Image candidates stay within the supported release
+line and must clear the selected finding before copyback. Other findings may remain.
+
+npm, pnpm, Bun and Poetry have real repair acceptance evidence. Bun is supported
+by `fix` and its built-in rescan; standalone Bun `scan` is unsupported. uv/pip-tools
+have code coverage but remain outside the recorded real acceptance matrix.
+Live Dependabot repair requires separate local-verification work. Alpine 3.10
+previously produced an incomplete scan; this is not a verified no-fix outcome.
+
+## Configuration and security
+
+`config init`, `config validate`, `config migrate`, `project list`, `project add`
+and `environment bootstrap` are the supported helpers. Toolchain defaults are
+embedded and built on demand. Schema 1 retains legacy data fields for existing
+configuration compatibility, including inert verification/Git/orchestration fields;
+these do not execute workflows or project tests. `update.egress` and explicit
+`update.toolchain_profiles` remain active repair-container settings.
+
+The exact Docker executable/socket is attested. Scanners receive bounded in-memory
+allowlisted archives rather than repository mounts. Registry access uses managed
+fail-closed egress. Mutation runs in private copies without lifecycle scripts and
+admits only recognized output files. Scan/fix do not execute project code on the host.
+
+## Verification and distribution
+
+```sh
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm test
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm race
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm lint
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm build
+COMPOSE_DISABLE_ENV_FILE=1 make build
+VUELTA_DOCKER_SOCKET=/absolute/path/to/docker.sock scripts/real-engine-acceptance.sh
+```
+
+Real-engine acceptance is opt-in and networked: fresh private projects, real npm,
+Trivy and image candidates. The read-only fixture smoke is
+`bash acceptance/readonly-smoke.sh BINARY SOCKET` (requires jq). The Ubuntu workflow
+builds a Linux binary and checksum, runs the read-only smoke and uploads both.
+Refreshing pinned images requires review of the registry's multi-platform index
+digest and Docker verification; never substitute floating tags.
+
+The only maintained binary is `vuelta`. Old update/scheduler/bridge/history commands
+are removed. Historical deployment/gateway and corpus/update matrix source lives in
+`attic/`, excluded from active builds by a nested module. The local `pre-vuln-focus`
+tag identifies the complete tree before removal.
+
+Architecture: [vulnerability focus](../docs/product/architecture/vulnerability-focus.md),
+[trust model](../docs/product/architecture/app-boundaries-and-trust-model.md).

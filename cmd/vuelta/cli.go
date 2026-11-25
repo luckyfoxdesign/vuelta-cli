@@ -54,17 +54,15 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
-		description: "find vulnerabilities and package candidates; create snapshots only for safely mutable manifests", group: "Everyday commands",
+		description: "find vulnerabilities in dependencies and referenced images", group: "Everyday commands",
 		examples: []string{"vuelta scan", "vuelta scan --project api --timeout 10m", "vuelta scan --directory . --timeout 10m", "vuelta scan --all --timeout 10m --json"},
 		options: []optionDefinition{
 			{names: []string{"-p", "--project"}, valueName: "NAME", description: "scan one configured project"},
 			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "scan an explicit registered or adhoc directory"},
 			{names: []string{"--all"}, description: "scan every configured project"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select a detected stack during onboarding or repair genuine stack drift"},
-			{names: []string{"--only"}, valueName: "MODE", description: "scan only vulnerabilities or packages"},
+			{names: []string{"--only"}, valueName: "MODE", description: "scan vulnerabilities (the only supported mode)"},
 			{names: []string{"--read-only"}, description: "scan tracked vulnerability inputs without project writes or prompts"},
-			{names: []string{"--policy"}, valueName: "PATH", description: "use an optional standalone package policy"},
-			{names: []string{"--min-release-age"}, valueName: "DURATION", description: "minimum candidate age (machine floor 14d)"},
 			{names: []string{"--timeout"}, valueName: "DURATION", description: "maximum duration per project (default 4m; maximum 1h)"},
 			{names: []string{"--allow-project-config"}, description: "honor reviewed package-manager configuration"},
 			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
@@ -72,132 +70,13 @@ var commandDefinitions = []commandDefinition{
 			{names: []string{"--verbose"}, description: "show technical stages, inputs, warnings, and error details"},
 			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
 		},
-		security:    []string{"Scan never modifies manifests, lock files, or source. On first use it atomically onboards versioned .vuelta.yaml plus the exact /.vuelta/ root ignore rule; an explicit freshly detected --stack may later atomically repair genuine stack drift and regenerate only stack-dependent project policy. Private reports and snapshots stay under the selected project. A requirements.txt-only Python project is candidate-scan-only and never creates an update snapshot. Package-manager and vulnerability tools run only in containers. A Docker image is scanned by exact digest when config or a compose file pins one; otherwise a tag is resolved to a digest through the same registry egress path, labelled by resolution tier, and never written back into .vuelta.yaml. An image that cannot be resolved is a loud, structured skip, not a hidden failure."},
+		security:    []string{"Scan runs vulnerability tools in containers against allowlisted inputs. --read-only admits only tracked files and writes no project configuration or state. Ordinary scans may onboard .vuelta.yaml and save a bounded report. Image scans inspect referenced base/runtime images by exact digest; unresolved references are visible skips. fix mutates only a private copy and copies back verified manifest/lock files or image references with lifecycle scripts disabled."},
 		takesConfig: true, handler: "scan",
-	},
-	{
-		path: []string{"update"}, usage: "vuelta update PROJECT [options]",
-		description: "request a reviewed dependency update on GitHub Actions", group: "Everyday commands",
-		examples: []string{"vuelta update api", "vuelta update api --yes --json", "vuelta update status api"},
-		options: []optionDefinition{
-			{names: []string{"--yes"}, description: "confirm the displayed plan"},
-			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
-			{names: []string{"--include-major"}, description: "explicitly include reviewed stable major candidates"},
-			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "retired here; use 'vuelta update local'"},
-			{names: []string{"--snapshot"}, valueName: "ID", description: "retired here; use 'vuelta update local'"},
-			{names: []string{"--dry-run"}, description: "retired here; use 'vuelta update local'"},
-			{names: []string{"--allow-scripts"}, description: "retired here; use 'vuelta update local'"},
-			{names: []string{"--allow-unverified-release-age"}, description: "retired here; use 'vuelta update local'"},
-		},
-		security:    []string{"The server checkout is never mutated. GitHub receives only the exact base commit, request ID, and closed policy inputs; the workflow revalidates candidates before changing files."},
-		takesConfig: true, handler: "update",
-	},
-	{
-		path: []string{"update", "status"}, usage: "vuelta update status [PROJECT] [--json]",
-		description: "synchronize and show known GitHub update runs",
-		examples:    []string{"vuelta update status api", "vuelta update status --json"},
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "update status",
-	},
-	{
-		path: []string{"update", "local"}, usage: "vuelta update local [options]",
-		description: "explicit compatibility path for containerized local mutation",
-		examples:    []string{"vuelta update local --directory /path/to/project --dry-run"},
-		options: []optionDefinition{
-			{names: []string{"-d", "--directory"}, valueName: "PATH", description: "select one exact project root"},
-			{names: []string{"--snapshot"}, valueName: "ID", description: "select one exact project-local snapshot"},
-			{names: []string{"--dry-run"}, description: "run in a disposable copy without durable changes"},
-			{names: []string{"--yes"}, description: "confirm the displayed plan"},
-			{names: []string{"--json"}, description: "write the versioned JSON envelope"},
-			{names: []string{"--allow-scripts"}, description: "allow package lifecycle scripts"},
-			{names: []string{"--allow-unverified-release-age"}, description: "allow candidates whose release age was not verified"},
-			{names: []string{"--routine-only"}, description: "apply only delayed-latest routine candidates"},
-			{names: []string{"--include-major"}, description: "include eligible stable majors with --routine-only"},
-		},
-		security:    []string{"This separately named compatibility path may mutate only its selected sandboxed project and is never used by unattended server workflows."},
-		takesConfig: true, handler: "update local",
-	},
-	{
-		path: []string{"status"}, usage: "vuelta status [--json] [config-path]",
-		description: "show durable project and operation status", group: "Everyday commands",
-		examples:    []string{"vuelta status", "vuelta status --json"},
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "status",
-	},
-	{
-		path: []string{"history"}, usage: "vuelta history PROJECT [--json] [config-path]",
-		description: "show installed dependency version changes", group: "Operations",
-		examples:    []string{"vuelta history api", "vuelta history api --json"},
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "history",
-	},
-	{
-		path: []string{"deploy"}, usage: "vuelta deploy [PROJECT] [--json]",
-		description: "synchronize one automatically discovered project release",
-		group:       "Everyday commands",
-		examples:    []string{"vuelta deploy sync", "vuelta deploy api", "vuelta deploy status api"},
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		security:    []string{"Deployment metadata and runtime overlays are machine-owned; managed repositories and their Nginx or Traefik configuration are never modified."},
-		takesConfig: true, handler: "deploy",
-	},
-	{
-		path: []string{"deploy", "sync"}, usage: "vuelta deploy sync [--json] [config-path]",
-		description: "discover and deploy ordinary releases for configured workspaces",
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "deploy sync",
-	},
-	{
-		path: []string{"deploy", "plan"}, usage: "vuelta deploy plan PROJECT [--json] [config-path]",
-		description: "show the derived zero-write deployment contract",
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "deploy plan",
-	},
-	{
-		path: []string{"deploy", "status"}, usage: "vuelta deploy status [PROJECT] [--json] [config-path]",
-		description: "show discovered contracts and exact release states",
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "deploy status",
-	},
-	{
-		path: []string{"deploy", "rollback"}, usage: "vuelta deploy rollback PROJECT [--json] [config-path]",
-		description: "restore the recorded previous immutable digest",
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "deploy rollback",
 	},
 	{
 		path: []string{"project"}, usage: "vuelta project <command>",
 		description: "list or add configured projects", group: "Configuration",
 		examples: []string{"vuelta project list", "vuelta project add . --name api"},
-	},
-	{
-		path: []string{"project", "verify"}, usage: "vuelta project verify <command>",
-		description: "generate and approve project-local verification",
-		examples:    []string{"vuelta project verify init", "vuelta project verify approve --yes"},
-	},
-	{
-		path: []string{"project", "verify", "init"}, usage: "vuelta project verify init [--directory PATH] [--script NAME] [--refresh-image] [config-path]",
-		description: "generate compose.verify.yml or explicitly refresh its base image digest",
-		examples:    []string{"vuelta project verify init", "vuelta project verify init --script build", "vuelta project verify init --refresh-image"},
-		options: []optionDefinition{
-			{names: []string{"--directory"}, valueName: "PATH", description: "project root to generate compose.verify.yml for (default: .)"},
-			{names: []string{"--script"}, valueName: "NAME", description: "explicit package.json script name (overrides automatic detection)"},
-			{names: []string{"--refresh-image"}, description: "atomically refresh only the existing validated verification image digest"},
-		},
-		security:    []string{"Writes only compose.verify.yml; it never touches .vuelta.yaml or the machine config. Normal initialization never overwrites an existing file. --refresh-image changes only the uniquely identified image digest after validating both the existing and resulting Compose models. The base image is always digest-pinned."},
-		takesConfig: true, handler: "project verify init",
-	},
-	{
-		path: []string{"project", "verify", "approve"}, usage: "vuelta project verify approve [--directory PATH] [--verification NAME] [--yes]",
-		description: "promote a project-local scan-only profile after review",
-		examples:    []string{"vuelta project verify approve", "vuelta project verify approve --verification build-compose-verify --yes"},
-		options: []optionDefinition{
-			{names: []string{"--directory"}, valueName: "PATH", description: "project root containing .vuelta.yaml (default: .)"},
-			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},
-			{names: []string{"--yes"}, description: "confirm the displayed verification config diff"},
-			{names: []string{"--non-interactive"}, description: "legacy alias for --no-input"},
-		},
-		security: []string{"Requires an existing scan_only .vuelta.yaml, validates the ready profile through the update Compose policy, prints the exact steps and diff, and atomically rewrites only workspace.verification after confirmation."},
-		handler:  "project verify approve",
 	},
 	{
 		path: []string{"project", "list"}, usage: "vuelta project list [--json] [config-path]",
@@ -207,15 +86,13 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		path: []string{"project", "add"}, usage: "vuelta project add [options] <path> [config-path]",
-		description: "detect and add one project", examples: []string{"vuelta project add . --name api", "vuelta project add . --name api --no-input --branch main --remote origin --yes"},
+		description: "detect and add one project", examples: []string{"vuelta project add . --name api", "vuelta project add . --name api --no-input --yes"},
 		options: []optionDefinition{
 			{names: []string{"--name"}, valueName: "NAME", description: "set the persistent project name (defaults to path basename)"},
 			{names: []string{"--stack"}, valueName: "STACK", description: "select python, node, or docker"},
 			{names: []string{"--package-manager"}, valueName: "NAME", description: "select the detected manager or requirements scan profile"},
 			{names: []string{"--toolchain-profile"}, valueName: "ID", description: "select an explicit operator override instead of the detected default"},
 			{names: []string{"--platform"}, valueName: "PLATFORM", description: "select linux/amd64 or linux/arm64"},
-			{names: []string{"--verification"}, valueName: "NAME", description: "select a declarative verification candidate (repeatable)"},
-			{names: []string{"--scan-only"}, description: "disable updates until a ready verification profile is configured"},
 			{names: []string{"--branch"}, valueName: "NAME", description: "set the protected branch"},
 			{names: []string{"--remote"}, valueName: "NAME", description: "set the Git remote"},
 			{names: []string{"--allow-path"}, valueName: "PATH", description: "allow a changed path (repeatable)"},
@@ -276,19 +153,8 @@ var commandDefinitions = []commandDefinition{
 	{
 		path: []string{"help"}, usage: "vuelta help [command] [--all]",
 		description: "show top-level or command-specific help", group: "Help",
-		examples: []string{"vuelta help scan", "vuelta help update", "vuelta help --all"},
-		options:  []optionDefinition{{names: []string{"--all"}, description: "include CI and server commands"}}, handler: "help",
-	},
-	{
-		path: []string{"commands"}, usage: "vuelta commands <command>",
-		description: "consume typed machine-state commands", group: "CI and server commands",
-		hidden: true,
-	},
-	{
-		path: []string{"commands", "consume"}, usage: "vuelta commands consume [--json] [config-path]",
-		description: "consume one bounded typed update request",
-		options:     []optionDefinition{{names: []string{"--json"}, description: "write the versioned JSON envelope"}},
-		takesConfig: true, handler: "commands consume", hidden: true,
+		examples: []string{"vuelta help scan", "vuelta help fix", "vuelta help --all"},
+		options:  []optionDefinition{{names: []string{"--all"}, description: "show all command details"}}, handler: "help",
 	},
 }
 
@@ -355,10 +221,10 @@ func (c *cli) run(args []string) error {
 	if definition.handler == "" {
 		return c.writeCommandHelp(definition)
 	}
-	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "project verify approve" || definition.handler == "environment bootstrap") {
+	if globals.noInput && (definition.handler == "config init" || definition.handler == "config migrate" || definition.handler == "project add" || definition.handler == "environment bootstrap") {
 		commandArgs = append([]string{"--non-interactive"}, commandArgs...)
 	}
-	if globals.config != "" && definition.takesConfig && definition.handler != "update" && definition.handler != "update local" {
+	if globals.config != "" && definition.takesConfig {
 		if containsArgument(commandArgs, "--") {
 			commandArgs = append(commandArgs, globals.config)
 		} else {
@@ -375,17 +241,11 @@ func (c *cli) run(args []string) error {
 		}
 		return err
 	}
-	if globals.noInput && (definition.handler == "update" || definition.handler == "update local") {
-		normalized = append([]string{"--non-interactive"}, normalized...)
-	}
 	if globals.noInput && definition.handler == "scan" {
 		normalized = append([]string{"--internal-no-input"}, normalized...)
 	}
 	if globals.noColor && definition.handler == "scan" {
 		normalized = append([]string{"--internal-no-color"}, normalized...)
-	}
-	if globals.config != "" && (definition.handler == "update" || definition.handler == "update local") {
-		normalized = append([]string{"--internal-config", globals.config}, normalized...)
 	}
 	return dispatchCommand(definition.handler, normalized)
 }
@@ -617,28 +477,6 @@ func dispatchCommand(handler string, args []string) error {
 		return runScan(args)
 	case "fix":
 		return runFix(args)
-	case "update":
-		return executeUpdate(args)
-	case "update status":
-		return executeUpdateStatus(args)
-	case "update local":
-		return executeLocalUpdate(args)
-	case "status":
-		return executeStatus(args)
-	case "history":
-		return executeHistory(args)
-	case "deploy":
-		return executeDeploy(args)
-	case "deploy sync":
-		return executeDeploySync(args)
-	case "deploy plan":
-		return executeDeployPlan(args)
-	case "deploy status":
-		return executeDeployStatus(args)
-	case "deploy rollback":
-		return executeDeployRollback(args)
-	case "commands consume":
-		return executeCommandConsume(args)
 	case "config validate":
 		return runConfig(append([]string{"validate"}, args...))
 	case "config init":
@@ -651,10 +489,6 @@ func dispatchCommand(handler string, args []string) error {
 		return runProjectList(args)
 	case "project add":
 		return runProjectAdd(args)
-	case "project verify init":
-		return runProjectVerifyInit(args)
-	case "project verify approve":
-		return runProjectVerifyApprove(args)
 	default:
 		return fail(exitConfig, "command %q is not executable", handler)
 	}
@@ -691,7 +525,7 @@ func (c *cli) runHelp(args []string) error {
 
 func (c *cli) writeTopLevelHelp(showAll bool) error {
 	writer := newTextWriter(c.out.stdout)
-	writer.println("vuelta — checks and safely updates dependencies")
+	writer.println("vuelta — finds and safely repairs vulnerabilities")
 	writer.println()
 	writer.println("Examples:")
 	writer.println("  vuelta scan")
@@ -723,7 +557,7 @@ func (c *cli) writeTopLevelHelp(showAll bool) error {
 	writer.println()
 	writer.println("Run 'vuelta help <command>' for command details.")
 	if !showAll {
-		writer.println("Run 'vuelta help --all' to include CI and server commands.")
+		writer.println("Run 'vuelta help --all' to show all command details.")
 	}
 	return writer.result()
 }

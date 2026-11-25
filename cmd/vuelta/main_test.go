@@ -122,7 +122,7 @@ func TestOnboardingPrintsRunnableNextCommandsWithSelectedConfig(t *testing.T) {
 	output, err = captureStdout(t, func() error {
 		return run([]string{"config", "validate", "--config", configPath})
 	})
-	if err != nil || !strings.Contains(output, "Next: "+quotedExecutable+" scan --directory . --only packages --config "+quotedConfig) {
+	if err != nil || !strings.Contains(output, "Next: "+quotedExecutable+" scan --directory . --only vulnerabilities --config "+quotedConfig) {
 		t.Fatalf("config validate output = %q, error = %v", output, err)
 	}
 }

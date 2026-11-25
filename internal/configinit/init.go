@@ -2,8 +2,6 @@ package configinit
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +15,6 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/gitexec"
 	"github.com/luckyfoxdesign/vuelta/internal/gitpath"
-	"github.com/luckyfoxdesign/vuelta/internal/testrunner"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"gopkg.in/yaml.v3"
 )
@@ -134,10 +131,6 @@ func Detect(selectedRoot string) (Discovery, error) {
 	if hasDockerfile || (len(d.Stacks) == 0 && len(d.DockerFiles) > 0) {
 		d.Stacks = append(d.Stacks, config.StackDocker)
 	}
-	d.VerificationCandidates, err = verificationCandidates(root, d)
-	if err != nil {
-		return Discovery{}, err
-	}
 	d.Branches = gitValues(root, "branch", "--show-current")
 	d.Remotes = gitValues(root, "remote")
 	sort.Strings(d.Stacks)
@@ -184,11 +177,6 @@ func (d *Discovery) addManager(stack, manager string) {
 		d.Stacks = append(d.Stacks, stack)
 	}
 	d.PackageManagers[stack] = append(d.PackageManagers[stack], manager)
-}
-
-func regular(root, name string) bool {
-	info, err := os.Lstat(filepath.Join(root, name))
-	return err == nil && info.Mode().IsRegular()
 }
 
 // dockerRuntimeImages records every external base-image reference in a
@@ -255,130 +243,6 @@ func composeRuntimeImages(path string) ([]string, error) {
 	return uniqueSorted(images), nil
 }
 
-var verificationFactories = []string{"test", "lint", "typecheck", "check", "build"}
-
-func verificationCandidates(root string, discovery Discovery) ([]config.VerificationStep, error) {
-	var candidates []config.VerificationStep
-	scripts, err := packageScripts(root)
-	if err != nil {
-		return nil, err
-	}
-	for _, composeFile := range discovery.ComposeFiles {
-		for _, service := range discovery.Services[composeFile] {
-			for _, factory := range verificationFactories {
-				body, ok := scripts[factory]
-				if !ok || !safePackageScript(body) || !verificationService(service, factory) {
-					continue
-				}
-				for _, manager := range discovery.PackageManagers[config.StackNode] {
-					registry, err := catalog.New()
-					if err != nil {
-						return nil, err
-					}
-					adapter, err := registry.Lookup(config.StackNode, manager)
-					if err != nil {
-						return nil, err
-					}
-					command := adapter.(ecosystem.VerificationProvider).VerificationCommand(factory)
-					candidates = append(candidates, newVerificationCandidate(factory, composeFile, service, command))
-				}
-			}
-		}
-	}
-	if len(candidates) == 0 {
-		for _, composeFile := range discovery.ComposeFiles {
-			steps, detectErr := composeCommandCandidates(filepath.Join(root, composeFile), composeFile)
-			if detectErr != nil {
-				return nil, fmt.Errorf("read verification metadata from %s: %w", composeFile, detectErr)
-			}
-			candidates = append(candidates, steps...)
-		}
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
-	return candidates, nil
-}
-
-func packageScripts(root string) (map[string]string, error) {
-	if !regular(root, "package.json") {
-		return map[string]string{}, nil
-	}
-	data, err := os.ReadFile(filepath.Join(root, "package.json"))
-	if err != nil {
-		return nil, fmt.Errorf("read package.json verification metadata: %w", err)
-	}
-	var document struct {
-		Scripts map[string]string `json:"scripts"`
-	}
-	if err := json.Unmarshal(data, &document); err != nil {
-		return nil, fmt.Errorf("parse package.json verification metadata: %w", err)
-	}
-	return document.Scripts, nil
-}
-
-func safePackageScript(body string) bool {
-	if body == "" || strings.ContainsAny(body, "\r\n;&|`$><") {
-		return false
-	}
-	lower := strings.ToLower(body)
-	if strings.Contains(lower, "--watch") || strings.Contains(lower, " -w") {
-		return false
-	}
-	unsafeWord := regexp.MustCompile(`(?i)(^|[^a-z0-9_-])(dev|watch|serve|server|start|preview|interactive)([^a-z0-9_-]|$)`)
-	return !unsafeWord.MatchString(body)
-}
-
-func verificationService(service, factory string) bool {
-	if service == factory {
-		return true
-	}
-	return service == "verify" || service == "verification" || service == "ci"
-}
-
-func newVerificationCandidate(factory, composeFile, service string, command []string) config.VerificationStep {
-	fileID := strings.TrimSuffix(strings.TrimSuffix(composeFile, filepath.Ext(composeFile)), filepath.Ext(strings.TrimSuffix(composeFile, filepath.Ext(composeFile))))
-	name := factory + "-" + strings.ReplaceAll(fileID, ".", "-") + "-" + service
-	return config.VerificationStep{
-		Name: name, ComposeFile: composeFile, Service: service, Command: command,
-		TimeoutSeconds: 900, Required: true, SuccessExitCodes: []int{0},
-	}
-}
-
-func composeCommandCandidates(path, composeFile string) ([]config.VerificationStep, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var document struct {
-		Services map[string]struct {
-			Command yaml.Node `yaml:"command"`
-		} `yaml:"services"`
-	}
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return nil, err
-	}
-	var candidates []config.VerificationStep
-	for _, factory := range verificationFactories {
-		service, ok := document.Services[factory]
-		if !ok || service.Command.Kind != yaml.SequenceNode {
-			continue
-		}
-		command := make([]string, 0, len(service.Command.Content))
-		valid := true
-		for _, item := range service.Command.Content {
-			if item.Kind != yaml.ScalarNode || item.Tag == "!!null" {
-				valid = false
-				break
-			}
-			command = append(command, item.Value)
-		}
-		if !valid || config.ValidateVerificationCommand(command) != nil {
-			continue
-		}
-		candidates = append(candidates, newVerificationCandidate(factory, composeFile, factory, command))
-	}
-	return candidates, nil
-}
-
 func gitValues(root string, args ...string) []string {
 	out, err := gitexec.Output(context.Background(), root, args...)
 	if err != nil {
@@ -428,6 +292,9 @@ func (d Discovery) Build(input Input) (*config.Config, error) {
 // BuildWorkspace returns a workspace only when every required selection is
 // explicit or uniquely detected.
 func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
+	if len(input.VerificationNames) > 0 {
+		return config.Workspace{}, fmt.Errorf("declarative verification candidate selection is retired")
+	}
 	stack, err := choose("--stack", input.Stack, d.Stacks)
 	if err != nil {
 		return config.Workspace{}, err
@@ -452,16 +319,7 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 			return config.Workspace{}, err
 		}
 	}
-	verification, err := d.buildVerification(input, stack, manager)
-	if err != nil {
-		return config.Workspace{}, err
-	}
-	if verification.State == config.VerificationReady {
-		verification, err = config.PinVerificationScriptBodies(d.Root, verification)
-		if err != nil {
-			return config.Workspace{}, fmt.Errorf("pin verification package scripts: %w", err)
-		}
-	}
+	verification := config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}
 	branch, err := chooseOptional("--branch", input.Branch, d.Branches)
 	if err != nil {
 		return config.Workspace{}, err
@@ -510,129 +368,14 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 	if err := cfg.Validate(); err != nil {
 		return config.Workspace{}, fmt.Errorf("generated workspace is invalid: %w", err)
 	}
-	if ws.Verification.State == config.VerificationReady {
-		if err := testrunner.ValidateProfile(ws.Path, ws.Verification); err != nil {
-			return config.Workspace{}, fmt.Errorf("generated verification profile is not allowed by the Compose policy: %w", err)
-		}
-	}
-	return ws, nil
-}
 
-func (d Discovery) buildVerification(input Input, stack, manager string) (config.VerificationProfile, error) {
-	if adapterScanOnly(stack, manager) {
-		if len(input.VerificationNames) != 0 {
-			return config.VerificationProfile{}, fmt.Errorf("%s/%s has no safe mutation contract and cannot use --verification; register it as scan-only", stack, manager)
-		}
-		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
-	}
-	if input.ScanOnly {
-		if len(input.VerificationNames) != 0 {
-			return config.VerificationProfile{}, errors.New("--scan-only cannot be combined with --verification")
-		}
-		return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
-	}
-	candidates := d.verificationCandidatesForManager(stack, manager)
-	names := append([]string(nil), input.VerificationNames...)
-	if len(names) == 0 {
-		switch len(candidates) {
-		case 0:
-			return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationScanOnly}, nil
-		case 1:
-			names = []string{candidates[0].Name}
-		default:
-			options := make([]string, 0, len(candidates))
-			for _, candidate := range candidates {
-				options = append(options, candidate.Name)
-			}
-			return config.VerificationProfile{}, &MissingValueError{Flag: "--verification", Options: options}
-		}
-	}
-	selected := make([]config.VerificationStep, 0, len(names))
-	seen := make(map[string]bool, len(names))
-	for _, name := range names {
-		if seen[name] {
-			return config.VerificationProfile{}, fmt.Errorf("--verification %q was selected more than once", name)
-		}
-		seen[name] = true
-		found := false
-		for _, candidate := range candidates {
-			if candidate.Name == name {
-				selected = append(selected, candidate)
-				found = true
-				break
-			}
-		}
-		if !found {
-			return config.VerificationProfile{}, fmt.Errorf("--verification %q is not a declarative verification candidate", name)
-		}
-	}
-	return config.VerificationProfile{Version: config.VerificationVersion, State: config.VerificationReady, Steps: selected}, nil
+	return ws, nil
 }
 
 // BuildReadyVerification selects and validates an explicit ready profile for
 // an existing project workspace. It uses the same declarative candidates and
 // selection rules as onboarding, but fails instead of returning scan_only
 // when the project has no verification service to approve.
-func (d Discovery) BuildReadyVerification(workspace config.Workspace, names []string) (config.VerificationProfile, error) {
-	if workspace.Verification.State != config.VerificationScanOnly && workspace.Verification.State != config.VerificationReady {
-		return config.VerificationProfile{}, errors.New("project verification profile must be scan_only or ready")
-	}
-	if d.Root != workspace.Path {
-		return config.VerificationProfile{}, errors.New("verification discovery root does not match the project config root")
-	}
-	profile := workspace.Verification
-	if workspace.Verification.State == config.VerificationScanOnly || len(names) != 0 {
-		var err error
-		profile, err = d.buildVerification(Input{VerificationNames: names}, workspace.Stack, workspace.PackageManager)
-		if err != nil {
-			return config.VerificationProfile{}, err
-		}
-	}
-	if profile.State != config.VerificationReady {
-		return config.VerificationProfile{}, errors.New("no Compose file declares a verification service; run 'vuelta project verify init' first")
-	}
-	pinned, err := config.PinVerificationScriptBodies(workspace.Path, profile)
-	if err != nil {
-		return config.VerificationProfile{}, fmt.Errorf("pin verification package scripts: %w", err)
-	}
-	profile = pinned
-	workspace.Verification = profile
-	if err := config.ValidateWorkspace(workspace); err != nil {
-		return config.VerificationProfile{}, fmt.Errorf("validate approved project workspace: %w", err)
-	}
-	if err := testrunner.ValidateProfile(workspace.Path, profile); err != nil {
-		return config.VerificationProfile{}, fmt.Errorf("verification profile is not allowed by the Compose policy: %w", err)
-	}
-	return profile, nil
-}
-
-func (d Discovery) verificationCandidatesForManager(stack, manager string) []config.VerificationStep {
-	candidates := make([]config.VerificationStep, 0, len(d.VerificationCandidates))
-	for _, candidate := range d.VerificationCandidates {
-		if len(candidate.Command) > 0 {
-			if registry, err := catalog.New(); err == nil {
-				if _, lookupErr := registry.Lookup(stack, candidate.Command[0]); lookupErr == nil && candidate.Command[0] != manager {
-					continue
-				}
-			}
-		}
-		candidates = append(candidates, candidate)
-	}
-	return candidates
-}
-
-func adapterScanOnly(stack, manager string) bool {
-	registry, err := catalog.New()
-	if err != nil {
-		return false
-	}
-	adapter, err := registry.Lookup(stack, manager)
-	if err != nil {
-		return false
-	}
-	_, mutable := adapter.(ecosystem.MutationProvider)
-	return !mutable && adapter.Metadata().UnsupportedReason == ""
-}
 
 func choose(flag, supplied string, options []string) (string, error) {
 	if supplied != "" {
