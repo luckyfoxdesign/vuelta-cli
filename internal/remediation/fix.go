@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystem"
 	"github.com/luckyfoxdesign/vuelta/internal/ecosystems/catalog"
 	"github.com/luckyfoxdesign/vuelta/internal/githubalerts"
+	"github.com/luckyfoxdesign/vuelta/internal/safeerr"
 	"github.com/luckyfoxdesign/vuelta/internal/toolchain"
 	"github.com/luckyfoxdesign/vuelta/internal/updater"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
@@ -63,8 +65,26 @@ type FixedFinding struct {
 	TargetVersion string `json:"target_version,omitempty"`
 }
 
+// ImageCandidate records a bounded reason, never scanner errors or output.
+type ImageCandidate struct {
+	Reference string `json:"reference"`
+	Reason    string `json:"reason"`
+	Remaining *int   `json:"remaining,omitempty"`
+}
+
+// ImageRepair describes one image group. All selected findings must be removed
+// by the same candidate; BestRemaining is absent without a complete scan.
+type ImageRepair struct {
+	Image         string           `json:"image"`
+	Selected      int              `json:"selected"`
+	Candidates    []ImageCandidate `json:"candidates"`
+	BestRemaining *int             `json:"best_remaining,omitempty"`
+	Reason        string           `json:"reason"`
+}
+
 // Result distinguishes a complete clean rescan from unavailable coverage.
 type Result struct {
+	ImageRepairs []ImageRepair          `json:"image_repairs,omitempty"`
 	Fixed        []FixedFinding         `json:"fixed"`
 	Skipped      []Skipped              `json:"skipped"`
 	ChangedFiles []string               `json:"changed_files"`
@@ -339,7 +359,83 @@ func nextTarget(name, current string, introduced []vulnscan.Finding) (string, bo
 	return next, found
 }
 
-func rewriteJSON(root, manifest, name, version string) error {
+// jsonField keeps byte offsets from the decoder, so whitespace, escaped keys,
+// key order and line endings outside the replaced values stay untouched.
+type jsonField struct {
+	name       string
+	start, end int
+	raw        json.RawMessage
+}
+
+func jsonFields(data []byte) ([]jsonField, error) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("expected JSON object")
+	}
+	var fields []jsonField
+	seen := map[string]bool{}
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := key.(string)
+		if !ok || seen[name] {
+			return nil, errors.New("ambiguous JSON keys")
+		}
+		seen[name] = true
+		var raw json.RawMessage
+		if err := d.Decode(&raw); err != nil {
+			return nil, err
+		}
+		end := int(d.InputOffset())
+		fields = append(fields, jsonField{name: name, start: end - len(raw), end: end, raw: raw})
+	}
+	return fields, nil
+}
+
+func patchJSONVersion(data []byte, name, version string) ([]byte, error) {
+	fields, err := jsonFields(data)
+	if err != nil {
+		return nil, err
+	}
+	var edits []jsonField
+	for _, group := range fields {
+		if !slices.Contains([]string{"dependencies", "devDependencies", "optionalDependencies", "peerDependencies"}, group.name) {
+			continue
+		}
+		deps, err := jsonFields(group.raw)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			if dep.name != name {
+				continue
+			}
+			var previous string
+			if json.Unmarshal(dep.raw, &previous) != nil || bytes.Equal(dep.raw, []byte("null")) {
+				return nil, errors.New("non-string dependency")
+			}
+			dep.start += group.start
+			dep.end += group.start
+			edits = append(edits, dep)
+		}
+	}
+	if len(edits) == 0 {
+		return nil, errors.New("dependency span unavailable")
+	}
+	encoded, err := json.Marshal(version)
+	if err != nil {
+		return nil, err
+	}
+	for _, edit := range slices.Backward(edits) {
+		data = append(append(append([]byte(nil), data[:edit.start]...), encoded...), data[edit.end:]...)
+	}
+	return data, nil
+}
+
+func rewriteJSON(root, manifest, name, version string, diagnostic func(error)) error {
 	data, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
 	if err != nil {
 		return err
@@ -369,15 +465,22 @@ func rewriteJSON(root, manifest, name, version string) error {
 	if !found {
 		return errors.New("dependency is not directly declared")
 	}
-	encoded, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
+	encoded, patchErr := patchJSONVersion(data, name, version)
+	if patchErr != nil {
+		if diagnostic != nil {
+			diagnostic(errors.New("package.json: formatting_fallback (ambiguous dependency spans)"))
+		}
+		encoded, err = json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return err
+		}
+		encoded = append(encoded, '\n')
 	}
 	info, err := os.Stat(filepath.Join(root, manifest))
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, manifest), append(encoded, '\n'), info.Mode().Perm())
+	return os.WriteFile(filepath.Join(root, manifest), encoded, info.Mode().Perm())
 }
 
 // Run scans, plans, repairs admitted files in private copies and rescans. Each
@@ -532,7 +635,14 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 						return err
 					}
 					if spec.RewriteJSON {
-						if err = rewriteJSON(root, manifest, name, version); err != nil {
+						if err = rewriteJSON(root, manifest, name, version, options.Diagnostic); err != nil {
+							return err
+						}
+					}
+					var intendedManifest []byte
+					if spec.RewriteJSON {
+						intendedManifest, err = ecosystem.ReadRootFile(root, manifest, 16<<20)
+						if err != nil {
 							return err
 						}
 					}
@@ -553,6 +663,23 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 					}
 					for _, args := range spec.Commands {
 						if _, err = e.Command(ctx, profile, args, root); err != nil {
+							return err
+						}
+					}
+					if spec.RewriteJSON {
+						after, err := ecosystem.ReadRootFile(root, manifest, 16<<20)
+						if err != nil {
+							return err
+						}
+						var intended, actual any
+						intendedDecoder := json.NewDecoder(bytes.NewReader(intendedManifest))
+						actualDecoder := json.NewDecoder(bytes.NewReader(after))
+						intendedDecoder.UseNumber()
+						actualDecoder.UseNumber()
+						if !json.Valid(after) || intendedDecoder.Decode(&intended) != nil || actualDecoder.Decode(&actual) != nil || !reflect.DeepEqual(intended, actual) {
+							return errors.New("dependency command changed manifest beyond the planned version")
+						}
+						if err := os.WriteFile(filepath.Join(root, manifest), intendedManifest, manifestInfo.Mode().Perm()); err != nil {
 							return err
 						}
 					}
@@ -661,7 +788,12 @@ func (e Engine) Run(ctx context.Context, ws config.Workspace, cfg config.Config,
 	sort.Strings(images)
 	for _, image := range images {
 		indexes := imageGroups[image]
-		changed, replacement, imageErr := e.repairImage(ctx, ws, cfg, image, indexes, plan)
+		detail := ImageRepair{Image: safeerr.Excerpt([]byte(image), 256), Selected: len(indexes), Candidates: []ImageCandidate{}}
+		changed, replacement, imageErr := e.repairImage(ctx, ws, cfg, image, indexes, plan, &detail, options.Diagnostic)
+		result.ImageRepairs = append(result.ImageRepairs, detail)
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
 		reason := ""
 		if imageErr != nil {
 			reason = "no_verified_image_fix"
@@ -759,7 +891,8 @@ func imageCandidates(image string) []string {
 	return candidates
 }
 
-func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config.Config, image string, indexes []int, plan []Repair) ([]string, string, error) {
+func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config.Config, image string, indexes []int, plan []Repair, detail *ImageRepair, diagnostic func(error)) ([]string, string, error) {
+	detail.Reason = "source_unavailable"
 	if ws.DockerImages == nil || image == "" {
 		return nil, "", errors.New("image has no source file")
 	}
@@ -768,21 +901,34 @@ func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config
 		// They cannot be silently invalidated by changing a source reference.
 		for _, pin := range ws.DockerImages.RuntimeImages {
 			if pin == image {
+				detail.Reason = "runtime_policy_requires_review"
 				return nil, "", errors.New("explicit runtime image policy requires a separate reviewed change")
 			}
 		}
 	}
 	files := append([]string(nil), ws.DockerImages.Files...)
+	record := func(attempt ImageCandidate) {
+		detail.Candidates = append(detail.Candidates, attempt)
+		if diagnostic != nil {
+			if attempt.Remaining != nil {
+				diagnostic(fmt.Errorf("image candidate %s: %s (%d/%d selected findings remain)", attempt.Reference, attempt.Reason, *attempt.Remaining, len(indexes)))
+			} else {
+				diagnostic(fmt.Errorf("image candidate %s: %s", attempt.Reference, attempt.Reason))
+			}
+		}
+	}
 	for _, candidate := range imageCandidates(image) {
 		if ctx.Err() != nil {
 			return nil, "", ctx.Err()
 		}
 		replacement := ""
+		attempt := ImageCandidate{Reference: safeerr.Excerpt([]byte(candidate), 256), Reason: "source_unavailable"}
 		_, err := adhoc.InPrivateFiles(ws.Path, files, false, func(root string) error {
 			if err := replaceImageReference(root, files, image, candidate); err != nil {
 				return err
 			}
 			candidateWS := config.Workspace{Path: root, Stack: config.StackDocker, DockerImages: &config.DockerImagesSpec{Files: files, RuntimeImages: []string{candidate}, Platforms: append([]string(nil), ws.DockerImages.Platforms...)}}
+			attempt.Reason = "scan_incomplete"
 			r, err := e.Scan(ctx, root, candidateWS, cfg, false)
 			if err != nil {
 				return err
@@ -790,21 +936,33 @@ func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config
 			if len(r.ImageSkips) > 0 || len(r.ImageResolutions) == 0 {
 				return errors.New("candidate image could not be completely scanned")
 			}
+			remaining := 0
 			for _, i := range indexes {
 				for _, f := range r.Findings {
 					if f.ID == plan[i].Finding.ID && f.Package == plan[i].Finding.Package {
-						return errors.New("candidate image still contains the finding")
+						remaining++
+						break
 					}
 				}
 			}
+			attempt.Remaining = &remaining
+			if detail.BestRemaining == nil || remaining < *detail.BestRemaining {
+				detail.BestRemaining = &remaining
+			}
+			if remaining > 0 {
+				attempt.Reason = "finding_remains"
+				return errors.New("candidate image still contains selected findings")
+			}
 			replacement = candidate
 			if strings.Contains(image, "@") {
+				attempt.Reason = "digest_unavailable"
 				digest := r.ImageResolutions[0].ResolvedDigest
 				if !digestPattern.MatchString(digest) {
 					return errors.New("candidate image digest is unavailable")
 				}
 				for _, resolution := range r.ImageResolutions {
 					if resolution.ResolvedDigest != digest {
+						attempt.Reason = "digest_mismatch"
 						return errors.New("candidate platform digests differ; an index digest is required")
 					}
 				}
@@ -813,8 +971,10 @@ func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config
 			return nil
 		})
 		if err != nil {
+			record(attempt)
 			continue
 		}
+		attempt.Reason = "verification_incomplete"
 		changed, err := adhoc.InPrivateFiles(ws.Path, files, true, func(root string) error {
 			if err := replaceImageReference(root, files, image, replacement); err != nil {
 				return err
@@ -833,6 +993,7 @@ func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config
 			for _, i := range indexes {
 				for _, f := range r.Findings {
 					if f.ID == plan[i].Finding.ID && f.Package == plan[i].Finding.Package {
+						attempt.Reason = "verification_finding_remains"
 						return errors.New("updated image still contains the finding")
 					}
 				}
@@ -840,10 +1001,27 @@ func (e Engine) repairImage(ctx context.Context, ws config.Workspace, cfg config
 			return ctx.Err()
 		})
 		if err == nil {
+			attempt.Reason = "accepted"
+			record(attempt)
+			detail.Reason = "accepted"
 			return changed, replacement, nil
 		}
+		record(attempt)
 	}
-	return nil, "", errors.New("no scanned candidate on the same image tag line removes the findings")
+	detail.Reason = "no_verified_candidate"
+	return nil, "", errors.New(detail.Summary())
+}
+
+// Summary explains the all-or-nothing image selection rule without file data.
+func (d ImageRepair) Summary() string {
+	if d.Reason == "accepted" {
+		return fmt.Sprintf("image %s: candidate accepted", d.Image)
+	}
+	remaining := "no complete candidate scan"
+	if d.BestRemaining != nil {
+		remaining = fmt.Sprintf("best candidate retains %d/%d selected findings", *d.BestRemaining, d.Selected)
+	}
+	return fmt.Sprintf("image %s: no candidate accepted (%s); %s; one candidate must remove all selected findings; use --finding to narrow selection", d.Image, d.Reason, remaining)
 }
 
 func replaceImageReference(root string, files []string, image, replacement string) error {

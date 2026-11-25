@@ -1,7 +1,9 @@
 package remediation
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,7 +17,8 @@ import (
 )
 
 func TestRepairCopiesBackOnlyAfterVerification(t *testing.T) {
-	for _, reject := range []bool{false, true} {
+	for _, scenario := range []string{"accept", "reject", "manifest_drift"} {
+		reject := scenario != "accept"
 		root := t.TempDir()
 		manifest := filepath.Join(root, "package.json")
 		lockfile := filepath.Join(root, "package-lock.json")
@@ -35,7 +38,7 @@ func TestRepairCopiesBackOnlyAfterVerification(t *testing.T) {
 				if err != nil {
 					return vulnscan.Report{}, err
 				}
-				if string(data) == "{}" || reject {
+				if string(data) == "{}" || scenario == "reject" {
 					return vulnscan.Report{Findings: []vulnscan.Finding{finding}}, nil
 				}
 				return vulnscan.Report{}, nil
@@ -43,6 +46,22 @@ func TestRepairCopiesBackOnlyAfterVerification(t *testing.T) {
 			Command: func(_ context.Context, _ config.ToolchainProfile, args []string, path string) (string, error) {
 				file := filepath.Join(path, "package-lock.json")
 				if args[0] == "npm" {
+					// npm may rewrite the entire manifest while updating its lock.
+					data, err := os.ReadFile(filepath.Join(path, "package.json"))
+					if err != nil {
+						return "", err
+					}
+					var formatted bytes.Buffer
+					if err := json.Indent(&formatted, data, "", "  "); err != nil {
+						return "", err
+					}
+					if scenario == "manifest_drift" {
+						formatted.Reset()
+						formatted.WriteString(`{"dependencies":{"demo":"1.0.1"},"unexpected":true}`)
+					}
+					if err := os.WriteFile(filepath.Join(path, "package.json"), formatted.Bytes(), 0600); err != nil {
+						return "", err
+					}
 					return "", os.WriteFile(file, []byte(`{"fixed":true}`), 0600)
 				}
 				data, err := os.ReadFile(file)
@@ -63,6 +82,11 @@ func TestRepairCopiesBackOnlyAfterVerification(t *testing.T) {
 			}
 		} else if err != nil || len(result.Fixed) != 1 || len(result.ChangedFiles) != 2 || !result.Complete {
 			t.Fatalf("verified repair not applied: %+v, %v", result, err)
+		} else {
+			data, readErr := os.ReadFile(manifest)
+			if readErr != nil || string(data) != strings.Replace(original, "1.0.0", "1.0.1", 1) {
+				t.Fatalf("package manager formatting escaped: %q, %v", data, readErr)
+			}
 		}
 	}
 }

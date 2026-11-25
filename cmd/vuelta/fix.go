@@ -142,6 +142,9 @@ func runFix(args []string) (runErr error) {
 		}
 	} else {
 		fmt.Printf("Fixed: %d, skipped: %d, changed files: %d\n", len(result.Fixed), len(result.Skipped), len(result.ChangedFiles))
+		for _, image := range result.ImageRepairs {
+			fmt.Println(image.Summary())
+		}
 		for _, item := range result.Skipped {
 			fmt.Printf("%s: %s\n", item.Finding.ID, item.Reason)
 		}
