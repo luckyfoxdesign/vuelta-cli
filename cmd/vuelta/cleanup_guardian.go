@@ -23,11 +23,12 @@ func runCleanupGuardian(args []string) error {
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "")
 	dockerPath := flags.String("docker", "", "")
+	socket := flags.String("socket", "", "")
 	invocation := flags.String("invocation", "", "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("invalid cleanup guardian invocation")
 	}
-	if !filepath.IsAbs(*configPath) || !filepath.IsAbs(*dockerPath) || !runlease.ValidID(*invocation) {
+	if !filepath.IsAbs(*configPath) || !filepath.IsAbs(*dockerPath) || !filepath.IsAbs(*socket) || !runlease.ValidID(*invocation) {
 		return errors.New("invalid cleanup guardian authority")
 	}
 	parentPipe := os.NewFile(uintptr(3), "vuelta-parent-lease")
@@ -50,7 +51,7 @@ func runCleanupGuardian(args []string) error {
 	if cfg.Docker == nil {
 		return errors.New("cleanup guardian Docker authority is unavailable")
 	}
-	endpoint, err := configuredDockerEndpoint(cfg.Docker.Developer, "docker.developer")
+	endpoint, err := configuredCleanupEndpoint(*cfg, *socket)
 	if err != nil {
 		return errors.New("resolve cleanup guardian Docker authority")
 	}

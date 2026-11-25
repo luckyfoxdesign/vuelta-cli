@@ -116,6 +116,33 @@ func TestValidateDockerEndpointRequiresPinnedIdentityAndLocalSocket(t *testing.T
 	}
 }
 
+func TestDeveloperEndpointSchemas(t *testing.T) {
+	first := DockerEndpointConfig{Socket: "/approved/first.sock", ExpectedDaemon: DockerDaemonIdentity{
+		ID: "first", ServerVersion: "28.3.2", OperatingSystem: "linux", Architecture: "arm64",
+		MinimumAPIVersion: "1.44", RequiredSecurityOptions: []string{"name=seccomp,profile=builtin"},
+	}}
+	second := first
+	second.Socket = "/approved/second.sock"
+	for _, tc := range []struct {
+		name  string
+		cfg   DockerConfig
+		valid bool
+	}{
+		{"legacy", DockerConfig{Developer: &first}, true},
+		{"ordered", DockerConfig{DeveloperEndpoints: []DockerEndpointConfig{first, second}}, true},
+		{"ambiguous", DockerConfig{Developer: &first, DeveloperEndpoints: []DockerEndpointConfig{second}}, false},
+		{"duplicate", DockerConfig{DeveloperEndpoints: []DockerEndpointConfig{first, first}}, false},
+		{"unpinned", DockerConfig{DeveloperEndpoints: []DockerEndpointConfig{first, {Socket: second.Socket}}}, false},
+		{"limit", DockerConfig{DeveloperEndpoints: make([]DockerEndpointConfig, 17)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if errs := validateDeveloperDocker(&tc.cfg); (len(errs) == 0) != tc.valid {
+				t.Fatalf("validation = %v", errs)
+			}
+		})
+	}
+}
+
 func TestValidateDeployRequiresCentralWorkflowAndPinnedGateway(t *testing.T) {
 	if errs := validateDeployConfig(DeployConfig{
 		Enabled: true, GatewayImage: "ghcr.io/example/gateway:latest",

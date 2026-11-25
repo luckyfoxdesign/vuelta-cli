@@ -180,7 +180,7 @@ func TestRealEngineInstalledBootstrapAndAdhocScans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("[parsing] load bootstrapped config: %v", err)
 	}
-	if cfg.Docker == nil || cfg.Docker.Developer == nil || (cfg.Docker.Developer.ExpectedDaemon.Architecture != "amd64" && cfg.Docker.Developer.ExpectedDaemon.Architecture != "arm64") {
+	if cfg.Docker == nil || len(cfg.Docker.TrustedDeveloperEndpoints()) != 1 || (cfg.Docker.TrustedDeveloperEndpoints()[0].ExpectedDaemon.Architecture != "amd64" && cfg.Docker.TrustedDeveloperEndpoints()[0].ExpectedDaemon.Architecture != "arm64") {
 		t.Fatalf("[security] bootstrap did not persist a canonical daemon identity")
 	}
 	validateOutput := runTextInDir(t, ctx, env, project, "compatibility", binary,
@@ -788,7 +788,7 @@ type composeOwnedProxyConflict struct {
 
 func createComposeOwnedProxyConflict(t *testing.T, ctx context.Context, cfg *config.Config) composeOwnedProxyConflict {
 	t.Helper()
-	developer := cfg.Docker.Developer
+	developer := cfg.Docker.TrustedDeveloperEndpoints()[0]
 	docker := dockerexec.New(dockerexec.Options{Endpoint: dockerexec.Endpoint{
 		SocketPath: developer.Socket,
 		Expected: dockerexec.DaemonIdentity{

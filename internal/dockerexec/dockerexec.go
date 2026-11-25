@@ -135,6 +135,9 @@ type Options struct {
 	EndpointValidator EndpointValidator
 	ConfigDir         string
 	Endpoint          Endpoint
+	// Endpoints selects the first reachable trusted endpoint, once per executor.
+	// It must not be combined with Endpoint.
+	Endpoints []Endpoint
 }
 
 // ProbeOptions supplies the explicit socket plus test seams for trusted
@@ -216,12 +219,12 @@ func Default() Runner {
 }
 
 // ConfigureDefault replaces the fail-closed process default with an executor
-// bound to endpoint. CLI entrypoints call it only after loading their reviewed
+// bound to the first available trusted endpoint. CLI entrypoints call it after loading their reviewed
 // configuration; ambient Docker variables are never consulted.
-func ConfigureDefault(endpoint Endpoint) {
+func ConfigureDefault(endpoints ...Endpoint) {
 	defaultMu.Lock()
 	defer defaultMu.Unlock()
-	defaultExecutor = New(Options{Endpoint: endpoint})
+	defaultExecutor = New(Options{Endpoints: endpoints})
 }
 
 // Path returns the verified absolute Docker CLI path.
@@ -236,7 +239,7 @@ func (e *Executor) Verify(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	e.initialize()
+	e.initializeContext(ctx)
 	if e.err != nil {
 		return e.err
 	}
@@ -263,7 +266,7 @@ func (e *Executor) Run(ctx context.Context, request Request) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	e.initialize()
+	e.initializeContext(ctx)
 	if e.err != nil {
 		return Result{}, e.err
 	}
@@ -306,8 +309,14 @@ func (e *Executor) recheckExecutable() error {
 	return nil
 }
 
-func (e *Executor) initialize() {
+func (e *Executor) initialize() { e.initializeContext(context.Background()) }
+
+func (e *Executor) initializeContext(ctx context.Context) {
 	e.once.Do(func() {
+		if len(e.options.Endpoints) > 0 {
+			e.initializeOrdered(ctx)
+			return
+		}
 		resolve := e.options.Resolver
 		if resolve == nil {
 			resolve = exec.LookPath
@@ -377,6 +386,60 @@ func (e *Executor) initialize() {
 	})
 }
 
+// EndpointUnavailableError permits ordered selection to try the next explicitly
+// trusted socket. Invalid identities and unsafe filesystem permissions never do.
+type EndpointUnavailableError struct{ Err error }
+
+func (e *EndpointUnavailableError) Error() string { return e.Err.Error() }
+func (e *EndpointUnavailableError) Unwrap() error { return e.Err }
+
+func (e *Executor) initializeOrdered(ctx context.Context) {
+	if e.options.Endpoint.SocketPath != "" || len(e.options.Endpoints) > 16 {
+		e.err = errors.New("docker endpoint selection requires one schema and at most 16 endpoints")
+		return
+	}
+	var failures []error
+	for i, endpoint := range e.options.Endpoints {
+		options := e.options
+		options.Endpoints = nil
+		options.Endpoint = endpoint
+		candidate := New(options)
+		if err := ctx.Err(); err != nil {
+			e.err = err
+			return
+		}
+		err := candidate.Verify(ctx)
+		if err == nil {
+			e.path, e.env, e.host = candidate.path, candidate.env, candidate.host
+			e.configDir, e.info = candidate.configDir, candidate.info
+			e.options.Endpoint = endpoint
+			e.verified = true
+			return
+		}
+		if options.ConfigDir == "" && candidate.configDir != "" {
+			_ = os.RemoveAll(candidate.configDir)
+		}
+		if ctx.Err() != nil {
+			e.err = ctx.Err()
+			return
+		}
+		var unavailable *EndpointUnavailableError
+		if !errors.As(err, &unavailable) {
+			e.err = err
+			return
+		}
+		failures = append(failures, fmt.Errorf("trusted endpoint %d (%s): %w", i+1, endpoint.SocketPath, err))
+	}
+	e.err = fmt.Errorf("no trusted Docker endpoint is available: %w", errors.Join(failures...))
+}
+
+// SocketPath returns the configured socket selected for this executor's lifetime.
+// Cleanup guardians must use this exact endpoint rather than select again.
+func (e *Executor) SocketPath() (string, error) {
+	e.initialize()
+	return e.options.Endpoint.SocketPath, e.err
+}
+
 func (e *Executor) boundArgs(args []string) []string {
 	bound := make([]string, 0, len(args)+2)
 	bound = append(bound, "--host", e.host)
@@ -420,7 +483,12 @@ func (e *Executor) probeDaemon(ctx context.Context, run CommandRunner, environme
 	}
 	versionResult, err := run(ctx, e.path, versionRequest, environment)
 	if err != nil {
-		return DaemonIdentity{}, daemonProbeError(ctx, err)
+		probeErr := daemonProbeError(ctx, err)
+		category, _, _ := Classify(err)
+		if category == safeerr.CategoryPermission || category == safeerr.CategoryOutputLimit || category == safeerr.CategoryUnsupportedFlag || category == safeerr.CategoryCancelled {
+			return DaemonIdentity{}, probeErr
+		}
+		return DaemonIdentity{}, &EndpointUnavailableError{Err: probeErr}
 	}
 	var version versionIdentity
 	if err := json.Unmarshal(versionResult.Stdout, &version); err != nil {

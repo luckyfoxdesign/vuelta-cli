@@ -31,7 +31,10 @@ func validateProbeEndpoint(endpoint Endpoint) (string, error) {
 	}
 	canonical, err := filepath.EvalSymlinks(endpoint.SocketPath)
 	if err != nil {
-		return "", errors.New("approved Docker socket does not exist or is inaccessible")
+		if errors.Is(err, os.ErrNotExist) {
+			return "", &EndpointUnavailableError{Err: errors.New("approved Docker socket does not exist")}
+		}
+		return "", errors.New("approved Docker socket is inaccessible")
 	}
 	info, err := os.Stat(canonical)
 	if err != nil || info.Mode()&os.ModeSocket == 0 {

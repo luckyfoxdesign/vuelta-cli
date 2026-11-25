@@ -41,7 +41,7 @@ docker compose run --rm race   # go test -race ./...
 docker compose run --rm lint   # golangci-lint run
 docker compose run --rm tidy   # go mod tidy
 docker compose run --rm build  # go build ./...
-vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint
+vuelta environment bootstrap --socket PATH # add/update one explicit trusted Docker endpoint
 vuelta project verify init       # generate hardened compose.verify.yml
 vuelta project verify init --refresh-image # refresh only its pinned base image digest
 vuelta project verify approve    # promote reviewed project verification

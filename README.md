@@ -131,7 +131,9 @@ exact server version, OS/architecture, minimum API version, and required
 security options. A mismatch fails closed before a scanner, updater, or test
 command runs.
 
-Configure development under `docker.developer`. Linux Docker Engine normally
+Configure development under `docker.developer_endpoints` (an ordered list of
+`socket` / `expected_daemon` mappings). The legacy single `docker.developer`
+mapping remains supported; combining the two forms is rejected. Linux Docker Engine normally
 uses `/var/run/docker.sock`; Docker Desktop on macOS normally uses the
 per-user `/Users/YOU/.docker/run/docker.sock`. Do not create a system-wide
 socket symlink. Bootstrap the endpoint through Vuelta so the exact non-secret
@@ -148,6 +150,17 @@ For automation, both authority-bearing flags are mandatory:
 vuelta --no-input environment bootstrap \
   --socket /absolute/path/to/docker.sock --yes --json
 ```
+
+Repeat bootstrap with each explicit socket to trust both Docker Desktop and
+OrbStack. It adds a new socket at the end or updates an existing socket in place,
+without erasing other entries. Adding a second endpoint to a legacy config
+migrates its existing entry into the ordered list. At most 16 entries are allowed.
+The first reachable trusted endpoint is selected once per invocation. Missing
+sockets and failed connection probes permit fallback; unsafe socket permissions,
+malformed identities, and attestation mismatches stop execution. If all trusted
+endpoints are unavailable, the error lists the configured attempts. Ambient
+contexts and unlisted socket paths are never candidates. Cleanup remains bound
+to the selected endpoint even if runtime availability changes.
 
 The command normalizes `aarch64` to `arm64` and `x86_64` to `amd64` before
 persisting and attesting image platforms. Re-review the identity after an

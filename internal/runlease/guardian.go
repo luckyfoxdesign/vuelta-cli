@@ -22,11 +22,11 @@ type Guardian struct {
 }
 
 // StartGuardian starts the hidden Vuelta cleanup process.
-func StartGuardian(executable, configPath, dockerPath, invocation string) (*Guardian, error) {
+func StartGuardian(executable, configPath, dockerPath, invocation, socket string) (*Guardian, error) {
 	if !ValidID(invocation) {
 		return nil, errors.New("invalid cleanup guardian invocation identity")
 	}
-	for _, value := range []string{executable, configPath, dockerPath} {
+	for _, value := range []string{executable, configPath, dockerPath, socket} {
 		if !filepath.IsAbs(value) {
 			return nil, errors.New("cleanup guardian paths must be absolute")
 		}
@@ -36,6 +36,7 @@ func StartGuardian(executable, configPath, dockerPath, invocation string) (*Guar
 		"__vuelta-cleanup-guardian",
 		"--config", configPath,
 		"--docker", dockerPath,
+		"--socket", socket,
 		"--invocation", invocation,
 	)
 	command.Env = []string{"LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin:/usr/local/bin"}

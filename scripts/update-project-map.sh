@@ -65,7 +65,7 @@ trap 'rm -f "$tmp"' EXIT
   printf 'docker compose run --rm lint   # golangci-lint run\n'
 	printf 'docker compose run --rm tidy   # go mod tidy\n'
 	printf 'docker compose run --rm build  # go build ./...\n'
-	printf 'vuelta environment bootstrap --socket PATH # trust one explicit Docker endpoint\n'
+	printf 'vuelta environment bootstrap --socket PATH # add/update one explicit trusted Docker endpoint\n'
 	printf 'vuelta project verify init       # generate hardened compose.verify.yml\n'
 	printf 'vuelta project verify init --refresh-image # refresh only its pinned base image digest\n'
 	printf 'vuelta project verify approve    # promote reviewed project verification\n'

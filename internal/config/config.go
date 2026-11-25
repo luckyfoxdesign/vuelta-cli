@@ -68,7 +68,21 @@ type StateConfig struct {
 // DockerConfig holds the developer-side daemon authority used by scan and
 // update.
 type DockerConfig struct {
-	Developer *DockerEndpointConfig `yaml:"developer,omitempty"`
+	// Developer is the legacy single-endpoint form; do not combine it with DeveloperEndpoints.
+	Developer          *DockerEndpointConfig  `yaml:"developer,omitempty"`
+	DeveloperEndpoints []DockerEndpointConfig `yaml:"developer_endpoints,omitempty"`
+}
+
+// TrustedDeveloperEndpoints returns the approved endpoints in selection order.
+// Validation rejects ambiguous configurations containing both schema forms.
+func (c *DockerConfig) TrustedDeveloperEndpoints() []DockerEndpointConfig {
+	if c == nil {
+		return nil
+	}
+	if c.Developer != nil {
+		return []DockerEndpointConfig{*c.Developer}
+	}
+	return append([]DockerEndpointConfig(nil), c.DeveloperEndpoints...)
 }
 
 // DockerEndpointConfig selects one approved local Unix socket and the daemon
@@ -554,7 +568,7 @@ func (c *Config) Validate() error {
 
 	errs = append(errs, validateEgress(c.Update.Egress)...)
 	if c.Docker != nil {
-		errs = append(errs, validateDockerEndpoint("docker.developer", c.Docker.Developer, false)...)
+		errs = append(errs, validateDeveloperDocker(c.Docker)...)
 	}
 	if c.Update.MinReleaseAgeDays < 14 {
 		errs = append(errs, errors.New("update.min_release_age_days: must be at least the machine safety default of 14"))
@@ -763,6 +777,29 @@ func validateEgress(c EgressConfig) []error {
 		errs = append(errs, errors.New("update.egress.proxy_url: must be a plain http://host:port proxy URL without credentials"))
 	} else if u.Hostname() != c.ProxyContainer || u.Port() != "3128" {
 		errs = append(errs, errors.New("update.egress.proxy_url: host must match proxy_container and port must be 3128"))
+	}
+	return errs
+}
+
+func validateDeveloperDocker(c *DockerConfig) []error {
+	var errs []error
+	if c.Developer != nil && c.DeveloperEndpoints != nil {
+		errs = append(errs, errors.New("docker: developer and developer_endpoints cannot be combined"))
+	}
+	if len(c.DeveloperEndpoints) > 16 {
+		errs = append(errs, errors.New("docker.developer_endpoints: at most 16 trusted endpoints are allowed"))
+	}
+	errs = append(errs, validateDockerEndpoint("docker.developer", c.Developer, false)...)
+	seen := make(map[string]bool)
+	for i := range c.DeveloperEndpoints {
+		endpoint := &c.DeveloperEndpoints[i]
+		label := fmt.Sprintf("docker.developer_endpoints[%d]", i)
+		errs = append(errs, validateDockerEndpoint(label, endpoint, false)...)
+		socket := filepath.Clean(endpoint.Socket)
+		if seen[socket] {
+			errs = append(errs, fmt.Errorf("%s.socket: duplicate trusted socket", label))
+		}
+		seen[socket] = true
 	}
 	return errs
 }

@@ -17,9 +17,11 @@ schema_version: 1
 state:
   # database_path: "/var/lib/vuelta/history.db"
 
+# Endpoints are tried in this explicit order; repeat bootstrap for each socket.
+# Legacy docker.developer (one endpoint mapping) remains supported.
 # docker:
-#   developer:
-#     socket: "/Users/YOU/.docker/run/docker.sock"
+#   developer_endpoints:
+#   - socket: "/Users/YOU/.docker/run/docker.sock"
 #     expected_daemon:
 #       id: "<exact-docker-info-id>"
 #       server_version: "<exact-server-version>"

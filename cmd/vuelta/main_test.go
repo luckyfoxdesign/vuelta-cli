@@ -82,7 +82,7 @@ func TestEnvironmentBootstrapPersistsConfirmedCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Docker == nil || loaded.Docker.Developer == nil || loaded.Docker.Developer.ExpectedDaemon.ID != "daemon-reviewed" {
+	if loaded.Docker == nil || len(loaded.Docker.TrustedDeveloperEndpoints()) != 1 || loaded.Docker.TrustedDeveloperEndpoints()[0].ExpectedDaemon.ID != "daemon-reviewed" {
 		t.Fatalf("Docker config = %#v", loaded.Docker)
 	}
 }

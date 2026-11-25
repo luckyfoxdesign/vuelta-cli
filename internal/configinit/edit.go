@@ -407,7 +407,7 @@ func PlanProjectVerificationUpdate(path string, profile config.VerificationProfi
 }
 
 // PlanDockerBootstrap creates a default config when none exists or updates
-// only docker.developer in an existing config. Existing comments, key order,
+// only docker.developer_endpoints in an existing config. Existing comments, key order,
 // unrelated settings, and protected file mode are preserved.
 func PlanDockerBootstrap(path string, endpoint config.DockerEndpointConfig) (EditPlan, error) {
 	original, mode, exists, err := readConfigForWrite(path)
@@ -416,7 +416,7 @@ func PlanDockerBootstrap(path string, endpoint config.DockerEndpointConfig) (Edi
 	}
 	if !exists {
 		cfg := NewConfig()
-		cfg.Docker = &config.DockerConfig{Developer: &endpoint}
+		cfg.Docker = &config.DockerConfig{DeveloperEndpoints: []config.DockerEndpointConfig{endpoint}}
 		return PlanConfigWrite(cfg, path, false)
 	}
 	cfg, err := config.Parse(original)
@@ -426,10 +426,23 @@ func PlanDockerBootstrap(path string, endpoint config.DockerEndpointConfig) (Edi
 	if err := cfg.Validate(); err != nil {
 		return EditPlan{}, fmt.Errorf("validate config before Docker bootstrap: %w", err)
 	}
-	if cfg.Docker != nil && cfg.Docker.Developer != nil && reflect.DeepEqual(*cfg.Docker.Developer, endpoint) {
-		return EditPlan{Original: original, Updated: original, Mode: mode, Exists: true}, nil
+	endpoints := cfg.Docker.TrustedDeveloperEndpoints()
+	matchedIndex := -1
+	for i := range endpoints {
+		if filepath.Clean(endpoints[i].Socket) != filepath.Clean(endpoint.Socket) {
+			continue
+		}
+		if reflect.DeepEqual(endpoints[i], endpoint) {
+			return EditPlan{Original: original, Updated: original, Mode: mode, Exists: true}, nil
+		}
+		endpoints[i] = endpoint
+		matchedIndex = i
+		break
 	}
-	cfg.Docker = &config.DockerConfig{Developer: &endpoint}
+	if matchedIndex < 0 {
+		endpoints = append(endpoints, endpoint)
+	}
+	cfg.Docker = &config.DockerConfig{DeveloperEndpoints: endpoints}
 	if err := cfg.Validate(); err != nil {
 		return EditPlan{}, fmt.Errorf("validate bootstrapped config: %w", err)
 	}
@@ -453,7 +466,24 @@ func PlanDockerBootstrap(path string, endpoint config.DockerEndpointConfig) (Edi
 	} else if dockerNode.Kind != yaml.MappingNode {
 		return EditPlan{}, errors.New("docker must be a YAML mapping")
 	}
-	setMappingNode(dockerNode, "developer", endpointNode)
+	sequence := mappingValue(dockerNode, "developer_endpoints")
+	if sequence == nil || sequence.Tag == "!!null" {
+		sequence = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		if legacy := mappingValue(dockerNode, "developer"); legacy != nil && legacy.Tag != "!!null" {
+			sequence.Content = append(sequence.Content, legacy)
+		}
+	} else if sequence.Kind != yaml.SequenceNode {
+		return EditPlan{}, errors.New("docker.developer_endpoints must be a YAML sequence")
+	}
+	if matchedIndex < 0 {
+		sequence.Content = append(sequence.Content, endpointNode)
+	} else {
+		previous := sequence.Content[matchedIndex]
+		endpointNode.HeadComment, endpointNode.LineComment, endpointNode.FootComment = previous.HeadComment, previous.LineComment, previous.FootComment
+		sequence.Content[matchedIndex] = endpointNode
+	}
+	deleteMappingNode(dockerNode, "developer")
+	setMappingNode(dockerNode, "developer_endpoints", sequence)
 	updated, err := encodeDocument(&document, original)
 	if err != nil {
 		return EditPlan{}, err

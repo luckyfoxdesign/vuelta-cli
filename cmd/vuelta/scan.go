@@ -316,7 +316,7 @@ func executeScan(args []string) error {
 	if selection.DriftWarning != "" {
 		warnings = appendUniqueStrings(warnings, selection.DriftWarning)
 	}
-	if selection.Scope == "project" && (cfg.Docker == nil || cfg.Docker.Developer == nil) {
+	if selection.Scope == "project" && len(cfg.Docker.TrustedDeveloperEndpoints()) == 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"machine Docker trust is not configured; run %s",
 			displayCommand("environment", "bootstrap", "--socket", "/path/to/docker.sock", "--config", selection.MachineConfig),
@@ -405,7 +405,11 @@ func executeScan(args []string) error {
 		if executableErr != nil {
 			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "resolve cleanup guardian configuration"), "Run the scan again")
 		}
-		cleanupGuardian, executableErr = startScanCleanupGuardian(executable, guardianConfig, dockerPath, invocation)
+		socket, socketErr := selectedDeveloperDockerSocket()
+		if socketErr != nil {
+			return fail(exitEnv, "%v", socketErr)
+		}
+		cleanupGuardian, executableErr = startScanCleanupGuardian(executable, guardianConfig, dockerPath, invocation, socket)
 		if executableErr != nil {
 			return scanTopLevelFailure(options.jsonOutput, "environment_unavailable", fail(exitEnv, "%v", executableErr), "Run the scan again")
 		}

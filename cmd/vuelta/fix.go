@@ -117,7 +117,11 @@ func runFix(args []string) (runErr error) {
 	if err != nil {
 		return fail(exitEnv, "%v", err)
 	}
-	guardian, err := startScanCleanupGuardian(executable, machine, dockerPath, invocation)
+	socket, err := selectedDeveloperDockerSocket()
+	if err != nil {
+		return fail(exitEnv, "%v", err)
+	}
+	guardian, err := startScanCleanupGuardian(executable, machine, dockerPath, invocation, socket)
 	if err != nil {
 		return fail(exitEnv, "%v", err)
 	}

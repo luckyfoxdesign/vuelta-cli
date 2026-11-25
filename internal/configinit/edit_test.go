@@ -619,7 +619,7 @@ func TestDockerBootstrapCreatesOrPreservesProtectedConfig(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if loaded.Docker == nil || loaded.Docker.Developer == nil || loaded.Docker.Developer.ExpectedDaemon.Architecture != "arm64" {
+		if loaded.Docker == nil || len(loaded.Docker.TrustedDeveloperEndpoints()) != 1 || loaded.Docker.TrustedDeveloperEndpoints()[0].ExpectedDaemon.Architecture != "arm64" {
 			t.Fatalf("Docker endpoint = %#v", loaded.Docker)
 		}
 	})
