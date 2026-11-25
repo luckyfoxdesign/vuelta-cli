@@ -247,6 +247,25 @@ func TestBuildWorkspaceRejectsBunBeforeOnboarding(t *testing.T) {
 	}
 }
 
+func TestBuildWorkspaceRepairAdmitsBunOnlyForRepair(t *testing.T) {
+	project := nodeProject(t)
+	writeProjectFile(t, project, "bun.lock", "[lockfile]\n")
+	discovery, err := Detect(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := discovery.BuildWorkspace(Input{PackageManager: "bun", ScanOnly: true, Repair: true})
+	if err != nil {
+		t.Fatalf("bun repair workspace: %v", err)
+	}
+	if workspace.Stack != config.StackNode || workspace.PackageManager != "bun" || workspace.Verification.State != config.VerificationScanOnly {
+		t.Fatalf("unexpected repair workspace: %+v", workspace)
+	}
+	if _, err = discovery.BuildWorkspace(Input{PackageManager: "bun", ScanOnly: true}); err == nil || !strings.Contains(err.Error(), "use npm or pnpm") {
+		t.Fatalf("bun without repair must stay unsupported: %v", err)
+	}
+}
+
 func TestDetectDoesNotOfferSingleDevServerAsVerification(t *testing.T) {
 	project := nodeProject(t)
 	writeProjectFile(t, project, "package.json", `{"scripts":{"build":"vite build"}}`+"\n")

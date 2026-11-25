@@ -651,6 +651,9 @@ Missing fixes are `[]`; unknown severity is `unknown`. Severity is always one
 of `critical`, `high`, `medium`, `low`, `unknown`. Ordering is deterministic,
 not a priority ranking. Dependabot supplies no installed version, so that
 field is empty for its findings; a vulnerable range is not an installed version.
+For the same reason `vuelta fix` leaves Dependabot findings unchanged and
+reports them as skipped with `source_requires_local_verification`; applying
+them after a local lockfile check is a separate planned task.
 Legacy `vulnerabilities` remains during migration.
 
 Exit codes retain their existing meaning: `0` completed; `1` all targets

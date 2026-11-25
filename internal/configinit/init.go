@@ -56,6 +56,9 @@ type Input struct {
 	AllowedPaths, DockerFiles, RuntimeImages    []string
 	VerificationNames                           []string
 	ScanOnly                                    bool
+	// Repair admits managers by their vulnerability-repair contract instead of
+	// a candidate scanner. It is only for the ephemeral workspace of `fix`.
+	Repair bool
 }
 
 // MissingValueError identifies a required flag when detection is ambiguous or
@@ -441,7 +444,11 @@ func (d Discovery) BuildWorkspace(input Input) (config.Workspace, error) {
 		if !contains(d.PackageManagers[stack], manager) {
 			return config.Workspace{}, fmt.Errorf("--package-manager %q was not detected for stack %q", manager, stack)
 		}
-		if err := toolchain.ValidateManagerSupport(stack, manager); err != nil {
+		validate := toolchain.ValidateManagerSupport
+		if input.Repair {
+			validate = toolchain.ValidateRepairSupport
+		}
+		if err := validate(stack, manager); err != nil {
 			return config.Workspace{}, err
 		}
 	}

@@ -425,3 +425,19 @@ func TestResolveSnapshotProfileRestoresEmbeddedImageAcrossProcesses(t *testing.T
 		t.Fatalf("tampered snapshot error = %v", err)
 	}
 }
+
+func TestValidateRepairSupportDoesNotAdmitScanner(t *testing.T) {
+	t.Parallel()
+	for _, manager := range []string{"npm", "pnpm", "bun"} {
+		if err := ValidateRepairSupport(config.StackNode, manager); err != nil {
+			t.Fatalf("%s repair support: %v", manager, err)
+		}
+	}
+	var capability *ecosystem.CapabilityError
+	if err := ValidateManagerSupport(config.StackNode, "bun"); !errors.As(err, &capability) || capability.Capability != "candidate-scanner" {
+		t.Fatalf("bun scanner support must stay rejected: %v", err)
+	}
+	if err := ValidateRepairSupport(config.StackPython, "requirements"); !errors.As(err, &capability) || capability.Capability != "vulnerability-repair" {
+		t.Fatalf("python/requirements has no repair: %v", err)
+	}
+}

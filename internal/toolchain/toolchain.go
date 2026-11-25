@@ -81,6 +81,24 @@ func ValidateManagerSupport(stack, manager string) error {
 	return nil
 }
 
+// ValidateRepairSupport rejects manager families without a reviewed
+// vulnerability-repair contract. Repair targets come from advisory data, so it
+// needs no candidate scanner and must not be used to admit update or scan.
+func ValidateRepairSupport(stack, manager string) error {
+	registry, err := catalog.New()
+	if err != nil {
+		return fmt.Errorf("construct built-in ecosystem catalog: %w", err)
+	}
+	adapter, err := registry.Lookup(stack, manager)
+	if err != nil {
+		return err
+	}
+	if _, ok := adapter.(ecosystem.FixProvider); !ok {
+		return &ecosystem.CapabilityError{Key: adapter.Key(), Capability: "vulnerability-repair"}
+	}
+	return nil
+}
+
 // IdentityForProfile returns the stable full-contract identity of a profile.
 func IdentityForProfile(profile config.ToolchainProfile) (Identity, error) {
 	return IdentityForResolvedProfile(profile, SourceOverride, profile.Image)

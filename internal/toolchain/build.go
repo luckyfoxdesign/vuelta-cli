@@ -56,6 +56,55 @@ func Prepare(ctx context.Context, ws config.Workspace, cfg config.Config, docker
 	if err != nil {
 		return Prepared{}, err
 	}
+	return prepareSelection(ctx, selection, docker, announce)
+}
+
+// PrepareForFix resolves a repair-capable adapter independently of latest
+// discovery. In particular Bun repairs use native bun, without running ncu.
+func PrepareForFix(ctx context.Context, ws config.Workspace, cfg config.Config, docker dockerexec.Runner, announce func(string)) (Prepared, error) {
+	constraints, err := Detect(ws)
+	if err != nil {
+		return Prepared{}, err
+	}
+	registry, err := catalog.New()
+	if err != nil {
+		return Prepared{}, err
+	}
+	adapter, err := registry.Lookup(ws.Stack, ws.PackageManager)
+	if err != nil {
+		return Prepared{}, err
+	}
+	provider, ok := adapter.(ecosystem.FixProvider)
+	if !ok {
+		return Prepared{}, errors.New("adapter has no vulnerability repair capability")
+	}
+	runtimeConstraint, err := ecosystem.ParseRuntimeConstraint(constraints.Stack, constraints.Runtime)
+	if err != nil {
+		return Prepared{}, err
+	}
+	profile, found, err := selectOverride(ws, cfg.Update.ToolchainProfiles, constraints, runtimeConstraint)
+	if err != nil {
+		return Prepared{}, err
+	}
+	selection := Selection{Profile: profile, Constraints: constraints, RuntimeConstraint: runtimeConstraint.Canonical(), Source: SourceOverride}
+	if !found {
+		spec, err := provider.FixToolchain(ecosystem.Constraints{Key: adapter.Key(), Runtime: constraints.Runtime, PackageManagerVersion: constraints.PackageManagerVersion, LockFormat: constraints.LockFormat, Platform: constraints.Platform})
+		if err != nil {
+			return Prepared{}, err
+		}
+		if spec.Key != adapter.Key() || !exactVersionPattern.MatchString(spec.PackageManagerVersion) {
+			return Prepared{}, errors.New("invalid repair toolchain contract")
+		}
+		selection.Profile = config.ToolchainProfile{Version: config.ToolchainProfileVersion, ID: spec.ID, Stack: spec.Key.Stack, PackageManager: spec.Key.PackageManager,
+			Runtime: spec.Runtime, PackageManagerVersion: spec.PackageManagerVersion, Scanner: spec.Scanner, ScannerVersion: spec.ScannerVersion,
+			Platform: spec.Platform, User: spec.User, LockFormats: append([]string(nil), spec.LockFormats...), Capabilities: config.ToolchainCapabilities{ReadOnlyDiscovery: spec.Capabilities.ReadOnlyDiscovery}}
+		selection.Source = SourceDefault
+		selection.build = &buildSpec{Dockerfile: spec.Dockerfile, Args: spec.BuildArgs}
+	}
+	return prepareSelection(ctx, selection, docker, announce)
+}
+
+func prepareSelection(ctx context.Context, selection Selection, docker dockerexec.Runner, announce func(string)) (Prepared, error) {
 	if selection.Source == SourceOverride {
 		identity, identityErr := IdentityForResolvedProfile(selection.Profile, selection.Source, selection.Profile.Image)
 		if identityErr != nil {

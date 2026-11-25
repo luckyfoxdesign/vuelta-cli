@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,22 @@ func TestStructuredFindingsRetainAllAffectedLocations(t *testing.T) {
 	}
 	if refs := findingRefs(got); len(refs) != 1 || refs[0] != "CVE-1" {
 		t.Fatalf("legacy references changed: %v", refs)
+	}
+}
+
+func TestRepairTargetsAdmitBunButReadOnlyScanDoesNot(t *testing.T) {
+	root := t.TempDir()
+	writeScanProjectFile(t, root, "package.json", `{"packageManager":"bun@1.4.5"}`+"\n")
+	writeScanProjectFile(t, root, "bun.lock", "{}\n")
+	repair := prepareTargets([]scanTarget{{path: root}}, "node", true)
+	if repair[0].err != nil || repair[0].workspace == nil || repair[0].workspace.PackageManager != "bun" {
+		t.Fatalf("fix must admit Bun: %+v", repair[0])
+	}
+	scan := prepareReadOnlyTargets([]scanTarget{{path: root}}, "node")
+	if scan[0].err == nil || !strings.Contains(scan[0].err.Error(), "candidate-scanner") {
+		t.Fatalf("scan must keep rejecting Bun: %+v", scan[0])
+	}
+	if _, err := os.Stat(filepath.Join(root, projectConfigName)); !os.IsNotExist(err) {
+		t.Fatalf("configuration written: %v", err)
 	}
 }

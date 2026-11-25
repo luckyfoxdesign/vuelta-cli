@@ -278,6 +278,40 @@ type PlannedMutationProvider interface {
 	PlannedMutation(PlannedMutationRequest) (PlannedMutationSpec, error)
 }
 
+// FixDependency is bounded dependency metadata used for vulnerability repair.
+// Versions are installed lockfile versions, not declared requirement ranges.
+type FixDependency struct {
+	Versions []string `json:"versions"`
+	Direct   bool     `json:"direct"`
+	Group    string   `json:"group,omitempty"`
+}
+
+// FixRequest binds a vulnerability-provided exact target to its dependency.
+type FixRequest struct {
+	Name       string
+	Version    string
+	Dependency FixDependency
+}
+
+// FixSpec contains reviewed argv and a closed optional manifest rewrite.
+// A lock-only repair must leave its manifest byte-for-byte unchanged.
+type FixSpec struct {
+	Commands    [][]string
+	RewriteJSON bool
+	LockOnly    bool
+	Unsupported string
+}
+
+// FixProvider owns manager-specific repair and metadata inspection. Inspection
+// emits only a JSON map of package names to FixDependency, never file contents.
+// It is independent of latest-version discovery and project verification.
+type FixProvider interface {
+	FixInspect() []string
+	FixName(string) string
+	Fix(FixRequest) (FixSpec, error)
+	FixToolchain(Constraints) (ToolchainSpec, error)
+}
+
 // ChangePolicy owns the exact project paths a package mutation may change.
 type ChangePolicy interface {
 	AllowedChangedPaths() []string

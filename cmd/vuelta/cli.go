@@ -41,6 +41,18 @@ var globalOptionDefinitions = []optionDefinition{
 // The final command surface and help are defined here without compatibility aliases.
 var commandDefinitions = []commandDefinition{
 	{
+		path: []string{"fix"}, usage: "vuelta fix --directory PATH [--finding ID] [--min-severity LEVEL] [--json]",
+		description: "repair verified vulnerability findings", group: "Everyday commands", takesConfig: true, handler: "fix",
+		options: []optionDefinition{
+			{names: []string{"--directory"}, valueName: "PATH", description: "select one project directory"},
+			{names: []string{"--stack"}, valueName: "STACK", description: "select the detected project stack"},
+			{names: []string{"--finding"}, valueName: "ID", description: "select a finding ID (repeatable)"},
+			{names: []string{"--min-severity"}, valueName: "LEVEL", description: "minimum severity to repair"},
+			{names: []string{"--json"}, description: "write structured repair results"},
+			{names: []string{"--verbose"}, description: "show bounded repair diagnostics on stderr"},
+		},
+	},
+	{
 		path: []string{"scan"}, usage: "vuelta scan [-p NAME | -d PATH | --all] [options] [config-path]",
 		description: "find vulnerabilities and package candidates; create snapshots only for safely mutable manifests", group: "Everyday commands",
 		examples: []string{"vuelta scan", "vuelta scan --project api --timeout 10m", "vuelta scan --directory . --timeout 10m", "vuelta scan --all --timeout 10m --json"},
@@ -603,6 +615,8 @@ func dispatchCommand(handler string, args []string) error {
 	switch handler {
 	case "scan":
 		return runScan(args)
+	case "fix":
+		return runFix(args)
 	case "update":
 		return executeUpdate(args)
 	case "update status":

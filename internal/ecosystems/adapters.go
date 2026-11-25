@@ -196,6 +196,49 @@ type mutableAdapter struct {
 	plannedMutationCapability
 }
 
+// FixToolchain reuses the adapter's reviewed default without latest discovery.
+func (a mutableAdapter) FixToolchain(c ecosystem.Constraints) (ecosystem.ToolchainSpec, error) {
+	return a.DefaultToolchain(c)
+}
+
+func (a mutableAdapter) FixInspect() []string { return fixInspect(a.Key().PackageManager) }
+func (a mutableAdapter) FixName(name string) string {
+	if a.Key().Stack == "python" {
+		return regexp.MustCompile(`[-_.]+`).ReplaceAllString(strings.ToLower(name), "-")
+	}
+	return name
+}
+func (a mutableAdapter) Fix(r ecosystem.FixRequest) (ecosystem.FixSpec, error) {
+	return fixSpec(a.Key().PackageManager, r)
+}
+
+type bunFixAdapter struct{ unsupportedAdapter }
+
+func (a bunFixAdapter) FixInspect() []string       { return fixInspect("bun") }
+func (a bunFixAdapter) FixName(name string) string { return name }
+func (a bunFixAdapter) Fix(r ecosystem.FixRequest) (ecosystem.FixSpec, error) {
+	return fixSpec("bun", r)
+}
+func (a bunFixAdapter) ProfilePolicy() ecosystem.ProfilePolicy {
+	return ecosystem.ProfilePolicy{ExpectedScanner: "bun", AllowedLockFormats: []string{"bun-text"}, VersionOutputStyle: "exact"}
+}
+func (a bunFixAdapter) FixToolchain(c ecosystem.Constraints) (ecosystem.ToolchainSpec, error) {
+	version := c.PackageManagerVersion
+	if version == "" {
+		version = "1.4.5"
+	}
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(version) {
+		return ecosystem.ToolchainSpec{}, errors.New("Bun repair requires an exact stable packageManager version")
+	}
+	runtime, err := ecosystem.ResolveRuntime("node", c.Runtime, "22", []string{"22", "24", "20"})
+	if err != nil {
+		return ecosystem.ToolchainSpec{}, err
+	}
+	return ecosystem.ToolchainSpec{ID: "fix-bun-" + version, Key: a.Key(), AdapterVersion: adapterVersion, Runtime: runtime,
+		PackageManagerVersion: version, Scanner: "bun", ScannerVersion: version, Platform: c.Platform, User: "10001:10001", LockFormats: []string{"bun-text"},
+		Dockerfile: "bun-fix.Dockerfile", BuildArgs: map[string]string{"BASE_IMAGE": "oven/bun:" + version}}, nil
+}
+
 type npmAdapter struct {
 	mutableAdapter
 	verifyEnvironmentCapability
@@ -391,7 +434,7 @@ func PNPM() ecosystem.Adapter {
 // adapter.
 func Bun() ecosystem.Adapter {
 	key := ecosystem.Key{Stack: "node", PackageManager: "bun"}
-	return unsupportedAdapter{
+	return bunFixAdapter{unsupportedAdapter{
 		baseAdapter: base(key, "Bun", 100, false,
 			"npm-check-updates cannot use the mandatory egress proxy under Bun; use npm or pnpm until a Bun scanner with stable structured output is available"),
 		inputCapability:        inputs("package.json", "bun.lock", []string{".npmrc", "bunfig.toml"}),
@@ -402,7 +445,145 @@ func Bun() ecosystem.Adapter {
 			expectedScanner: "ncu", lockFormats: []string{"bun-text"}, versionStyle: "exact",
 		},
 		changeCapability: changes("package.json", "bun.lock"),
+	}}
+}
+
+// Inspection runs in the same minimal private copy and hardened container as
+// mutation. Scripts are fixed trusted code; repository data is only parsed.
+func fixInspect(manager string) []string {
+	switch manager {
+	case "npm", "pnpm", "bun":
+		engine := "node"
+		if manager == "bun" {
+			engine = "bun"
+		}
+		return []string{engine, "-e", fixNodeInspect}
+	default:
+		return []string{"python", "-c", fixPythonInspect}
 	}
+}
+
+const fixNodeInspect = `const fs=require('fs');
+const p=JSON.parse(fs.readFileSync('package.json','utf8'));const out={};
+for(const group of ['dependencies','devDependencies','optionalDependencies','peerDependencies'])
+ for(const name of Object.keys(p[group]||{})) out[name]={direct:true,group,versions:[]};
+if(fs.existsSync('package-lock.json')||fs.existsSync('npm-shrinkwrap.json')) {
+ const l=JSON.parse(fs.readFileSync(fs.existsSync('npm-shrinkwrap.json')?'npm-shrinkwrap.json':'package-lock.json','utf8'));
+ for(const [path,pkg] of Object.entries(l.packages||{})) {
+  const name=path.split('node_modules/').pop();if(!name||!pkg.version)continue;
+  const d=out[name]||(out[name]={direct:false,versions:[]});if(!d.versions.includes(pkg.version))d.versions.push(pkg.version);
+ }
+}
+if(fs.existsSync('pnpm-lock.yaml')) {
+ const text=fs.readFileSync('pnpm-lock.yaml','utf8');
+ for(const m of text.matchAll(/^  ['"]?\/?((?:@[^/\s]+\/)?[^@/\s'"]+)(?:@|\/)([0-9][0-9A-Za-z.+-]*)/gm)) {
+  const d=out[m[1]]||(out[m[1]]={direct:false,versions:[]});if(!d.versions.includes(m[2]))d.versions.push(m[2]);
+ }
+}
+if(fs.existsSync('bun.lock')) {
+ for(const m of fs.readFileSync('bun.lock','utf8').matchAll(/"((?:@[^/"\s]+\/)?[^@/"\s]+)@([0-9][0-9A-Za-z.+-]*)"/g)) {
+  const d=out[m[1]]||(out[m[1]]={direct:false,versions:[]});if(!d.versions.includes(m[2]))d.versions.push(m[2]);
+ }
+}
+process.stdout.write(JSON.stringify(out));`
+
+const fixPythonInspect = `import json,re,pathlib
+try:import tomllib
+except ImportError:from pip._vendor import tomli as tomllib
+out={}
+norm=lambda n:re.sub(r'[-_.]+','-',n).lower()
+def add(n,g=''):
+ n=norm(n);out.setdefault(n,{'versions':[]})['direct']=True;out[n]['group']=g
+def requirement(s,g=''):
+ m=re.match(r'^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)',s)
+ if m:add(m[1],g)
+if pathlib.Path('pyproject.toml').exists():
+ p=tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+ for s in p.get('project',{}).get('dependencies',[]):requirement(s)
+ for g,ss in p.get('project',{}).get('optional-dependencies',{}).items():
+  for s in ss:requirement(s,'extra:'+g)
+ poetry=p.get('tool',{}).get('poetry',{})
+ for n in poetry.get('dependencies',{}):
+  if n!='python':add(n)
+ for g,data in poetry.get('group',{}).items():
+  for n in data.get('dependencies',{}):add(n,g)
+ for g,ss in p.get('dependency-groups',{}).items():
+  for s in ss:
+   if isinstance(s,str):requirement(s,g)
+for f in ['uv.lock','poetry.lock']:
+ if pathlib.Path(f).exists():
+  for p in tomllib.loads(pathlib.Path(f).read_text()).get('package',[]):
+   n=norm(p['name']);d=out.setdefault(n,{'direct':False,'versions':[]})
+   if p.get('version') and p['version'] not in d['versions']:d['versions'].append(p['version'])
+if pathlib.Path('requirements.in').exists():
+ for line in pathlib.Path('requirements.in').read_text().splitlines():requirement(line)
+if pathlib.Path('requirements.txt').exists():
+ for line in pathlib.Path('requirements.txt').read_text().splitlines():
+  m=re.match(r'^([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9.+!-]+)',line)
+  if m:
+   d=out.setdefault(norm(m[1]),{'direct':False,'versions':[]})
+   if m[2] not in d['versions']:d['versions'].append(m[2])
+print(json.dumps(out))`
+
+func fixSpec(manager string, r ecosystem.FixRequest) (ecosystem.FixSpec, error) {
+	if !regexp.MustCompile(`^(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9][A-Za-z0-9_.-]*$`).MatchString(r.Name) ||
+		!regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,3}$`).MatchString(r.Version) {
+		return ecosystem.FixSpec{}, errors.New("invalid exact vulnerability repair target")
+	}
+	spec := ecosystem.FixSpec{LockOnly: !r.Dependency.Direct}
+	switch manager {
+	case "npm", "pnpm", "bun":
+		if !r.Dependency.Direct {
+			// pnpm and Bun cannot guarantee one exact transitive version without
+			// adding overrides or changing the owning parent's requirement.
+			spec.Unsupported = "needs_parent_upgrade"
+			if manager == "npm" {
+				spec.Unsupported = ""
+				spec.Commands = [][]string{{"npm", "install", "--package-lock-only", "--ignore-scripts", "--no-save", r.Name + "@" + r.Version}, {"npm", "ls", "--package-lock-only", "--all", "--json"}}
+			}
+			return spec, nil
+		}
+		spec.RewriteJSON = true
+		switch manager {
+		case "npm":
+			spec.Commands = [][]string{{"npm", "install", "--package-lock-only", "--ignore-scripts"}}
+		case "pnpm":
+			spec.Commands = [][]string{{"pnpm", "install", "--lockfile-only", "--ignore-scripts"}}
+		case "bun":
+			spec.Commands = [][]string{{"bun", "install", "--lockfile-only", "--ignore-scripts"}}
+		}
+	case "uv":
+		args := []string{"uv", "lock", "--no-build", "--no-config", "--no-sources", "--upgrade-package", r.Name + "==" + r.Version}
+		if r.Dependency.Direct {
+			args = []string{"uv", "add", "--no-sync", "--no-build", "--no-config", "--no-sources", r.Name + "==" + r.Version}
+			if strings.HasPrefix(r.Dependency.Group, "extra:") {
+				args = append(args, "--optional", strings.TrimPrefix(r.Dependency.Group, "extra:"))
+			} else if r.Dependency.Group != "" {
+				args = append(args, "--group", r.Dependency.Group)
+			}
+		}
+		spec.Commands = [][]string{args}
+	case "poetry":
+		if !r.Dependency.Direct {
+			spec.Unsupported = "needs_parent_upgrade"
+			return spec, nil
+		}
+		args := []string{"poetry", "--no-plugins", "--no-interaction", "add", "--lock", r.Name + "==" + r.Version}
+		if strings.HasPrefix(r.Dependency.Group, "extra:") {
+			args = append(args, "--optional", strings.TrimPrefix(r.Dependency.Group, "extra:"))
+		} else if r.Dependency.Group != "" {
+			args = append(args, "--group", r.Dependency.Group)
+		}
+		spec.Commands = [][]string{args}
+	case "pip-tools":
+		// pip-compile's exact upgrade constraint respects the parent ranges;
+		// keeping requirements.in unchanged also handles direct dependencies.
+		spec.LockOnly = true
+		spec.Commands = [][]string{{"pip-compile", "--upgrade-package", r.Name + "==" + r.Version, "requirements.in"}}
+	default:
+		return ecosystem.FixSpec{}, errors.New("package manager has no reviewed vulnerability repair")
+	}
+	return spec, nil
 }
 
 // Poetry returns the python/poetry built-in adapter.

@@ -249,6 +249,7 @@ type scanOptions struct {
 	verbose                   bool
 	jsonOutput                bool
 	readOnly                  bool
+	repair                    bool
 	toolchainProfile          *config.ToolchainProfile
 	toolchainIdentity         *toolchain.Identity
 	toolchainConstraint       string
@@ -509,7 +510,7 @@ func selectReadOnlyScanConfiguration(options scanOptions, configPath string) (*c
 		if detectErr != nil {
 			return nil, scanConfigSelection{}, detectErr
 		}
-		workspace, detectErr := discovery.BuildWorkspace(configinit.Input{Stack: options.stack, ScanOnly: true})
+		workspace, detectErr := discovery.BuildWorkspace(configinit.Input{Stack: options.stack, ScanOnly: true, Repair: options.repair})
 		if detectErr != nil {
 			return nil, scanConfigSelection{}, detectErr
 		}
@@ -528,6 +529,12 @@ func selectReadOnlyScanConfiguration(options scanOptions, configPath string) (*c
 // prepareReadOnlyTargets detects unregistered Docker and package projects
 // without onboarding. Existing project policy is loaded without repairs.
 func prepareReadOnlyTargets(targets []scanTarget, stack string) []scanTarget {
+	return prepareTargets(targets, stack, false)
+}
+
+// prepareTargets is prepareReadOnlyTargets with an optional repair admission
+// contract used only by `fix`.
+func prepareTargets(targets []scanTarget, stack string, repair bool) []scanTarget {
 	for index := range targets {
 		target := &targets[index]
 		if target.err != nil {
@@ -561,7 +568,7 @@ func prepareReadOnlyTargets(targets []scanTarget, stack string) []scanTarget {
 			continue
 		}
 		if workspace.Stack == "" {
-			workspace, err = discovery.BuildWorkspace(configinit.Input{Stack: stack, ScanOnly: true})
+			workspace, err = discovery.BuildWorkspace(configinit.Input{Stack: stack, ScanOnly: true, Repair: repair})
 			if err != nil {
 				target.err = err
 				continue

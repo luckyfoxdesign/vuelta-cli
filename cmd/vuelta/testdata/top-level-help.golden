@@ -6,6 +6,7 @@ Examples:
   vuelta project add . --name api
 
 Everyday commands:
+  fix          repair verified vulnerability findings
   scan         find vulnerabilities and package candidates; create snapshots only for safely mutable manifests
   update       request a reviewed dependency update on GitHub Actions
   status       show durable project and operation status

@@ -34,6 +34,11 @@ cannot use the mandatory proxy when executed by Bun, while `bun outdated`
 does not provide a stable structured output contract. Keep the Dockerfile as
 an upstream compatibility fixture, not as a catalog release input.
 
+`bun-fix.Dockerfile` is separate: it is the repair-only image used by
+`vuelta fix`. It contains native `bun` only, runs as `10001:10001`, and is
+always invoked with `--ignore-scripts` behind the mandatory proxy. It never
+runs `ncu` and is not a scan or update profile.
+
 ## pnpm candidate contract
 
 Embedded pnpm scanning accepts exact pnpm 8, 9, 10, and 11 declarations.

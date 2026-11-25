@@ -24,6 +24,7 @@ type Project struct {
 	Manifest    string
 	Lock        string
 	ConfigFiles []string
+	Files       []string
 }
 
 // Detect resolves exactly one updateable manifest/lock pair in path. It never
@@ -117,6 +118,43 @@ func InPrivateCopy(path string, allowProjectConfig, apply bool, operation func(P
 	if err := rejectProjectConfig(project, allowProjectConfig); err != nil {
 		return nil, err
 	}
+	files := projectFiles(project)
+	if allowProjectConfig {
+		for _, name := range project.ConfigFiles {
+			if regularFile(project.Root, name) {
+				files = append(files, name)
+			}
+		}
+	}
+	return inPrivateProject(project, files, apply, operation)
+}
+
+// InPrivateFiles admits only literal, non-secret root files. It validates all
+// changes and performs the same race-checked atomic copyback as package repair.
+// apply is false for inspection and for candidate image scans.
+func InPrivateFiles(root string, files []string, apply bool, operation func(string) error) ([]string, error) {
+	if len(files) == 0 || len(files) > 64 {
+		return nil, errors.New("private repair requires 1 to 64 explicit files")
+	}
+	seen := map[string]bool{}
+	for _, name := range files {
+		if name == "" || filepath.Base(name) != name || name == "." || strings.ContainsAny(name, `/\`) || ecosystem.IsSecretLikePath(name) || seen[name] {
+			return nil, errors.New("invalid private repair file allowlist")
+		}
+		seen[name] = true
+	}
+	project := Project{Root: root, Files: append([]string(nil), files...)}
+	return inPrivateProject(project, project.Files, apply, func(p Project) error { return operation(p.Root) })
+}
+
+func projectFiles(p Project) []string {
+	if p.Files != nil {
+		return append([]string(nil), p.Files...)
+	}
+	return []string{p.Manifest, p.Lock}
+}
+
+func inPrivateProject(project Project, files []string, apply bool, operation func(Project) error) ([]string, error) {
 	dir, err := os.MkdirTemp("", "vuelta-adhoc-update-")
 	if err != nil {
 		return nil, fmt.Errorf("create private update copy: %w", err)
@@ -124,14 +162,6 @@ func InPrivateCopy(path string, allowProjectConfig, apply bool, operation func(P
 	defer func() { _ = os.RemoveAll(dir) }()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("restrict private update copy: %w", err)
-	}
-	files := []string{project.Manifest, project.Lock}
-	if allowProjectConfig {
-		for _, name := range project.ConfigFiles {
-			if regularFile(project.Root, name) {
-				files = append(files, name)
-			}
-		}
 	}
 	for _, name := range files {
 		if err := copyRegularFile(project.Root, dir, name); err != nil {
@@ -146,6 +176,21 @@ func InPrivateCopy(path string, allowProjectConfig, apply bool, operation func(P
 	}
 	if err := operation(copyProject); err != nil {
 		return nil, err
+	}
+	// Reject unexpected paths before reading their contents for a digest.
+	// A manager-created credential file or symlink must never be opened.
+	admitted := map[string]bool{}
+	for _, name := range files {
+		admitted[name] = true
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !admitted[entry.Name()] || !entry.Type().IsRegular() {
+			return nil, errors.New("private update copy security check: package manager created an unallowlisted path")
+		}
 	}
 	after, err := privateProjectState(copyProject)
 	if err != nil {
@@ -184,7 +229,7 @@ func rejectProjectConfig(project Project, allowed bool) error {
 
 func copyRegularFile(sourceRoot, destinationRoot, name string) error {
 	info, err := os.Lstat(filepath.Join(sourceRoot, name))
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 16<<20 {
 		return fmt.Errorf("copy dependency input %s: not a regular file", name)
 	}
 	data, err := os.ReadFile(filepath.Join(sourceRoot, name))
@@ -199,7 +244,7 @@ func copyRegularFile(sourceRoot, destinationRoot, name string) error {
 
 func changedDependencyFiles(before, after state, project Project) []string {
 	var changed []string
-	for _, name := range []string{project.Manifest, project.Lock} {
+	for _, name := range projectFiles(project) {
 		if before[name] != after[name] {
 			changed = append(changed, name)
 		}
@@ -212,7 +257,7 @@ func copyBackAtomically(host, private Project, expected state, changed []string)
 	if err != nil {
 		return fmt.Errorf("revalidate host dependency inputs: %w", err)
 	}
-	for _, name := range []string{host.Manifest, host.Lock} {
+	for _, name := range projectFiles(host) {
 		if hostState[name].digest != expected[name].digest || hostState[name].mode.Perm() != expected[name].mode.Perm() {
 			return fmt.Errorf("host dependency input %s changed during private update", name)
 		}
@@ -323,7 +368,11 @@ func projectState(project Project) (state, error) {
 			return nil, err
 		}
 		item := fileState{mode: info.Mode(), size: info.Size(), modTime: info.ModTime()}
-		if info.Mode().IsRegular() && (name == project.Manifest || name == project.Lock) {
+		allowed := false
+		for _, file := range projectFiles(project) {
+			allowed = allowed || file == name
+		}
+		if info.Mode().IsRegular() && allowed {
 			data, err := os.ReadFile(filepath.Join(project.Root, name))
 			if err != nil {
 				return nil, err
@@ -337,7 +386,10 @@ func projectState(project Project) (state, error) {
 }
 
 func (before state) onlyAllowedChanges(after state, project Project) error {
-	allowed := map[string]bool{project.Manifest: true, project.Lock: true}
+	allowed := map[string]bool{}
+	for _, name := range projectFiles(project) {
+		allowed[name] = true
+	}
 	for name, old := range before {
 		current, ok := after[name]
 		if !ok {
@@ -355,11 +407,10 @@ func (before state) onlyAllowedChanges(after state, project Project) error {
 			return fmt.Errorf("container package manager created unallowlisted path %s", name)
 		}
 	}
-	if _, ok := after[project.Manifest]; !ok {
-		return fmt.Errorf("container package manager removed manifest %s", project.Manifest)
-	}
-	if _, ok := after[project.Lock]; !ok {
-		return fmt.Errorf("container package manager removed lock file %s", project.Lock)
+	for _, name := range projectFiles(project) {
+		if item, ok := after[name]; !ok || !item.mode.IsRegular() {
+			return fmt.Errorf("container package manager removed or replaced input %s", name)
+		}
 	}
 	return nil
 }
