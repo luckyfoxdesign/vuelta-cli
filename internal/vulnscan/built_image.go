@@ -161,9 +161,12 @@ func (s Scanner) ScanBuiltImage(ctx context.Context, input BuiltImageInput, repo
 	if err != nil {
 		return failure("database_unavailable")
 	}
+	// Image analysis inventories installed packages, including installed dev
+	// dependencies. The pinned Trivy image subcommand does not accept the
+	// lockfile-scanning --include-dev-deps flag.
 	out, err := s.trivyCommand(ctx, bundle, report.ScannerImage, cfg.Update.Egress, report.DatabaseMaxAgeHours,
 		"image", "--config", "/dev/null", "--ignorefile", "/dev/null", "--scanners", "vuln",
-		"--pkg-types", "os,library", "--list-all-pkgs", "--include-dev-deps", "--image-src", "remote",
+		"--pkg-types", "os,library", "--list-all-pkgs", "--image-src", "remote",
 		"--cache-backend", "memory", "--format", "json", "--platform", input.Artifact.Platform, input.Artifact.Image)
 	if err != nil {
 		return failure("image_scan_failed")
