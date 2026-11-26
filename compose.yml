@@ -36,6 +36,12 @@ services:
   build:
     build: .
     working_dir: /src
+    # The container owns the build process; the host/CI runner owns this exact
+    # checkout mount. Retain VCS stamping without trusting other directories.
+    environment:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /src
     volumes:
       - .:/src
       - go-mod-cache:/go/pkg/mod
