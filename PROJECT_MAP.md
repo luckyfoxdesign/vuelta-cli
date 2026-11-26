@@ -98,6 +98,7 @@ make build                     # both cross-build targets
 - Vuelta is a one-shot vulnerability CLI: scan and fix, with config/project/environment helpers.
 - `scan --read-only` accepts tracked allowlisted inputs and writes no project config or state. JSON uses `schema_version: 1` and structured `findings`.
 - `scan image` accepts versioned digest/platform metadata on stdin and exact repository allowlists; scans full OS/library inventories with explicit partial coverage and production-export comparison. Contract: `../docs/product/architecture/image-digest-scanning.md`.
+- `acceptance/image-smoke.sh` runs the built Linux CLI against public digest-pinned synthetic images; workflow dispatch modes publish fixtures or run image acceptance and upload a gated 30-day Linux artifact. Fixture recipe and commands: `acceptance/image-fixtures/README.md`.
 - Ordinary scan may onboard the exact root and save bounded reports/image drift. There are no update plans, SQLite history, scheduler, bridge, commits, push, or deployment commands.
 - `fix` scans, selects conservative candidates, mutates a private copy in containers with scripts disabled, verifies candidates and copies back only manifest/lock files or image references.
 - Docker endpoint attestation, managed allowlisted registry egress, bounded subprocess output, and tracked scan inputs remain core boundaries.

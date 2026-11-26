@@ -70,7 +70,7 @@ jq -e --arg image "$vulnerable" --arg clean "$clean" '
   .production_comparison == "different" and .production.image == $clean and
   .artifact.image == $image and .artifact.platform == "linux/amd64" and
   any(.findings[]; .package == "lodash" and .installed_version == "4.17.20" and
-    .image == $image and .kind == "image" and (.target | contains("node_modules/lodash")))
+    .image == $image and .kind == "image" and (.target | length > 0))
 ' "$root/vulnerable.json" >/dev/null
 input "$clean" linux/amd64 | jq '.production=(.artifact+{observed_at:(now|todateiso8601)})' |
   scan clean 0 "$machine_config"

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "source_sha": "d8debd26823509e6ae3ba35c19e7c78f497787a4",
+  "vulnerable": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:da317502bec4eb54cdef8d74d71c78f059ee6f0c4f6a271723c62b25ebe6ef10",
+  "clean": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:5fbcaf4b91504ed46dc4a985c57adf4c540135b5cbd1d16d81fa880e2aecedfa",
+  "db_stale": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:b3d185fa0e43dcad061aea5aa229f646778b6d4eaa86f179e5d65510ad65040c",
+  "db_missing": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:2293d75a8aa37d37ee72a3f560b111504f54b72232e07448c7ca7b893c4dc310"
+}
