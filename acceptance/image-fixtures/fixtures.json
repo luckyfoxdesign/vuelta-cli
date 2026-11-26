@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "source_sha": "b2d552676048e595fed5e8bfcf4904edc89cab18",
-  "vulnerable": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:61f595f30b2699b6954f50b8d2aa456371733c72c9876c8991dc8765195b7e37",
-  "clean": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:4dca8c0133e27df14e5ab1c3b24ffc763d9883971443e1f0efb7f822e3377df3",
-  "db_stale": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:899fdbf872ad36e2f2eb644b362bfc81ae60cb5f1453355b103d061e71ff3a9d",
-  "db_missing": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:f62e39b91c2eb3c58d44303aa7c7c31bfc938720364afff4b0b707aa4c9b33e3"
+  "source_sha": "829f22cb97eb61c9b151abb8b8ffe3f717943e36",
+  "vulnerable": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:548128652fa389337d92548d9719ae95b300f0622d93a9653d0cf05e9c520b48",
+  "clean": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:3f0c65bcaa9189ad046f8226f7fea59f9510815d9b9a7f6031085561c0d75634",
+  "db_stale": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:a5ca7b4d8f6cf2e77d92fd8bee2a67fbcc7fefa5a783a05556c16ce047e1a777",
+  "db_missing": "ghcr.io/luckyfoxdesign/vuelta-cli-scan-fixtures@sha256:be3b551fee3dd8282254073c8390d8ddb14c3693e474596663eb634f1d33cc51"
 }
