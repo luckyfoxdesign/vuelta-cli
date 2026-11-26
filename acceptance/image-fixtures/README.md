@@ -2,7 +2,12 @@
 
 Run from `app/`. Only synthetic public images are published. The application
 fixture copies the checksum-verified contents of a real lodash package into
-an application layer on the pinned Alpine base. No installation scripts run.
+an application layer on the pinned Alpine base. The runtime removes the unused
+APK package manager and its dependencies offline with `apk del --no-scripts`;
+the remaining OS files and APK inventory agree. The native build-stage package
+manager operates on the target root without executing target binaries, so both
+architectures build without QEMU or privileged containers. No installation
+scripts run. No findings are filtered or ignored.
 Versions: vulnerable `4.17.20`, clean candidate `4.18.1`. A newly disclosed
 vulnerability must fail the clean gate; do not filter it out.
 
