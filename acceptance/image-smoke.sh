@@ -93,10 +93,17 @@ jq -e '.status == "partial" and .coverage.os == "detected" and
   .coverage.libraries == "missing_metadata"' "$root/os-only.json" >/dev/null
 for mode in stale missing; do
   scanner=$(jq -r ".db_$mode" "$fixtures")
-  sed "s|aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f|$scanner|g" \
-    "$machine_config" > "$root/db-$mode-config.yaml"
+  awk -v scanner="$scanner" '
+    $1 == "image_scan:" { image_scan=1 }
+    image_scan && $1 == "image:" {
+      sub(/image:.*/, "image: \"" scanner "\""); image_scan=0; updated=1
+    }
+    { print }
+    END { if (!updated) exit 1 }
+  ' "$machine_config" > "$root/db-$mode-config.yaml"
+  chmod 600 "$root/db-$mode-config.yaml"
   input "$clean" linux/amd64 | scan "db-$mode-standin" 6 "$root/db-$mode-config.yaml"
-  jq -e '.status == "failed" and .error == "database_unavailable" and
+  jq -e --arg scanner "$scanner" '.status == "failed" and .error == "database_unavailable" and .scanner_image == $scanner and
     (has("database_updated_at") | not)' "$root/db-$mode-standin.json" >/dev/null
 done
 input "$clean" linux/amd64 | scan timeout 6 "$root/db-missing-config.yaml" 5s &
