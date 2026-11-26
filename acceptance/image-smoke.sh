@@ -99,7 +99,19 @@ for mode in stale missing; do
   jq -e '.status == "failed" and .error == "database_unavailable" and
     (has("database_updated_at") | not)' "$root/db-$mode-standin.json" >/dev/null
 done
-input "$clean" linux/amd64 | scan timeout 6 "$machine_config" 1ns
+input "$clean" linux/amd64 | scan timeout 6 "$root/db-missing-config.yaml" 5s &
+timeout_pid=$!
+observed=false
+while kill -0 "$timeout_pid" 2>/dev/null; do
+  if test -n "$(docker container ls -q --filter label=com.luckyfoxdesign.vuelta.resource=scanner-final)"; then
+    observed=true
+    break
+  fi
+  sleep 0.1
+done
+wait "$timeout_pid"
+test "$observed" = true
+jq -n '{case:"timeout",active_scanner_observed:true}' > "$root/timeout-observation.json"
 jq -e '.status == "failed"' "$root/timeout.json" >/dev/null
 printf '%s\n' '{"schema_version":2}' | scan invalid-input 2 "$machine_config"
 jq -e '.status == "failed" and .error == "invalid_image_input"' "$root/invalid-input.json" >/dev/null

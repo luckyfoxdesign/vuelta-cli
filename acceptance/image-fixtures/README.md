@@ -40,6 +40,8 @@ matching/differing production exports, arm64 contents, a wrong digest/platform
 combination, unavailable digest, OS-only partial coverage, timeout and malformed
 input. Resource snapshots verify cleanup after each invocation and preservation
 of pre-existing containers/volumes; managed DB volumes are intentionally retained.
+The missing-DB stand-in delays its version response. The timeout case observes
+an active scanner before the five-second deadline and verifies resource cleanup.
 
 `db-stale` and `db-missing` are scanner stand-ins. They execute through the real
 CLI/Docker boundary and exercise DB rejection without modifying the real Trivy
