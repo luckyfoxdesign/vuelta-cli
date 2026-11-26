@@ -8,6 +8,8 @@ the remaining OS files and APK inventory agree. The native build-stage package
 manager operates on the target root without executing target binaries, so both
 architectures build without QEMU or privileged containers. No installation
 scripts run. No findings are filtered or ignored.
+The application manifest declares lodash as a development dependency; its
+installed package must still be detected by the image scan.
 Versions: vulnerable `4.17.20`, clean candidate `4.18.1`. A newly disclosed
 vulnerability must fail the clean gate; do not filter it out.
 

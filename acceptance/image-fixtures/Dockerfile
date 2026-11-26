@@ -6,7 +6,8 @@ ARG VERSION
 ARG CHECKSUM
 RUN wget -q "https://registry.npmjs.org/lodash/-/lodash-${VERSION}.tgz" -O /package.tgz \
     && echo "${CHECKSUM}  /package.tgz" | sha256sum -c - \
-    && mkdir /library && tar -xzf /package.tgz -C /library --strip-components=1
+    && mkdir /library && tar -xzf /package.tgz -C /library --strip-components=1 \
+    && printf '{"name":"vuelta-image-fixture","version":"1.0.0","private":true,"devDependencies":{"lodash":"%s"}}\n' "$VERSION" > /package.json
 
 # Make a minimal runtime with a real APK inventory. Use the native package
 # manager offline on the target root, with target install scripts disabled;
@@ -19,6 +20,7 @@ RUN apk --root /runtime --no-network --no-scripts del apk-tools
 FROM scratch AS application
 LABEL org.opencontainers.image.source="https://github.com/luckyfoxdesign/vuelta-cli"
 COPY --from=runtime /runtime/ /
+COPY --from=package /package.json /app/package.json
 COPY --from=package /library /app/node_modules/lodash
 USER 65532:65532
 
