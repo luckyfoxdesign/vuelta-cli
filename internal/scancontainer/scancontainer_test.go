@@ -198,6 +198,9 @@ func TestRunMountsAllowlistedTrivyDatabaseVolumeWritableForSQLite(t *testing.T) 
 	for _, required := range []string{
 		"TRIVY_CACHE_DIR=/tmp/trivy",
 		"TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
+		"TRIVY_JAVA_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-java-db",
+		"DOCKER_CONFIG=/tmp/vuelta-empty-docker-config",
+		"--tmpfs /tmp/trivy:rw,noexec,nosuid,size=64m,uid=65532,gid=65532",
 		"type=volume,src=vuelta-trivy-db-0123456789abcdef,dst=/tmp/trivy/db",
 	} {
 		if !strings.Contains(create, required) {

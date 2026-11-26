@@ -41,6 +41,17 @@ var globalOptionDefinitions = []optionDefinition{
 // The final command surface and help are defined here without compatibility aliases.
 var commandDefinitions = []commandDefinition{
 	{
+		path: []string{"scan", "image"}, usage: "vuelta scan image --allow-repository REPOSITORY [--timeout DURATION] [--fail-on vulnerabilities] [config-path] < metadata.json",
+		description: "scan a complete published image at an exact digest and platform", group: "Everyday commands",
+		takesConfig: true, handler: "scan image",
+		options: []optionDefinition{
+			{names: []string{"--allow-repository"}, valueName: "REPOSITORY", description: "allow one exact canonical registry repository (repeatable)"},
+			{names: []string{"--timeout"}, valueName: "DURATION", description: "maximum scan duration (default 4m; maximum 1h)"},
+			{names: []string{"--fail-on"}, valueName: "KIND", description: "return 5 when vulnerabilities are found"},
+		},
+		security: []string{"Reads only versioned artifact metadata from stdin and emits versioned JSON. Registry access is anonymous through managed egress; no server access or repository discovery."},
+	},
+	{
 		path: []string{"fix"}, usage: "vuelta fix --directory PATH [--finding ID] [--min-severity LEVEL] [--json]",
 		description: "repair verified vulnerability findings", group: "Everyday commands", takesConfig: true, handler: "fix",
 		options: []optionDefinition{
@@ -233,6 +244,9 @@ func (c *cli) run(args []string) error {
 	}
 	normalized, err := normalizeCommandArgs(definition, commandArgs)
 	if err != nil {
+		if definition.handler == "scan image" {
+			return builtImageCommandFailure(exitConfig, "invalid_invocation")
+		}
 		if definition.handler == "scan" && scanJSONRequested(commandArgs) {
 			return scanTopLevelFailure(true, "invalid_invocation", err, "Run vuelta help scan for usage")
 		}
@@ -473,6 +487,8 @@ func optionNames(options []optionDefinition) []string {
 
 func dispatchCommand(handler string, args []string) error {
 	switch handler {
+	case "scan image":
+		return runBuiltImageScan(args)
 	case "scan":
 		return runScan(args)
 	case "fix":

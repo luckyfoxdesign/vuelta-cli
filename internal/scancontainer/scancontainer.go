@@ -423,9 +423,16 @@ func createArgs(name, image string, request Request, invocation string) []string
 	}
 	args = append(args, "--user", user)
 	if request.Tool == "trivy" {
+		// A nested DB volume otherwise makes Docker create /tmp/trivy as
+		// root. Language analysis also needs an ephemeral writable java-db
+		// sibling, while the verified vulnerability DB remains persistent.
+		identity := strings.SplitN(user, ":", 2)
+		args = append(args, "--tmpfs", "/tmp/trivy:rw,noexec,nosuid,size="+request.Tmpfs+",uid="+identity[0]+",gid="+identity[1])
 		args = append(args,
 			"--env", "TRIVY_CACHE_DIR=/tmp/trivy",
 			"--env", "TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db",
+			"--env", "TRIVY_JAVA_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-java-db",
+			"--env", "DOCKER_CONFIG=/tmp/vuelta-empty-docker-config",
 		)
 		if request.TrivyDBVolume != "" {
 			mount := "type=volume,src=" + request.TrivyDBVolume + ",dst=/tmp/trivy/db"

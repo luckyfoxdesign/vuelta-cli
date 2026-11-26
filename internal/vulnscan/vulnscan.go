@@ -592,8 +592,7 @@ func (s Scanner) scanImages(ctx context.Context, root string, ws config.Workspac
 	step := 0
 	for _, intent := range intents {
 		// Keep image analysis state ephemeral and inside the scanner's memory
-		// limit. Docker creates the parent of the nested DB volume as root, so
-		// its sibling filesystem cache is not writable by the scanner user.
+		// limit; only the verified vulnerability database is persistent.
 		args := []string{"image", "--scanners", "vuln", "--pkg-types", "os", "--cache-backend", "memory", "--format", "json"}
 		if scanConfig.ImageScan.VEX == "auto" {
 			args = append(args, "--vex", "repo")

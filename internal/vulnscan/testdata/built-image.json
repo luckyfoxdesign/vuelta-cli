@@ -1,0 +1,14 @@
+{
+  "SchemaVersion":2,
+  "ArtifactType":"container_image",
+  "Metadata": {
+    "DBUpdatedAt":"2026-11-26T10:00:00Z",
+    "RepoDigests":["ghcr.io/example/application@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    "ImageConfig":{"os":"linux","architecture":"amd64"},
+    "OS":{"Family":"alpine","Name":"3.22"}
+  },
+  "Results":[
+    {"Class":"os-pkgs","Type":"alpine","Target":"Alpine Linux","Packages":[{"Name":"musl","Version":"1.2.5"}]},
+    {"Class":"lang-pkgs","Type":"node-pkg","Target":"/app/node_modules/application-dependency/package.json","Packages":[{"Name":"application-dependency","Version":"1.0"}],"Vulnerabilities":[{"VulnerabilityID":"CVE-TEST-1","PkgName":"application-dependency","InstalledVersion":"1.0","FixedVersion":"1.1","Severity":"HIGH","Layer":{"DiffID":"sha256:own-layer"}}]}
+  ]
+}
