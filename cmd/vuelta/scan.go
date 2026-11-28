@@ -144,26 +144,27 @@ type scanStageResult struct {
 }
 
 type scanResult struct {
-	Project               string               `json:"project,omitempty"`
-	Directory             string               `json:"directory"`
-	Origin                string               `json:"origin"`
-	Execution             string               `json:"execution"`
-	Timeout               string               `json:"timeout"`
-	Stack                 string               `json:"stack,omitempty"`
-	PackageManager        string               `json:"package_manager,omitempty"`
-	Status                string               `json:"status"`
-	Vulnerabilities       []string             `json:"-"`
-	VulnerabilityFindings []vulnscan.Finding   `json:"-"`
-	Tools                 []scanToolResult     `json:"tools"`
-	Stages                []scanStageResult    `json:"stages"`
-	InputCategories       []string             `json:"input_categories"`
-	Warnings              []string             `json:"warnings"`
-	Toolchain             *scanToolchainResult `json:"toolchain,omitempty"`
-	Capabilities          []scanCapability     `json:"capabilities"`
-	ImageScans            []imageScanRecord    `json:"image_scans"`
-	Error                 *jsonCommandError    `json:"error,omitempty"`
-	StartedAt             time.Time            `json:"-"`
-	CompletedAt           time.Time            `json:"-"`
+	Project               string                              `json:"project,omitempty"`
+	Directory             string                              `json:"directory"`
+	Origin                string                              `json:"origin"`
+	Execution             string                              `json:"execution"`
+	Timeout               string                              `json:"timeout"`
+	Stack                 string                              `json:"stack,omitempty"`
+	PackageManager        string                              `json:"package_manager,omitempty"`
+	Status                string                              `json:"status"`
+	Vulnerabilities       []string                            `json:"-"`
+	VulnerabilityFindings []vulnscan.Finding                  `json:"-"`
+	Tools                 []scanToolResult                    `json:"tools"`
+	Stages                []scanStageResult                   `json:"stages"`
+	InputCategories       []string                            `json:"input_categories"`
+	Warnings              []string                            `json:"warnings"`
+	Toolchain             *scanToolchainResult                `json:"toolchain,omitempty"`
+	Capabilities          []scanCapability                    `json:"capabilities"`
+	ImageScans            []imageScanRecord                   `json:"image_scans"`
+	DatabaseCaches        []vulnscan.DatabaseCacheObservation `json:"database_caches,omitempty"`
+	Error                 *jsonCommandError                   `json:"error,omitempty"`
+	StartedAt             time.Time                           `json:"-"`
+	CompletedAt           time.Time                           `json:"-"`
 }
 
 type scanSummary struct {
@@ -863,7 +864,7 @@ func scanOneTarget(ctx context.Context, cfg config.Config, target scanTarget, op
 }
 
 type scanStageRunners struct {
-	vulnerabilities func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error)
+	vulnerabilities func(context.Context, config.Config, scanTarget, scanOptions) (vulnscan.Report, string, bool, error)
 	alerts          func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error)
 }
 
@@ -920,9 +921,7 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 		result = addStage(result, stageAlerts, stageNotRequested, "")
 	} else {
 		options.stageTracker.set(stageVulnerability)
-		var findings []vulnscan.Finding
-		var imageResolutions []vulnscan.ImageResolution
-		var imageSkips []vulnscan.ImageSkip
+		var report vulnscan.Report
 		tool := cfg.VulnScan.DependencySource
 		requested := true
 		var scanErr error
@@ -930,9 +929,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			scanErr = target.dockerErr
 		} else {
 			progress.start(scanPhaseMessage(options, target, vulnerabilityProgressMessage(tool)))
-			findings, imageResolutions, imageSkips, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options)
+			report, tool, requested, scanErr = runners.vulnerabilities(ctx, cfg, target, options)
 			progress.stop()
 		}
+		result.DatabaseCaches = report.DatabaseCaches
 		if ctx.Err() != nil {
 			return result
 		}
@@ -942,10 +942,10 @@ func scanOneTargetWith(ctx context.Context, cfg config.Config, target scanTarget
 			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "failed", Reason: scanErr.Error()})
 			result = recordScanStageFailure(result, stageVulnerability, "vulnerability_scan_failed", scanErr, "Make the configured scanner available and run scan again")
 		} else {
-			result.VulnerabilityFindings = appendUniqueFindings(result.VulnerabilityFindings, findings...)
+			result.VulnerabilityFindings = appendUniqueFindings(result.VulnerabilityFindings, report.Findings...)
 			result.Tools = append(result.Tools, scanToolResult{Name: tool, Status: "used"})
 			result = addStage(result, stageVulnerability, stageSucceeded, "")
-			imageScans, driftWarnings := buildImageScanRecords(target.path, imageResolutions, imageSkips)
+			imageScans, driftWarnings := buildImageScanRecords(target.path, report.ImageResolutions, report.ImageSkips)
 			result.ImageScans = imageScans
 			result.Warnings = appendUniqueStrings(result.Warnings, driftWarnings...)
 		}
@@ -1137,10 +1137,10 @@ func finalizeCleanOrFindings(result scanResult) scanResult {
 	return result
 }
 
-func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
+func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanTarget, options scanOptions) (vulnscan.Report, string, bool, error) {
 	workspace, err := scanWorkspace(target)
 	if err != nil {
-		return nil, nil, nil, cfg.VulnScan.DependencySource, true, err
+		return vulnscan.Report{}, cfg.VulnScan.DependencySource, true, err
 	}
 	diagnostics := vulnscan.WithImageFailure(func(err error) {
 		if options.verbose {
@@ -1162,13 +1162,13 @@ func scanVulnerabilityStage(ctx context.Context, cfg config.Config, target scanT
 	}
 	if cfg.VulnScan.DependencySource == "github-dependabot" {
 		if !cfg.VulnScan.ImageScan.Enabled || workspace.DockerImages == nil {
-			return nil, nil, nil, "trivy-images", false, nil
+			return vulnscan.Report{}, "trivy-images", false, nil
 		}
 		report, scanErr := scanner.ScanImages(ctx, target.path, workspace, cfg)
-		return report.Findings, report.ImageResolutions, report.ImageSkips, cfg.VulnScan.ImageScan.Tool, true, scanErr
+		return report, cfg.VulnScan.ImageScan.Tool, true, scanErr
 	}
 	report, scanErr := scanner.Scan(ctx, target.path, workspace, cfg)
-	return report.Findings, report.ImageResolutions, report.ImageSkips, cfg.VulnScan.DependencySource, true, scanErr
+	return report, cfg.VulnScan.DependencySource, true, scanErr
 }
 
 // buildImageScanRecords turns one scan's raw image resolutions/skips into

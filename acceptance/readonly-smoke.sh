@@ -42,6 +42,7 @@ done
 
 "$binary" --no-input --config "$machine_config" config init --yes
 "$binary" --no-input --config "$machine_config" environment bootstrap --socket "$socket" --yes
+previous_report=
 for project in "$projects"/*; do
   name=$(basename "$project")
   # Check tracked inputs with Git and list every entry, including untracked
@@ -56,4 +57,20 @@ for project in "$projects"/*; do
   cmp "$smoke_root/$name.before" "$smoke_root/$name.after"
   test -z "$(git -C "$project" status --porcelain --untracked-files=all --ignored)"
   jq -e '.schema_version == 1 and (.results | length == 1) and (.results[0].findings | length > 0) and ([.results[0].findings[].severity] | all(. == "critical" or . == "high" or . == "medium" or . == "low" or . == "unknown")) and any(.results[0].findings[]; (.fixed_versions | length) > 0)' "$smoke_root/$name.json" > /dev/null
+  jq -e '.results[0].database_caches | length > 0 and all(.[]; .updated_at != null and (.cache_key | length) == 16)' "$smoke_root/$name.json" > /dev/null
+  if test -z "$previous_report"; then
+    jq -e 'all(.results[0].database_caches[];
+      (.cache_status == "hit" and .download_attempts == 0) or
+      ((.cache_status == "miss" or .cache_status == "refreshed") and .download_attempts > 0))' "$smoke_root/$name.json" > /dev/null
+  else
+    jq -se '.[0].results[0].database_caches as $previous |
+      all(.[1].results[0].database_caches[];
+        . as $current | .cache_status == "hit" and .download_attempts == 0 and
+        any($previous[]; .cache_key == $current.cache_key and .scanner_image == $current.scanner_image and .updated_at == $current.updated_at))' \
+      "$previous_report" "$smoke_root/$name.json" > /dev/null
+  fi
+  # Bounded, machine-readable CI evidence; no project inputs or raw tool output.
+  printf 'database-cache-evidence '
+  jq -c '{schema_version, results:[.results[] | {database_caches}]}' "$smoke_root/$name.json"
+  previous_report="$smoke_root/$name.json"
 done

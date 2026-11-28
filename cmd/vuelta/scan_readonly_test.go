@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,68 @@ import (
 	"github.com/luckyfoxdesign/vuelta/internal/config"
 	"github.com/luckyfoxdesign/vuelta/internal/vulnscan"
 )
+
+func TestScanJSONCarriesNativeDatabaseObservationsOnSuccessAndFailure(t *testing.T) {
+	updated := time.Date(2026, 11, 28, 6, 0, 0, 0, time.UTC)
+	for _, status := range []string{"hit", "miss", "failed", "unobserved"} {
+		t.Run(status, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "machine"))
+			root := t.TempDir()
+			writeScanProjectFile(t, root, "package.json", "{}\n")
+			options, _, err := parseScanOptions([]string{"--directory", root, "--read-only", "--json"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := selectReadOnlyScanConfiguration(options, "unused")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var observations []vulnscan.DatabaseCacheObservation
+			var scanErr error
+			if status != "unobserved" {
+				observations = []vulnscan.DatabaseCacheObservation{{ScannerImage: "scanner@sha256:" + strings.Repeat("a", 64), CacheKey: "0123456789abcdef", CacheStatus: status, UpdatedAt: &updated}}
+				if status == "miss" {
+					observations[0].DownloadAttempts = 1
+				}
+				if status == "failed" {
+					observations[0].UpdatedAt = nil
+					observations[0].DownloadAttempts = 3
+					scanErr = &vulnscan.DatabaseAcquisitionError{Kind: vulnscan.FailureTransientTransport, Attempts: 3, Err: errors.New("private transport diagnostic")}
+				}
+			}
+			result := scanOneTargetWith(context.Background(), *cfg, scanTarget{path: root, workspace: &cfg.Workspaces[0]}, options, scanStageRunners{
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) (vulnscan.Report, string, bool, error) {
+					return vulnscan.Report{DatabaseCaches: observations}, "trivy", true, scanErr
+				},
+				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
+					return nil, false, nil
+				},
+			})
+			stdout, _ := captureScanOutput(t, func() {
+				if err := writeScanJSONEnvelope(jsonCommandEnvelope{Command: "scan", Results: []scanResult{result}}); err != nil {
+					t.Fatal(err)
+				}
+			})
+			var output struct {
+				Results []struct {
+					DatabaseCaches []vulnscan.DatabaseCacheObservation `json:"database_caches"`
+				} `json:"results"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+				t.Fatal(err)
+			}
+			if len(output.Results) != 1 || !reflect.DeepEqual(output.Results[0].DatabaseCaches, observations) {
+				t.Fatalf("telemetry lost: %s", stdout)
+			}
+			if status == "unobserved" && strings.Contains(stdout, "database_caches") {
+				t.Fatalf("unknown observation claimed: %s", stdout)
+			}
+			if status == "failed" && (result.Status == "clean" || strings.Contains(stdout, "private transport diagnostic")) {
+				t.Fatalf("failure was hidden or diagnostics leaked: %s", stdout)
+			}
+		})
+	}
+}
 
 func TestReadOnlyScanLeavesProjectUnchanged(t *testing.T) {
 	for _, reuse := range []bool{false, true} {
@@ -45,8 +108,8 @@ func TestReadOnlyScanLeavesProjectUnchanged(t *testing.T) {
 			}
 			workspace := cfg.Workspaces[0]
 			runners := scanStageRunners{
-				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) ([]vulnscan.Finding, []vulnscan.ImageResolution, []vulnscan.ImageSkip, string, bool, error) {
-					return []vulnscan.Finding{{ID: "CVE-1", Package: "example", Severity: "HIGH", Source: "trivy"}}, nil, nil, "trivy", true, nil
+				vulnerabilities: func(context.Context, config.Config, scanTarget, scanOptions) (vulnscan.Report, string, bool, error) {
+					return vulnscan.Report{Findings: []vulnscan.Finding{{ID: "CVE-1", Package: "example", Severity: "HIGH", Source: "trivy"}}}, "trivy", true, nil
 				},
 				alerts: func(context.Context, config.Config, scanTarget) ([]vulnscan.Finding, bool, error) {
 					return nil, false, nil

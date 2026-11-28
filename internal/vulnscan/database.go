@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -97,6 +98,50 @@ type databaseCache struct {
 	updatedAt time.Time
 }
 
+// DatabaseCacheObservation describes native acquisition during one scan call.
+// Attempts count download commands, not requests or bytes transferred. UpdatedAt
+// comes only from validated DB metadata; absent telemetry makes no cache claim.
+type DatabaseCacheObservation struct {
+	ScannerImage     string     `json:"scanner_image"`
+	CacheKey         string     `json:"cache_key"`
+	CacheStatus      string     `json:"cache_status"`
+	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+	DownloadAttempts int        `json:"download_attempts"`
+}
+
+var databaseScannerReference = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}@sha256:[a-f0-9]{64}$`)
+
+func (s Scanner) recordDatabaseObservation(image, status string, updated time.Time, attempts int) {
+	if s.databaseObservations == nil || !databaseScannerReference.MatchString(image) || strings.Contains(image, "://") {
+		return
+	}
+	observation, exists := s.databaseObservations[image]
+	if !exists {
+		observation = DatabaseCacheObservation{
+			ScannerImage: image, CacheKey: strings.TrimPrefix(trivyDatabaseVolume(image), "vuelta-trivy-db-"),
+		}
+	}
+	// A later in-session hit must not hide acquisition or failure earlier in the call.
+	if !exists || status == "failed" || (observation.CacheStatus != "failed" && status != "hit") {
+		observation.CacheStatus = status
+	}
+	if !updated.IsZero() {
+		value := updated.UTC()
+		observation.UpdatedAt = &value
+	}
+	observation.DownloadAttempts += attempts
+	s.databaseObservations[image] = observation
+}
+
+func (s Scanner) databaseCacheObservations() []DatabaseCacheObservation {
+	var observations []DatabaseCacheObservation
+	for _, observation := range s.databaseObservations {
+		observations = append(observations, observation)
+	}
+	sort.Slice(observations, func(i, j int) bool { return observations[i].ScannerImage < observations[j].ScannerImage })
+	return observations
+}
+
 func (s *databaseSession) readyCache(key string, maxAgeHours int, now time.Time) (databaseCache, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,10 +186,21 @@ func (s Scanner) ensureTrivyDatabase(
 	image string,
 	egressConfig config.EgressConfig,
 	maxAgeHours int,
-) (databaseCache, error) {
+) (selected databaseCache, resultErr error) {
 	if s.Command != nil {
 		return databaseCache{}, nil
 	}
+	status, attempts := "hit", 0
+	var observedUpdated time.Time
+	defer func() {
+		if resultErr != nil {
+			status = "failed"
+		}
+		if !selected.updatedAt.IsZero() {
+			observedUpdated = selected.updatedAt
+		}
+		s.recordDatabaseObservation(image, status, observedUpdated, attempts)
+	}()
 	volumes := trivyDatabaseVolumes(image)
 	family := volumes[0]
 	if s.database != nil {
@@ -200,9 +256,14 @@ func (s Scanner) ensureTrivyDatabase(
 		if fallback == nil || updated.After(fallback.updatedAt) {
 			copy := cache
 			fallback = &copy
+			observedUpdated = updated
 		}
 	}
 
+	status = "miss"
+	if fallback != nil {
+		status = "refreshed"
+	}
 	candidate := volumes[0]
 	if fallback != nil && fallback.volume == candidate {
 		candidate = volumes[1]
@@ -216,6 +277,7 @@ func (s Scanner) ensureTrivyDatabase(
 	history := make([]string, 0, trivyDatabaseAttempts)
 	var lastErr error
 	for attempt := 1; attempt <= trivyDatabaseAttempts; attempt++ {
+		attempts++
 		_, acquireErr := s.commandWithDatabase(
 			ctx, bundle, image, egressConfig, candidate, true,
 			"trivy", "image", "--download-db-only", "--no-progress",

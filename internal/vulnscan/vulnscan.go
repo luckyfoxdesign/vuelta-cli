@@ -139,6 +139,7 @@ type Report struct {
 	Suppressed       []Finding
 	ImageResolutions []ImageResolution
 	ImageSkips       []ImageSkip
+	DatabaseCaches   []DatabaseCacheObservation
 }
 
 // ImageTier is the resolution ladder rung an image reference was scanned at.
@@ -236,6 +237,9 @@ type Scanner struct {
 	imageFailure         func(error)
 	database             *databaseSession
 	databaseCommand      databaseCommand
+	// Owned by one synchronous Scan/ScanImages/ScanBuiltImage invocation. Value
+	// receiver copies share observations within that call, never between calls.
+	databaseObservations map[string]DatabaseCacheObservation
 }
 
 // NewAdhocScanner returns the narrow scanner used only for an explicit
@@ -420,6 +424,7 @@ func (s Scanner) trivyCommand(
 		return nil, &ScannerPlatformError{}
 	}
 	if err != nil && isTrivyDatabaseRuntimeFailure(err) {
+		s.recordDatabaseObservation(image, "failed", cache.updatedAt, 0)
 		kind := classifyDatabaseFailure(err)
 		invalidateErr := s.invalidateTrivyDatabase(trivyDatabaseVolume(image), volume)
 		ageHours := int(s.now().Sub(cache.updatedAt) / time.Hour)
@@ -451,7 +456,9 @@ func (s Scanner) now() time.Time {
 // Scan checks dependency lock files with the selected local scanner and, for
 // Docker workspaces, every exact digest referenced by docker_images.files. No
 // scanner ignore flag is ever used: tracked policy is evaluated afterwards.
-func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (report Report, resultErr error) {
+	s.databaseObservations = make(map[string]DatabaseCacheObservation)
+	defer func() { report.DatabaseCaches = s.databaseCacheObservations() }()
 	if s.database == nil {
 		s.database = &databaseSession{}
 	}
@@ -472,7 +479,7 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 	if err != nil {
 		return Report{}, err
 	}
-	report := applyPolicy(append(findings, imageFindings...), policy)
+	report = applyPolicy(append(findings, imageFindings...), policy)
 	report.ImageResolutions = resolutions
 	report.ImageSkips = skips
 	return report, nil
@@ -481,7 +488,9 @@ func (s Scanner) Scan(ctx context.Context, root string, ws config.Workspace, cfg
 // ScanImages checks configured immutable images without scanning repository
 // dependencies. It lets the security gate retain image coverage when
 // github-dependabot is selected as the dependency source.
-func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (Report, error) {
+func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspace, cfg config.Config) (report Report, resultErr error) {
+	s.databaseObservations = make(map[string]DatabaseCacheObservation)
+	defer func() { report.DatabaseCaches = s.databaseCacheObservations() }()
 	if s.database == nil {
 		s.database = &databaseSession{}
 	}
@@ -496,7 +505,7 @@ func (s Scanner) ScanImages(ctx context.Context, root string, ws config.Workspac
 	if err != nil {
 		return Report{}, err
 	}
-	report := applyPolicy(findings, policy)
+	report = applyPolicy(findings, policy)
 	report.ImageResolutions = resolutions
 	report.ImageSkips = skips
 	return report, nil

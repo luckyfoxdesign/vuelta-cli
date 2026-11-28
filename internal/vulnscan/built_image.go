@@ -47,18 +47,19 @@ type ImageCoverage struct {
 // Only status=clean or findings is a successful scan; partial and failed must
 // never be interpreted as absence of vulnerabilities.
 type BuiltImageReport struct {
-	SchemaVersion        int              `json:"schema_version"`
-	Artifact             ImageArtifact    `json:"artifact"`
-	Production           *ProductionImage `json:"production,omitempty"`
-	ProductionComparison string           `json:"production_comparison"`
-	ScannedAt            time.Time        `json:"scanned_at"`
-	ScannerImage         string           `json:"scanner_image"`
-	DatabaseUpdatedAt    *time.Time       `json:"database_updated_at,omitempty"`
-	DatabaseMaxAgeHours  int              `json:"database_max_age_hours"`
-	Coverage             ImageCoverage    `json:"coverage"`
-	Status               string           `json:"status"`
-	Error                string           `json:"error,omitempty"`
-	Findings             []JSONFinding    `json:"findings"`
+	SchemaVersion        int                        `json:"schema_version"`
+	Artifact             ImageArtifact              `json:"artifact"`
+	Production           *ProductionImage           `json:"production,omitempty"`
+	ProductionComparison string                     `json:"production_comparison"`
+	ScannedAt            time.Time                  `json:"scanned_at"`
+	ScannerImage         string                     `json:"scanner_image"`
+	DatabaseUpdatedAt    *time.Time                 `json:"database_updated_at,omitempty"`
+	DatabaseMaxAgeHours  int                        `json:"database_max_age_hours"`
+	DatabaseCaches       []DatabaseCacheObservation `json:"database_caches,omitempty"`
+	Coverage             ImageCoverage              `json:"coverage"`
+	Status               string                     `json:"status"`
+	Error                string                     `json:"error,omitempty"`
+	Findings             []JSONFinding              `json:"findings"`
 }
 
 var (
@@ -126,8 +127,10 @@ func ValidateBuiltImageInput(input BuiltImageInput, repositories []string, now t
 // ScanBuiltImage scans the merged published image, including application
 // layers, through the existing isolated Trivy boundary. On error it returns
 // a usable report with explicit failure/coverage, never a clean result.
-func (s Scanner) ScanBuiltImage(ctx context.Context, input BuiltImageInput, repositories []string, cfg config.Config) (BuiltImageReport, error) {
-	report := BuiltImageReport{
+func (s Scanner) ScanBuiltImage(ctx context.Context, input BuiltImageInput, repositories []string, cfg config.Config) (report BuiltImageReport, resultErr error) {
+	s.databaseObservations = make(map[string]DatabaseCacheObservation)
+	defer func() { report.DatabaseCaches = s.databaseCacheObservations() }()
+	report = BuiltImageReport{
 		SchemaVersion: 1, Artifact: input.Artifact, Production: input.Production,
 		ProductionComparison: "not_provided", ScannedAt: s.now().UTC(),
 		ScannerImage: cfg.VulnScan.ImageScan.Image, DatabaseMaxAgeHours: cfg.VulnScan.DatabaseMaxAgeHours,
