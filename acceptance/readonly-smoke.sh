@@ -69,8 +69,11 @@ for project in "$projects"/*; do
         any($previous[]; .cache_key == $current.cache_key and .scanner_image == $current.scanner_image and .updated_at == $current.updated_at))' \
       "$previous_report" "$smoke_root/$name.json" > /dev/null
   fi
-  # Bounded, machine-readable CI evidence; no project inputs or raw tool output.
-  printf 'database-cache-evidence '
-  jq -c '{schema_version, results:[.results[] | {database_caches}]}' "$smoke_root/$name.json"
   previous_report="$smoke_root/$name.json"
 done
+
+# Export only native DB observations. The CI artifact excludes logs, project
+# inputs, paths and raw tool output and remains usable without reading CI logs.
+jq -s '{schema_version:1, invocations:map({database_caches:.results[0].database_caches})}' \
+  "$smoke_root/docker-app-cve.json" "$smoke_root/node-pnpm-cve.json" \
+  > "$smoke_root/db-cache-evidence.json"
