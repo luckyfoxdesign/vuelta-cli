@@ -43,7 +43,33 @@ done
 "$binary" --no-input --config "$machine_config" config init --yes
 "$binary" --no-input --config "$machine_config" environment bootstrap --socket "$socket" --yes
 previous_report=
+phase='scan'
+input_index=0
+retain_database_evidence() {
+  local script_exit=$?
+  trap - EXIT
+  jq -n --arg phase "$phase" --argjson input_index "$input_index" --argjson script_exit "$script_exit" \
+    '{schema_version:1,phase:$phase,input_index:$input_index,script_exit:$script_exit,invocations:[]}' \
+    > "$smoke_root/db-cache-evidence.json"
+  for report in "$smoke_root/docker-app-cve.json" "$smoke_root/node-pnpm-cve.json"; do
+    test -s "$report" || continue
+    jq -e . "$report" > /dev/null 2>&1 || continue
+    jq -s '.[0] as $evidence | .[1].results[0] as $result | $evidence |
+      .invocations += [{database_caches:(($result.database_caches // []) |
+          map({scanner_image,cache_key,cache_status,updated_at,download_attempts})),
+        status:([$result.status] | map(select(. == "clean" or . == "findings" or . == "failed" or . == "partial"))),
+        error_code:([$result.error.code] | map(select(type == "string" and test("^[a-z_]{1,64}$")))),
+        stages:[$result.stages[]? | {name,status} | select(
+          (.name == "preflight" or .name == "vulnerability" or .name == "alerts") and
+          (.status == "succeeded" or .status == "failed" or .status == "not_requested"))]}]' \
+      "$smoke_root/db-cache-evidence.json" "$report" > "$smoke_root/db-cache-evidence.next"
+    mv "$smoke_root/db-cache-evidence.next" "$smoke_root/db-cache-evidence.json"
+  done
+}
+trap retain_database_evidence EXIT
 for project in "$projects"/*; do
+  phase='scan'
+  input_index=$((input_index + 1))
   name=$(basename "$project")
   # Check tracked inputs with Git and list every entry, including untracked
   # and ignored state. Reports stay outside the scanned directory.
@@ -53,16 +79,20 @@ for project in "$projects"/*; do
     jq '.results[] | {status, error, stages, image_scans, warnings, tools}' "$smoke_root/$name.json" >&2
     exit 1
   fi
+  phase='input-integrity'
   (cd "$project" && find . -not -path './.git/*' -print | LC_ALL=C sort) > "$smoke_root/$name.after"
   cmp "$smoke_root/$name.before" "$smoke_root/$name.after"
   test -z "$(git -C "$project" status --porcelain --untracked-files=all --ignored)"
+  phase='report-contract'
   jq -e '.schema_version == 1 and (.results | length == 1) and (.results[0].findings | length > 0) and ([.results[0].findings[].severity] | all(. == "critical" or . == "high" or . == "medium" or . == "low" or . == "unknown")) and any(.results[0].findings[]; (.fixed_versions | length) > 0)' "$smoke_root/$name.json" > /dev/null
+  phase='db-observations'
   jq -e '.results[0].database_caches | length > 0 and all(.[]; .updated_at != null and (.cache_key | length) == 16)' "$smoke_root/$name.json" > /dev/null
   if test -z "$previous_report"; then
     jq -e 'all(.results[0].database_caches[];
       (.cache_status == "hit" and .download_attempts == 0) or
       ((.cache_status == "miss" or .cache_status == "refreshed") and .download_attempts > 0))' "$smoke_root/$name.json" > /dev/null
   else
+    phase='db-reuse'
     jq -se '.[0].results[0].database_caches as $previous |
       all(.[1].results[0].database_caches[];
         . as $current | .cache_status == "hit" and .download_attempts == 0 and
@@ -71,9 +101,4 @@ for project in "$projects"/*; do
   fi
   previous_report="$smoke_root/$name.json"
 done
-
-# Export only native DB observations. The CI artifact excludes logs, project
-# inputs, paths and raw tool output and remains usable without reading CI logs.
-jq -s '{schema_version:1, invocations:map({database_caches:.results[0].database_caches})}' \
-  "$smoke_root/docker-app-cve.json" "$smoke_root/node-pnpm-cve.json" \
-  > "$smoke_root/db-cache-evidence.json"
+phase='done'
